@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="940" viewBox="0 0 1400 940" role="img" aria-labelledby="title description">
+  <title id="title">Latest CMSSDT chatbot pipeline</title>
+  <desc id="description">A numbered end-to-end view of CMSSDT source ingestion, graph storage, browser chat routing, read-only LLM fallback, and persisted answers.</desc>
+  <defs>
+    <style>
+      .title { font: 700 31px sans-serif; fill: #182b3f; }
+      .subtitle { font: 17px sans-serif; fill: #536b80; }
+      .lane { font: 700 19px sans-serif; fill: #182b3f; }
+      .step { font: 700 18px sans-serif; fill: #182b3f; }
+      .copy { font: 15px sans-serif; fill: #273b4e; }
+      .note { font: 14px sans-serif; fill: #536b80; }
+      .box { stroke-width: 2; rx: 10; }
+      .arrow { stroke: #57718b; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .branch { stroke: #57718b; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#57718b"/></marker>
+  </defs>
+  <rect width="1400" height="940" fill="#f6f9fb"/>
+  <text x="58" y="55" class="title">CMSSDT chatbot: latest end-to-end pipeline</text>
+  <text x="58" y="84" class="subtitle">Top lane refreshes trusted data. Bottom lane turns one user question into a saved, grounded answer.</text>
+
+  <rect x="40" y="112" width="1320" height="310" rx="14" fill="#edf5f1" stroke="#91c6a7"/>
+  <text x="66" y="146" class="lane">A. Data update pipeline</text>
+
+  <rect x="70" y="178" width="205" height="150" class="box" fill="#ffffff" stroke="#4c9a70"/>
+  <text x="91" y="214" class="step">1. Collect sources</text>
+  <text x="91" y="242" class="copy">Build/RelVal JSON</text><text x="91" y="265" class="copy">Clang HTML logs</text><text x="91" y="288" class="copy">GitHub exports</text>
+  <rect x="325" y="178" width="205" height="150" class="box" fill="#ffffff" stroke="#4c9a70"/>
+  <text x="346" y="214" class="step">2. Parse and normalize</text>
+  <text x="346" y="242" class="copy">Extract facts, tags,</text><text x="346" y="265" class="copy">architectures, and</text><text x="346" y="288" class="copy">relationships</text>
+  <rect x="580" y="178" width="205" height="150" class="box" fill="#ffffff" stroke="#4c9a70"/>
+  <text x="601" y="214" class="step">3. Detect changes</text>
+  <text x="601" y="242" class="copy">Compare SHA-256 hash</text><text x="601" y="265" class="copy">to ImportState;</text><text x="601" y="288" class="copy">skip unchanged input</text>
+  <rect x="835" y="178" width="205" height="150" class="box" fill="#ffffff" stroke="#4c9a70"/>
+  <text x="856" y="214" class="step">4. Update Neo4j</text>
+  <text x="856" y="242" class="copy">Replace only records</text><text x="856" y="265" class="copy">owned by a changed</text><text x="856" y="288" class="copy">source unit</text>
+  <rect x="1090" y="178" width="230" height="150" class="box" fill="#ffffff" stroke="#4c9a70"/>
+  <text x="1111" y="214" class="step">5. Ready for queries</text>
+  <text x="1111" y="242" class="copy">Neo4j: connected facts</text><text x="1111" y="265" class="copy">OpenSearch: optional</text><text x="1111" y="288" class="copy">archived log evidence</text>
+  <path d="M275 253 L325 253" class="arrow"/><path d="M530 253 L580 253" class="arrow"/><path d="M785 253 L835 253" class="arrow"/><path d="M1040 253 L1090 253" class="arrow"/>
+  <text x="70" y="375" class="note">The importer derives primary/sub-IB metadata from tags and keeps each tag plus architecture distinct.</text>
+
+  <rect x="40" y="462" width="1320" height="412" rx="14" fill="#edf2f8" stroke="#9bb6d1"/>
+  <text x="66" y="496" class="lane">B. Question and answer pipeline</text>
+  <rect x="70" y="530" width="195" height="144" class="box" fill="#ffffff" stroke="#4d86bd"/>
+  <text x="91" y="566" class="step">6. Ask in browser</text>
+  <text x="91" y="594" class="copy">User enters a question.</text><text x="91" y="617" class="copy">Same-tab ID comes from</text><text x="91" y="640" class="copy">sessionStorage.</text>
+  <rect x="310" y="530" width="205" height="144" class="box" fill="#ffffff" stroke="#4d86bd"/>
+  <text x="331" y="566" class="step">7. Call the API</text>
+  <text x="331" y="594" class="copy">POST /api/chat sends</text><text x="331" y="617" class="copy">question + optional</text><text x="331" y="640" class="copy">session ID to FastAPI.</text>
+  <rect x="560" y="530" width="205" height="144" class="box" fill="#fff7e9" stroke="#d79727"/>
+  <text x="581" y="566" class="step">8. Exact route?</text>
+  <text x="581" y="594" class="copy">Recognize known build,</text><text x="581" y="617" class="copy">warning, RelVal, PR, or</text><text x="581" y="640" class="copy">comparison questions.</text>
+  <rect x="815" y="514" width="225" height="163" class="box" fill="#eef8f1" stroke="#4c9a70"/>
+  <text x="836" y="550" class="step">9A. Deterministic</text><text x="836" y="578" class="step">database answer</text>
+  <text x="836" y="606" class="copy">Run a focused Neo4j</text><text x="836" y="629" class="copy">query in Python and</text><text x="836" y="652" class="copy">format the result.</text>
+  <rect x="815" y="718" width="225" height="128" class="box" fill="#f5eef9" stroke="#946eb8"/>
+  <text x="836" y="754" class="step">9B. LLM fallback</text>
+  <text x="836" y="782" class="copy">Restore recent history;</text><text x="836" y="805" class="copy">attach retrieved evidence.</text>
+  <rect x="1090" y="530" width="225" height="144" class="box" fill="#ffffff" stroke="#4d86bd"/>
+  <text x="1111" y="566" class="step">10. Read-only tools</text>
+  <text x="1111" y="594" class="copy">LLM queries Neo4j with</text><text x="1111" y="617" class="copy">named tools or guarded</text><text x="1111" y="640" class="copy">MATCH/RETURN Cypher.</text>
+  <path d="M265 602 L310 602" class="arrow"/><path d="M515 602 L560 602" class="arrow"/><path d="M765 572 L815 572" class="branch"/><path d="M663 674 L663 782 L815 782" class="branch"/><path d="M1040 782 L1065 782 L1065 602 L1090 602" class="arrow"/>
+  <text x="774" y="541" class="note">yes</text><text x="675" y="760" class="note">no</text>
+  <rect x="1090" y="718" width="225" height="128" class="box" fill="#fff7e9" stroke="#d79727"/>
+  <text x="1111" y="754" class="step">11. Return and save</text>
+  <text x="1111" y="782" class="copy">Store ChatTurn records;</text><text x="1111" y="805" class="copy">return answer + citations.</text>
+  <path d="M927 677 L927 700 L1265 700 L1265 718" class="arrow"/><path d="M1202 674 L1202 718" class="arrow"/>
+  <text x="70" y="900" class="note">Guardrail: text matches and shared files indicate relevance only. They do not prove a cause, a fix, a dependency, or a merge reason.</text>
+</svg>
