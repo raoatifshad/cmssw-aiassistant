@@ -1,0 +1,73 @@
+services:
+  neo4j:
+    image: docker.io/library/neo4j:5
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-change-me}
+    ports:
+      - "7475:7474"
+      - "7688:7687"
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  opensearch:
+    image: docker.io/opensearchproject/opensearch:2.15.0
+    environment:
+      discovery.type: single-node
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  logstash:
+    image: docker.io/opensearchproject/logstash-oss-with-opensearch-output-plugin:8.9.0
+    environment:
+      OPENSEARCH_URL: http://opensearch:9200
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro,Z
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      OPENSEARCH_URL: http://opensearch:9200
+      OPENSEARCH_INDEX: ${OPENSEARCH_INDEX:-cmssdt-log-events}
+      LOG_RAG_ARCHIVE_DIR: /data/log-rag
+      CLANG_LOG_ROOT: /data/clang-logs
+    ports:
+      - "${LOG_RAG_API_PORT:-8002}:8001"
+    volumes:
+      - log-rag-data:/data/log-rag
+      - /home/rao/CHAT-BOT-AI/CLANG-LOGS:/data/clang-logs:ro,Z
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+
+volumes:
+  neo4j-data:
+  opensearch-data:
+  log-rag-data:

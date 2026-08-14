@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CMSSDT Log RAG</title>
+  <style>
+    :root {
+      --ink: #152423;
+      --muted: #60716d;
+      --line: #cedbd6;
+      --paper: #f5f6ef;
+      --panel: #ffffff;
+      --teal: #087f78;
+      --teal-dark: #05655f;
+      --orange: #d8642b;
+      --source: #eaf4f1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background-color: var(--paper);
+      background-image: linear-gradient(90deg, rgba(8, 127, 120, .05) 1px, transparent 1px), linear-gradient(rgba(8, 127, 120, .05) 1px, transparent 1px);
+      background-size: 28px 28px;
+      font-family: Georgia, "Times New Roman", serif;
+    }
+    .shell { max-width: 1060px; min-height: 100vh; margin: 0 auto; padding: 28px 24px 36px; display: grid; grid-template-rows: auto 1fr auto; gap: 22px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .mark { width: 42px; height: 42px; display: grid; place-items: center; border: 2px solid var(--teal); color: var(--teal); font: 700 18px/1 Georgia, serif; }
+    h1 { margin: 0; font-size: 21px; letter-spacing: 0; }
+    .subhead { margin: 3px 0 0; color: var(--muted); font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    button { font: 600 14px/1 ui-monospace, SFMono-Regular, Menlo, monospace; cursor: pointer; }
+    .new-chat { padding: 10px 13px; color: var(--teal-dark); background: var(--panel); border: 1px solid var(--teal); }
+    .new-chat:hover { color: #fff; background: var(--teal); }
+    main { min-height: 0; background: var(--panel); border: 1px solid var(--line); box-shadow: 6px 6px 0 rgba(8, 127, 120, .12); display: flex; flex-direction: column; }
+    #messages { flex: 1; min-height: 420px; padding: 28px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
+    .empty { max-width: 610px; margin: auto; text-align: center; }
+    .empty .eyebrow { color: var(--orange); font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; }
+    .empty h2 { margin: 12px 0 8px; font-size: 32px; font-weight: 500; }
+    .empty p { margin: 0; color: var(--muted); line-height: 1.5; }
+    .message { max-width: min(780px, 88%); padding: 14px 16px; line-height: 1.55; white-space: pre-wrap; border: 1px solid var(--line); }
+    .message.user { align-self: flex-end; color: #fff; background: var(--teal); border-color: var(--teal); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .message.assistant { align-self: flex-start; background: #fbfcfa; }
+    .message.error { align-self: flex-start; color: #8e2b1f; background: #fff1ed; border-color: #e3a292; }
+    .source-list { display: grid; gap: 7px; margin-top: 10px; }
+    .source { padding: 9px 10px; color: #35514b; background: var(--source); border-left: 3px solid var(--teal); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .source strong { color: var(--teal-dark); }
+    .action-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .chat-action { padding: 8px 10px; color: var(--teal-dark); background: #fff; border: 1px solid var(--teal); font-size: 12px; }
+    .chat-action:hover, .chat-action:focus-visible { color: #fff; background: var(--teal); outline: none; }
+    form { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 16px; border-top: 1px solid var(--line); background: #fbfcf8; }
+    textarea { min-width: 0; height: 52px; resize: none; padding: 14px; color: var(--ink); background: #fff; border: 1px solid #aabbb6; font: 14px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    textarea:focus { outline: 2px solid rgba(8, 127, 120, .28); border-color: var(--teal); }
+    .send { min-width: 104px; color: #fff; background: var(--orange); border: 1px solid var(--orange); }
+    .send:hover { background: #b94d20; }
+    .send:disabled, textarea:disabled { opacity: .6; cursor: wait; }
+    .status { min-height: 17px; padding: 0 16px 12px; color: var(--muted); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .loading { display: inline-flex; align-items: center; gap: 8px; }
+    .spinner { width: 12px; height: 12px; border: 2px solid rgba(8, 127, 120, .25); border-top-color: var(--teal); border-radius: 50%; animation: spin .75s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 620px) { .shell { padding: 18px 12px; } header { align-items: flex-start; } .brand { gap: 10px; } .mark { width: 36px; height: 36px; } h1 { font-size: 18px; } .subhead { display: none; } #messages { min-height: 380px; padding: 18px; } .message { max-width: 96%; } .empty h2 { font-size: 26px; } form { grid-template-columns: 1fr; } .send { height: 44px; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <div class="mark">KG</div>
+        <div>
+          <h1>CMSSDT Log RAG</h1>
+          <p class="subhead">NEO4J + OPENSEARCH EVIDENCE CONSOLE</p>
+        </div>
+      </div>
+      <button class="new-chat" id="reset" type="button">New chat</button>
+    </header>
+    <main>
+      <section id="messages" aria-live="polite">
+        <div class="empty" id="welcome">
+          <div class="eyebrow">Grounded investigation</div>
+          <h2>Ask the logs what happened.</h2>
+          <p>Answers are grounded in archived events, OpenSearch retrieval, and Neo4j relationships.</p>
+        </div>
+      </section>
+      <form id="chat-form">
+        <textarea id="question" aria-label="Question" placeholder="Ask about a build, warning, service, or failure..." required></textarea>
+        <button class="send" id="send" type="submit">Send</button>
+      </form>
+      <div class="status" id="status"></div>
+    </main>
+  </div>
+  <script>
+    const messages = document.getElementById("messages");
+    const form = document.getElementById("chat-form");
+    const question = document.getElementById("question");
+    const send = document.getElementById("send");
+    const status = document.getElementById("status");
+    const reset = document.getElementById("reset");
+    let sessionId = sessionStorage.getItem("cmssdt-session");
+
+    function addMessage(kind, text, citations = [], actions = []) {
+      document.getElementById("welcome")?.remove();
+      const item = document.createElement("article");
+      item.className = `message ${kind}`;
+      item.textContent = text;
+      if (citations.length) {
+        const sources = document.createElement("div");
+        sources.className = "source-list";
+        for (const citation of citations) {
+          const source = document.createElement("div");
+          source.className = "source";
+          const label = document.createElement("strong");
+          label.textContent = `${citation.event_id} | ${citation.source}`;
+          source.append(label, document.createElement("br"), document.createTextNode(citation.excerpt));
+          sources.append(source);
+        }
+        item.append(sources);
+      }
+      if (actions.length) {
+        const actionList = document.createElement("div");
+        actionList.className = "action-list";
+        for (const action of actions) {
+          const button = document.createElement("button");
+          button.className = "chat-action";
+          button.type = "button";
+          button.textContent = action.label;
+          button.addEventListener("click", () => {
+            question.value = action.question;
+            form.requestSubmit();
+          });
+          actionList.append(button);
+        }
+        item.append(actionList);
+      }
+      messages.append(item);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function setBusy(busy, label = "Thinking...") {
+      question.disabled = busy;
+      send.disabled = busy;
+      send.textContent = busy ? label : "Send";
+    }
+
+    function setStatus(message, loading = false) {
+      status.replaceChildren();
+      if (loading) {
+        const indicator = document.createElement("span");
+        indicator.className = "loading";
+        const spinner = document.createElement("span");
+        spinner.className = "spinner";
+        spinner.setAttribute("aria-hidden", "true");
+        indicator.append(spinner, document.createTextNode(message));
+        status.append(indicator);
+        return;
+      }
+      status.textContent = message;
+    }
+
+    async function restoreHistory() {
+      if (!sessionId) return;
+      try {
+        const response = await fetch(`/api/chat/${encodeURIComponent(sessionId)}/history`);
+        if (!response.ok) return;
+        const data = await response.json();
+        for (const turn of data.turns || []) {
+          if (turn.role === "user" || turn.role === "assistant") addMessage(turn.role, turn.content);
+        }
+        if (data.turns?.length) setStatus("Conversation restored.");
+      } catch {
+        setStatus("Previous conversation could not be restored.");
+      }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const text = question.value.trim();
+      if (!text) return;
+      addMessage("user", text);
+      question.value = "";
+      const prSearch = /\b(?:pr|mr|pull request|merge request|fix|fixes|fixed)\b/i.test(text);
+      setBusy(true, prSearch ? "Searching..." : "Thinking...");
+      setStatus(
+        prSearch
+          ? "Searching PR titles, descriptions, changed files, warnings, and test evidence..."
+          : "Retrieving evidence and consulting the graph...",
+        true,
+      );
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: text, session_id: sessionId }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Chat request failed");
+        sessionId = data.session_id;
+        sessionStorage.setItem("cmssdt-session", sessionId);
+        addMessage("assistant", data.answer, data.citations || [], data.actions || []);
+        setStatus(data.citations?.length ? `${data.citations.length} evidence source(s) attached.` : "Graph search completed.");
+      } catch (error) {
+        addMessage("error", `Request failed: ${error.message}`);
+        setStatus("The server is reachable, but the chat request could not complete.");
+      } finally {
+        setBusy(false);
+        question.focus();
+      }
+    });
+
+    question.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    });
+
+    reset.addEventListener("click", async () => {
+      if (sessionId) await fetch(`/api/chat/${sessionId}`, { method: "DELETE" });
+      sessionId = null;
+      sessionStorage.removeItem("cmssdt-session");
+      messages.replaceChildren();
+      messages.innerHTML = '<div class="empty" id="welcome"><div class="eyebrow">Grounded investigation</div><h2>Ask the logs what happened.</h2><p>Answers are grounded in archived events, OpenSearch retrieval, and Neo4j relationships.</p></div>';
+      setStatus("Conversation reset.");
+      question.focus();
+    });
+
+    restoreHistory();
+  </script>
+</body>
+</html>
