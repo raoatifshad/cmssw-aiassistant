@@ -291,17 +291,6 @@ After restart, check:
 curl http://localhost:8002/api/health
 ```
 
-## 12. Suggested meeting demonstration
-
-1. Open the chat UI and ask for the latest IB.
-2. Show that a primary IB is listed with sub-IB variants beneath it.
-3. Ask the RelVal example above and explain the difference between 13 failed
-   workflows and the aggregate 100,777 per-step counter.
-4. Ask a known warning or PR/Issue question to show deterministic evidence.
-5. Refresh the page to show the same-tab conversation restoration.
-6. Submit feedback for a fact question and show the recorded verification
-   result.
-
 ## 13. Current boundaries and next improvements
 
 - Browser recovery is currently same-tab only; `localStorage` or authenticated
