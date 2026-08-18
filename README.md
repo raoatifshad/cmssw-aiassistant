@@ -51,6 +51,29 @@ outside `cmsrepo` and must have this layout:
 /home/rao/CHAT-BOT-AI/CLANG-LOGS/<ib-tag>/<arch>/build-logs/**/log.html
 ```
 
+### RelVal exception logs
+
+The CMSSDT logreader (`cmssdt.cern.ch/SDT/cgi-bin/logreader/...`) requires a
+CERN SSO login, so pyRelValMatrixLogs step logs can't be fetched automatically.
+Stage them manually — same idea as `--clang-root` — mirroring the logreader's
+own URL path so nothing needs renaming:
+
+```
+/home/rao/CHAT-BOT-AI/buildlogs/raw/<arch>/<tag>/pyRelValMatrixLogs/run/<workflow>_<name>/<step>_<name>.log
+```
+
+Pass `--relval-logs-root` pointing at that root. Ingestion parses each log's
+`----- Begin/End Fatal Exception -----` blocks (category, message, context)
+and links them to the matching `RelVal` via `HAS_EXCEPTION`, citing the exact
+line range back to the original logreader URL:
+
+```bash
+PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
+  --cmsrepo cmsrepo \
+  --relval-logs-root /home/rao/CHAT-BOT-AI/buildlogs/raw \
+  --reconcile
+```
+
 Run the normal update after refreshing `cmsrepo` or adding Clang logs:
 
 ```bash

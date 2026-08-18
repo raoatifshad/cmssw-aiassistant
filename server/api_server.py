@@ -24,16 +24,23 @@ from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "graph"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from tools import TOOLS, GRAPH_SCHEMA, count_warnings_by_package, find_prs_for_error, get_failing_relvals  # noqa: E402
+from tools import (  # noqa: E402
+    TOOLS, GRAPH_SCHEMA, count_warnings_by_package, find_prs_for_error, get_exit_code_names, get_failing_relvals,
+    get_relval_recurrence, search_concepts,
+)
+from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # noqa: E402
 from server.llm_client import DEFAULT_MODEL, get_client  # noqa: E402
 from server.agent import (  # noqa: E402
     KGChatSession,
     execute_read_only_plan,
+    propose_capability_classification,
     propose_investigation_plan,
     synthesize_evidence_answer,
 )
 from server.knowledge_contract import LLM_KNOWLEDGE_CONTRACT  # noqa: E402
-from server.request_planner import Clarification, Capability, Plan, PlanKind, RequestContext, RequestPlanner, Scope  # noqa: E402
+from server.request_planner import (  # noqa: E402
+    Clarification, Capability, IB_TAG_RE, Plan, PlanKind, RequestContext, RequestPlanner, Scope,
+)
 from neo4j_conn import get_driver, setup_schema  # noqa: E402
 from ingestion.log_summary import read_build_summary  # noqa: E402
 from log_rag.opensearch import OpenSearchIndexer  # noqa: E402
@@ -105,6 +112,17 @@ _pasted_exception_search_contexts: dict[str, dict[str, int | str]] = {}
 _llm_client = None
 _pipeline: LogRAGPipeline | None = None
 _retriever: HybridRetriever | None = None
+
+# Phase 2/4: both off by default -- each adds a real per-message LLM call
+# (latency + cost) with no user-visible benefit until explicitly enabled.
+# ENABLE_ROUTER_SHADOW: log-only comparison of an LLM classifier against the
+#   deterministic planner, never used to answer (Phase 3's promotion gate
+#   needs this data to accumulate over real usage first).
+# ENABLE_ANSWER_SYNTHESIS: LLM rephrases an already-deterministic answer,
+#   verified to preserve every number in it before being shown; falls back
+#   to the original deterministic text otherwise.
+ROUTER_SHADOW_ENABLED = os.environ.get("ENABLE_ROUTER_SHADOW", "false").strip().lower() == "true"
+ANSWER_SYNTHESIS_ENABLED = os.environ.get("ENABLE_ANSWER_SYNTHESIS", "false").strip().lower() == "true"
 STATIC_DIR = Path(__file__).parent / "static"
 _request_planner = RequestPlanner((
     Capability(name="ib_menu", required_tag_count=1, bare_tag_only=True, priority=90),
@@ -277,6 +295,45 @@ def _store_planning_decision(session_id: str, question: str, plan: Plan) -> None
             driver.close()
 
 
+def _log_router_shadow_decision(
+    question: str, deterministic_kind: str, deterministic_capability: str | None, session_id: str,
+) -> None:
+    """Phase 2: ask the LLM to classify this question independently of the
+    deterministic planner, and log both decisions for later comparison.
+    Logging only -- never used to answer, never allowed to affect the real
+    response. No-op unless ENABLE_ROUTER_SHADOW=true, since this costs a real
+    LLM call on every message with no user-visible benefit yet."""
+    if not ROUTER_SHADOW_ENABLED or _llm_client is None:
+        return
+    try:
+        capability_names = [c.name for c in _request_planner.capabilities if not c.llm_only]
+        llm_result = propose_capability_classification(_llm_client, DEFAULT_MODEL, question, capability_names)
+        llm_capability = (llm_result or {}).get("capability")
+        llm_confidence = (llm_result or {}).get("confidence")
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                session.run(
+                    "CREATE (log:RouterShadowLog {"
+                    "log_id:$log_id, session_id:$session_id, question:$question, "
+                    "deterministic_kind:$deterministic_kind, deterministic_capability:$deterministic_capability, "
+                    "llm_capability:$llm_capability, llm_confidence:$llm_confidence, "
+                    "agree:$agree, created_at:datetime()})",
+                    log_id=str(uuid.uuid4()),
+                    session_id=session_id,
+                    question=question,
+                    deterministic_kind=deterministic_kind,
+                    deterministic_capability=deterministic_capability,
+                    llm_capability=llm_capability,
+                    llm_confidence=llm_confidence,
+                    agree=(llm_capability == deterministic_capability),
+                )
+        finally:
+            driver.close()
+    except Exception as exc:
+        print(f"WARNING: could not log router shadow decision: {exc}")
+
+
 def _store_pending_clarification(session_id: str, clarification: Clarification) -> None:
     try:
         driver = get_driver()
@@ -340,12 +397,47 @@ def _restore_pending_clarification(session_id: str) -> None:
             driver.close()
 
 
+_NUMBER_RE = re.compile(r"\d[\d,]*\.?\d*")
+
+
+def _extract_numbers(text: str) -> set[str]:
+    return {token.replace(",", "").rstrip(".") for token in _NUMBER_RE.findall(text) if token.strip(",.")}
+
+
+def _synthesize_if_safe(question: str, deterministic_answer: str) -> str:
+    """Phase 4: let the LLM rephrase an already-correct deterministic answer
+    into more natural prose, but verify it didn't drop or alter any number
+    before showing it -- silently falls back to the original deterministic
+    text otherwise, so a paraphrase glitch can degrade to "less fluent,"
+    never to "wrong fact." No-op unless ENABLE_ANSWER_SYNTHESIS=true, since
+    this costs a real LLM call with a new failure surface this codebase has
+    otherwise avoided all session: an LLM stating a fact, not just routing.
+    """
+    if not ANSWER_SYNTHESIS_ENABLED or _llm_client is None:
+        return deterministic_answer
+    try:
+        synthesized = synthesize_evidence_answer(
+            _llm_client, DEFAULT_MODEL, SYSTEM_PROMPT, question,
+            [{"deterministic_answer": deterministic_answer}],
+        )
+        if not synthesized:
+            return deterministic_answer
+        if not _extract_numbers(deterministic_answer).issubset(_extract_numbers(synthesized)):
+            return deterministic_answer
+        return synthesized
+    except Exception as exc:
+        print(f"WARNING: answer synthesis failed, falling back to deterministic text: {exc}")
+        return deterministic_answer
+
+
 def _chat_response(session_id: str, original_question: str, answer: str,
                    route: str, citations: list[dict] | None = None,
                    github_matches: list[dict] | None = None,
                    actions: list[dict] | None = None) -> ChatResponse:
     citations = citations or []
     actions = actions or []
+    if ANSWER_SYNTHESIS_ENABLED and route != "clarification" and not actions:
+        answer = _synthesize_if_safe(original_question, answer)
     _store_chat_turns(session_id, original_question, answer, route, citations)
     if route != "llm" and session_id in _sessions:
         _sessions[session_id].remember(original_question, answer)
@@ -395,6 +487,15 @@ class SearchRequest(BaseModel):
     limit: int = 6
 
 
+class AlertRuleRequest(BaseModel):
+    name: str
+    rule_type: Literal["relval_failure_count", "relval_recurrence", "latest_ib_stalled"]
+    params: dict
+    threshold: float
+    channel: str = "log"
+    owner: str | None = None
+
+
 class FeedbackRequest(BaseModel):
     question: str
     answer: str
@@ -427,9 +528,12 @@ def _normalize_deterministic_question(question: str) -> str:
 
 
 def _requested_ib_arch(question: str) -> str | None:
-    """Return an architecture explicitly named in an IB question."""
+    """Return an architecture explicitly named in an IB question. The single
+    canonical arch-extraction pattern — other inline copies of this regex have
+    drifted narrower over time (amd64-only) and silently missed aarch64/riscv64
+    architectures; route through this function instead of a fresh regex."""
     match = re.search(
-        r"\b(el\d+)[_\s-]+(amd64|aarch64)[_\s-]+(gcc\d+)\b",
+        r"\b(el\d+)[_\s-]+(amd64|aarch64|riscv64)[_\s-]+(gcc\d+)\b",
         question,
         re.IGNORECASE,
     )
@@ -523,7 +627,7 @@ def _relval_failure_count_answer(question: str, session_id: str) -> str | None:
     pending = _pending_relval_scopes.get(session_id)
     all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
     selected_arch = _requested_ib_arch(question)
-    tag_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    tag_match = IB_TAG_RE.search(question)
 
     if pending and tag_match and _is_relval_failure_count_question(question):
         _pending_relval_scopes.pop(session_id, None)
@@ -579,7 +683,7 @@ def _relval_data_availability_answer(question: str) -> str | None:
     """Confirm imported RelVal coverage for one explicitly named IB."""
     if not re.search(r"\b(?:do\s+you\s+have|have\s+data|is\s+there\s+data|available)\b", question, re.IGNORECASE):
         return None
-    tag_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    tag_match = IB_TAG_RE.search(question)
     if not tag_match:
         return None
 
@@ -599,7 +703,7 @@ def _relval_ib_summary_answer(question: str) -> str | None:
         return None
     if not re.search(r"\brelvals?\b", question, re.IGNORECASE):
         return None
-    tag_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    tag_match = IB_TAG_RE.search(question)
     if not tag_match:
         return None
 
@@ -636,7 +740,7 @@ def _unittest_scope_records(tag: str) -> list[dict]:
 def _unittest_summary_answer(question: str, context_tag: str | None) -> str | None:
     if not re.search(r"\bunit\s*tests?\b", question, re.IGNORECASE):
         return None
-    tag_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    tag_match = IB_TAG_RE.search(question)
     tag = tag_match.group(1) if tag_match else context_tag
     if not tag:
         return "Name an Integration Build tag to query its imported unit-test results."
@@ -665,8 +769,17 @@ def _unittest_summary_answer(question: str, context_tag: str | None) -> str | No
     return "\n".join(lines)
 
 
+_PRIMARY_IB_TAG_RE = re.compile(r"^CMSSW_(\d+)_(\d+)_X_(\d{4}-\d{2}-\d{2}-\d{4})$")
+
+
 def _latest_ib_records(arch: str | None = None) -> list[dict]:
-    """Return primary IBs sharing the newest imported timestamp in scope."""
+    """Return primary IBs for the newest release series (highest major.minor),
+    using the newest build timestamp within that series.
+
+    A higher release series (e.g. 20_1) outranks a lower one (e.g. 20_0) even
+    if that series' most recent build is older in wall-clock time — this
+    matches how the IB dashboard orders releases.
+    """
     driver = get_driver()
     try:
         with driver.session() as session:
@@ -674,22 +787,86 @@ def _latest_ib_records(arch: str | None = None) -> list[dict]:
                 "MATCH (ib:IB) "
                 "WHERE ($arch IS NULL OR ib.arch = $arch) "
                 "AND ib.tag =~ '^CMSSW_[0-9]+_[0-9]+_X_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' "
-                "WITH max(right(ib.tag, 15)) AS build_timestamp "
-                "MATCH (ib:IB) "
-                "WHERE ($arch IS NULL OR ib.arch = $arch) "
-                "AND ib.tag =~ '^CMSSW_[0-9]+_[0-9]+_X_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' "
-                "AND right(ib.tag, 15) = build_timestamp "
-                "OPTIONAL MATCH (sub_ib:IB {parent_tag:ib.tag}) "
-                "WHERE sub_ib.tag <> ib.tag "
-                "RETURN ib.tag AS tag, ib.release AS release, "
-                "collect(DISTINCT ib.arch) AS architectures, "
-                "collect(DISTINCT sub_ib.tag) AS sub_ib_tags, build_timestamp "
-                "ORDER BY tag DESC",
+                "RETURN DISTINCT ib.tag AS tag",
                 arch=arch,
             )]
     finally:
         driver.close()
-    return rows
+    if not rows:
+        return []
+
+    def version_key(tag: str) -> tuple[int, int, str]:
+        major, minor, timestamp = _PRIMARY_IB_TAG_RE.match(tag).groups()
+        return (int(major), int(minor), timestamp)
+
+    keyed = [(version_key(row["tag"]), row["tag"]) for row in rows]
+    newest_series = max(key[:2] for key, _ in keyed)
+    in_series = [(key, tag) for key, tag in keyed if key[:2] == newest_series]
+    build_timestamp = max(key[2] for key, _ in in_series)
+    winning_tags = sorted({tag for key, tag in in_series if key[2] == build_timestamp}, reverse=True)
+
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            out = [dict(record) for record in session.run(
+                "MATCH (ib:IB) WHERE ib.tag IN $tags "
+                "AND ($arch IS NULL OR ib.arch = $arch) "
+                "OPTIONAL MATCH (sub_ib:IB {parent_tag:ib.tag}) "
+                "WHERE sub_ib.tag <> ib.tag "
+                "RETURN ib.tag AS tag, ib.release AS release, "
+                "collect(DISTINCT ib.arch) AS architectures, "
+                "collect(DISTINCT sub_ib.tag) AS sub_ib_tags "
+                "ORDER BY tag DESC",
+                tags=winning_tags, arch=arch,
+            )]
+    finally:
+        driver.close()
+    for record in out:
+        record["build_timestamp"] = build_timestamp
+    return out
+
+
+def _latest_and_previous_ib_tags(arch: str | None = None) -> tuple[str, str] | None:
+    """Return (latest_tag, previous_tag): the two most recent builds within the
+    newest (highest major.minor) release series, or None if fewer than two exist."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB) "
+                "WHERE ($arch IS NULL OR ib.arch = $arch) "
+                "AND ib.tag =~ '^CMSSW_[0-9]+_[0-9]+_X_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' "
+                "RETURN DISTINCT ib.tag AS tag",
+                arch=arch,
+            )]
+    finally:
+        driver.close()
+    if not rows:
+        return None
+
+    def version_key(tag: str) -> tuple[int, int, str]:
+        major, minor, timestamp = _PRIMARY_IB_TAG_RE.match(tag).groups()
+        return (int(major), int(minor), timestamp)
+
+    keyed = [(version_key(row["tag"]), row["tag"]) for row in rows]
+    newest_series = max(key[:2] for key, _ in keyed)
+    timestamps = sorted({key[2] for key, _ in keyed if key[:2] == newest_series}, reverse=True)
+    if len(timestamps) < 2:
+        return None
+    major, minor = newest_series
+    latest_tag = f"CMSSW_{major}_{minor}_X_{timestamps[0]}"
+    previous_tag = f"CMSSW_{major}_{minor}_X_{timestamps[1]}"
+    return latest_tag, previous_tag
+
+
+def _is_latest_comparison_question(question: str) -> bool:
+    return bool(
+        re.search(r"\b(?:compare|comparison|delta|deltas|versus|vs)\b", question, re.IGNORECASE)
+        and re.search(
+            r"\b(?:latest|newest|most\s+recent|current|previous|prior|last\s+two)\b",
+            question, re.IGNORECASE,
+        )
+    )
 
 
 def _latest_ib_answer(question: str) -> str | None:
@@ -1062,7 +1239,7 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
     if relval_context is None and re.search(r"\brelvals?\b", question, re.IGNORECASE) and re.search(
         r"\b(?:failing|failed|failures?)\b", question, re.IGNORECASE
     ):
-        tag_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+        tag_match = IB_TAG_RE.search(question)
         if tag_match:
             relval_context = {"tag": tag_match.group(1), "arch": None}
 
@@ -1514,7 +1691,7 @@ def _build_warning_answer(question: str) -> str | None:
         return None
     if not re.search(r"\bwarnings?\b", question, re.IGNORECASE):
         return None
-    tag_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    tag_match = IB_TAG_RE.search(question)
     if not tag_match:
         return None
 
@@ -1560,11 +1737,11 @@ def _failing_relval_context(question: str) -> dict[str, str] | None:
         return None
     if not re.search(r"\b(?:failing|failed|failures?)\b", question, re.IGNORECASE):
         return None
-    tag_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
-    arch_match = re.search(r"\b(el\d+)[_\s-]+amd64[_\s-]+(gcc\d+)\b", question, re.IGNORECASE)
-    if not tag_match or not arch_match:
+    tag_match = IB_TAG_RE.search(question)
+    arch = _requested_ib_arch(question)
+    if not tag_match or not arch:
         return None
-    return {"tag": tag_match.group(1), "arch": f"{arch_match.group(1)}_amd64_{arch_match.group(2)}"}
+    return {"tag": tag_match.group(1), "arch": arch}
 
 
 def _relval_exception_context(question: str) -> dict[str, str | None] | None:
@@ -1573,13 +1750,12 @@ def _relval_exception_context(question: str) -> dict[str, str | None] | None:
         return None
     if not re.search(r"\bexceptions?\b", question, re.IGNORECASE):
         return None
-    tag_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    tag_match = IB_TAG_RE.search(question)
     if not tag_match:
         return None
-    arch_match = re.search(r"\b(el\d+)[_\s-]+amd64[_\s-]+(gcc\d+)\b", question, re.IGNORECASE)
     return {
         "tag": tag_match.group(1),
-        "arch": f"{arch_match.group(1)}_amd64_{arch_match.group(2)}" if arch_match else None,
+        "arch": _requested_ib_arch(question),
     }
 
 
@@ -1587,11 +1763,19 @@ def _relval_exception_list_answer(question: str, context: dict[str, str | None] 
     """List imported RelVal exception signatures for an explicitly named IB."""
     if not context or re.search(r"\b\d{3,6}\.\d+\b", question):
         return None
+    if not re.search(r"\b(?:exceptions?|matche?s?)\b", question, re.IGNORECASE):
+        return None
+    other_tag_match = IB_TAG_RE.search(question)
+    if other_tag_match and other_tag_match.group(1) != context.get("tag"):
+        # The question names a different IB than the cached exception context —
+        # a stale session context must not silently answer for the wrong build.
+        return None
     query = """
         MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal)-[:HAS_EXCEPTION]->(exception:RelValException)
         WHERE (ib.tag = $tag OR ib.parent_tag = $tag)
           AND ($arch IS NULL OR ib.arch = $arch)
-        RETURN DISTINCT ib.arch AS arch, relval.workflow_id AS workflow_id, exception.text AS exception
+        RETURN DISTINCT ib.arch AS arch, relval.workflow_id AS workflow_id, exception.text AS exception,
+               exception.category AS category, exception.source_url AS source_url
         ORDER BY arch, workflow_id, exception
         LIMIT 100
     """
@@ -1605,13 +1789,15 @@ def _relval_exception_list_answer(question: str, context: dict[str, str | None] 
     if not rows:
         return (
             f"No imported RelVal exception signatures were found for `{context['tag']}`{scope}. "
-            "The corresponding `*_EXCEPTIONS.json` source may not have been generated or imported yet."
+            "Neither a `*_EXCEPTIONS.json` source nor staged pyRelValMatrixLogs step logs "
+            "have been imported for this scope yet."
         )
     lines = [f"Imported RelVal exceptions for `{context['tag']}`{scope}:"]
-    lines.extend(
-        f"- `{row['arch']}` workflow `{row['workflow_id']}`: `{row['exception']}`"
-        for row in rows
-    )
+    for row in rows:
+        category = f" **[{row['category']}]**" if row.get("category") else ""
+        lines.append(f"- `{row['arch']}` workflow `{row['workflow_id']}`:{category} `{row['exception']}`")
+        if row.get("source_url"):
+            lines.append(f"  - Source: {row['source_url']}")
     return "\n".join(lines)
 
 
@@ -1623,7 +1809,7 @@ def _relval_error_count_answer(question: str) -> str | None:
         return None
     if not re.search(r"\berrors?\b", question, re.IGNORECASE):
         return None
-    tag_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    tag_match = IB_TAG_RE.search(question)
     if not tag_match:
         return None
 
@@ -1655,6 +1841,25 @@ def _relval_error_count_answer(question: str) -> str | None:
         f"**{record['passed_errors'] or 0:,}** come from **{record['passed_relvals'] or 0:,}** "
         f"RelVals marked `PASSED`, and **{record['failed_errors'] or 0:,}** come from the failed RelVals."
     )
+
+
+def _concept_answer(question: str) -> str | None:
+    """Surface a stored expert correction relevant to this question, if any.
+    These are UserFeedback corrections that already passed verification —
+    durable graph facts, checked before falling through to the LLM."""
+    matches = search_concepts(question, limit=3)
+    if not matches:
+        return None
+    lines = ["A previously verified correction is relevant here:"]
+    for match in matches:
+        lines.append(f"- Re: \"{match['question']}\" — {match['definition']}")
+    lines.append("This came from expert-reviewed chat feedback, not the live IB/RelVal graph facts.")
+    return "\n".join(lines)
+
+
+def _format_exit_code(code: int, names: dict[int, str]) -> str:
+    name = names.get(code)
+    return f"{code} ({name})" if name else str(code)
 
 
 def _workflow_reported_answer(question: str) -> str | None:
@@ -1690,11 +1895,12 @@ def _workflow_reported_answer(question: str) -> str | None:
 
     total = record["total"]
     rows = record["records"]
+    exit_code_names = get_exit_code_names()
     lines = [f"Workflow `{workflow_id}` is reported in **{total}** imported IB record(s)."]
     lines.append(f"The {len(rows)} most recent imported record(s):")
     lines.extend(
         f"- `{row['ib_tag']}` on `{row['arch']}`: `{row['status']}`"
-        f" (errors: {row['errors']}; exit code: {row['exitcode']})"
+        f" (errors: {row['errors']}; exit code: {_format_exit_code(row['exitcode'], exit_code_names)})"
         for row in rows
     )
     return "\n".join(lines)
@@ -1709,6 +1915,7 @@ def _failed_relval_list_answer(question: str, context: dict[str, str] | None) ->
     rows = get_failing_relvals(context["tag"], arch=context["arch"], limit=100)
     if not rows:
         return f"No failing RelVals were found for `{context['tag']}` on `{context['arch']}`."
+    exit_code_names = get_exit_code_names()
     lines = [
         f"The {len(rows)} failing RelVals for `{context['tag']}` and its sub-IBs on `{context['arch']}` are:",
         "",
@@ -1716,15 +1923,52 @@ def _failed_relval_list_answer(question: str, context: dict[str, str] | None) ->
         "| --- | --- | ---: | ---: | ---: |",
     ]
     lines.extend(
-        f"| {row['ib_tag']} | {row['name']} | {row['workflow_id']} | {row['errors'] or 0} | {row['exitcode'] or 0} |"
+        f"| {row['ib_tag']} | {row['name']} | {row['workflow_id']} | {row['errors'] or 0} | "
+        f"{_format_exit_code(row['exitcode'], exit_code_names) if row['exitcode'] else 0} |"
         for row in rows
+    )
+    return "\n".join(lines)
+
+
+def _recurring_failure_answer(question: str) -> str | None:
+    """Has this workflow failed before, across every imported IB -- not just
+    the one currently being discussed? Computed at query time (§5 tier 3:
+    mined patterns) rather than by a scheduled job; always reflects whatever
+    has been ingested so far."""
+    if not re.search(
+        r"\b(?:recurring|recur(?:s|red)?|happened\s+before|seen\s+(?:this\s+)?before|"
+        r"known\s+issue|keeps?\s+failing|how\s+often|history)\b",
+        question, re.IGNORECASE,
+    ):
+        return None
+    workflow_match = re.search(r"\b(\d{3,6}\.\d+)\b", question)
+    if not workflow_match:
+        return "Please provide the failed RelVal workflow ID, for example `37834.0`."
+
+    workflow_id = workflow_match.group(1)
+    recurrence = get_relval_recurrence(workflow_id)
+    if not recurrence["total_appearances"]:
+        return f"Workflow `{workflow_id}` is not reported in the imported RelVal records."
+
+    total = recurrence["total_appearances"]
+    failed = recurrence["failed_appearances"]
+    rate = failed / total if total else 0
+    lines = [
+        f"Workflow `{workflow_id}` (`{recurrence['name']}`) has failed in **{failed} of {total}** "
+        f"imported record(s) ({rate:.0%}) across every architecture and IB seen so far."
+    ]
+    if recurrence["failed_tags"]:
+        lines.append("Most recent failing builds: " + ", ".join(f"`{tag}`" for tag in recurrence["failed_tags"]))
+    lines.append(
+        "This counts every imported IB/architecture combination, not just the one currently discussed — "
+        "a high rate suggests a persistent issue rather than a one-off."
     )
     return "\n".join(lines)
 
 
 def _relval_exception_answer(question: str, context: dict[str, str | None] | None) -> str | None:
     """Find imported exceptions for one failed workflow and their GitHub text matches."""
-    if not re.search(r"\b(?:exception|match)\b", question, re.IGNORECASE):
+    if not re.search(r"\b(?:exceptions?|matche?s?)\b", question, re.IGNORECASE):
         return None
     workflow_match = re.search(r"\b(\d{3,6}\.\d+)\b", question)
     if not context and workflow_match:
@@ -1733,47 +1977,84 @@ def _relval_exception_answer(question: str, context: dict[str, str | None] | Non
         return None
     if not workflow_match:
         return "Please provide the failed RelVal workflow ID, for example `37834.0`."
+    other_tag_match = IB_TAG_RE.search(question)
+    if other_tag_match and other_tag_match.group(1) != context.get("tag"):
+        return (
+            f"Please ask again including `relval` (e.g. \"relval exception {workflow_match.group(1)} in "
+            f"{other_tag_match.group(1)}\") so I use `{other_tag_match.group(1)}` instead of the "
+            f"previously discussed `{context.get('tag')}`."
+        )
 
     workflow_id = workflow_match.group(1)
     exception_query = """
         MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal)-[:HAS_EXCEPTION]->(exception:RelValException)
         WHERE (ib.tag = $tag OR ib.parent_tag = $tag)
                     AND ($arch IS NULL OR ib.arch = $arch) AND relval.workflow_id = $workflow_id
-        RETURN DISTINCT exception.text AS exception
+        RETURN DISTINCT exception.text AS exception, exception.category AS category,
+               exception.source_url AS source_url, exception.context AS context, relval.name AS name
         ORDER BY exception
         LIMIT 20
     """
+    related_workflows_query = """
+        MATCH (ib2:IB)-[:RAN_RELVAL]->(relval2:RelVal)-[:HAS_EXCEPTION]->(:RelValException {text:$text})
+        WHERE relval2.workflow_id <> $workflow_id
+        RETURN DISTINCT relval2.workflow_id AS workflow_id, relval2.name AS name,
+               ib2.tag AS tag, ib2.arch AS arch
+        ORDER BY tag DESC, arch
+        LIMIT 10
+    """
+    # Matches on the exact exception text, the module reported in the exception's
+    # call-stack frame, and the failing workflow's name/ID — a merged PR or open
+    # Issue rarely quotes the full exception text, but commonly names the module
+    # or workflow it affects (as seen with real CMSSW Issues).
     artifact_query = """
         MATCH (item)
         WHERE item.repo = 'cmssw' AND (item:Issue OR item:PR)
         OPTIONAL MATCH (item)-[:HAS_COMMENT]->(comment:GitHubComment)
         WITH item, collect(coalesce(comment.body, '')) AS comment_bodies
-        WITH item, CASE
-            WHEN toLower(coalesce(item.title, '')) CONTAINS toLower($exception) THEN 'title'
-            WHEN toLower(coalesce(item.body, '')) CONTAINS toLower($exception) THEN 'body'
-            WHEN any(comment_body IN comment_bodies WHERE toLower(comment_body) CONTAINS toLower($exception)) THEN 'comment'
-        END AS matched_field
-        WHERE matched_field IS NOT NULL
+        WITH item, [term IN $terms WHERE
+            toLower(coalesce(item.title, '')) CONTAINS toLower(term)
+            OR toLower(coalesce(item.body, '')) CONTAINS toLower(term)
+            OR any(comment_body IN comment_bodies WHERE toLower(comment_body) CONTAINS toLower(term))
+        ] AS matched_terms
+        WHERE size(matched_terms) > 0
         RETURN CASE WHEN item:Issue THEN 'Issue' ELSE 'PR' END AS kind,
                item.number AS number, item.title AS title,
                coalesce(item.state, item.github_state, 'unknown') AS state,
-               item.merged_at AS merged_at, matched_field
+               item.merged_at AS merged_at, matched_terms[0..5] AS matched_terms
         ORDER BY number DESC
         LIMIT 10
     """
     driver = get_driver()
     try:
         with driver.session() as session:
-            exceptions = [record["exception"] for record in session.run(
+            exceptions = [dict(record) for record in session.run(
                 exception_query,
                 tag=context["tag"],
                 arch=context["arch"],
                 workflow_id=workflow_id,
             )]
-            artifact_matches = {
-                exception: [dict(record) for record in session.run(artifact_query, exception=exception)]
-                for exception in exceptions
-            }
+            artifact_matches = {}
+            related_workflows = {}
+            for row in exceptions:
+                exception = row["exception"]
+                module_match = re.search(r"Calling method for module\s+([\w:]+)/", row.get("context") or "")
+                module = module_match.group(1) if module_match else None
+                # Strong terms are specific to this exact failure. Workflow name/ID are
+                # weak: cms-bot posts every tested workflow ID in routine PR CI comments,
+                # so matching a PR on workflow_id/name alone is usually noise, not evidence.
+                strong_terms = {value for value in (exception, module) if value}
+                weak_terms = [value for value in (row.get("name"), workflow_id) if value]
+                terms = list(strong_terms) + weak_terms
+                candidates = [dict(record) for record in session.run(artifact_query, terms=terms)]
+                artifact_matches[exception] = [
+                    match for match in candidates
+                    if match["kind"] == "Issue" or strong_terms & set(match["matched_terms"])
+                ]
+                related_workflows[exception] = [
+                    dict(record) for record in
+                    session.run(related_workflows_query, text=exception, workflow_id=workflow_id)
+                ]
     finally:
         driver.close()
 
@@ -1782,29 +2063,53 @@ def _relval_exception_answer(question: str, context: dict[str, str | None] | Non
         return (
             f"No imported exception signature exists for failed workflow `{workflow_id}` in "
             f"`{context['tag']}`{scope}. "
-            "The corresponding `*_EXCEPTIONS.json` source may not have been generated or imported yet."
+            "Neither a `*_EXCEPTIONS.json` source nor staged pyRelValMatrixLogs step logs "
+            "have been imported for this workflow yet."
         )
     scope = f" on `{context['arch']}`" if context["arch"] else " across all imported architectures"
     lines = [
         f"Exception evidence for failed workflow `{workflow_id}` in `{context['tag']}`{scope}:",
     ]
-    for exception in exceptions:
-        lines.append(f"- **Exception:** `{exception}`")
+    for row in exceptions:
+        exception = row["exception"]
+        category = f" **[{row['category']}]**" if row.get("category") else ""
+        lines.append(f"- **Exception:**{category} `{exception}`")
+        if row.get("source_url"):
+            lines.append(f"  - Source: {row['source_url']}")
+        others = related_workflows[exception]
+        if others:
+            lines.append(f"  - **Also seen in {len(others)} other imported workflow(s):**")
+            lines.extend(
+                f"    - `{other['workflow_id']}` ({other['name']}) on `{other['tag']}` / `{other['arch']}`"
+                for other in others
+            )
         matches = artifact_matches[exception]
         if matches:
-            for match in matches:
-                status = f"merged {match['merged_at']}" if match["merged_at"] else f"state `{match['state']}`"
-                lines.append(
-                    f"  - **{match['kind']} #{match['number']}** - {match['title']} "
-                    f"({status}; match: {match['matched_field']})"
-                )
+            merged = [m for m in matches if m["kind"] == "PR" and m["merged_at"]]
+            unmerged_pr = [m for m in matches if m["kind"] == "PR" and not m["merged_at"]]
+            open_issues = [m for m in matches if m["kind"] == "Issue" and str(m["state"]).lower() == "open"]
+            other_issues = [m for m in matches if m["kind"] == "Issue" and str(m["state"]).lower() != "open"]
+            for label, group in (
+                ("Merged PR (candidate fix or cause — check the diff)", merged),
+                ("Open, unmerged PR", unmerged_pr),
+                ("Open Issue", open_issues),
+                ("Closed/other Issue", other_issues),
+            ):
+                for match in group:
+                    lines.append(
+                        f"  - **{label}: {match['kind']} #{match['number']}** - {match['title']} "
+                        f"(matched: {', '.join(f'`{t}`' for t in match['matched_terms'])})"
+                    )
         else:
-            lines.append("  - No imported CMSSW Issue or PR contains this exact exception text.")
+            lines.append("  - No imported CMSSW Issue or PR matches this exception's text, module, or workflow.")
         lines.append(
             "  - GitHub search: "
             f"https://github.com/search?q={quote_plus(f'repo:cms-sw/cmssw {exception}')}&type=issues"
         )
-    lines.append("These are textual matches in imported GitHub content; they do not prove a cause or a fix.")
+    lines.append(
+        "These are textual matches in imported GitHub content, not proof of cause or fix — a merged PR "
+        "matching by module/workflow name may be unrelated; read the diff before attributing the failure to it."
+    )
     return "\n".join(lines)
 
 
@@ -1847,7 +2152,7 @@ def _build_summary_answer(question: str) -> str | None:
     """Render a build's logAnalysis summary from the local analyzer archive."""
     if not re.search(r"\b(?:summary|summar(?:y|ize)|analysis)\b", question, re.IGNORECASE):
         return None
-    match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    match = IB_TAG_RE.search(question)
     if not match:
         return None
     summary = read_build_summary(Path(os.environ.get("CLANG_LOG_ROOT", "/data/clang-logs")), match.group(1))
@@ -1877,7 +2182,7 @@ def _ib_results_summary_answer(
     question: str, context_tag: str | None, context_arch: str | None
 ) -> str | None:
     """Summarize a primary IB and its imported sub-IB variants."""
-    tag_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    tag_match = IB_TAG_RE.search(question)
     selected_arch = _requested_ib_arch(question) or context_arch
     all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
     summary_requested = bool(re.search(
@@ -1975,7 +2280,7 @@ def _ib_relationship_answer(question: str) -> str | None:
     """Explain the graph-backed primary/sub-IB relationship for one exact tag."""
     if not re.search(r"\b(?:why|parent|sub[\s-]*ib|variant)\b", question, re.IGNORECASE):
         return None
-    match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    match = IB_TAG_RE.search(question)
     if not match:
         return None
     tag = match.group(1)
@@ -2052,13 +2357,12 @@ def _clang_warning_comparison_answer(question: str) -> str | None:
         return None
     if not re.search(r"\b(?:compare|comparison|delta|deltas)\b", question, re.IGNORECASE):
         return None
-    tags = list(dict.fromkeys(re.findall(r"\bCMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4}\b", question)))
-    arch_match = re.search(r"\b(el\d+_amd64_gcc\d+)\b", question)
-    if len(tags) != 2 or not arch_match:
+    tags = list(dict.fromkeys(IB_TAG_RE.findall(question)))
+    arch = _requested_ib_arch(question)
+    if len(tags) != 2 or not arch:
         return None
 
     before_tag, after_tag = sorted(tags)
-    arch = arch_match.group(1)
     totals_query = """
         MATCH (ib:IB)
         WHERE ib.tag IN $tags AND ib.arch = $arch
@@ -2149,7 +2453,7 @@ def _clang_warning_comparison_answer(question: str) -> str | None:
 
 def _pending_ib_comparison(question: str) -> dict[str, object] | None:
     """Capture a two-build comparison that still needs an architecture."""
-    tags = list(dict.fromkeys(re.findall(r"\bCMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4}\b", question)))
+    tags = list(dict.fromkeys(IB_TAG_RE.findall(question)))
     if len(tags) != 2 or not re.search(
         r"\b(?:all|compare|comparison|delta|deltas|everything|versus|vs)\b", question, re.IGNORECASE
     ):
@@ -2162,7 +2466,7 @@ def _pending_ib_comparison(question: str) -> dict[str, object] | None:
 
 def _all_arch_ib_comparison_answer(question: str) -> str | None:
     """Compare imported IB facts across every architecture without LLM tool calls."""
-    tags = list(dict.fromkeys(re.findall(r"\bCMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4}\b", question)))
+    tags = list(dict.fromkeys(IB_TAG_RE.findall(question)))
     if len(tags) != 2 or not re.search(r"\b(?:all|every)\s+architectures?\b|\beverything\b", question, re.IGNORECASE):
         return None
 
@@ -2241,14 +2545,26 @@ def _ib_comparison_answer(question: str) -> str | None:
     """Compare relval and unit-test outcomes for two IBs without LLM tool calling."""
     if not re.search(r"\b(?:compare|comparison|delta|deltas)\b", question, re.IGNORECASE):
         return None
-    tags = list(dict.fromkeys(re.findall(r"\bCMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4}\b", question)))
-    arch_match = re.search(r"\b(el\d+_amd64_gcc\d+)\b", question)
+    tags = list(dict.fromkeys(IB_TAG_RE.findall(question)))
+    arch_match = re.search(r"\b(el\d+_(?:amd64|aarch64|riscv64)_gcc\d+)\b", question, re.IGNORECASE)
     if len(tags) != 2:
         return None
     if not arch_match:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                rows = [dict(record) for record in session.run(
+                    "MATCH (ib:IB) WHERE ib.tag IN $tags RETURN DISTINCT ib.arch AS arch ORDER BY arch",
+                    tags=tags,
+                )]
+        finally:
+            driver.close()
+        architectures = [row["arch"] for row in rows]
+        if not architectures:
+            return "Neither requested Integration Build is present in the imported graph."
         return (
-            "Which architecture should I compare? IB data is stored separately for each architecture; "
-            "for example, `el9_amd64_gcc13`."
+            "Which architecture should I compare? IB data is stored separately for each architecture. "
+            f"Available for these builds: {', '.join(f'`{arch}`' for arch in architectures)}."
         )
 
     query = """
@@ -2312,6 +2628,7 @@ def _ib_comparison_answer(question: str) -> str | None:
         if previous_failures.get(workflow_id) != later_failures.get(workflow_id)
     ]
     if changed_failures:
+        exit_code_names = get_exit_code_names()
         lines.extend(["", "### Changed failing workflows"])
         for workflow_id, previous, later in changed_failures:
             name = (later or previous)["name"]
@@ -2319,7 +2636,8 @@ def _ib_comparison_answer(question: str) -> str | None:
                 lines.append(
                     f"- `{workflow_id}` - {name}: errors {previous['errors']} to {later['errors']}; "
                     f"warnings {previous['warnings']} to {later['warnings']}; "
-                    f"exit code {previous['exitcode']} to {later['exitcode']}."
+                    f"exit code {_format_exit_code(previous['exitcode'], exit_code_names)} to "
+                    f"{_format_exit_code(later['exitcode'], exit_code_names)}."
                 )
             elif later:
                 lines.append(f"- `{workflow_id}` - {name}: newly failing in {after['tag']}.")
@@ -2346,45 +2664,56 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
             return menu
         return None
     if capability == "comparison":
-        for answer in (
-            _clang_warning_comparison_answer(question),
-            _all_arch_ib_comparison_answer(question),
-            _ib_comparison_answer(question),
-        ):
-            if answer:
-                return answer, []
-        return None
+        # `or` short-circuits, unlike `for x in (a(), b(), c())` which builds the
+        # tuple eagerly and always runs every call — _ib_comparison_answer's
+        # architecture-listing fallback does a real graph query, so it must not
+        # run when an earlier answer already resolved the question.
+        answer = (
+            _clang_warning_comparison_answer(question)
+            or _all_arch_ib_comparison_answer(question)
+            or _ib_comparison_answer(question)
+        )
+        return (answer, []) if answer else None
     if capability == "relval":
-        for answer in (
-            _relval_failure_count_answer(question, session_id),
-            _relval_data_availability_answer(question),
-            _relval_error_count_answer(question),
-            _relval_ib_summary_answer(question),
-        ):
-            if answer:
-                return answer, []
-        return None
+        # Exception lookups are tried first and specifically: a generic RelVal
+        # question ("relval results for <tag>") should fall through to the
+        # summary below, but "relval exception for <tag>/<workflow>" must not
+        # be swallowed by that summary before reaching the exception answer.
+        exception_context = _relval_exception_context(question)
+        if exception_context:
+            _relval_exception_contexts[session_id] = exception_context
+        exception_scope = _relval_exception_contexts.get(session_id) or _failed_relval_contexts.get(session_id)
+        # Sequential, short-circuiting: `for x in (a(), b(), ...)` builds the whole
+        # tuple eagerly and runs every function regardless of an earlier match —
+        # several of these run real graph queries, so that would mean up to 6
+        # queries per relval question even when the first one already answered.
+        answer = (
+            _relval_exception_list_answer(question, exception_scope)
+            or _relval_exception_answer(question, exception_scope)
+            or _recurring_failure_answer(question)
+            or _relval_failure_count_answer(question, session_id)
+            or _relval_data_availability_answer(question)
+            or _relval_error_count_answer(question)
+            or _relval_ib_summary_answer(question)
+        )
+        return (answer, []) if answer else None
     if capability == "unittest":
         answer = _unittest_summary_answer(question, _latest_ib_contexts.get(session_id))
         return (answer, []) if answer else None
     if capability == "clang":
-        for answer in (
-            _clang_warning_comparison_answer(question),
-            _build_summary_answer(question),
-            _latest_clang_warning_answer(question),
-        ):
-            if answer:
-                return answer, []
-        return None
+        answer = (
+            _clang_warning_comparison_answer(question)
+            or _build_summary_answer(question)
+            or _latest_clang_warning_answer(question)
+        )
+        return (answer, []) if answer else None
     if capability == "build":
-        for answer in (
-            _build_warning_answer(question),
-            _build_summary_answer(question),
-            _warning_count_answer(question),
-        ):
-            if answer:
-                return answer, []
-        return None
+        answer = (
+            _build_warning_answer(question)
+            or _build_summary_answer(question)
+            or _warning_count_answer(question)
+        )
+        return (answer, []) if answer else None
     if capability == "ib_summary":
         answer = _ib_results_summary_answer(
             question, _latest_ib_contexts.get(session_id), _latest_ib_arch_contexts.get(session_id)
@@ -2405,6 +2734,12 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
             answer, prs = result
             _pr_contexts[session_id] = prs
             return answer, []
+        # "is this a known issue" contains the word "issue", routing here even
+        # though it's really a recurrence question, not a GitHub Issue lookup —
+        # try it once PR/Issue evidence itself found nothing.
+        recurring_answer = _recurring_failure_answer(question)
+        if recurring_answer:
+            return recurring_answer, []
     return None
 
 
@@ -2424,7 +2759,19 @@ def chat(req: ChatRequest):
     sid = req.session_id or str(uuid.uuid4())
     original_question = req.question
     question = _normalize_deterministic_question(original_question)
-    ib_match = re.search(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+
+    explicit_tags = IB_TAG_RE.findall(question)
+    if len(explicit_tags) < 2 and _is_latest_comparison_question(question):
+        # "compare latest branches" / "compare latest with previous" etc. with no (or
+        # only one) explicit tag — resolve to the two most recent builds of the newest
+        # release series so the comparison capabilities have concrete tags to match.
+        arch_hint = _requested_ib_arch(question)
+        tag_pair = _latest_and_previous_ib_tags(arch_hint)
+        if tag_pair:
+            latest_tag, previous_tag = tag_pair
+            question = f"{question} {previous_tag} {latest_tag}"
+
+    ib_match = IB_TAG_RE.search(question)
     if ib_match:
         _latest_ib_contexts[sid] = ib_match.group(1)
         selected_arch = _requested_ib_arch(question)
@@ -2432,8 +2779,28 @@ def chat(req: ChatRequest):
             _latest_ib_arch_contexts[sid] = selected_arch
         else:
             _latest_ib_arch_contexts.pop(sid, None)
-    architecture_only = re.fullmatch(r"\s*(el\d+_amd64_gcc\d+)\s*[.?!]?\s*", question)
-    all_architectures_only = re.fullmatch(r"\s*(?:all(?:\s+architectures?)?|everything)\s*[.?!]?\s*", question, re.IGNORECASE)
+    elif _is_latest_ib_question(question):
+        # No explicit tag given but the question refers to "the latest IB" (e.g.
+        # "how many relvals failing in the latest IB") — resolve it to a concrete
+        # tag up front so downstream capability lookups (relval/build/unittest)
+        # have an explicit tag to match against instead of returning no evidence.
+        arch_hint = _requested_ib_arch(question)
+        latest_records = _latest_ib_records(arch_hint)
+        if latest_records:
+            resolved_tag = latest_records[0]["tag"]
+            question = f"{question} {resolved_tag}"
+            _latest_ib_contexts[sid] = resolved_tag
+            if arch_hint:
+                _latest_ib_arch_contexts[sid] = arch_hint
+            else:
+                _latest_ib_arch_contexts.pop(sid, None)
+    _ACK_PREFIX = r"\s*(?:yes|yeah|yep|sure|ok(?:ay)?|please)?[,:\s]*"
+    architecture_only = re.fullmatch(
+        _ACK_PREFIX + r"(el\d+_(?:amd64|aarch64|riscv64)_gcc\d+)\s*[.?!]?\s*", question, re.IGNORECASE
+    )
+    all_architectures_only = re.fullmatch(
+        _ACK_PREFIX + r"(?:all(?:\s+architectures?)?|everything)\s*[.?!]?\s*", question, re.IGNORECASE
+    )
     pending_comparison = _pending_ib_comparisons.get(sid)
     if pending_comparison and architecture_only:
         comparison_type = "Clang warnings" if pending_comparison["clang_warnings"] else "IB results"
@@ -2452,6 +2819,7 @@ def chat(req: ChatRequest):
     _restore_pending_clarification(sid)
     planned = _request_planner.plan(RequestContext.extract(question), sid)
     _store_planning_decision(sid, original_question, planned)
+    _log_router_shadow_decision(question, planned.kind.value, planned.capability, sid)
     if planned.kind == PlanKind.CLARIFICATION and planned.clarification:
         _store_pending_clarification(sid, planned.clarification)
     elif sid not in _request_planner.pending:
@@ -2501,6 +2869,9 @@ def chat(req: ChatRequest):
     workflow_reported_answer = _workflow_reported_answer(question)
     if workflow_reported_answer:
         return _chat_response(sid, original_question, workflow_reported_answer, "deterministic")
+    recurring_failure_answer = _recurring_failure_answer(question)
+    if recurring_failure_answer:
+        return _chat_response(sid, original_question, recurring_failure_answer, "deterministic")
     relval_context = _failing_relval_context(question)
     if relval_context:
         _failed_relval_contexts[sid] = relval_context
@@ -2598,6 +2969,9 @@ def chat(req: ChatRequest):
         pr_answer, prs = pr_result
         _pr_contexts[sid] = prs
         return _chat_response(sid, original_question, pr_answer, "deterministic")
+    concept_answer = _concept_answer(question)
+    if concept_answer:
+        return _chat_response(sid, original_question, concept_answer, "deterministic")
     if _llm_client is None:
         raise HTTPException(503, "CERN API not configured — see .env")
     raw_plan = propose_investigation_plan(
@@ -2769,6 +3143,24 @@ def record_feedback(req: FeedbackRequest):
                 verification=verification,
                 verification_method=verification_method,
             )
+            # A correction that passed the same verification gate used for the
+            # accept/reject decision above becomes a durable graph fact, not just
+            # a conversation record — this is the trust boundary the glossary
+            # layer builds on, not a new invented review process.
+            concept_id = None
+            if status == "accepted" and req.verdict == "incorrect" and req.corrected_answer:
+                concept_id = str(uuid.uuid4())
+                session.run(
+                    "CREATE (concept:Concept {"
+                    "concept_id:$concept_id, question:$question, definition:$definition, "
+                    "source_feedback_id:$feedback_id, verification_method:$verification_method, "
+                    "created_at:datetime()})",
+                    concept_id=concept_id,
+                    question=req.question,
+                    definition=req.corrected_answer,
+                    feedback_id=feedback_id,
+                    verification_method=verification_method,
+                )
     finally:
         driver.close()
     return {
@@ -2777,8 +3169,42 @@ def record_feedback(req: FeedbackRequest):
         "verification": verification,
         "verification_method": verification_method,
         "verified_ib_tags": verified_ib_tags,
+        "concept_id": concept_id,
         "message": "Feedback was recorded. Imported IB and warning facts were not changed.",
     }
+
+
+@app.post("/api/alerts")
+def create_alert_rule(req: AlertRuleRequest):
+    """Register a rule that reuses an existing capability's query on a
+    schedule (see ingestion/run_alerts.py) instead of a chat turn."""
+    try:
+        rule_id = create_rule(
+            req.name, req.rule_type, req.params, req.threshold, req.channel, req.owner,
+        )
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(422, str(exc))
+    return {"rule_id": rule_id}
+
+
+@app.get("/api/alerts")
+def get_alert_rules(active_only: bool = True):
+    return {"rules": list_rules(active_only=active_only)}
+
+
+@app.delete("/api/alerts/{rule_id}")
+def remove_alert_rule(rule_id: str):
+    if not deactivate_rule(rule_id):
+        raise HTTPException(404, "No alert rule with that ID.")
+    return {"status": "deactivated"}
+
+
+@app.post("/api/alerts/evaluate")
+def evaluate_alert_rules_now():
+    """Evaluate every active rule immediately (for testing a rule without
+    waiting for the next scheduled run of ingestion/run_alerts.py)."""
+    fired = evaluate_rules()
+    return {"fired": len(fired), "alerts": fired}
 
 
 @app.delete("/api/chat/{session_id}")

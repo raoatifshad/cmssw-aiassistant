@@ -30,6 +30,8 @@ from server.api_server import (
     _workflow_reported_answer,
     _workflow_artifact_answer,
     _requested_ib_arch,
+    _execute_planned_capability,
+    _failing_relval_context,
     chat,
     record_feedback,
 )
@@ -303,6 +305,24 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("No imported RelVal exception signatures", answer)
         self.assertIn("CMSSW_20_1_X_2026-08-12-1100", answer)
         get_driver.return_value.close.assert_called_once()
+
+    def test_relval_exception_list_requires_exception_keyword(self):
+        # A plain relval question (no "exception"/"match") must never reuse a
+        # cached exception context — regression guard for the stale-context bug.
+        context = {"tag": "CMSSW_20_1_DEVEL_X_2026-08-17-2300", "arch": "el9_amd64_gcc14"}
+        self.assertIsNone(
+            _relval_exception_list_answer("what relvals are failing in CMSSW_20_1_CLANG_X_2026-08-16-2300", context)
+        )
+
+    def test_relval_exception_list_rejects_stale_tag_context(self):
+        # A question naming a *different* explicit IB than the cached context
+        # must not silently answer using the stale tag.
+        context = {"tag": "CMSSW_20_1_DEVEL_X_2026-08-17-2300", "arch": "el9_amd64_gcc14"}
+        self.assertIsNone(
+            _relval_exception_list_answer(
+                "what relval exceptions does CMSSW_20_1_CLANG_X_2026-08-16-2300 have", context
+            )
+        )
 
     def test_workflow_exception_search_requires_ib_context(self):
         self.assertEqual(
@@ -641,8 +661,9 @@ class ChatRoutingTests(unittest.TestCase):
             "are there open Issues for failed RelVals in CMSSW_20_1_X_2026-08-10-1100?"
         ))
 
+    @patch("server.api_server.get_exit_code_names", return_value={16640: "OtherCMS"})
     @patch("server.api_server.get_driver")
-    def test_workflow_reported_without_an_ib_lists_matching_records(self, get_driver):
+    def test_workflow_reported_without_an_ib_lists_matching_records(self, get_driver, exit_code_names):
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value.single.return_value = {
             "total": 2,
@@ -657,7 +678,7 @@ class ChatRoutingTests(unittest.TestCase):
                 "arch": "el10_amd64_gcc15",
                 "status": "FAILED",
                 "errors": 2,
-                "exitcode": 8001,
+                "exitcode": 16640,
             }],
         }
 
@@ -667,6 +688,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("The 2 most recent", answer)
         self.assertIn("CMSSW_20_1_X_2026-08-11-2300", answer)
         self.assertIn("CMSSW_20_1_X_2026-08-12-1100", answer)
+        self.assertIn("exit code: 16640 (OtherCMS)", answer)
         self.assertEqual(session.run.call_args.kwargs["workflow_id"], "140.051")
         get_driver.return_value.close.assert_called_once()
 
@@ -692,16 +714,18 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server.get_driver")
     def test_relval_exception_search_returns_imported_artifact_matches(self, get_driver):
         session = get_driver.return_value.session.return_value.__enter__.return_value
+        exception_text = "An exception of category 'NoSecondaryFiles' occurred while"
         session.run.side_effect = [
-            [{"exception": "An exception of category 'NoSecondaryFiles' occurred while"}],
+            [{"exception": exception_text, "category": None, "source_url": None, "context": None, "name": "TTbar"}],
             [{
                 "kind": "PR",
                 "number": 44029,
                 "title": "Tau DQM miniAOD validation for DATA",
                 "state": "closed",
                 "merged_at": "2024-02-20T00:00:00+00:00",
-                "matched_field": "body",
+                "matched_terms": [exception_text],
             }],
+            [],
         ]
 
         answer = _relval_exception_answer(
@@ -713,7 +737,47 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("PR #44029", answer)
         self.assertIn("https://github.com/search?q=repo%3Acms-sw%2Fcmssw+An+exception", answer)
         self.assertEqual(session.run.call_args_list[0].kwargs["workflow_id"], "37834.0")
+        self.assertIn(exception_text, session.run.call_args_list[1].kwargs["terms"])
         get_driver.return_value.close.assert_called_once()
+
+    @patch("server.api_server.get_driver")
+    def test_relval_exception_answer_labels_merged_pr_and_open_issue(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        exception_text = "LogicError: A muon candidate track has more than 5 stations"
+        session.run.side_effect = [
+            [{
+                "exception": exception_text, "category": "LogicError", "source_url": "https://example/log#/1-1",
+                "context": "Calling method for module EvaluateMuonMVAID/'muonMVAID'", "name": "RunMuonEG2022C",
+            }],
+            [
+                {
+                    "kind": "PR", "number": 51375, "title": "Unrelated PR", "state": "closed",
+                    "merged_at": "2026-08-01T00:00:00+00:00", "matched_terms": ["RunMuonEG2022C", "140.051"],
+                },
+                {
+                    "kind": "PR", "number": 50360, "title": "Touches EvaluateMuonMVAID", "state": "closed",
+                    "merged_at": "2026-08-02T00:00:00+00:00", "matched_terms": ["EvaluateMuonMVAID"],
+                },
+                {
+                    "kind": "Issue", "number": 51354, "title": "LogicError in EvaluateMuonMVAID", "state": "open",
+                    "merged_at": None, "matched_terms": ["EvaluateMuonMVAID", "RunMuonEG2022C"],
+                },
+            ],
+            [],
+        ]
+
+        answer = _relval_exception_answer(
+            "what relval exception does workflow 140.051 have?",
+            {"tag": "CMSSW_20_1_DEVEL_X_2026-08-17-2300", "arch": "el9_amd64_gcc14"},
+        )
+
+        # The PR matched only on the weak workflow-name/ID terms (routine CI-comment
+        # noise) must be dropped; the one matched on the specific module name, and
+        # the open Issue, must both survive.
+        self.assertNotIn("PR #51375", answer)
+        self.assertIn("Merged PR (candidate fix or cause", answer)
+        self.assertIn("PR #50360", answer)
+        self.assertIn("Open Issue: Issue #51354", answer)
 
     @patch("server.api_server.get_driver")
     def test_named_issue_author_is_deterministic(self, get_driver):
@@ -971,13 +1035,124 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server._chat_response", side_effect=lambda *args, **kwargs: args[2])
     @patch("server.api_server.propose_investigation_plan", return_value={"capability": "unknown"})
     @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.search_concepts", return_value=[])
     def test_invalid_llm_plan_is_rejected_before_tool_execution(
-        self, propose_plan, chat_response, restore, store_decision, clear_pending
+        self, concepts, propose_plan, chat_response, restore, store_decision, clear_pending
     ):
         result = chat(ChatRequest(question="Explain the graph topology", session_id="invalid-plan"))
 
         self.assertIn("could not create a valid local evidence plan", result)
         propose_plan.assert_called_once()
+
+    # -- Regression tests for bugs found and fixed this session (Phase 0 golden set) --
+
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._chat_response", side_effect=lambda *args, **kwargs: args[2])
+    @patch("server.api_server._execute_planned_capability", return_value=("relval evidence", []))
+    @patch("server.api_server._latest_ib_records")
+    def test_latest_ib_phrase_resolves_to_a_tag_before_routing(
+        self, latest_ib_records, execute, chat_response, restore, store_decision, clear_pending
+    ):
+        # "the latest IB" with no explicit tag must resolve to a concrete tag
+        # before capability dispatch, or relval/build/unittest questions phrased
+        # this way silently fall through to "no imported local evidence."
+        latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
+
+        result = chat(ChatRequest(
+            question="how many relvals failing in the latest IB", session_id="latest-ib-resolve",
+        ))
+
+        self.assertEqual(result, "relval evidence")
+        self.assertEqual(execute.call_args.args[0], "relval")
+        self.assertIn("CMSSW_20_1_X_2026-08-17-2300", execute.call_args.args[1])
+
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._chat_response", side_effect=lambda *args, **kwargs: args[2])
+    @patch("server.api_server._execute_planned_capability", return_value=("comparison evidence", []))
+    @patch("server.api_server._latest_and_previous_ib_tags")
+    def test_compare_latest_branches_resolves_to_a_tag_pair(
+        self, latest_and_previous, execute, chat_response, restore, store_decision, clear_pending
+    ):
+        # "compare latest branches" with zero explicit tags must resolve to the
+        # two most recent builds of the newest release series before routing.
+        latest_and_previous.return_value = (
+            "CMSSW_20_1_X_2026-08-17-2300", "CMSSW_20_1_X_2026-08-17-1100",
+        )
+
+        result = chat(ChatRequest(question="compare latest branches", session_id="compare-latest-resolve"))
+
+        self.assertEqual(result, "comparison evidence")
+        self.assertEqual(execute.call_args.args[0], "comparison")
+        question_used = execute.call_args.args[1]
+        self.assertIn("CMSSW_20_1_X_2026-08-17-2300", question_used)
+        self.assertIn("CMSSW_20_1_X_2026-08-17-1100", question_used)
+
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._chat_response", side_effect=lambda *args, **kwargs: args[2])
+    @patch("server.api_server._execute_planned_capability", return_value=("comparison evidence", []))
+    def test_architecture_ack_with_leading_yes_completes_pending_comparison(
+        self, execute, chat_response, restore, store_decision, clear_pending
+    ):
+        # A natural "yes el9_amd64_gcc14" reply must still be recognized as an
+        # architecture-only answer — a bare fullmatch regex previously required
+        # the reply to contain nothing but the architecture string.
+        session_id = "ack-architecture-reply"
+        tags = ["CMSSW_20_1_X_2026-08-17-1100", "CMSSW_20_1_X_2026-08-17-2300"]
+        _pending_ib_comparisons[session_id] = {"tags": tags, "clang_warnings": False}
+        try:
+            result = chat(ChatRequest(question="yes el9_amd64_gcc14", session_id=session_id))
+        finally:
+            _pending_ib_comparisons.pop(session_id, None)
+
+        self.assertEqual(result, "comparison evidence")
+        self.assertEqual(
+            execute.call_args.args[1],
+            f"compare IB results {tags[0]} and {tags[1]} with el9_amd64_gcc14",
+        )
+
+    @patch("server.api_server._relval_ib_summary_answer", return_value="generic summary")
+    @patch("server.api_server._relval_exception_answer", return_value="exception evidence")
+    @patch("server.api_server._relval_exception_context")
+    def test_relval_exception_answer_is_not_shadowed_by_generic_summary(
+        self, exception_context, exception_answer, summary_answer
+    ):
+        # Regression for the capability-dispatch-order bug: a question containing
+        # both "relval" and "exception" must reach _relval_exception_answer, not
+        # the generic _relval_ib_summary_answer catch-all tried later in the chain.
+        exception_context.return_value = {
+            "tag": "CMSSW_20_1_X_2026-08-17-2300", "arch": "el9_amd64_gcc14",
+        }
+
+        answer, _ = _execute_planned_capability(
+            "relval",
+            "what relval exception does workflow 140.051 have in CMSSW_20_1_X_2026-08-17-2300?",
+            "dispatch-order-session",
+        )
+
+        self.assertEqual(answer, "exception evidence")
+        summary_answer.assert_not_called()
+
+    def test_relval_exception_context_recognizes_aarch64_architecture(self):
+        # Regression for a Phase 1 finding: this function used to build its own
+        # amd64-only arch regex, so an aarch64 architecture in the question was
+        # silently dropped (context["arch"] came back None, meaning "all
+        # architectures") instead of scoping to the one actually named.
+        context = _relval_exception_context(
+            "relval exception for CMSSW_20_1_X_2026-08-17-2300 el9_aarch64_gcc14"
+        )
+        self.assertEqual(context["arch"], "el9_aarch64_gcc14")
+
+    def test_failing_relval_context_recognizes_aarch64_architecture(self):
+        context = _failing_relval_context(
+            "failed relvals for CMSSW_20_1_X_2026-08-17-2300 el9_aarch64_gcc14"
+        )
+        self.assertEqual(context["arch"], "el9_aarch64_gcc14")
 
 
 if __name__ == "__main__":

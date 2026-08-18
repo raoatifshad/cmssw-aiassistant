@@ -10,6 +10,7 @@ from build_graph import (
     command_records,
     command_source_paths,
     discover_clang_builds,
+    exit_code_records,
     file_hash,
     github_issue_from_issue,
     github_pr_from_issue,
@@ -84,6 +85,17 @@ class IncrementalGraphTests(unittest.TestCase):
         self.assertEqual(records[0]["number"], 51668)
         self.assertEqual(records[0]["sha"], "1234567890abcdef1234567890abcdef12345678")
         self.assertEqual(records[0]["branch"], "CMSSW_20_1_X")
+
+    def test_exit_code_records_parses_codes_as_integers(self):
+        records = exit_code_records({"16640": "OtherCMS", "35584": "SIGSEGV"})
+
+        self.assertIn({"code": 16640, "name": "OtherCMS"}, records)
+        self.assertIn({"code": 35584, "name": "SIGSEGV"}, records)
+
+    def test_exit_code_records_skips_malformed_entries(self):
+        records = exit_code_records({"not-a-number": "Whatever", "16640": "", "35584": "SIGSEGV"})
+
+        self.assertEqual(records, [{"code": 35584, "name": "SIGSEGV"}])
 
     def test_ib_key_preserves_architecture(self):
         tag = "CMSSW_20_1_X_2026-08-03-2300"
@@ -194,6 +206,8 @@ class IncrementalGraphTests(unittest.TestCase):
             "tag": "CMSSW_20_1_DBG_X_2026-08-07-2300",
             "arch": "el9_amd64_gcc13",
             "release": "CMSSW_20_1_DBG_X",
+            "parent_tag": "CMSSW_20_1_X_2026-08-07-2300",
+            "variant": "DBG",
             "status": "warning",
             "comp_warnings": 1,
             "ignored_warnings": 2117,
