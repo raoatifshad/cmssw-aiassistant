@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "graph"))
 from neo4j_conn import clear_graph, get_driver, setup_schema  # noqa: E402
 
 from clang_parser import aggregate_occurrences, extract_warnings, html_to_text  # noqa: E402
+from relval_log_parser import extract_es_exception_blocks, extract_fatal_exceptions  # noqa: E402
 
 
 GITHUB_REFERENCE_PATTERN = re.compile(r"(?<![\w/])#(\d+)\b")
@@ -320,6 +321,200 @@ def ingest_relval_exceptions(driver, root: Path, force: bool = False, reconcile:
     return total
 
 
+RELVAL_LOG_WORKFLOW_DIR_RE = re.compile(r"^(\d{3,6}\.\d+)_(.+)$")
+LOGREADER_BASE_URL = "https://cmssdt.cern.ch/SDT/cgi-bin/logreader"
+
+
+def discover_relval_log_runs(root: Path) -> list[tuple[str, str, Path]]:
+    """Find <root>/<arch>/<tag>/pyRelValMatrixLogs/run directories.
+
+    This mirrors the CMSSDT logreader URL layout exactly, so a user can save
+    step logs into a local tree with the same path shape as the URL they
+    copied them from (e.g. via `wget -r` or manual folder creation) and have
+    them discovered without any extra configuration.
+    """
+    runs = []
+    if not root.is_dir():
+        return runs
+    for arch_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        for tag_dir in sorted(path for path in arch_dir.iterdir() if path.is_dir()):
+            run_dir = tag_dir / "pyRelValMatrixLogs" / "run"
+            if run_dir.is_dir():
+                runs.append((tag_dir.name, arch_dir.name, run_dir))
+    return runs
+
+
+def _ingest_relval_log_file(driver, path: Path, run_dir: Path, tag: str, arch: str, force: bool) -> tuple[int, str]:
+    source_id = f"relval-logs:{tag}:{arch}:{path.resolve()}"
+    digest = file_hash(path)
+    if not source_needs_import(driver, source_id, digest, force):
+        return 0, source_id
+
+    workflow_dir = path.parent.name
+    workflow_match = RELVAL_LOG_WORKFLOW_DIR_RE.match(workflow_dir)
+    if not workflow_match:
+        print(f"  relval logs: skipping unrecognized workflow directory {workflow_dir}")
+        return 0, source_id
+    workflow_id, name = workflow_match.groups()
+    step = path.stem.split("_", 1)[0]
+
+    exceptions = extract_fatal_exceptions(path.read_text(errors="replace"))
+    current_ib_key = ib_key(tag, arch)
+    records = []
+    for exception in exceptions:
+        text = f"{exception['category']}: {exception['message']}" if exception["message"] else exception["category"]
+        exception_hash = sha256_bytes(text.encode())[:16]
+        records.append({
+            "workflow_id": workflow_id,
+            "category": exception["category"],
+            "message": exception["message"],
+            "context": exception["context"],
+            "text": text,
+            "exception_hash": exception_hash,
+            "source_url": (
+                f"{LOGREADER_BASE_URL}/{arch}/{tag}/pyRelValMatrixLogs/run/{workflow_dir}/{path.name}"
+                f"#/{exception['line_start']}-{exception['line_end']}"
+            ),
+        })
+
+    with driver.session() as session:
+        session.run(
+            "MATCH (:RelVal)-[:HAS_EXCEPTION]->(exception:RelValException {source_id:$source_id}) "
+            "DETACH DELETE exception",
+            source_id=source_id,
+        )
+        session.run(
+            "UNWIND $records AS record "
+            "MATCH (relval:RelVal {key:$ib_key + ':' + record.workflow_id}) "
+            "MERGE (exception:RelValException "
+            "{key:$ib_key + ':' + record.workflow_id + ':' + record.exception_hash}) "
+            "SET exception.text=record.text, exception.category=record.category, "
+            "exception.message=record.message, exception.context=record.context, "
+            "exception.ib_key=$ib_key, exception.ib_tag=$tag, exception.arch=$arch, "
+            "exception.workflow_id=record.workflow_id, exception.step=$step, "
+            "exception.source_url=record.source_url, exception.source_id=$source_id "
+            "MERGE (relval)-[:HAS_EXCEPTION]->(exception)",
+            records=records,
+            ib_key=current_ib_key,
+            tag=tag,
+            arch=arch,
+            step=step,
+            source_id=source_id,
+        )
+    mark_source_imported(driver, source_id, digest, "relval-logs", path)
+    return len(records), source_id
+
+
+def ingest_relval_logs(driver, run_dir: Path, tag: str, arch: str, force: bool = False, reconcile: bool = False) -> int:
+    if not run_dir.is_dir():
+        print(f"  relval logs: path not found {run_dir}")
+        return 0
+    total = 0
+    active_sources = set()
+    logs = sorted(run_dir.rglob("*.log"))
+    for path in logs:
+        count, source_id = _ingest_relval_log_file(driver, path, run_dir, tag, arch, force)
+        total += count
+        active_sources.add(source_id)
+    if reconcile:
+        _reconcile_missing_sources(driver, f"relval-logs:{tag}:{arch}:", active_sources)
+    print(f"  RelVal logs {tag} {arch}: {len(logs)} logs scanned, {total} exceptions imported")
+    return total
+
+
+def ingest_relval_logs_root(driver, root: Path, force: bool = False, reconcile: bool = False) -> int:
+    """Import Fatal Exception blocks from manually-staged pyRelValMatrixLogs step logs.
+
+    Expects <root>/<arch>/<tag>/pyRelValMatrixLogs/run/<workflow>_<name>/<step>_<name>.log,
+    matching the CMSSDT logreader URL path — copy logs in preserving that structure
+    (the logreader requires a CERN SSO login, so this is staged manually rather than
+    fetched automatically) and this discovers and imports them incrementally.
+    """
+    runs = discover_relval_log_runs(root)
+    total = 0
+    for tag, arch, run_dir in runs:
+        total += ingest_relval_logs(driver, run_dir, tag, arch, force, reconcile)
+    print(f"  RelVal log builds discovered: {len(runs)}")
+    return total
+
+
+def ingest_es_exceptions(driver, path: Path, force: bool = False) -> int:
+    """Import RelVal exceptions from an Elasticsearch export (e.g. the output
+    of cms-bot's es-cmssw-exceptions.py, redirected to a JSON file) rather
+    than manually-staged step logs. One JSON file is one source: it's a batch
+    snapshot, not per-IB, so any change to the file reprocesses the whole
+    thing (consistent with how every other single-file source here works).
+
+    No source_url line anchor: an ES document's `exception` field is a
+    structured value, not a byte offset into a real log file, so there's no
+    line range to cite -- the constructed URL points at the run's log file
+    without a `#/start-end` fragment.
+    """
+    if not path.is_file():
+        print(f"  ES exceptions: path not found {path}")
+        return 0
+    source_id = f"es-exceptions:{path.resolve()}"
+    digest = file_hash(path)
+    if not source_needs_import(driver, source_id, digest, force):
+        return 0
+
+    payload = json.loads(path.read_text())
+    docs = [hit["_source"] for hit in payload.get("hits", {}).get("hits", [])]
+
+    records = []
+    for doc in docs:
+        tag = doc.get("release")
+        arch = doc.get("architecture")
+        workflow_id = doc.get("workflow")
+        step = doc.get("step")
+        exception_text = doc.get("exception")
+        if not (tag and arch and workflow_id and step and exception_text):
+            continue
+        current_ib_key = ib_key(tag, arch)
+        for block in extract_es_exception_blocks(exception_text):
+            text = f"{block['category']}: {block['message']}" if block["message"] else block["category"]
+            records.append({
+                "tag": tag,
+                "arch": arch,
+                "workflow_id": workflow_id,
+                "step": step,
+                "category": block["category"],
+                "message": block["message"],
+                "context": block["context"],
+                "text": text,
+                "exception_hash": sha256_bytes(text.encode())[:16],
+                "ib_key": current_ib_key,
+            })
+
+    with driver.session() as session:
+        session.run(
+            "MATCH (:RelVal)-[:HAS_EXCEPTION]->(exception:RelValException {source_id:$source_id}) "
+            "DETACH DELETE exception",
+            source_id=source_id,
+        )
+        session.run(
+            "UNWIND $records AS record "
+            "MATCH (relval:RelVal {key:record.ib_key + ':' + record.workflow_id}) "
+            "MERGE (exception:RelValException "
+            "{key:record.ib_key + ':' + record.workflow_id + ':' + record.exception_hash}) "
+            "SET exception.text=record.text, exception.category=record.category, "
+            "exception.message=record.message, exception.context=record.context, "
+            "exception.ib_key=record.ib_key, exception.ib_tag=record.tag, exception.arch=record.arch, "
+            "exception.workflow_id=record.workflow_id, exception.step=record.step, "
+            "exception.source_url=$logreader_base + '/' + record.arch + '/' + record.tag + "
+            "'/pyRelValMatrixLogs/run/' + record.workflow_id + '_' + relval.name + '/' + "
+            "record.step + '_' + relval.name + '.log', "
+            "exception.source_id=$source_id "
+            "MERGE (relval)-[:HAS_EXCEPTION]->(exception)",
+            records=records,
+            logreader_base=LOGREADER_BASE_URL,
+            source_id=source_id,
+        )
+    mark_source_imported(driver, source_id, digest, "es-exceptions", path)
+    print(f"  ES exceptions imported: {len(records)} (from {len(docs)} documents)")
+    return len(records)
+
+
 def ingest_relvals(driver, root: Path, force: bool = False, reconcile: bool = False):
     if not root.is_dir():
         print(f"  relvals: path not found {root}")
@@ -619,6 +814,45 @@ def ingest_pr_cache(driver, path: Path, force: bool = False) -> list[dict]:
     mark_source_imported(driver, source_id, digest, "pr-cache", path)
     print(f"  PR cache imported: {len(records)}")
     return records
+
+
+def exit_code_records(entries: dict) -> list[dict]:
+    """Normalize cmsrepo's CMSSW exit-code table. A later duplicate key in the
+    source file wins, matching how json.loads already resolved it."""
+    records = []
+    for code_text, name in entries.items():
+        try:
+            code = int(code_text)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(name, str) or not name:
+            continue
+        records.append({"code": code, "name": name})
+    return records
+
+
+def ingest_exit_codes(driver, path: Path, force: bool = False) -> int:
+    """Import CMSSW's exit-code-to-category table (e.g. 16640 -> OtherCMS),
+    sourced from cms-sw.github.io. Static reference data, not IB-scoped."""
+    if not path.is_file():
+        print(f"  exit codes: path not found {path}")
+        return 0
+    source_id = f"exit-codes:{path.resolve()}"
+    digest = file_hash(path)
+    if not source_needs_import(driver, source_id, digest, force):
+        return 0
+    records = exit_code_records(json.loads(path.read_text()))
+    with driver.session() as session:
+        session.run(
+            "UNWIND $records AS record "
+            "MERGE (code:ExitCode {code:record.code}) "
+            "SET code.name=record.name, code.source_id=$source_id",
+            records=records,
+            source_id=source_id,
+        )
+    mark_source_imported(driver, source_id, digest, "exit-codes", path)
+    print(f"  Exit codes imported: {len(records)}")
+    return len(records)
 
 
 def ingest_commands(
@@ -1130,6 +1364,16 @@ def main():
     parser.add_argument("--force", action="store_true", help="reimport unchanged source files")
     parser.add_argument("--reconcile", action="store_true", help="remove records from sources no longer on disk")
     parser.add_argument("--command-history", action="store_true", help="import all historical command snapshots")
+    parser.add_argument(
+        "--relval-logs-root",
+        help="Root containing <arch>/<tag>/pyRelValMatrixLogs/run/<workflow>_<name>/<step>_<name>.log "
+        "(mirrors the CMSSDT logreader URL layout; kept outside cmsrepo, like --clang-root)",
+    )
+    parser.add_argument(
+        "--es-exceptions-json",
+        help="JSON file from cms-bot's es-cmssw-exceptions.py (e.g. `es-cmssw-exceptions.py > exceptions.JSON`), "
+        "imported as RelVal exceptions the same way as --relval-logs-root but without CERN SSO or manual staging",
+    )
     args = parser.parse_args()
     if args.clang_logs and not args.ib_tag:
         parser.error("--clang-logs requires --ib-tag")
@@ -1145,9 +1389,14 @@ def main():
     ingest_relval_defaults(driver, cmsrepo / "data" / "RelvalsAvailableResults.json", args.force)
     ingest_unittest_defaults(driver, cmsrepo / "data" / "UnitTestsAvailableResults.json", args.force)
     ingest_relval_exceptions(driver, cmsrepo / "data" / "relvals", args.force, args.reconcile)
+    if args.relval_logs_root:
+        ingest_relval_logs_root(driver, Path(args.relval_logs_root), args.force, args.reconcile)
+    if args.es_exceptions_json:
+        ingest_es_exceptions(driver, Path(args.es_exceptions_json), args.force)
     ingest_unittests(driver, cmsrepo / "data" / "unitTests", args.force, args.reconcile)
     ingest_prs(driver, cmsrepo / "data" / "prs", args.force, args.reconcile)
     pr_cache = ingest_pr_cache(driver, cmsrepo / "cmssw-prs-cache.json", args.force)
+    ingest_exit_codes(driver, cmsrepo / "exitcodes.json", args.force)
     ingest_commands(
         driver, cmsrepo / "data" / "commands", pr_cache, args.force,
         args.reconcile, args.command_history,

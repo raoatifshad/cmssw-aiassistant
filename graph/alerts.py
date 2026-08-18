@@ -1,0 +1,176 @@
+"""Alert rules: reuse the same capability library chat already reuses, on a
+schedule instead of a chat turn.
+
+By design this module is standalone (no FastAPI dependency) so it can be
+invoked by cron/systemd-timer/manual run via ingestion/run_alerts.py, the same
+way build_graph.py is — this codebase never runs its own in-process
+scheduler.
+
+Notification delivery is pluggable (see Notifier below). Only a log-based
+notifier ships today, since no real channel credentials (Slack/email/etc.)
+have been provided; adding a real channel later is a one-class addition, not
+a change to rule storage or evaluation.
+"""
+import json
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Protocol
+
+sys.path.insert(0, str(Path(__file__).parent))
+from neo4j_conn import get_driver  # noqa: E402
+from tools import get_failing_relvals, get_relval_recurrence, list_ib_tags  # noqa: E402
+
+
+RULE_TYPES = {"relval_failure_count", "relval_recurrence", "latest_ib_stalled"}
+
+
+def create_rule(
+    name: str, rule_type: str, params: dict, threshold: float, channel: str = "log", owner: str | None = None,
+) -> str:
+    if rule_type not in RULE_TYPES:
+        raise ValueError(f"Unknown rule type {rule_type!r}; expected one of {sorted(RULE_TYPES)}")
+    rule_id = str(uuid.uuid4())
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            session.run(
+                "CREATE (rule:AlertRule {"
+                "rule_id:$rule_id, name:$name, rule_type:$rule_type, params:$params, "
+                "threshold:$threshold, channel:$channel, owner:$owner, active:true, "
+                "created_at:datetime()})",
+                rule_id=rule_id, name=name, rule_type=rule_type, params=json.dumps(params),
+                threshold=threshold, channel=channel, owner=owner,
+            )
+    finally:
+        driver.close()
+    return rule_id
+
+
+def list_rules(active_only: bool = True) -> list[dict]:
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            query = "MATCH (rule:AlertRule) "
+            if active_only:
+                query += "WHERE rule.active = true "
+            query += (
+                "RETURN rule.rule_id AS rule_id, rule.name AS name, rule.rule_type AS rule_type, "
+                "rule.params AS params, rule.threshold AS threshold, rule.channel AS channel, "
+                "rule.owner AS owner, rule.active AS active"
+            )
+            rows = [dict(record) for record in session.run(query)]
+    finally:
+        driver.close()
+    for row in rows:
+        row["params"] = json.loads(row["params"])
+    return rows
+
+
+def deactivate_rule(rule_id: str) -> bool:
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            result = session.run(
+                "MATCH (rule:AlertRule {rule_id:$rule_id}) SET rule.active = false RETURN rule.rule_id AS rule_id",
+                rule_id=rule_id,
+            ).single()
+    finally:
+        driver.close()
+    return result is not None
+
+
+def _check_relval_failure_count(params: dict, threshold: float) -> tuple[bool, str, dict]:
+    tag = params["tag"]
+    arch = params.get("arch")
+    failing = get_failing_relvals(tag, arch=arch, limit=100)
+    count = len(failing)
+    triggered = count >= threshold
+    message = f"`{tag}`{f' on `{arch}`' if arch else ''} has {count} failing RelVal(s) (threshold {threshold:g})."
+    return triggered, message, {"count": count}
+
+
+def _check_relval_recurrence(params: dict, threshold: float) -> tuple[bool, str, dict]:
+    workflow_id = params["workflow_id"]
+    recurrence = get_relval_recurrence(workflow_id)
+    total = recurrence.get("total_appearances", 0)
+    failed = recurrence.get("failed_appearances", 0)
+    rate = (failed / total) if total else 0.0
+    triggered = total > 0 and rate >= threshold
+    message = (
+        f"Workflow `{workflow_id}` has a {rate:.0%} failure rate ({failed}/{total}), "
+        f"at or above the {threshold:.0%} threshold."
+    )
+    return triggered, message, {"rate": rate, "failed": failed, "total": total}
+
+
+def _check_latest_ib_stalled(params: dict, threshold: float) -> tuple[bool, str, dict]:
+    """Threshold is hours since the newest imported IB timestamp."""
+    latest = list_ib_tags(limit=1)
+    if not latest:
+        return False, "No IB records are imported.", {}
+    tag = latest[0]["tag"]
+    timestamp_text = tag[-15:]
+    try:
+        ts = datetime.strptime(timestamp_text, "%Y-%m-%d-%H%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False, f"Could not parse a timestamp from `{tag}`.", {}
+    hours_stale = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+    triggered = hours_stale >= threshold
+    message = (
+        f"Latest imported IB `{tag}` is {hours_stale:.1f}h old, "
+        f"at or above the {threshold:g}h staleness threshold."
+    )
+    return triggered, message, {"hours_stale": hours_stale, "tag": tag}
+
+
+_CHECKS = {
+    "relval_failure_count": _check_relval_failure_count,
+    "relval_recurrence": _check_relval_recurrence,
+    "latest_ib_stalled": _check_latest_ib_stalled,
+}
+
+
+class Notifier(Protocol):
+    def notify(self, rule: dict, message: str, evidence: dict) -> None: ...
+
+
+class LogNotifier:
+    """Default notifier: writes matched alerts to a JSON-lines file. Honest
+    about not reaching a real channel yet -- a real Notifier (Slack/email/
+    webhook) is a drop-in addition once credentials exist; nothing about rule
+    storage or evaluation needs to change."""
+
+    def __init__(self, path: Path | str = "alerts.log.jsonl"):
+        self.path = Path(path)
+
+    def notify(self, rule: dict, message: str, evidence: dict) -> None:
+        record = {
+            "rule_id": rule["rule_id"],
+            "rule_name": rule["name"],
+            "message": message,
+            "evidence": evidence,
+            "fired_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with self.path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+        print(f"  ALERT [{rule['name']}]: {message}")
+
+
+def evaluate_rules(notifier: Notifier | None = None) -> list[dict]:
+    """Run every active rule once and notify on each one that triggers.
+    Meant to be invoked periodically by cron/systemd-timer, not by an
+    in-process scheduler."""
+    notifier = notifier or LogNotifier()
+    fired = []
+    for rule in list_rules(active_only=True):
+        check = _CHECKS.get(rule["rule_type"])
+        if not check:
+            print(f"  skipping rule {rule['name']!r}: unknown rule_type {rule['rule_type']!r}")
+            continue
+        triggered, message, evidence = check(rule["params"], rule["threshold"])
+        if triggered:
+            notifier.notify(rule, message, evidence)
+            fired.append({"rule": rule, "message": message, "evidence": evidence})
+    return fired

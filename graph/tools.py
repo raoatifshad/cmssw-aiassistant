@@ -29,6 +29,11 @@ NODES:
     (:Label {key, name})
   (:Author {name})
     (:RelVal {key, ib_key, ib_tag, arch, workflow_id, name, status, errors, warnings, exitcode})
+    (:RelValException {key, ib_key, ib_tag, arch, workflow_id, step, category, message, context, text, source_url})
+    (:ExitCode {code, name}) — static CMSSW exit-code table, e.g. 16640 -> 'OtherCMS'; not IB-scoped
+    (:Concept {concept_id, question, definition, source_feedback_id, verification_method, created_at})
+        — an expert correction that passed feedback verification, stored as a durable fact
+    (:AlertRule {rule_id, name, capability, params, condition, channel, owner, active, created_at})
     (:UnitTest {key, ib_key, ib_tag, arch, name, status, errors, ok})
     (:ImportState {source_id, content_hash, source_type, source_path, last_ingested_at})
 
@@ -41,6 +46,7 @@ EDGES:
   (Package)-[:CONTAINS]->(SourceFile)
   (SourceFile)-[:FLAGGED_BY]->(Checker)
   (IB)-[:RAN_RELVAL]->(RelVal)
+  (RelVal)-[:HAS_EXCEPTION]->(RelValException)
   (IB)-[:RAN_UNITTEST]->(UnitTest)
   (UnitTest)-[:IN_PACKAGE]->(Package)
   (PR)-[:AUTHORED_BY]->(Author)
@@ -64,6 +70,11 @@ UnitTest results are package-level aggregates. A PR test-file match in a failed
 package is evidence of relevance, not a failure for a specific test name.
 An IB with no variant is a primary run. An IB with a variant (for example,
 NONLTO or CLANG) is a sub-IB whose parent_tag identifies its primary run.
+RelValException category/message/context come from EDM Fatal Exception blocks
+parsed out of manually-staged pyRelValMatrixLogs step logs (the CMSSDT
+logreader requires CERN SSO, so these are not fetched automatically); coverage
+is only as complete as the logs someone has staged. source_url cites the exact
+line range in the original log.
 """
 
 MAX_ROWS = 100
@@ -125,22 +136,115 @@ def get_database_overview() -> dict:
     }
 
 
+_IB_TAG_SORT_PATTERN = re.compile(
+    r"^CMSSW_(\d+)_(\d+)(?:_.+)?_X_(\d{4}-\d{2}-\d{2}-\d{4})$"
+)
+
+
+def _ib_sort_key(tag: str) -> tuple:
+    """Rank by release series (major, minor) first, then by build timestamp.
+
+    A higher release series (e.g. 20_1) is "later" than a lower one (e.g. 20_0)
+    even if that series' most recent build is older in wall-clock time — this
+    matches how the IB dashboard orders releases.
+    """
+    match = _IB_TAG_SORT_PATTERN.match(tag)
+    if not match:
+        return (-1, -1, tag)
+    major, minor, timestamp = match.groups()
+    return (int(major), int(minor), timestamp)
+
+
 def list_ib_tags(release: str | None = None, arch: str | None = None, limit: int = 20) -> list[dict]:
-    """List known IB tags, most recent first."""
+    """List known IB tags, most recent release series first, newest build within a series first."""
     limit = min(limit, MAX_ROWS)
-    if release or arch:
-        return _run_query(
-            "MATCH (ib:IB) WHERE ($rel IS NULL OR ib.release = $rel) "
-            "AND ($arch IS NULL OR ib.arch = $arch) "
-            "RETURN ib.tag AS tag, ib.arch AS arch, ib.release AS release "
-            "ORDER BY ib.tag DESC LIMIT $lim",
-            {"rel": release, "arch": arch, "lim": limit},
-        )
-    return _run_query(
-        "MATCH (ib:IB) RETURN ib.tag AS tag, ib.arch AS arch, ib.release AS release "
-        "ORDER BY ib.tag DESC LIMIT $lim",
-        {"lim": limit},
+    cypher = (
+        "MATCH (ib:IB) WHERE ($rel IS NULL OR ib.release = $rel) "
+        "AND ($arch IS NULL OR ib.arch = $arch) "
+        "RETURN ib.tag AS tag, ib.arch AS arch, ib.release AS release"
     )
+    # Fetch unsliced: _run_query truncates to MAX_ROWS before we can sort, which
+    # would drop the actual top entries when there are more IBs than MAX_ROWS.
+    driver = get_driver()
+    try:
+        with driver.session() as s:
+            rows = [dict(r) for r in s.run(cypher, {"rel": release, "arch": arch})]
+    finally:
+        driver.close()
+    rows.sort(key=lambda row: _ib_sort_key(row["tag"]), reverse=True)
+    return rows[:limit]
+
+
+_CONCEPT_STOPWORDS = {
+    "what", "this", "that", "have", "does", "with", "from", "about", "which",
+    "there", "would", "could", "should", "your", "when", "where", "will",
+}
+
+
+def search_concepts(question: str, limit: int = 5) -> list[dict]:
+    """Search stored expert-corrected facts (:Concept) for ones relevant to a
+    question. These are corrections that already passed the same verification
+    gate as an accepted UserFeedback row -- durable graph facts, not just
+    conversation history."""
+    limit = min(limit, MAX_ROWS)
+    terms = [
+        word for word in re.findall(r"[A-Za-z][A-Za-z0-9_]{3,}", question)
+        if word.lower() not in _CONCEPT_STOPWORDS
+    ]
+    if not terms:
+        return []
+    return _run_query(
+        "MATCH (c:Concept) "
+        "WITH c, [term IN $terms WHERE toLower(c.question) CONTAINS toLower(term) "
+        "OR toLower(c.definition) CONTAINS toLower(term)] AS matched_terms "
+        "WHERE size(matched_terms) > 0 "
+        "RETURN c.question AS question, c.definition AS definition, "
+        "size(matched_terms) AS match_count "
+        "ORDER BY match_count DESC, c.created_at DESC LIMIT $limit",
+        {"terms": terms, "limit": limit},
+    )
+
+
+def get_relval_recurrence(workflow_id: str) -> dict:
+    """How often has this workflow failed across every imported IB, not just
+    the one currently being discussed? Computed at query time from data
+    already ingested -- no scheduled job needed, always current."""
+    rows = _run_query(
+        "MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal {workflow_id:$workflow_id}) "
+        "WITH relval.name AS name, ib, relval "
+        "ORDER BY ib.tag DESC "
+        "RETURN name, count(relval) AS total_appearances, "
+        "sum(CASE WHEN relval.status = 'FAILED' THEN 1 ELSE 0 END) AS failed_appearances, "
+        "collect(CASE WHEN relval.status = 'FAILED' THEN ib.tag ELSE null END)[0..10] AS failed_tags",
+        {"workflow_id": workflow_id},
+    )
+    if not rows or not rows[0]["total_appearances"]:
+        return {"workflow_id": workflow_id, "total_appearances": 0}
+    row = rows[0]
+    return {
+        "workflow_id": workflow_id,
+        "name": row["name"],
+        "total_appearances": row["total_appearances"],
+        "failed_appearances": row["failed_appearances"],
+        "failed_tags": [tag for tag in row["failed_tags"] if tag],
+    }
+
+
+def get_exit_code_names() -> dict[int, str]:
+    """Return the full CMSSW exit-code -> category-name table (e.g. 16640 ->
+    'OtherCMS'), imported from cms-sw.github.io's exitcodes.json. Small static
+    reference data — one query fetches the whole table rather than one lookup
+    per row. Bypasses _run_query's MAX_ROWS cap: the table has ~160 entries,
+    already over that cap, and silently dropping some would misreport exit
+    codes as unknown rather than fail loudly.
+    """
+    driver = get_driver()
+    try:
+        with driver.session() as s:
+            rows = [dict(r) for r in s.run("MATCH (code:ExitCode) RETURN code.code AS code, code.name AS name")]
+    finally:
+        driver.close()
+    return {row["code"]: row["name"] for row in rows}
 
 
 def count_warnings_by_package(package: str, ib_tag: str | None = None, arch: str | None = None) -> dict:

@@ -1,0 +1,41 @@
+import unittest
+from unittest.mock import patch
+
+from graph.tools import get_exit_code_names
+from server.api_server import _format_exit_code
+
+
+class ExitCodeLookupTests(unittest.TestCase):
+    @patch("graph.tools.get_driver")
+    def test_get_exit_code_names_returns_full_table_as_a_dict(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"code": 16640, "name": "OtherCMS"},
+            {"code": 35584, "name": "SIGSEGV"},
+        ]
+
+        names = get_exit_code_names()
+
+        self.assertEqual(names, {16640: "OtherCMS", 35584: "SIGSEGV"})
+        get_driver.return_value.close.assert_called_once()
+
+    def test_format_exit_code_includes_the_category_name_when_known(self):
+        self.assertEqual(_format_exit_code(16640, {16640: "OtherCMS"}), "16640 (OtherCMS)")
+
+    def test_format_exit_code_falls_back_to_the_bare_number_when_unknown(self):
+        self.assertEqual(_format_exit_code(99999, {16640: "OtherCMS"}), "99999")
+
+    @patch("graph.tools.get_driver")
+    def test_get_exit_code_names_does_not_truncate_at_max_rows(self, get_driver):
+        # The real table has ~160 entries, already over _run_query's MAX_ROWS=100
+        # cap; silently dropping some would misreport known codes as unknown.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"code": code, "name": f"Code{code}"} for code in range(150)]
+
+        names = get_exit_code_names()
+
+        self.assertEqual(len(names), 150)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -37,6 +37,33 @@ def propose_investigation_plan(client, model: str, question: str, capabilities: 
         return None
 
 
+def propose_capability_classification(client, model: str, question: str, capabilities: list[str]) -> dict | None:
+    """Ask the LLM to independently pick which registered capability (if any)
+    a question needs, for shadow-mode comparison against the deterministic
+    regex planner. Logging only — this result is never used to answer a
+    question, only to evaluate whether an LLM router would agree with the
+    existing one before ever promoting it to primary (Phase 3's gate)."""
+    prompt = (
+        "Return exactly one JSON object with fields capability and confidence. "
+        f"capability must be one of: {', '.join(capabilities)}, or null if none fit. "
+        "confidence is a number from 0 to 1. Do not answer the question."
+    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": question},
+            ],
+            temperature=0,
+        )
+        content = response.choices[0].message.content or ""
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        return json.loads(match.group(0) if match else content)
+    except (AttributeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
 def execute_read_only_plan(tool_calls: tuple[tuple[str, dict], ...], tools_registry: dict) -> list[dict]:
     """Execute already-validated tools and retain each structured result as evidence."""
     evidence = []
