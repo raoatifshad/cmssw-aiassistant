@@ -22,6 +22,7 @@ from server.api_server import (
     _normalize_deterministic_question,
     _pr_search_terms,
     _pending_relval_scopes,
+    _pending_unittest_scopes,
     _relval_data_availability_answer,
     _relval_error_count_answer,
     _relval_failure_count_answer,
@@ -32,9 +33,11 @@ from server.api_server import (
     _requested_ib_arch,
     _execute_planned_capability,
     _failing_relval_context,
+    _fallback_clarification,
     chat,
     record_feedback,
 )
+from server.request_planner import RequestContext
 from server.agent import KGChatSession
 from graph.tools import TOOLS, get_failing_relvals, search_issues_by_text
 from ingestion.build_graph import ib_parent_tag
@@ -314,6 +317,25 @@ class ChatRoutingTests(unittest.TestCase):
             _relval_exception_list_answer("what relvals are failing in CMSSW_20_1_CLANG_X_2026-08-16-2300", context)
         )
 
+    @patch("server.api_server.get_driver")
+    def test_relval_exception_list_answer_recognizes_natural_why_failing_phrasing(self, get_driver):
+        # Regression: a real user asked "What are the failed RelVals?" (setting
+        # _failed_relval_contexts via _failing_relval_context), then followed up
+        # with "Analyze the logs why they are failing" -- a natural phrasing with
+        # neither "exception" nor "match" in it. That must still reuse the
+        # session's failing-RelVal context instead of falling through to the LLM
+        # path with no memory of what was just discussed.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = []
+        context = _failing_relval_context(
+            "what are the failed relvals for CMSSW_20_1_TF_X_2026-08-18-1100 el9_amd64_gcc14"
+        )
+
+        answer = _relval_exception_list_answer("Analyze the logs why they are failing", context)
+
+        self.assertIsNotNone(answer)
+        get_driver.return_value.close.assert_called_once()
+
     def test_relval_exception_list_rejects_stale_tag_context(self):
         # A question naming a *different* explicit IB than the cached context
         # must not silently answer using the stale tag.
@@ -379,21 +401,18 @@ class ChatRoutingTests(unittest.TestCase):
             ("CMSSW_20_1_X_2026-08-10-2300", None),
         )
 
-    @patch("server.api_server.get_driver")
-    def test_named_relval_error_count_is_deterministic(self, get_driver):
-        session = get_driver.return_value.session.return_value.__enter__.return_value
-        session.run.return_value.single.return_value = {
-            "ib_records": 1,
-            "relval_total": 950,
-            "error_count": 100777,
-            "failed_relvals": 13,
-            "failed_errors": 126,
-            "passed_relvals": 937,
-            "passed_errors": 100651,
-        }
+    @patch("server.api_server._relval_scope_records")
+    def test_named_relval_error_count_is_deterministic(self, scope_records):
+        scope_records.return_value = [{
+            "tag": "CMSSW_20_1_EVTGEN3_X_2026-08-09-2300", "arch": "el9_amd64_gcc14",
+            "is_relval_default": True,
+            "relval_total": 950, "error_count": 100777,
+            "failed_relvals": 13, "failed_errors": 126,
+            "passed_relvals": 937, "passed_errors": 100651,
+        }]
 
         answer = _relval_error_count_answer(
-            "how many relvals errors in CMSSW_20_1_EVTGEN3_X_2026-08-09-2300"
+            "how many relvals errors in CMSSW_20_1_EVTGEN3_X_2026-08-09-2300", "s1"
         )
 
         self.assertIn("13 failed RelVal(s)", answer)
@@ -401,8 +420,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("1 IB record(s)", answer)
         self.assertIn("100,651", answer)
         self.assertIn("126", answer)
-        self.assertIn("ib.parent_tag = $tag", session.run.call_args.args[0])
-        get_driver.return_value.close.assert_called_once()
+        scope_records.assert_called_once_with("CMSSW_20_1_EVTGEN3_X_2026-08-09-2300", include_sub_ibs=True)
 
     @patch("server.api_server._relval_scope_records")
     def test_primary_relval_failure_count_requires_architecture(self, scope_records):
@@ -558,19 +576,69 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertNotIn("architecture-specific", answer)
 
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_uses_default_architectures(self, scope_records):
+    def test_unittest_summary_asks_when_multiple_default_architectures_exist(self, scope_records):
+        # Regression: a real IB had 4 architectures marked default
+        # simultaneously, and their unit-test counts were silently added
+        # together into one misleading headline number ("6 failed") instead
+        # of asking which architecture, same bug class fixed for RelVals.
         scope_records.return_value = [
             {"arch": "el9_amd64_gcc13", "is_default": False, "total": 950, "failed": 3, "passed": 947, "errors": 3},
             {"arch": "el9_amd64_gcc15", "is_default": True, "total": 950, "failed": 3, "passed": 947, "errors": 3},
             {"arch": "el9_amd64_gcc16", "is_default": True, "total": 950, "failed": 4, "passed": 946, "errors": 4},
         ]
 
-        answer = _unittest_summary_answer("and unit tests", "CMSSW_20_1_X_2026-08-09-0000")
+        answer = _unittest_summary_answer("and unit tests", "CMSSW_20_1_X_2026-08-09-0000", "s-multi-unittest")
 
-        self.assertIn("7 failed", answer)
+        self.assertIn("Choose one", answer)
         self.assertIn("el9_amd64_gcc15", answer)
         self.assertIn("el9_amd64_gcc16", answer)
         self.assertNotIn("el9_amd64_gcc13", answer)
+        self.assertIn("s-multi-unittest", _pending_unittest_scopes)
+        _pending_unittest_scopes.pop("s-multi-unittest", None)
+
+    @patch("server.api_server._unittest_scope_records")
+    def test_unittest_summary_resolves_after_choosing_an_architecture(self, scope_records):
+        scope_records.return_value = [
+            {"arch": "el9_amd64_gcc15", "is_default": True, "total": 950, "failed": 3, "passed": 947, "errors": 3},
+            {"arch": "el9_amd64_gcc16", "is_default": True, "total": 950, "failed": 4, "passed": 946, "errors": 4},
+        ]
+        _unittest_summary_answer("and unit tests", "CMSSW_20_1_X_2026-08-09-0000", "s-resume-unittest")
+
+        answer = _unittest_summary_answer("el9_amd64_gcc16", None, "s-resume-unittest")
+
+        self.assertIn("4 failed", answer)
+        self.assertNotIn("s-resume-unittest", _pending_unittest_scopes)
+
+    @patch("server.api_server._unittest_scope_records")
+    def test_unittest_summary_honors_an_explicit_architecture_up_front(self, scope_records):
+        # An architecture named directly in the first question must resolve
+        # immediately -- no reason to ask when the user already said which one.
+        scope_records.return_value = [
+            {"arch": "el9_amd64_gcc15", "is_default": True, "total": 950, "failed": 3, "passed": 947, "errors": 3},
+            {"arch": "el9_amd64_gcc16", "is_default": True, "total": 950, "failed": 4, "passed": 946, "errors": 4},
+        ]
+
+        answer = _unittest_summary_answer(
+            "unit tests for CMSSW_20_1_X_2026-08-09-0000 el9_amd64_gcc16", None, "s-explicit-unittest",
+        )
+
+        self.assertIn("4 failed", answer)
+        self.assertNotIn("s-explicit-unittest", _pending_unittest_scopes)
+
+    @patch("server.api_server._unittest_scope_records")
+    def test_unittest_summary_recognizes_unit_without_the_word_test(self, scope_records):
+        # Regression: a real user asked "unit failures in <tag>" -- no "test"
+        # word at all -- and the old \bunit\s*tests?\b regex required "test"
+        # to be present, so this fell through to the ambiguous-category
+        # clarification instead of answering directly.
+        scope_records.return_value = [
+            {"arch": "el9_amd64_gcc14", "is_default": True, "total": 372, "failed": 2, "passed": 370, "errors": 0},
+        ]
+
+        answer = _unittest_summary_answer("unit failures in CMSSW_20_1_PY314_X_2026-08-19-1100", None, "s1")
+
+        self.assertIsNotNone(answer)
+        self.assertIn("2 failed", answer)
 
     @patch("server.api_server._relval_scope_records")
     def test_repeated_relval_question_restarts_pending_scope(self, scope_records):
@@ -614,7 +682,7 @@ class ChatRoutingTests(unittest.TestCase):
         }]
 
         answer = _relval_data_availability_answer(
-            "do you have data for CMSSW_20_1_X_2026-08-10-1100?"
+            "do you have data for CMSSW_20_1_X_2026-08-10-1100?", "s1"
         )
 
         self.assertIn("Imported RelVal data", answer)
@@ -622,6 +690,35 @@ class ChatRoutingTests(unittest.TestCase):
         scope_records.assert_called_once_with(
             "CMSSW_20_1_X_2026-08-10-1100", include_sub_ibs=False
         )
+
+    @patch("server.api_server._relval_scope_records")
+    def test_relval_data_availability_asks_when_multiple_default_architectures_exist(self, scope_records):
+        tag = "CMSSW_20_1_X_2026-08-10-1100"
+        scope_records.return_value = [
+            {"tag": tag, "arch": "el9_amd64_gcc15", "relval_total": 950, "failed_relvals": 3, "passed_relvals": 947, "is_relval_default": True},
+            {"tag": tag, "arch": "el9_amd64_gcc16", "relval_total": 950, "failed_relvals": 4, "passed_relvals": 946, "is_relval_default": True},
+        ]
+
+        answer = _relval_data_availability_answer(f"do you have data for {tag}?", "s-avail-multi")
+
+        self.assertIn("Choose one", answer)
+        _pending_relval_scopes.pop("s-avail-multi", None)
+
+    @patch("server.api_server._relval_scope_records")
+    def test_relval_error_count_asks_when_multiple_default_architectures_exist(self, scope_records):
+        tag = "CMSSW_20_1_X_2026-08-10-1100"
+        scope_records.return_value = [
+            {"tag": tag, "arch": "el9_amd64_gcc15", "relval_total": 950, "failed_relvals": 3, "passed_relvals": 947,
+             "error_count": 100, "failed_errors": 10, "passed_errors": 90, "is_relval_default": True},
+            {"tag": tag, "arch": "el9_amd64_gcc16", "relval_total": 950, "failed_relvals": 4, "passed_relvals": 946,
+             "error_count": 200, "failed_errors": 20, "passed_errors": 180, "is_relval_default": True},
+        ]
+
+        answer = _relval_error_count_answer(f"how many relvals errors in {tag}", "s-errcount-multi")
+
+        self.assertIn("Choose one", answer)
+        scope_records.assert_called_once_with(tag, include_sub_ibs=True)
+        _pending_relval_scopes.pop("s-errcount-multi", None)
 
     @patch("server.api_server._relval_scope_records")
     def test_ambiguous_named_relval_question_defaults_to_graph_summary(self, scope_records):
@@ -634,14 +731,19 @@ class ChatRoutingTests(unittest.TestCase):
         }]
 
         answer = _relval_ib_summary_answer(
-            "what RelVal results are in CMSSW_20_1_X_2026-08-10-1100?"
+            "what RelVal results are in CMSSW_20_1_X_2026-08-10-1100?", "s1"
         )
 
         self.assertIn("Imported RelVal results", answer)
         self.assertIn("3 failing RelVal(s)", answer)
 
     @patch("server.api_server._relval_scope_records")
-    def test_generic_relval_summary_uses_default_architectures(self, scope_records):
+    def test_generic_relval_summary_asks_when_multiple_default_architectures_exist(self, scope_records):
+        # Regression: silently summing every "default" architecture into one
+        # combined headline number is misleading when more than one exists
+        # (a real production IB had 4 simultaneously marked default) -- this
+        # must ask which architecture instead of guessing, same as the
+        # already-correct _relval_failure_count_answer.
         tag = "CMSSW_20_1_X_2026-08-09-0000"
         scope_records.return_value = [
             {"tag": tag, "arch": "el9_amd64_gcc13", "relval_total": 950, "failed_relvals": 5, "passed_relvals": 945, "is_relval_default": False},
@@ -649,16 +751,18 @@ class ChatRoutingTests(unittest.TestCase):
             {"tag": tag, "arch": "el9_amd64_gcc16", "relval_total": 950, "failed_relvals": 5, "passed_relvals": 945, "is_relval_default": True},
         ]
 
-        answer = _relval_ib_summary_answer(f"show RelVal results for {tag}")
+        answer = _relval_ib_summary_answer(f"show RelVal results for {tag}", "s-multi-default")
 
-        self.assertIn("10 failing RelVal(s)", answer)
+        self.assertIn("Choose one", answer)
         self.assertIn("el9_amd64_gcc15", answer)
         self.assertIn("el9_amd64_gcc16", answer)
         self.assertNotIn("el9_amd64_gcc13", answer)
+        self.assertEqual(_pending_relval_scopes["s-multi-default"]["stage"], "arch")
+        _pending_relval_scopes.pop("s-multi-default", None)
 
     def test_relval_summary_preserves_explicit_issue_intent(self):
         self.assertIsNone(_relval_ib_summary_answer(
-            "are there open Issues for failed RelVals in CMSSW_20_1_X_2026-08-10-1100?"
+            "are there open Issues for failed RelVals in CMSSW_20_1_X_2026-08-10-1100?", "s1"
         ))
 
     @patch("server.api_server.get_exit_code_names", return_value={16640: "OtherCMS"})
@@ -1039,10 +1143,14 @@ class ChatRoutingTests(unittest.TestCase):
     def test_invalid_llm_plan_is_rejected_before_tool_execution(
         self, concepts, propose_plan, chat_response, restore, store_decision, clear_pending
     ):
+        # Regression: an invalid/rejected LLM plan must not be a dead end --
+        # it offers concrete next-step actions instead of a flat rejection.
         result = chat(ChatRequest(question="Explain the graph topology", session_id="invalid-plan"))
 
-        self.assertIn("could not create a valid local evidence plan", result)
+        self.assertIn("couldn't match that to a specific local answer", result)
         propose_plan.assert_called_once()
+        actions = chat_response.call_args.kwargs["actions"]
+        self.assertIn({"label": "Latest IB", "question": "what is the latest IB"}, actions)
 
     # -- Regression tests for bugs found and fixed this session (Phase 0 golden set) --
 
@@ -1153,6 +1261,37 @@ class ChatRoutingTests(unittest.TestCase):
             "failed relvals for CMSSW_20_1_X_2026-08-17-2300 el9_aarch64_gcc14"
         )
         self.assertEqual(context["arch"], "el9_aarch64_gcc14")
+
+    def test_fallback_clarification_offers_tag_scoped_and_universal_actions(self):
+        context = RequestContext.extract("explain the odd behavior for CMSSW_20_1_X_2026-08-17-2300")
+
+        message, actions = _fallback_clarification(context)
+
+        self.assertIn("CMSSW_20_1_X_2026-08-17-2300", message)
+        labels = [action["label"] for action in actions]
+        self.assertEqual(
+            labels,
+            ["Build warnings", "RelVal failures", "Unit-test results", "Combined summary",
+             "Latest IB", "Frequent RelVal failures (last week)"],
+        )
+        self.assertIn(
+            {"label": "RelVal failures", "question": "failed RelVals for CMSSW_20_1_X_2026-08-17-2300"}, actions,
+        )
+
+    def test_fallback_clarification_offers_only_universal_actions_without_a_tag(self):
+        context = RequestContext.extract("explain the graph topology")
+
+        message, actions = _fallback_clarification(context)
+
+        self.assertNotIn("`None`", message)
+        self.assertEqual(
+            actions,
+            [
+                {"label": "Latest IB", "question": "what is the latest IB"},
+                {"label": "Frequent RelVal failures (last week)",
+                 "question": "what are the frequent failures over the last week"},
+            ],
+        )
 
 
 if __name__ == "__main__":
