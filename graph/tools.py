@@ -31,8 +31,14 @@ NODES:
     (:RelVal {key, ib_key, ib_tag, arch, workflow_id, name, status, errors, warnings, exitcode})
     (:RelValException {key, ib_key, ib_tag, arch, workflow_id, step, category, message, context, text, source_url})
     (:ExitCode {code, name}) — static CMSSW exit-code table, e.g. 16640 -> 'OtherCMS'; not IB-scoped
-    (:Concept {concept_id, question, definition, source_feedback_id, verification_method, created_at})
-        — an expert correction that passed feedback verification, stored as a durable fact
+    (:Concept {concept_id, question, definition, source_feedback_id, verification_method,
+        status, expires_at, last_revalidated_at, created_at})
+        — a correction that passed the same graph-evidence verification gate as an
+        accepted UserFeedback row, stored as a durable fact. status is 'active' or
+        'revoked'; an active Concept is periodically re-verified against current graph
+        facts before expires_at (see ingestion/revalidate_feedback.py) and revoked if it
+        no longer holds -- never trusted indefinitely from a single automated check, and
+        never promoted by user agreement alone.
     (:AlertRule {rule_id, name, capability, params, condition, channel, owner, active, created_at})
     (:UnitTest {key, ib_key, ib_tag, arch, name, status, errors, ok})
     (:ImportState {source_id, content_hash, source_type, source_path, last_ingested_at})
@@ -197,7 +203,7 @@ def search_concepts(question: str, limit: int = 5) -> list[dict]:
     if not terms:
         return []
     return _run_query(
-        "MATCH (c:Concept) "
+        "MATCH (c:Concept) WHERE coalesce(c.status, 'active') = 'active' "
         "WITH c, [term IN $terms WHERE toLower(c.question) CONTAINS toLower(term) "
         "OR toLower(c.definition) CONTAINS toLower(term)] AS matched_terms "
         "WHERE size(matched_terms) > 0 "

@@ -178,6 +178,28 @@ overwrites imported IB or warning facts.
 }
 ```
 
+An `accepted` correction (`verdict: incorrect` with a `corrected_answer`)
+becomes a durable `Concept` fact, retrievable in later chats — but never
+because a user asserted it, only because the same evidence gate above
+confirmed it against the graph. That trust isn't permanent: run
+`ingestion/revalidate_feedback.py` on a schedule (same standalone,
+cron-invoked pattern as `ingestion/run_alerts.py`) to re-check `pending`
+feedback against the graph as it changes, and to re-verify active Concepts
+before they expire — a Concept that no longer holds is revoked
+automatically, and one that comes back undecidable gets a single grace
+period before revocation. No human review step is involved at any point;
+the graph is always the one deciding.
+
+```bash
+# crontab, once a day
+0 3 * * * cd /path/to/cmssdt-kg-chatbot && \
+    NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/revalidate_feedback.py
+```
+
+`CONCEPT_TTL_DAYS` (default 14) and `CONCEPT_PENDING_GRACE_DAYS` (default 3)
+control the expiry and grace windows; `--limit` bounds how many rows a single
+run re-checks, since each re-check may cost an LLM call.
+
 ## Log RAG platform
 
 The API also provides a durable Log RAG pipeline. It normalizes JSON/JSONL and
