@@ -37,9 +37,11 @@ curl http://localhost:8001/api/health
 ./stop.sh     # stops services, preserves volumes
 
 # tests (unittest, not pytest — no pytest.ini/conftest.py in this repo)
-python -m unittest discover -s tests
-python -m unittest tests.test_chat_routing -v
-python -m unittest tests.test_chat_routing.LatestIbRankingTests.test_sort_key_ranks_release_series_before_timestamp
+# PYTHONPATH=ingestion is required: build_graph.py imports sibling modules
+# (e.g. clang_parser) by bare name, which only resolves with ingestion/ itself on the path.
+PYTHONPATH=ingestion python -m unittest discover -s tests
+PYTHONPATH=ingestion python -m unittest tests.test_chat_routing -v
+PYTHONPATH=ingestion python -m unittest tests.test_chat_routing.LatestIbRankingTests.test_sort_key_ranks_release_series_before_timestamp
 ```
 
 Tests mock the Neo4j driver / LLM client rather than requiring a live
@@ -148,12 +150,25 @@ text-fallback prompt injected).
 nodes (`_store_chat_turns`) and per-question routing decisions as
 `ChatPlanDecision` nodes (`_store_planning_decision`) — both purely additive,
 never touching imported CMSSW/Clang/GitHub facts. `POST /api/feedback`
-verifies a submitted correct/incorrect verdict: latest-IB questions are
-checked deterministically against the current imported tag; everything else
-goes through an LLM verifier (`KGChatSession` with read-only graph tools
-only) that must return an evidence-based `accepted`/`rejected`/`pending`
-decision — feedback never overwrites imported facts, only ever adds
-`Concept` nodes for verified corrections.
+verifies a submitted correct/incorrect verdict via `_verify_feedback`
+(`server/api_server.py`): latest-IB questions are checked deterministically
+against the current imported tag; everything else goes through an LLM
+verifier (`KGChatSession` with read-only graph tools only,
+`_llm_feedback_verification`) that must return an evidence-based
+`accepted`/`rejected`/`pending` decision — feedback never overwrites imported
+facts. An `accepted` correction (`verdict=incorrect` + `corrected_answer`)
+is promoted to a durable `Concept` fact by `_maybe_create_concept` — **only**
+because the graph confirmed it, never from user agreement/corroboration
+alone (a corroboration-based design was deliberately rejected — trusting how
+many users repeat a claim is not evidence, only the graph is). That trust
+isn't permanent either: `Concept` nodes carry `status`/`expires_at`, and
+`ingestion/revalidate_feedback.py` (same standalone/cron pattern as
+`run_alerts.py`) periodically re-runs `_verify_feedback` against the
+*current* graph — for `pending` feedback (so a claim the graph couldn't
+originally decide can still be recognized once more data is ingested) and
+for `active` Concepts nearing expiry (extend if still confirmed, revoke if
+contradicted, one grace period if newly undecidable). `search_concepts`
+(`graph/tools.py`) only ever surfaces `status='active'` Concepts.
 
 ### Alerts (`graph/alerts.py`)
 

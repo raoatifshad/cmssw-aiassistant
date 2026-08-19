@@ -72,6 +72,8 @@ def setup_schema(driver):
         "CREATE INDEX IF NOT EXISTS FOR (n:ChatTurn) ON (n.turn_order)",
         "CREATE INDEX IF NOT EXISTS FOR (n:EventOccurrence) ON (n.timestamp)",
         "CREATE INDEX IF NOT EXISTS FOR (n:EventOccurrence) ON (n.severity)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:Concept) ON (n.status, n.expires_at)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:UserFeedback) ON (n.status)",
         "CREATE FULLTEXT INDEX github_artifact_text IF NOT EXISTS "
         "FOR (n:Issue|PR) ON EACH [n.title, n.body]",
     ]

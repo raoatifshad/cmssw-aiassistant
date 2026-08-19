@@ -123,6 +123,14 @@ _retriever: HybridRetriever | None = None
 #   to the original deterministic text otherwise.
 ROUTER_SHADOW_ENABLED = os.environ.get("ENABLE_ROUTER_SHADOW", "false").strip().lower() == "true"
 ANSWER_SYNTHESIS_ENABLED = os.environ.get("ENABLE_ANSWER_SYNTHESIS", "false").strip().lower() == "true"
+# A Concept accepted from user feedback is re-verified against current graph
+# facts on this cadence (ingestion/revalidate_feedback.py), never trusted
+# indefinitely from a single automated verification. CONCEPT_TTL_DAYS: how
+# long an accepted Concept stays active before re-check. CONCEPT_PENDING_GRACE_DAYS:
+# if a re-check can no longer decide (graph facts changed), how long to wait
+# before revoking rather than revoking immediately.
+CONCEPT_TTL_DAYS = int(os.environ.get("CONCEPT_TTL_DAYS", "14"))
+CONCEPT_PENDING_GRACE_DAYS = int(os.environ.get("CONCEPT_PENDING_GRACE_DAYS", "3"))
 STATIC_DIR = Path(__file__).parent / "static"
 _request_planner = RequestPlanner((
     Capability(name="ib_menu", required_tag_count=1, bare_tag_only=True, priority=90),
@@ -3056,17 +3064,28 @@ def search(req: SearchRequest):
     return {"question": req.question, "evidence": _retriever.retrieve(req.question, max(1, min(req.limit, 20)))}
 
 
-@app.post("/api/feedback")
-def record_feedback(req: FeedbackRequest):
-    """Verify known facts before accepting feedback; preserve all source facts."""
-    feedback_id = str(uuid.uuid4())
+def _verify_feedback(question: str, answer: str, verdict: str,
+                      corrected_answer: str | None, ib_tag: str | None
+                      ) -> tuple[str, str, str, str | None, list[str]]:
+    """Check a submitted verdict/correction against current graph facts --
+    deterministically for latest-IB questions, otherwise via an LLM verifier
+    restricted to read-only graph tools. Never trusts the submitted text as
+    fact on its own; the graph decides. Shared by the live /api/feedback
+    endpoint and by ingestion/revalidate_feedback.py, which re-runs this same
+    check later for feedback that was pending and for Concepts nearing
+    expiry, so a correction is only ever trusted because the graph confirms
+    it -- never because a user asserted it or because other users agreed.
+
+    Returns (status, verification, verification_method, verified_ib_tag,
+    verified_ib_tags).
+    """
     status = "pending"
     verification = "Automatic graph verification has not yet reached a decision."
     verification_method = "unverified"
     verified_ib_tag = None
     verified_ib_tags: list[str] = []
-    if _is_latest_ib_question(req.question):
-        arch = _requested_ib_arch(req.question)
+    if _is_latest_ib_question(question):
+        arch = _requested_ib_arch(question)
         latest_records = _latest_ib_records(arch)
         scope = f" for architecture `{arch}`" if arch else ""
         if not latest_records:
@@ -3074,31 +3093,31 @@ def record_feedback(req: FeedbackRequest):
         else:
             verified_ib_tags = [record["tag"] for record in latest_records]
             verified_ib_tag = verified_ib_tags[0] if len(verified_ib_tags) == 1 else None
-            answer_matches = any(tag.lower() in req.answer.lower() for tag in verified_ib_tags)
-            correction_matches = any(tag.lower() in (req.corrected_answer or "").lower() for tag in verified_ib_tags)
-            selected_tag_matches = req.ib_tag in verified_ib_tags
+            answer_matches = any(tag.lower() in answer.lower() for tag in verified_ib_tags)
+            correction_matches = any(tag.lower() in (corrected_answer or "").lower() for tag in verified_ib_tags)
+            selected_tag_matches = ib_tag in verified_ib_tags
             graph_values = ", ".join(f"`{tag}`" for tag in verified_ib_tags)
-            if req.verdict == "correct" and answer_matches:
+            if verdict == "correct" and answer_matches:
                 status = "accepted"
                 verification_method = "deterministic"
                 verification = f"The response contains a latest imported IB recorded in the graph{scope}."
-            elif req.verdict == "correct":
+            elif verdict == "correct":
                 status = "rejected"
                 verification_method = "deterministic"
                 verification = f"The response does not contain a latest graph value ({graph_values}){scope}."
-            elif req.verdict == "incorrect" and answer_matches:
+            elif verdict == "incorrect" and answer_matches:
                 status = "rejected"
                 verification_method = "deterministic"
                 verification = f"The response already contains a latest graph value ({graph_values}){scope}."
-            elif req.verdict == "incorrect" and correction_matches and (req.ib_tag is None or selected_tag_matches):
+            elif verdict == "incorrect" and correction_matches and (ib_tag is None or selected_tag_matches):
                 status = "accepted"
                 verification_method = "deterministic"
                 verification = f"The correction matches a latest imported IB recorded in the graph{scope}."
-            elif req.ib_tag and not selected_tag_matches:
+            elif ib_tag and not selected_tag_matches:
                 status = "rejected"
                 verification_method = "deterministic"
                 verification = f"The submitted IB tag conflicts with the latest graph values ({graph_values}){scope}."
-            elif req.verdict == "incorrect" and not req.corrected_answer:
+            elif verdict == "incorrect" and not corrected_answer:
                 status = "accepted"
                 verification_method = "deterministic"
                 verification = (
@@ -3111,12 +3130,52 @@ def record_feedback(req: FeedbackRequest):
                     "to verify this feedback automatically."
                 )
     if status == "pending":
-        llm_decision = _llm_feedback_verification(req)
+        llm_decision = _llm_feedback_verification(
+            FeedbackRequest(question=question, answer=answer, verdict=verdict,
+                             corrected_answer=corrected_answer, ib_tag=ib_tag)
+        )
         if llm_decision:
             status, verification = llm_decision
             verification_method = "llm_graph_tools"
         else:
             verification = "Automatic graph verification could not reach an evidence-based decision."
+    return status, verification, verification_method, verified_ib_tag, verified_ib_tags
+
+
+def _maybe_create_concept(session, feedback_id: str, question: str, verdict: str,
+                           corrected_answer: str | None, status: str, verification_method: str) -> str | None:
+    """A correction that passed the same verification gate used for the
+    accept/reject decision becomes a durable graph fact, not just a
+    conversation record -- this is the trust boundary the glossary layer
+    builds on, not a new invented review process. Called both at submission
+    time and later by ingestion/revalidate_feedback.py when a previously-
+    pending submission becomes decidable once the graph has more data."""
+    if not (status == "accepted" and verdict == "incorrect" and corrected_answer):
+        return None
+    concept_id = str(uuid.uuid4())
+    session.run(
+        "CREATE (concept:Concept {"
+        "concept_id:$concept_id, question:$question, definition:$definition, "
+        "source_feedback_id:$feedback_id, verification_method:$verification_method, "
+        "status:'active', expires_at:datetime() + duration({days: $ttl_days}), "
+        "last_revalidated_at:datetime(), created_at:datetime()})",
+        concept_id=concept_id,
+        question=question,
+        definition=corrected_answer,
+        feedback_id=feedback_id,
+        verification_method=verification_method,
+        ttl_days=CONCEPT_TTL_DAYS,
+    )
+    return concept_id
+
+
+@app.post("/api/feedback")
+def record_feedback(req: FeedbackRequest):
+    """Verify known facts before accepting feedback; preserve all source facts."""
+    feedback_id = str(uuid.uuid4())
+    status, verification, verification_method, verified_ib_tag, verified_ib_tags = _verify_feedback(
+        req.question, req.answer, req.verdict, req.corrected_answer, req.ib_tag
+    )
     driver = get_driver()
     try:
         with driver.session() as session:
@@ -3143,24 +3202,9 @@ def record_feedback(req: FeedbackRequest):
                 verification=verification,
                 verification_method=verification_method,
             )
-            # A correction that passed the same verification gate used for the
-            # accept/reject decision above becomes a durable graph fact, not just
-            # a conversation record — this is the trust boundary the glossary
-            # layer builds on, not a new invented review process.
-            concept_id = None
-            if status == "accepted" and req.verdict == "incorrect" and req.corrected_answer:
-                concept_id = str(uuid.uuid4())
-                session.run(
-                    "CREATE (concept:Concept {"
-                    "concept_id:$concept_id, question:$question, definition:$definition, "
-                    "source_feedback_id:$feedback_id, verification_method:$verification_method, "
-                    "created_at:datetime()})",
-                    concept_id=concept_id,
-                    question=req.question,
-                    definition=req.corrected_answer,
-                    feedback_id=feedback_id,
-                    verification_method=verification_method,
-                )
+            concept_id = _maybe_create_concept(
+                session, feedback_id, req.question, req.verdict, req.corrected_answer, status, verification_method
+            )
     finally:
         driver.close()
     return {
