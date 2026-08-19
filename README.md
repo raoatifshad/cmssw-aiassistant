@@ -54,25 +54,32 @@ outside `cmsrepo` and must have this layout:
 ### RelVal exception logs
 
 The CMSSDT logreader (`cmssdt.cern.ch/SDT/cgi-bin/logreader/...`) requires a
-CERN SSO login, so pyRelValMatrixLogs step logs can't be fetched automatically.
-Stage them manually — same idea as `--clang-root` — mirroring the logreader's
-own URL path so nothing needs renaming:
+CERN SSO login, so exceptions are sourced from Elasticsearch instead: run
+cms-bot's `es-cmssw-exceptions.py` and redirect its output to a file —
 
-```
-/home/rao/CHAT-BOT-AI/buildlogs/raw/<arch>/<tag>/pyRelValMatrixLogs/run/<workflow>_<name>/<step>_<name>.log
+```bash
+es-cmssw-exceptions.py > exceptions.JSON
 ```
 
-Pass `--relval-logs-root` pointing at that root. Ingestion parses each log's
-`----- Begin/End Fatal Exception -----` blocks (category, message, context)
-and links them to the matching `RelVal` via `HAS_EXCEPTION`, citing the exact
-line range back to the original logreader URL:
+— then pass that file with `--es-exceptions-json`. Ingestion parses each
+document's `exception` field (category, message, context — a single document
+can concatenate several occurrences of the same category back to back) and
+links them to the matching `RelVal` via `HAS_EXCEPTION`. There's no exact
+source-line citation this way (an ES document is a structured field, not a
+byte offset into a real log file), but coverage is far broader than manually
+staging individual logs, since one export can span many releases and
+architectures at once:
 
 ```bash
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
   --cmsrepo cmsrepo \
-  --relval-logs-root /home/rao/CHAT-BOT-AI/buildlogs/raw \
+  --es-exceptions-json /home/rao/CHAT-BOT-AI/NEO4J/cms-bot/exceptions.JSON \
   --reconcile
 ```
+
+An exception only attaches if its `release`/`architecture`/`workflow` already
+matches an ingested `RelVal` record — one without the other is silently
+skipped, not stored.
 
 Run the normal update after refreshing `cmsrepo` or adding Clang logs:
 

@@ -70,11 +70,14 @@ UnitTest results are package-level aggregates. A PR test-file match in a failed
 package is evidence of relevance, not a failure for a specific test name.
 An IB with no variant is a primary run. An IB with a variant (for example,
 NONLTO or CLANG) is a sub-IB whose parent_tag identifies its primary run.
-RelValException category/message/context come from EDM Fatal Exception blocks
-parsed out of manually-staged pyRelValMatrixLogs step logs (the CMSSDT
-logreader requires CERN SSO, so these are not fetched automatically); coverage
-is only as complete as the logs someone has staged. source_url cites the exact
-line range in the original log.
+RelValException category/message/context come from EDM Fatal Exception text
+in a cms-bot es-cmssw-exceptions.py Elasticsearch export (--es-exceptions-json;
+the CMSSDT logreader itself requires CERN SSO, so exceptions are sourced from
+ES instead). An exception only exists here if both its RelVal and its
+release/architecture/workflow were present in that export -- coverage is
+whatever the export covered, not automatically comprehensive. source_url
+points at the run's log file with no line-range anchor, since ES stores a
+structured field, not a byte offset into a real file.
 """
 
 MAX_ROWS = 100
