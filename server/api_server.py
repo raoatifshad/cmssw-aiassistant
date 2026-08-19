@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "graph"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from tools import (  # noqa: E402
     TOOLS, GRAPH_SCHEMA, count_warnings_by_package, find_prs_for_error, get_exit_code_names, get_failing_relvals,
-    get_relval_recurrence, search_concepts,
+    get_relval_recurrence, relval_failure_architectures, search_concepts, top_recurring_relval_failures,
 )
 from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # noqa: E402
 from server.llm_client import DEFAULT_MODEL, get_client  # noqa: E402
@@ -105,6 +105,8 @@ _pr_contexts: dict[str, list[dict]] = {}
 _pending_ib_comparisons: dict[str, dict[str, object]] = {}
 _failed_relval_contexts: dict[str, dict[str, str]] = {}
 _pending_relval_scopes: dict[str, dict[str, object]] = {}
+_pending_unittest_scopes: dict[str, dict[str, object]] = {}
+_pending_frequent_failure_scopes: dict[str, dict[str, object]] = {}
 _latest_ib_contexts: dict[str, str] = {}
 _latest_ib_arch_contexts: dict[str, str] = {}
 _relval_exception_contexts: dict[str, dict[str, str | None]] = {}
@@ -549,7 +551,11 @@ def _requested_ib_arch(question: str) -> str | None:
 
 
 def _relval_scope_records(tag: str, include_sub_ibs: bool) -> list[dict]:
-    """Return one RelVal summary for every imported IB/architecture in scope."""
+    """Return one RelVal summary for every imported IB/architecture in scope.
+    Includes per-architecture error aggregates (error_count/failed_errors/
+    passed_errors) alongside the pass/fail counts, so callers that only need
+    failure counts and callers that need error breakdowns (e.g.
+    _relval_error_count_answer) share one query instead of two near-duplicates."""
     query = """
         MATCH (ib:IB)
         WHERE ib.tag = $tag OR ($include_sub_ibs AND ib.parent_tag = $tag)
@@ -557,11 +563,14 @@ def _relval_scope_records(tag: str, include_sub_ibs: bool) -> list[dict]:
         WITH ib,
             count(relval) AS relval_total,
             sum(CASE WHEN relval.status = 'FAILED' THEN 1 ELSE 0 END) AS failed_relvals,
-            sum(CASE WHEN relval.status = 'PASSED' THEN 1 ELSE 0 END) AS passed_relvals
+            sum(CASE WHEN relval.status = 'PASSED' THEN 1 ELSE 0 END) AS passed_relvals,
+            coalesce(sum(coalesce(relval.errors, 0)), 0) AS error_count,
+            sum(CASE WHEN relval.status = 'FAILED' THEN coalesce(relval.errors, 0) ELSE 0 END) AS failed_errors,
+            sum(CASE WHEN relval.status = 'PASSED' THEN coalesce(relval.errors, 0) ELSE 0 END) AS passed_errors
         WHERE relval_total > 0
         RETURN ib.tag AS tag, ib.arch AS arch, ib.variant AS variant,
             coalesce(ib.is_relval_default, false) AS is_relval_default,
-            relval_total, failed_relvals, passed_relvals
+            relval_total, failed_relvals, passed_relvals, error_count, failed_errors, passed_errors
         ORDER BY tag, arch
     """
     driver = get_driver()
@@ -630,6 +639,23 @@ def _relval_arch_choice_answer(tag: str, records: list[dict]) -> str:
     )
 
 
+def _relval_scope_or_choice(session_id: str, tag: str, records: list[dict], all_requested: bool) -> list[dict] | str:
+    """Filter to is_relval_default architectures; if more than one remains
+    and the user didn't say "all", register a pending choice -- resumed by
+    _relval_failure_count_answer, which always runs first in every dispatch
+    path, regardless of which caller created the pending state -- and return
+    the prompt instead of resolved records. Shared by every relval
+    summary-style answer so architecture ambiguity is never silently
+    resolved differently in different places."""
+    default_records = [record for record in records if record.get("is_relval_default")]
+    if default_records and not all_requested:
+        records = default_records
+    if len(records) == 1:
+        return records
+    _pending_relval_scopes[session_id] = {"root_tag": tag, "stage": "arch", "records": records}
+    return _relval_arch_choice_answer(tag, records)
+
+
 def _relval_failure_count_answer(question: str, session_id: str) -> str | None:
     """Resolve IB and architecture scope before calculating failed-RelVal counts."""
     pending = _pending_relval_scopes.get(session_id)
@@ -678,16 +704,13 @@ def _relval_failure_count_answer(question: str, session_id: str) -> str | None:
         if not selected_records:
             return _relval_arch_choice_answer(tag, records)
         return _relval_scope_summary(selected_records, f"RelVal results for `{tag}` on `{selected_arch}`")
-    default_records = [record for record in records if record.get("is_relval_default")]
-    if default_records and not all_requested:
-        records = default_records
-    if len(records) == 1:
-        return _relval_scope_summary(records, f"RelVal results for `{tag}`")
-    _pending_relval_scopes[session_id] = {"root_tag": tag, "stage": "arch", "records": records}
-    return _relval_arch_choice_answer(tag, records)
+    resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
+    if isinstance(resolved, str):
+        return resolved
+    return _relval_scope_summary(resolved, f"RelVal results for `{tag}`")
 
 
-def _relval_data_availability_answer(question: str) -> str | None:
+def _relval_data_availability_answer(question: str, session_id: str) -> str | None:
     """Confirm imported RelVal coverage for one explicitly named IB."""
     if not re.search(r"\b(?:do\s+you\s+have|have\s+data|is\s+there\s+data|available)\b", question, re.IGNORECASE):
         return None
@@ -699,13 +722,14 @@ def _relval_data_availability_answer(question: str) -> str | None:
     records = _relval_scope_records(tag, include_sub_ibs=False)
     if not records:
         return f"No imported RelVal data is available for `{tag}`."
-    default_records = [record for record in records if record.get("is_relval_default")]
-    if default_records and not re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE):
-        records = default_records
-    return _relval_scope_summary(records, f"Imported RelVal data for `{tag}`")
+    all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
+    resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
+    if isinstance(resolved, str):
+        return resolved
+    return _relval_scope_summary(resolved, f"Imported RelVal data for `{tag}`")
 
 
-def _relval_ib_summary_answer(question: str) -> str | None:
+def _relval_ib_summary_answer(question: str, session_id: str) -> str | None:
     """Keep direct IB/RelVal questions on local graph facts unless GitHub is requested."""
     if re.search(r"\b(?:issues?|prs?|pull\s+requests?|github)\b", question, re.IGNORECASE):
         return None
@@ -719,10 +743,11 @@ def _relval_ib_summary_answer(question: str) -> str | None:
     records = _relval_scope_records(tag, include_sub_ibs=False)
     if not records:
         return f"No imported RelVal data is available for `{tag}`."
-    default_records = [record for record in records if record.get("is_relval_default")]
-    if default_records and not re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE):
-        records = default_records
-    return _relval_scope_summary(records, f"Imported RelVal results for `{tag}`")
+    all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
+    resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
+    if isinstance(resolved, str):
+        return resolved
+    return _relval_scope_summary(resolved, f"Imported RelVal results for `{tag}`")
 
 
 def _unittest_scope_records(tag: str) -> list[dict]:
@@ -745,19 +770,16 @@ def _unittest_scope_records(tag: str) -> list[dict]:
         driver.close()
 
 
-def _unittest_summary_answer(question: str, context_tag: str | None) -> str | None:
-    if not re.search(r"\bunit\s*tests?\b", question, re.IGNORECASE):
-        return None
-    tag_match = IB_TAG_RE.search(question)
-    tag = tag_match.group(1) if tag_match else context_tag
-    if not tag:
-        return "Name an Integration Build tag to query its imported unit-test results."
-    records = _unittest_scope_records(tag)
-    if not records:
-        return f"No imported unit-test records were found for `{tag}`."
-    default_records = [record for record in records if record["is_default"]]
-    if default_records:
-        records = default_records
+def _unittest_arch_choice_answer(tag: str, records: list[dict]) -> str:
+    architectures = sorted({record["arch"] for record in records})
+    return (
+        f"Unit-test results for `{tag}` are architecture-specific. Choose one: "
+        f"{', '.join(f'`{arch}`' for arch in architectures)}. "
+        "Reply `all` or `everything` for all listed architectures."
+    )
+
+
+def _unittest_summary_from_records(tag: str, records: list[dict]) -> str:
     total = sum(record["total"] or 0 for record in records)
     failed = sum(record["failed"] or 0 for record in records)
     passed = sum(record["passed"] or 0 for record in records)
@@ -775,6 +797,59 @@ def _unittest_summary_answer(question: str, context_tag: str | None) -> str | No
         for record in records
     )
     return "\n".join(lines)
+
+
+def _unittest_summary_answer(question: str, context_tag: str | None, session_id: str) -> str | None:
+    """Resolve architecture scope before answering -- never silently sum
+    every "default" architecture into one combined headline number, the same
+    rule applied to every other IB summary answer (see _relval_scope_or_choice).
+    A real production IB had 4 architectures marked default simultaneously,
+    which used to be added together as if they were one build."""
+    pending = _pending_unittest_scopes.get(session_id)
+    all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
+    selected_arch = _requested_ib_arch(question)
+
+    if pending:
+        records = pending["records"]
+        tag = pending["tag"]
+        if all_requested:
+            _pending_unittest_scopes.pop(session_id, None)
+            return _unittest_summary_from_records(tag, records)
+        if selected_arch:
+            selected_records = [record for record in records if record["arch"] == selected_arch]
+            if not selected_records:
+                return (
+                    "That architecture is not available for this Integration Build. "
+                    "Choose one of the architectures listed above or reply `all`."
+                )
+            _pending_unittest_scopes.pop(session_id, None)
+            return _unittest_summary_from_records(tag, selected_records)
+        return _unittest_arch_choice_answer(tag, records)
+
+    # "unit" alone (not just "unit test(s)") must still match -- a natural
+    # phrasing like "unit failures" has no "test" word in it at all, and
+    # "unit" alone has no other established meaning in this domain.
+    if not re.search(r"\bunit(?:\s*tests?)?\b", question, re.IGNORECASE):
+        return None
+    tag_match = IB_TAG_RE.search(question)
+    tag = tag_match.group(1) if tag_match else context_tag
+    if not tag:
+        return "Name an Integration Build tag to query its imported unit-test results."
+    records = _unittest_scope_records(tag)
+    if not records:
+        return f"No imported unit-test records were found for `{tag}`."
+    if selected_arch:
+        selected_records = [record for record in records if record["arch"] == selected_arch]
+        if not selected_records:
+            return _unittest_arch_choice_answer(tag, records)
+        return _unittest_summary_from_records(tag, selected_records)
+    default_records = [record for record in records if record["is_default"]]
+    if default_records and not all_requested:
+        records = default_records
+    if len(records) == 1:
+        return _unittest_summary_from_records(tag, records)
+    _pending_unittest_scopes[session_id] = {"tag": tag, "records": records}
+    return _unittest_arch_choice_answer(tag, records)
 
 
 _PRIMARY_IB_TAG_RE = re.compile(r"^CMSSW_(\d+)_(\d+)_X_(\d{4}-\d{2}-\d{2}-\d{4})$")
@@ -1739,17 +1814,38 @@ def _build_warning_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
-def _failing_relval_context(question: str) -> dict[str, str] | None:
-    """Extract the IB identity from a failing-RelVal request."""
+def _failing_relval_context(question: str) -> dict[str, str | None] | None:
+    """Extract the IB identity from a failing-RelVal request. The architecture
+    is optional -- a bare tag mention still returns a context scoped to every
+    imported architecture (every downstream consumer already handles
+    context["arch"] being None), matching _relval_exception_context's more
+    permissive pattern. Requiring an explicit architecture here used to mean
+    this context was essentially never populated in real conversations, since
+    users don't repeat the architecture on every follow-up question."""
     if not re.search(r"\brelvals?\b", question, re.IGNORECASE):
         return None
     if not re.search(r"\b(?:failing|failed|failures?)\b", question, re.IGNORECASE):
         return None
     tag_match = IB_TAG_RE.search(question)
-    arch = _requested_ib_arch(question)
-    if not tag_match or not arch:
+    if not tag_match:
         return None
-    return {"tag": tag_match.group(1), "arch": arch}
+    return {"tag": tag_match.group(1), "arch": _requested_ib_arch(question)}
+
+
+# Shared by _relval_exception_list_answer and _relval_exception_answer, which
+# both consume an already-cached failing-RelVal session context rather than
+# requiring a fresh explicit mention -- so a natural follow-up like "analyze
+# the logs why they are failing" or "what's the root cause" must trigger the
+# same exception lookup as literally saying "exception", not just be a
+# near-miss that falls through to the LLM path with no session memory of what
+# was just discussed. Keep this as the one definition; a second inline copy
+# of "exceptions?|matches?" here would silently drift narrower over time the
+# way the old per-function arch regexes did (see _requested_ib_arch).
+_RELVAL_EXCEPTION_INTENT_RE = re.compile(
+    r"\b(?:exceptions?|matche?s?|analyz(?:e|ing|is)|root\s+cause|causing|"
+    r"cause(?:s)?\s+(?:of|for)|why\s+(?:is|are|it|they|these|this|that)\b)",
+    re.IGNORECASE,
+)
 
 
 def _relval_exception_context(question: str) -> dict[str, str | None] | None:
@@ -1771,7 +1867,7 @@ def _relval_exception_list_answer(question: str, context: dict[str, str | None] 
     """List imported RelVal exception signatures for an explicitly named IB."""
     if not context or re.search(r"\b\d{3,6}\.\d+\b", question):
         return None
-    if not re.search(r"\b(?:exceptions?|matche?s?)\b", question, re.IGNORECASE):
+    if not _RELVAL_EXCEPTION_INTENT_RE.search(question):
         return None
     other_tag_match = IB_TAG_RE.search(question)
     if other_tag_match and other_tag_match.group(1) != context.get("tag"):
@@ -1809,7 +1905,25 @@ def _relval_exception_list_answer(question: str, context: dict[str, str | None] 
     return "\n".join(lines)
 
 
-def _relval_error_count_answer(question: str) -> str | None:
+def _relval_error_count_summary(records: list[dict], tag: str) -> str:
+    ib_records = len({(record["tag"], record["arch"]) for record in records})
+    relval_total = sum(record["relval_total"] or 0 for record in records)
+    failed_relvals = sum(record["failed_relvals"] or 0 for record in records)
+    passed_relvals = sum(record["passed_relvals"] or 0 for record in records)
+    error_count = sum(record["error_count"] or 0 for record in records)
+    failed_errors = sum(record["failed_errors"] or 0 for record in records)
+    passed_errors = sum(record["passed_errors"] or 0 for record in records)
+    return (
+        f"`{tag}` has **{failed_relvals:,} failed RelVal(s)** across "
+        f"**{relval_total:,} RelVal record(s)** from **{ib_records:,} IB record(s)**. "
+        f"Its **{error_count:,}** "
+        f"reported errors are aggregate per-step counters, not a failed-RelVal count: "
+        f"**{passed_errors:,}** come from **{passed_relvals:,}** "
+        f"RelVals marked `PASSED`, and **{failed_errors:,}** come from the failed RelVals."
+    )
+
+
+def _relval_error_count_answer(question: str, session_id: str) -> str | None:
     """Count reported RelVal errors for one explicitly named Integration Build."""
     if not re.search(r"\b(?:how\s+many|count|number|total)\b", question, re.IGNORECASE):
         return None
@@ -1822,33 +1936,14 @@ def _relval_error_count_answer(question: str) -> str | None:
         return None
 
     tag = tag_match.group(1)
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            record = session.run(
-                "MATCH (ib:IB) "
-                "WHERE ib.tag = $tag OR ib.parent_tag = $tag "
-                "OPTIONAL MATCH (ib)-[:RAN_RELVAL]->(relval:RelVal) "
-                "RETURN count(DISTINCT ib) AS ib_records, count(relval) AS relval_total, "
-                "coalesce(sum(coalesce(relval.errors, 0)), 0) AS error_count, "
-                "sum(CASE WHEN relval.status = 'FAILED' THEN 1 ELSE 0 END) AS failed_relvals, "
-                "sum(CASE WHEN relval.status = 'FAILED' THEN coalesce(relval.errors, 0) ELSE 0 END) AS failed_errors, "
-                "sum(CASE WHEN relval.status = 'PASSED' THEN 1 ELSE 0 END) AS passed_relvals, "
-                "sum(CASE WHEN relval.status = 'PASSED' THEN coalesce(relval.errors, 0) ELSE 0 END) AS passed_errors",
-                tag=tag,
-            ).single()
-    finally:
-        driver.close()
-    if not record or not record["ib_records"]:
+    records = _relval_scope_records(tag, include_sub_ibs=True)
+    if not records:
         return f"No imported RelVal records were found for `{tag}`."
-    return (
-        f"`{tag}` has **{record['failed_relvals'] or 0:,} failed RelVal(s)** across "
-        f"**{record['relval_total'] or 0:,} RelVal record(s)** from **{record['ib_records']:,} IB record(s)**. "
-        f"Its **{record['error_count'] or 0:,}** "
-        f"reported errors are aggregate per-step counters, not a failed-RelVal count: "
-        f"**{record['passed_errors'] or 0:,}** come from **{record['passed_relvals'] or 0:,}** "
-        f"RelVals marked `PASSED`, and **{record['failed_errors'] or 0:,}** come from the failed RelVals."
-    )
+    all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
+    resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
+    if isinstance(resolved, str):
+        return resolved
+    return _relval_error_count_summary(resolved, tag)
 
 
 def _concept_answer(question: str) -> str | None:
@@ -1938,20 +2033,116 @@ def _failed_relval_list_answer(question: str, context: dict[str, str] | None) ->
     return "\n".join(lines)
 
 
-def _recurring_failure_answer(question: str) -> str | None:
-    """Has this workflow failed before, across every imported IB -- not just
-    the one currently being discussed? Computed at query time (§5 tier 3:
-    mined patterns) rather than by a scheduled job; always reflects whatever
-    has been ingested so far."""
-    if not re.search(
-        r"\b(?:recurring|recur(?:s|red)?|happened\s+before|seen\s+(?:this\s+)?before|"
-        r"known\s+issue|keeps?\s+failing|how\s+often|history)\b",
-        question, re.IGNORECASE,
-    ):
+# Shared by _recurring_failure_answer for both its modes (one named workflow,
+# or none -- rank every workflow instead). Keep this as the one definition;
+# see _requested_ib_arch for why an inline second copy would drift.
+_RECURRING_FAILURE_INTENT_RE = re.compile(
+    r"\b(?:recurring|recur(?:s|red)?|happened\s+before|seen\s+(?:this\s+)?before|"
+    r"known\s+issue|keeps?\s+failing|how\s+often|history|frequent(?:ly)?|"
+    r"common(?:est)?|most\s+(?:often|common|frequent))\b|\btop\b[^.?!]{0,20}\bfail",
+    re.IGNORECASE,
+)
+
+
+def _parse_recency_window_days(question: str) -> int | None:
+    """Parse an explicit recency window from a frequent-failures question.
+    None means "all imported history" -- an explicit all-time request (e.g.
+    "ever", "all time") must not silently fall back to the default window."""
+    if re.search(r"\ball(?:\s+time)?\b|\bever\b", question, re.IGNORECASE):
         return None
+    days_match = re.search(r"\blast\s+(\d+)\s+days?\b", question, re.IGNORECASE)
+    if days_match:
+        return int(days_match.group(1))
+    if re.search(r"\b(?:last|past)\s+week\b", question, re.IGNORECASE):
+        return 7
+    if re.search(r"\b(?:last|past)\s+month\b", question, re.IGNORECASE):
+        return 30
+    if re.search(r"\b(?:last|past)\s+(?:day|24\s*hours?)\b", question, re.IGNORECASE):
+        return 1
+    return 7
+
+
+def _format_frequent_failures_report(days: int | None, arch: str | None) -> str:
+    rows = top_recurring_relval_failures(days=days, limit=10, arch=arch)
+    window_label = f"the last {days} day{'s' if days != 1 else ''}" if days is not None else "all imported history"
+    scope_label = f" on `{arch}`" if arch else " across all imported architectures"
+    if not rows:
+        return f"No RelVal failures are recorded in imported IBs over {window_label}{scope_label}."
+    lines = [
+        f"Most frequently failing RelVals over {window_label}{scope_label}:",
+        "",
+        "| Workflow | Name | Failed / Total | Recent failing builds |",
+        "| --- | --- | ---: | --- |",
+    ]
+    for row in rows:
+        recent = ", ".join(f"`{tag}`" for tag in row["failed_tags"]) or "-"
+        lines.append(
+            f"| `{row['workflow_id']}` | {row['name']} | {row['failed_appearances']}/{row['total_appearances']} "
+            f"| {recent} |"
+        )
+    lines.append("Counts reflect only what has been ingested so far.")
+    return "\n".join(lines)
+
+
+def _frequent_failures_arch_choice_answer(architectures: list[str]) -> str:
+    return (
+        "RelVal failures over this period span multiple architectures — never silently combined "
+        f"without you choosing that. Choose one: {', '.join(f'`{arch}`' for arch in architectures)}. "
+        "Reply `all` or `everything` for every architecture combined."
+    )
+
+
+def _frequent_failures_report(question: str, session_id: str) -> str:
+    """Rank workflows by how often they've failed -- the aggregate answer to
+    "what are the frequent/recurring/most common failures" when no specific
+    workflow is already named. Asks which architecture before answering
+    whenever the period covers more than one, the same rule the rest of this
+    codebase applies to IB identity (never silently merge architectures)."""
+    pending = _pending_frequent_failure_scopes.get(session_id)
+    all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
+    selected_arch = _requested_ib_arch(question)
+
+    if pending:
+        days = pending["days"]
+        if all_requested:
+            _pending_frequent_failure_scopes.pop(session_id, None)
+            return _format_frequent_failures_report(days, arch=None)
+        if selected_arch:
+            if selected_arch not in pending["architectures"]:
+                return (
+                    "That architecture had no recorded failures in this period. "
+                    "Choose one of the architectures listed above or reply `all`."
+                )
+            _pending_frequent_failure_scopes.pop(session_id, None)
+            return _format_frequent_failures_report(days, arch=selected_arch)
+        return _frequent_failures_arch_choice_answer(pending["architectures"])
+
+    days = _parse_recency_window_days(question)
+    if all_requested:
+        return _format_frequent_failures_report(days, arch=None)
+    if selected_arch:
+        return _format_frequent_failures_report(days, arch=selected_arch)
+
+    architectures = relval_failure_architectures(days=days)
+    if len(architectures) <= 1:
+        return _format_frequent_failures_report(days, arch=(architectures[0] if architectures else None))
+    _pending_frequent_failure_scopes[session_id] = {"days": days, "architectures": architectures}
+    return _frequent_failures_arch_choice_answer(architectures)
+
+
+def _recurring_failure_answer(question: str, session_id: str) -> str | None:
+    """Has this workflow failed before, across every imported IB -- not just
+    the one currently being discussed? With no specific workflow named,
+    ranks which workflows fail most often instead. Computed at query time
+    (§5 tier 3: mined patterns) rather than by a scheduled job; always
+    reflects whatever has been ingested so far."""
+    if not _RECURRING_FAILURE_INTENT_RE.search(question) and session_id not in _pending_frequent_failure_scopes:
+        return None
+    if session_id in _pending_frequent_failure_scopes:
+        return _frequent_failures_report(question, session_id)
     workflow_match = re.search(r"\b(\d{3,6}\.\d+)\b", question)
     if not workflow_match:
-        return "Please provide the failed RelVal workflow ID, for example `37834.0`."
+        return _frequent_failures_report(question, session_id)
 
     workflow_id = workflow_match.group(1)
     recurrence = get_relval_recurrence(workflow_id)
@@ -1976,7 +2167,7 @@ def _recurring_failure_answer(question: str) -> str | None:
 
 def _relval_exception_answer(question: str, context: dict[str, str | None] | None) -> str | None:
     """Find imported exceptions for one failed workflow and their GitHub text matches."""
-    if not re.search(r"\b(?:exceptions?|matche?s?)\b", question, re.IGNORECASE):
+    if not _RELVAL_EXCEPTION_INTENT_RE.search(question):
         return None
     workflow_match = re.search(r"\b(\d{3,6}\.\d+)\b", question)
     if not context and workflow_match:
@@ -2315,6 +2506,32 @@ def _ib_relationship_answer(question: str) -> str | None:
         f"`{tag}` is imported as the `{variant}` sub-IB variant of primary IB `{parent_tag}`. "
         "Its build, RelVal, and unit-test results are shown separately and are not combined with the primary IB."
     )
+
+
+def _fallback_clarification(context: RequestContext) -> tuple[str, list[dict]]:
+    """Last resort before giving up: offer concrete, already-answerable next
+    steps instead of a dead-end rejection. Reached only when nothing in the
+    deterministic waterfall matched and the LLM investigation plan could not
+    be built or executed either -- "nothing is clear" should still leave a
+    path forward, not a flat "I could not create a valid plan" message."""
+    actions = []
+    if context.tag:
+        actions.extend([
+            {"label": "Build warnings", "question": f"build warnings for {context.tag}"},
+            {"label": "RelVal failures", "question": f"failed RelVals for {context.tag}"},
+            {"label": "Unit-test results", "question": f"unit tests for {context.tag}"},
+            {"label": "Combined summary", "question": f"summary for {context.tag}"},
+        ])
+    actions.extend([
+        {"label": "Latest IB", "question": "what is the latest IB"},
+        {"label": "Frequent RelVal failures (last week)", "question": "what are the frequent failures over the last week"},
+    ])
+    message = (
+        f"I couldn't match that to a specific local answer for `{context.tag}`. Choose what to look at, "
+        if context.tag else
+        "I couldn't match that to a specific local answer. Try one of these, "
+    ) + "or name an Integration Build tag, PR number, or workflow ID directly."
+    return message, actions
 
 
 def _ib_action_menu(question: str) -> tuple[str, list[dict]] | None:
@@ -2683,6 +2900,16 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         )
         return (answer, []) if answer else None
     if capability == "relval":
+        # Mirror the legacy waterfall's context bookkeeping (below, in chat()):
+        # a natural non-keyword follow-up like "why are they failing" has no
+        # "relval" category of its own, so RequestPlanner can't route it here
+        # deterministically -- it falls through to the legacy chain instead,
+        # which needs _failed_relval_contexts[session_id] already populated
+        # from this question to answer it. Without this, that follow-up would
+        # have no session memory of what "they" refers to.
+        relval_context = _failing_relval_context(question)
+        if relval_context:
+            _failed_relval_contexts[session_id] = relval_context
         # Exception lookups are tried first and specifically: a generic RelVal
         # question ("relval results for <tag>") should fall through to the
         # summary below, but "relval exception for <tag>/<workflow>" must not
@@ -2698,15 +2925,15 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         answer = (
             _relval_exception_list_answer(question, exception_scope)
             or _relval_exception_answer(question, exception_scope)
-            or _recurring_failure_answer(question)
+            or _recurring_failure_answer(question, session_id)
             or _relval_failure_count_answer(question, session_id)
-            or _relval_data_availability_answer(question)
-            or _relval_error_count_answer(question)
-            or _relval_ib_summary_answer(question)
+            or _relval_data_availability_answer(question, session_id)
+            or _relval_error_count_answer(question, session_id)
+            or _relval_ib_summary_answer(question, session_id)
         )
         return (answer, []) if answer else None
     if capability == "unittest":
-        answer = _unittest_summary_answer(question, _latest_ib_contexts.get(session_id))
+        answer = _unittest_summary_answer(question, _latest_ib_contexts.get(session_id), session_id)
         return (answer, []) if answer else None
     if capability == "clang":
         answer = (
@@ -2745,7 +2972,7 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         # "is this a known issue" contains the word "issue", routing here even
         # though it's really a recurrence question, not a GitHub Issue lookup —
         # try it once PR/Issue evidence itself found nothing.
-        recurring_answer = _recurring_failure_answer(question)
+        recurring_answer = _recurring_failure_answer(question, session_id)
         if recurring_answer:
             return recurring_answer, []
     return None
@@ -2865,19 +3092,19 @@ def chat(req: ChatRequest):
     relval_failure_count_answer = _relval_failure_count_answer(question, sid)
     if relval_failure_count_answer:
         return _chat_response(sid, original_question, relval_failure_count_answer, "deterministic")
-    relval_data_availability_answer = _relval_data_availability_answer(question)
+    relval_data_availability_answer = _relval_data_availability_answer(question, sid)
     if relval_data_availability_answer:
         return _chat_response(sid, original_question, relval_data_availability_answer, "deterministic")
-    unittest_summary_answer = _unittest_summary_answer(question, _latest_ib_contexts.get(sid))
+    unittest_summary_answer = _unittest_summary_answer(question, _latest_ib_contexts.get(sid), sid)
     if unittest_summary_answer:
         return _chat_response(sid, original_question, unittest_summary_answer, "deterministic")
-    relval_error_count_answer = _relval_error_count_answer(question)
+    relval_error_count_answer = _relval_error_count_answer(question, sid)
     if relval_error_count_answer:
         return _chat_response(sid, original_question, relval_error_count_answer, "deterministic")
     workflow_reported_answer = _workflow_reported_answer(question)
     if workflow_reported_answer:
         return _chat_response(sid, original_question, workflow_reported_answer, "deterministic")
-    recurring_failure_answer = _recurring_failure_answer(question)
+    recurring_failure_answer = _recurring_failure_answer(question, sid)
     if recurring_failure_answer:
         return _chat_response(sid, original_question, recurring_failure_answer, "deterministic")
     relval_context = _failing_relval_context(question)
@@ -2886,7 +3113,9 @@ def chat(req: ChatRequest):
     exception_context = _relval_exception_context(question)
     if exception_context:
         _relval_exception_contexts[sid] = exception_context
-    relval_exception_list_answer = _relval_exception_list_answer(question, _relval_exception_contexts.get(sid))
+    relval_exception_list_answer = _relval_exception_list_answer(
+        question, _relval_exception_contexts.get(sid) or _failed_relval_contexts.get(sid)
+    )
     if relval_exception_list_answer:
         return _chat_response(sid, original_question, relval_exception_list_answer, "deterministic")
     relval_exception_answer = _relval_exception_answer(
@@ -2902,7 +3131,7 @@ def chat(req: ChatRequest):
     relval_list_answer = _failed_relval_list_answer(question, _failed_relval_contexts.get(sid))
     if relval_list_answer:
         return _chat_response(sid, original_question, relval_list_answer, "deterministic")
-    relval_ib_summary_answer = _relval_ib_summary_answer(question)
+    relval_ib_summary_answer = _relval_ib_summary_answer(question, sid)
     if relval_ib_summary_answer:
         return _chat_response(sid, original_question, relval_ib_summary_answer, "deterministic")
     clang_warning_comparison_answer = _clang_warning_comparison_answer(question)
@@ -2993,20 +3222,12 @@ def chat(req: ChatRequest):
 
     llm_plan = validate_llm_plan(raw_plan, _request_planner.capabilities, set(_LLM_PLAN_TOOL_NAMES))
     if llm_plan is None or llm_plan.capability != "investigation":
-        return _chat_response(
-            sid,
-            original_question,
-            "I could not create a valid local evidence plan for that question. Please make the requested CMSSDT entity or category more specific.",
-            "llm_plan_rejected",
-        )
+        fallback_answer, fallback_actions = _fallback_clarification(planned.context)
+        return _chat_response(sid, original_question, fallback_answer, "fallback_clarification", actions=fallback_actions)
     tool_evidence = execute_read_only_plan(llm_plan.tool_calls, TOOLS)
     if not tool_evidence:
-        return _chat_response(
-            sid,
-            original_question,
-            "No approved local graph query could be executed for that question.",
-            "llm_plan_empty",
-        )
+        fallback_answer, fallback_actions = _fallback_clarification(planned.context)
+        return _chat_response(sid, original_question, fallback_answer, "fallback_clarification", actions=fallback_actions)
     citations = _retriever.retrieve(question) if _retriever else []
     if citations:
         tool_evidence.append({"tool": "local_log_retrieval", "arguments": {}, "result": citations})
@@ -3258,6 +3479,8 @@ def reset(session_id: str):
     _pending_ib_comparisons.pop(session_id, None)
     _failed_relval_contexts.pop(session_id, None)
     _pending_relval_scopes.pop(session_id, None)
+    _pending_unittest_scopes.pop(session_id, None)
+    _pending_frequent_failure_scopes.pop(session_id, None)
     _latest_ib_contexts.pop(session_id, None)
     _relval_exception_contexts.pop(session_id, None)
     _pasted_exception_search_contexts.pop(session_id, None)

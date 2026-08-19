@@ -11,6 +11,7 @@ Two kinds, same rationale as the old SQL system:
 """
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -237,6 +238,58 @@ def get_relval_recurrence(workflow_id: str) -> dict:
         "failed_appearances": row["failed_appearances"],
         "failed_tags": [tag for tag in row["failed_tags"] if tag],
     }
+
+
+def _recency_cutoff(days: int | None) -> str | None:
+    if days is None:
+        return None
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d-%H%M")
+
+
+def relval_failure_architectures(days: int | None = 7) -> list[str]:
+    """Distinct architectures with at least one failed RelVal within the
+    given recency window (or every imported IB if days is None). Used to
+    decide whether an architecture choice is needed before running
+    top_recurring_relval_failures -- IBs of different architectures are
+    never silently merged into one answer without the user choosing that,
+    same rule as the rest of this codebase's IB-identity handling."""
+    rows = _run_query(
+        "MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal {status:'FAILED'}) "
+        "WHERE $cutoff IS NULL OR right(ib.tag, 15) >= $cutoff "
+        "RETURN DISTINCT ib.arch AS arch ORDER BY arch",
+        {"cutoff": _recency_cutoff(days)},
+    )
+    return [row["arch"] for row in rows]
+
+
+def top_recurring_relval_failures(days: int | None = 7, limit: int = 10, arch: str | None = None) -> list[dict]:
+    """Rank workflows by how often they've failed across imported IBs,
+    scoped to builds from the last `days` days (by IB tag timestamp), or
+    every imported IB if days is None, and to one architecture if given.
+    Complements get_relval_recurrence, which answers the single-workflow
+    version of the same question -- this one answers "which workflows fail
+    a lot" when no workflow is named yet.
+
+    Time filtering reuses the fixed-width `YYYY-MM-DD-HHMM` suffix every IB
+    tag ends in, which already sorts correctly as a plain string elsewhere
+    in this codebase (e.g. _IB_TAG_SORT_PATTERN) -- no APOC dependency
+    needed for a Cypher-side cutoff comparison.
+    """
+    limit = min(limit, MAX_ROWS)
+    return _run_query(
+        "MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal) "
+        "WHERE ($cutoff IS NULL OR right(ib.tag, 15) >= $cutoff) AND ($arch IS NULL OR ib.arch = $arch) "
+        "WITH relval.workflow_id AS workflow_id, relval.name AS name, ib, relval "
+        "WITH workflow_id, name, count(relval) AS total_appearances, "
+        "sum(CASE WHEN relval.status = 'FAILED' THEN 1 ELSE 0 END) AS failed_appearances, "
+        "[tag IN collect(CASE WHEN relval.status = 'FAILED' THEN ib.tag ELSE null END) "
+        "WHERE tag IS NOT NULL] AS failed_tag_list "
+        "WHERE failed_appearances > 0 "
+        "RETURN workflow_id, name, total_appearances, failed_appearances, "
+        "failed_tag_list[0..5] AS failed_tags "
+        "ORDER BY failed_appearances DESC, total_appearances DESC LIMIT $limit",
+        {"cutoff": _recency_cutoff(days), "limit": limit, "arch": arch},
+    )
 
 
 def get_exit_code_names() -> dict[int, str]:
