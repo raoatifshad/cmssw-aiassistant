@@ -20,6 +20,7 @@ from server.api_server import (
     _relval_exception_list_answer,
     _relval_exception_answer,
     _normalize_deterministic_question,
+    _pr_evidence_answer,
     _pr_search_terms,
     _pending_relval_scopes,
     _pending_unittest_scopes,
@@ -34,6 +35,7 @@ from server.api_server import (
     _execute_planned_capability,
     _failing_relval_context,
     _fallback_clarification,
+    _request_planner,
     chat,
     record_feedback,
 )
@@ -168,6 +170,38 @@ class ChatRoutingTests(unittest.TestCase):
             _pr_search_terms(question),
             ["CMSSW_20_1_X_2026-08-04-2300", "36834.0"],
         )
+
+    @patch("server.api_server.find_prs_for_error")
+    def test_pr_evidence_falls_back_to_last_discussed_workflow(self, find_prs):
+        # Regression: a real user asked about workflow 140.0's recurrence,
+        # then "is there any issue /pr open for it recently?" -- every word in
+        # that follow-up is a stopword or has no digit/uppercase, so
+        # _pr_search_terms found nothing and the question was rejected
+        # outright even though "it" clearly meant the workflow just discussed.
+        find_prs.return_value = [{
+            "repo": "cmssw", "pr_number": 51000, "title": "Fix workflow 140.0",
+            "merged_at": None, "evidence": ["pr_title"], "matched_files": [],
+            "matched_unit_tests": False, "matched_unit_test_packages": [],
+            "matched_unit_test_ibs": [], "matched_warnings": None,
+        }]
+
+        result = _pr_evidence_answer("is there any issue /pr open for it recently?", fallback_term="140.0")
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("140.0", answer)
+        find_prs.assert_called_once_with("140.0")
+
+    @patch("server.api_server.find_prs_for_error", return_value=[])
+    def test_pr_evidence_prefers_an_explicit_identifier_over_the_fallback(self, find_prs):
+        # An identifier actually present in the question must never be
+        # overridden by stale remembered context from an earlier turn.
+        _pr_evidence_answer("any PR fixing CMSSW_20_1_X_2026-08-04-2300?", fallback_term="140.0")
+
+        find_prs.assert_called_once_with("CMSSW_20_1_X_2026-08-04-2300")
+
+    def test_pr_evidence_without_a_fallback_or_identifier_returns_none(self):
+        self.assertIsNone(_pr_evidence_answer("is there any issue /pr open for it recently?"))
 
     @patch("server.api_server.get_driver")
     def test_ib_results_summary_uses_explicit_architecture(self, get_driver):
@@ -1292,6 +1326,91 @@ class ChatRoutingTests(unittest.TestCase):
                  "question": "what are the frequent failures over the last week"},
             ],
         )
+
+
+class ShiftSummaryCapabilityTests(unittest.TestCase):
+    def test_trigger_regex_recognizes_shift_summary_phrasing(self):
+        for question in [
+            "give me a shift summary",
+            "shift report please",
+            "what changed since the last build",
+            "what changed between builds",
+            "any news from the previous IB",
+        ]:
+            with self.subTest(question=question):
+                self.assertTrue(RequestContext.extract(question).has_shift_summary_request)
+
+    def test_trigger_regex_does_not_fire_on_plain_comparison(self):
+        context = RequestContext.extract(
+            "compare CMSSW_20_1_X_2026-08-17-1100 and CMSSW_20_1_X_2026-08-17-2300"
+        )
+        self.assertFalse(context.has_shift_summary_request)
+
+    def test_shift_summary_capability_outranks_relval(self):
+        context = RequestContext.extract("what new relval failures showed up in a shift summary")
+        plan = _request_planner.plan(context)
+        self.assertEqual(plan.capability, "shift_summary")
+
+    def test_shift_summary_question_with_explicit_tag_does_not_trigger_scope_clarification(self):
+        # Regression: the generic "choose a scope" clarification fires when an explicit tag
+        # + a failure word appear with no recognized category -- "shift summary" is neither
+        # "relval"/"clang"/"unittest"/"build", so without an explicit guard this would wrongly
+        # ask the user to pick a scope instead of routing to shift_summary.
+        context = RequestContext.extract("shift summary for CMSSW_20_1_X_2026-08-17-2300, what failed")
+        plan = _request_planner.plan(context)
+        self.assertEqual(plan.kind.value, "deterministic")
+        self.assertEqual(plan.capability, "shift_summary")
+
+    @patch("server.api_server.generate_shift_summary")
+    @patch("server.api_server.get_shift_summary")
+    @patch("server.api_server._latest_and_previous_ib_tags")
+    def test_uses_cached_summary_without_regenerating(self, latest_and_previous, get_cached, generate):
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-08-17-2300", "CMSSW_20_1_X_2026-08-17-1100")
+        get_cached.return_value = {"markdown": "cached digest text"}
+
+        answer, actions = _execute_planned_capability("shift_summary", "give me a shift summary", "s1")
+
+        self.assertEqual(answer, "cached digest text")
+        self.assertEqual(actions, [])
+        generate.assert_not_called()
+
+    @patch("server.api_server.generate_shift_summary", return_value="freshly generated digest")
+    @patch("server.api_server.get_shift_summary", return_value=None)
+    @patch("server.api_server._latest_and_previous_ib_tags")
+    def test_falls_back_to_live_generation_when_uncached(self, latest_and_previous, get_cached, generate):
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-08-17-2300", "CMSSW_20_1_X_2026-08-17-1100")
+
+        answer, _ = _execute_planned_capability("shift_summary", "give me a shift summary", "s1")
+
+        self.assertEqual(answer, "freshly generated digest")
+        generate.assert_called_once_with(
+            "CMSSW_20_1_X_2026-08-17-2300", "CMSSW_20_1_X_2026-08-17-1100", None,
+        )
+
+    @patch("server.api_server.generate_shift_summary", return_value="live arch digest")
+    @patch("server.api_server.get_shift_summary")
+    @patch("server.api_server._latest_and_previous_ib_tags")
+    def test_architecture_scoped_question_bypasses_the_combined_cache(
+        self, latest_and_previous, get_cached, generate
+    ):
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-08-17-2300", "CMSSW_20_1_X_2026-08-17-1100")
+
+        answer, _ = _execute_planned_capability(
+            "shift_summary", "shift summary for el9_amd64_gcc14", "s1",
+        )
+
+        self.assertEqual(answer, "live arch digest")
+        get_cached.assert_not_called()
+        generate.assert_called_once_with(
+            "CMSSW_20_1_X_2026-08-17-2300", "CMSSW_20_1_X_2026-08-17-1100", "el9_amd64_gcc14",
+        )
+
+    @patch("server.api_server._latest_and_previous_ib_tags", return_value=None)
+    def test_not_enough_history_returns_graceful_message(self, latest_and_previous):
+        answer, actions = _execute_planned_capability("shift_summary", "give me a shift summary", "s1")
+
+        self.assertIn("Not enough Integration Build history", answer)
+        self.assertEqual(actions, [])
 
 
 if __name__ == "__main__":

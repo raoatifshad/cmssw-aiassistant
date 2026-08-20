@@ -18,6 +18,11 @@ ARCH_RE = re.compile(
 )
 PR_RE = re.compile(r"(?:\b(?:pr|mr|pull request|merge request)\s*#?|#)(\d+)\b", re.IGNORECASE)
 WORKFLOW_RE = re.compile(r"\bworkflow\s*#?(\d+(?:\.\d+)?)\b", re.IGNORECASE)
+SHIFT_SUMMARY_RE = re.compile(
+    r"\bshift\s*summary\b|\bshift\s*report\b|\bvirtual\s*shift(?:er)?\b|"
+    r"\bwhat\s+changed\s+(?:since|between)\b|\b(?:since|from)\s+the\s+(?:last|previous)\s+(?:ib|build)\b",
+    re.IGNORECASE,
+)
 
 
 class Scope(StrEnum):
@@ -47,6 +52,7 @@ class RequestContext:
     has_failure_request: bool = False
     has_comparison_request: bool = False
     has_relationship_request: bool = False
+    has_shift_summary_request: bool = False
     is_bare_ib_tag: bool = False
 
     @property
@@ -60,7 +66,7 @@ class RequestContext:
         architecture = "_".join(architecture_match.groups()).lower() if architecture_match else None
         lowered = question.lower()
         categories: set[str] = set()
-        if re.search(r"\brel[\s-]*vals?\b", lowered):
+        if re.search(r"\brel[\s-]*vals?\b", lowered) or re.search(r"\b(?:wfs?|work\s*flows?)\b", lowered):
             categories.add("relval")
         if re.search(r"\bunit(?:[\s-]*tests?)?\b", lowered):
             categories.add("unittest")
@@ -88,6 +94,7 @@ class RequestContext:
             has_failure_request=bool(re.search(r"\b(?:fail(?:ing|ed|ures?)|errors?)\b", lowered)),
             has_comparison_request=bool(re.search(r"\b(?:compare|comparison|delta|difference)\b", lowered)),
             has_relationship_request=bool(re.search(r"\b(?:why|parent|sub[\s-]*ib|variant)\b", lowered)),
+            has_shift_summary_request=bool(SHIFT_SUMMARY_RE.search(question)),
             is_bare_ib_tag=bare_tag,
         )
 
@@ -103,6 +110,7 @@ class Capability:
     requires_failures: bool = False
     requires_comparison: bool = False
     requires_relationship: bool = False
+    requires_shift_summary: bool = False
     bare_tag_only: bool = False
     llm_only: bool = False
     priority: int = 0
@@ -122,6 +130,8 @@ class Capability:
             return None
         if self.requires_relationship and not context.has_relationship_request:
             return None
+        if self.requires_shift_summary and not context.has_shift_summary_request:
+            return None
         if self.bare_tag_only and not context.is_bare_ib_tag:
             return None
         score = self.priority
@@ -131,6 +141,7 @@ class Capability:
         score += 8 if self.requires_failures else 0
         score += 8 if self.requires_comparison else 0
         score += 8 if self.requires_relationship else 0
+        score += 8 if self.requires_shift_summary else 0
         score += 16 if self.bare_tag_only else 0
         score += 4 if context.architecture else 0
         return score
@@ -228,7 +239,10 @@ class RequestPlanner:
 
     @staticmethod
     def _clarification(context: RequestContext) -> Clarification | None:
-        if context.tag and context.has_failure_request and not context.categories:
+        if (
+            context.tag and context.has_failure_request
+            and not context.categories and not context.has_shift_summary_request
+        ):
             return Clarification(
                 missing_field="category",
                 question="Do you want build warnings, failed RelVals, unit-test results, or a combined IB summary?",

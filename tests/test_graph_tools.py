@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from graph.tools import _ib_sort_key, list_ib_tags
+from graph.tools import _ib_sort_key, diff_warnings, list_ib_tags
 
 
 class LatestIbRankingTests(unittest.TestCase):
@@ -62,6 +62,24 @@ class LatestIbRankingTests(unittest.TestCase):
         rows = list_ib_tags(limit=1)
 
         self.assertEqual(rows[0]["tag"], "CMSSW_20_1_X_2026-08-17-2300")
+
+
+class DiffWarningsTests(unittest.TestCase):
+    @patch("graph.tools.get_driver")
+    def test_returns_new_resolved_and_changed_buckets_in_call_order(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        new_rows = [{"file": "a.cc", "line": 1, "flag": "f", "message": "m", "occurrences": 3}]
+        resolved_rows = [{"file": "b.cc", "line": 2, "flag": "f", "message": "m", "occurrences": 1}]
+        changed_rows = [{
+            "file": "c.cc", "line": 3, "flag": "f", "message": "m",
+            "before_count": 1, "after_count": 4,
+        }]
+        session.run.side_effect = [new_rows, resolved_rows, changed_rows]
+
+        result = diff_warnings("before_tag", "after_tag", "el9_amd64_gcc14")
+
+        self.assertEqual(result, {"new": new_rows, "resolved": resolved_rows, "changed": changed_rows})
+        self.assertEqual(session.run.call_count, 3)
 
 
 if __name__ == "__main__":

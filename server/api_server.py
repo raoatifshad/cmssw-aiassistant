@@ -16,17 +16,19 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote_plus
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from neo4j.exceptions import ClientError, ServiceUnavailable
 from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "graph"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from tools import (  # noqa: E402
-    TOOLS, GRAPH_SCHEMA, count_warnings_by_package, find_prs_for_error, get_exit_code_names, get_failing_relvals,
-    get_relval_recurrence, relval_failure_architectures, search_concepts, top_recurring_relval_failures,
+    TOOLS, GRAPH_SCHEMA, count_warnings_by_package, diff_warnings, find_prs_for_error, get_exit_code_names,
+    get_failing_relvals, get_relval_recurrence, get_shift_summary, relval_failure_architectures, search_concepts,
+    search_workflow_ids, store_shift_summary, top_recurring_relval_failures,
 )
 from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # noqa: E402
 from server.llm_client import DEFAULT_MODEL, get_client  # noqa: E402
@@ -38,6 +40,7 @@ from server.agent import (  # noqa: E402
     synthesize_evidence_answer,
 )
 from server.knowledge_contract import LLM_KNOWLEDGE_CONTRACT  # noqa: E402
+from server.shifter_auth import require_shifter, router as shifter_auth_router  # noqa: E402
 from server.request_planner import (  # noqa: E402
     Clarification, Capability, IB_TAG_RE, Plan, PlanKind, RequestContext, RequestPlanner, Scope,
 )
@@ -106,6 +109,8 @@ _pending_ib_comparisons: dict[str, dict[str, object]] = {}
 _failed_relval_contexts: dict[str, dict[str, str]] = {}
 _pending_relval_scopes: dict[str, dict[str, object]] = {}
 _pending_unittest_scopes: dict[str, dict[str, object]] = {}
+_pending_workflow_choices: dict[str, dict[str, object]] = {}
+_last_workflow_contexts: dict[str, str] = {}
 _pending_frequent_failure_scopes: dict[str, dict[str, object]] = {}
 _latest_ib_contexts: dict[str, str] = {}
 _latest_ib_arch_contexts: dict[str, str] = {}
@@ -137,6 +142,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 _request_planner = RequestPlanner((
     Capability(name="ib_menu", required_tag_count=1, bare_tag_only=True, priority=90),
     Capability(name="ib_relationship", required_tag_count=1, requires_relationship=True, priority=85),
+    Capability(name="shift_summary", requires_shift_summary=True, priority=82),
     Capability(name="comparison", required_tag_count=2, requires_comparison=True, priority=80),
     Capability(name="clang", required_categories=frozenset({"clang"}), priority=70),
     Capability(name="relval", required_categories=frozenset({"relval"}), priority=65),
@@ -162,11 +168,23 @@ app = FastAPI(title="CMSSDT KG Chatbot API")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+# Required by shifter_auth's CERN SSO login flow (authlib stores OIDC state/nonce in
+# request.session) and by require_shifter's post-login session cookie. SESSION_SECRET_KEY
+# must be set to a real secret in production -- the literal fallback below only exists so a
+# plain `uvicorn server.api_server:app` still boots for local chat-only development that
+# never touches /shift; it is not a safe value to actually rely on for the shifter page.
+app.add_middleware(SessionMiddleware, secret_key=os.environ.get("SESSION_SECRET_KEY", "dev-only-insecure-key"))
+app.include_router(shifter_auth_router)
 
 
 @app.get("/", include_in_schema=False)
 def chat_interface():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/shift", include_in_schema=False)
+def shifter_page(username: str = Depends(require_shifter)):
+    return FileResponse(STATIC_DIR / "shift.html")
 
 
 @app.on_event("startup")
@@ -583,10 +601,18 @@ def _relval_scope_records(tag: str, include_sub_ibs: bool) -> list[dict]:
         driver.close()
 
 
+# "wf"/"workflow" are established synonyms for "relval" in real user phrasing
+# (see server/request_planner.py's category regex) -- every relval-gated
+# answer function below must recognize them too, or a question the planner
+# correctly routes to the "relval" capability still dead-ends here with
+# "no imported local evidence".
+_RELVAL_KEYWORD_RE = re.compile(r"\b(?:rel[\s-]*vals?|wfs?|work\s*flows?)\b", re.IGNORECASE)
+
+
 def _is_relval_failure_count_question(question: str) -> bool:
     return bool(
         re.search(r"\b(?:how\s+many|count|number|total|any)\b", question, re.IGNORECASE)
-        and re.search(r"\brelvals?\b", question, re.IGNORECASE)
+        and _RELVAL_KEYWORD_RE.search(question)
         and re.search(r"\b(?:failing|failed|failures?)\b", question, re.IGNORECASE)
     )
 
@@ -733,7 +759,7 @@ def _relval_ib_summary_answer(question: str, session_id: str) -> str | None:
     """Keep direct IB/RelVal questions on local graph facts unless GitHub is requested."""
     if re.search(r"\b(?:issues?|prs?|pull\s+requests?|github)\b", question, re.IGNORECASE):
         return None
-    if not re.search(r"\brelvals?\b", question, re.IGNORECASE):
+    if not _RELVAL_KEYWORD_RE.search(question):
         return None
     tag_match = IB_TAG_RE.search(question)
     if not tag_match:
@@ -940,6 +966,40 @@ def _latest_and_previous_ib_tags(arch: str | None = None) -> tuple[str, str] | N
     latest_tag = f"CMSSW_{major}_{minor}_X_{timestamps[0]}"
     previous_tag = f"CMSSW_{major}_{minor}_X_{timestamps[1]}"
     return latest_tag, previous_tag
+
+
+def _all_release_series_latest_and_previous(arch: str | None = None) -> list[tuple[str, str]]:
+    """Like _latest_and_previous_ib_tags, but for every release series with at
+    least two imported primary builds, not just the newest one -- used by
+    ingestion/generate_shift_summaries.py so older-but-still-active series
+    also get a ShiftSummary, not only the current newest series."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB) "
+                "WHERE ($arch IS NULL OR ib.arch = $arch) "
+                "AND ib.tag =~ '^CMSSW_[0-9]+_[0-9]+_X_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' "
+                "RETURN DISTINCT ib.tag AS tag",
+                arch=arch,
+            )]
+    finally:
+        driver.close()
+
+    def version_key(tag: str) -> tuple[int, int, str]:
+        major, minor, timestamp = _PRIMARY_IB_TAG_RE.match(tag).groups()
+        return (int(major), int(minor), timestamp)
+
+    by_series: dict[tuple[int, int], set[str]] = {}
+    for row in rows:
+        major, minor, timestamp = version_key(row["tag"])
+        by_series.setdefault((major, minor), set()).add(timestamp)
+    pairs = []
+    for (major, minor), timestamps in by_series.items():
+        ordered = sorted(timestamps, reverse=True)
+        if len(ordered) >= 2:
+            pairs.append((f"CMSSW_{major}_{minor}_X_{ordered[0]}", f"CMSSW_{major}_{minor}_X_{ordered[1]}"))
+    return pairs
 
 
 def _is_latest_comparison_question(question: str) -> bool:
@@ -1208,11 +1268,18 @@ def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
     return "\n".join(lines), [pr]
 
 
-def _pr_evidence_answer(question: str) -> tuple[str, list[dict]] | None:
-    """Return direct graph evidence for PR-focused questions when available."""
+def _pr_evidence_answer(question: str, fallback_term: str | None = None) -> tuple[str, list[dict]] | None:
+    """Return direct graph evidence for PR-focused questions when available.
+    fallback_term (e.g. a workflow ID from _last_workflow_contexts) is only
+    used when the question itself supplies no identifier at all -- an
+    explicit identifier in the question always wins over remembered
+    context, so a natural follow-up like "any PRs for it?" can still resolve
+    to whatever was just discussed without a stale context ever overriding
+    something the user actually typed."""
     if not re.search(r"\b(?:pr|mr|pull request|merge request|fix|fixes|fixed)\b", question, re.IGNORECASE):
         return None
-    for term in _pr_search_terms(question):
+    terms = _pr_search_terms(question) or ([fallback_term] if fallback_term else [])
+    for term in terms:
         rows = find_prs_for_error(term)
         if not rows:
             continue
@@ -1242,9 +1309,8 @@ def _pr_evidence_answer(question: str) -> tuple[str, list[dict]] | None:
             "These links establish relevance only. Package-level unit-test results do not identify a specific failing test or prove a PR caused or fixed it."
         )
         return "\n".join(lines), rows
-    identifiers = _pr_search_terms(question)
-    if identifiers:
-        return f"No PR evidence matching `{identifiers[0]}` exists in the imported graph.", []
+    if terms:
+        return f"No PR evidence matching `{terms[0]}` exists in the imported graph.", []
     return None
 
 
@@ -1319,7 +1385,7 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
     if not re.search(r"\b(?:open|unresolved|active)\b", question, re.IGNORECASE):
         return None
 
-    if relval_context is None and re.search(r"\brelvals?\b", question, re.IGNORECASE) and re.search(
+    if relval_context is None and _RELVAL_KEYWORD_RE.search(question) and re.search(
         r"\b(?:failing|failed|failures?)\b", question, re.IGNORECASE
     ):
         tag_match = IB_TAG_RE.search(question)
@@ -1822,7 +1888,7 @@ def _failing_relval_context(question: str) -> dict[str, str | None] | None:
     permissive pattern. Requiring an explicit architecture here used to mean
     this context was essentially never populated in real conversations, since
     users don't repeat the architecture on every follow-up question."""
-    if not re.search(r"\brelvals?\b", question, re.IGNORECASE):
+    if not _RELVAL_KEYWORD_RE.search(question):
         return None
     if not re.search(r"\b(?:failing|failed|failures?)\b", question, re.IGNORECASE):
         return None
@@ -1850,7 +1916,7 @@ _RELVAL_EXCEPTION_INTENT_RE = re.compile(
 
 def _relval_exception_context(question: str) -> dict[str, str | None] | None:
     """Extract a named IB and optional architecture from an exception request."""
-    if not re.search(r"\brelvals?\b", question, re.IGNORECASE):
+    if not _RELVAL_KEYWORD_RE.search(question):
         return None
     if not re.search(r"\bexceptions?\b", question, re.IGNORECASE):
         return None
@@ -1927,7 +1993,7 @@ def _relval_error_count_answer(question: str, session_id: str) -> str | None:
     """Count reported RelVal errors for one explicitly named Integration Build."""
     if not re.search(r"\b(?:how\s+many|count|number|total)\b", question, re.IGNORECASE):
         return None
-    if not re.search(r"\brelvals?\b", question, re.IGNORECASE):
+    if not _RELVAL_KEYWORD_RE.search(question):
         return None
     if not re.search(r"\berrors?\b", question, re.IGNORECASE):
         return None
@@ -2037,11 +2103,25 @@ def _failed_relval_list_answer(question: str, context: dict[str, str] | None) ->
 # or none -- rank every workflow instead). Keep this as the one definition;
 # see _requested_ib_arch for why an inline second copy would drift.
 _RECURRING_FAILURE_INTENT_RE = re.compile(
+    # [^?!] rather than [^.?!] in the bounded-gap clauses below: a "." isn't
+    # safe to treat as a sentence boundary here since workflow IDs are
+    # decimal numbers (e.g. "140.0", "37634.702") that commonly appear
+    # between the trigger word and "fail".
     r"\b(?:recurring|recur(?:s|red)?|happened\s+before|seen\s+(?:this\s+)?before|"
     r"known\s+issue|keeps?\s+failing|how\s+often|history|frequent(?:ly)?|"
-    r"common(?:est)?|most\s+(?:often|common|frequent))\b|\btop\b[^.?!]{0,20}\bfail",
+    r"common(?:est)?|most\s+(?:often|common|frequent))\b|\btop\b[^?!]{0,20}\bfail|"
+    r"\bwhen\b[^?!]{0,30}\bfail",
     re.IGNORECASE,
 )
+# A wildcard-style workflow reference (e.g. "140.xx", "140.??") -- the exact-ID
+# extraction regex elsewhere (\d{3,6}\.\d+) requires digits after the decimal,
+# so this never matches there and needs its own recognition to trigger a
+# prefix search instead of falling through to a generic "provide a workflow
+# ID" prompt. Deliberately scoped to the decimal-with-placeholder shape only,
+# not a bare 3-6 digit number, which appears constantly in questions for
+# unrelated reasons (PR numbers, counts) and would false-positive as a
+# workflow-prefix search trigger on its own.
+_WORKFLOW_WILDCARD_RE = re.compile(r"\b(\d{3,6})\.(?:x+|X+|\?+|\*+)\b")
 
 
 def _parse_recency_window_days(question: str) -> int | None:
@@ -2130,25 +2210,8 @@ def _frequent_failures_report(question: str, session_id: str) -> str:
     return _frequent_failures_arch_choice_answer(architectures)
 
 
-def _recurring_failure_answer(question: str, session_id: str) -> str | None:
-    """Has this workflow failed before, across every imported IB -- not just
-    the one currently being discussed? With no specific workflow named,
-    ranks which workflows fail most often instead. Computed at query time
-    (§5 tier 3: mined patterns) rather than by a scheduled job; always
-    reflects whatever has been ingested so far."""
-    if not _RECURRING_FAILURE_INTENT_RE.search(question) and session_id not in _pending_frequent_failure_scopes:
-        return None
-    if session_id in _pending_frequent_failure_scopes:
-        return _frequent_failures_report(question, session_id)
-    workflow_match = re.search(r"\b(\d{3,6}\.\d+)\b", question)
-    if not workflow_match:
-        return _frequent_failures_report(question, session_id)
-
-    workflow_id = workflow_match.group(1)
-    recurrence = get_relval_recurrence(workflow_id)
-    if not recurrence["total_appearances"]:
-        return f"Workflow `{workflow_id}` is not reported in the imported RelVal records."
-
+def _workflow_recurrence_answer(workflow_id: str, recurrence: dict, session_id: str) -> str:
+    _last_workflow_contexts[session_id] = workflow_id
     total = recurrence["total_appearances"]
     failed = recurrence["failed_appearances"]
     rate = failed / total if total else 0
@@ -2163,6 +2226,75 @@ def _recurring_failure_answer(question: str, session_id: str) -> str | None:
         "a high rate suggests a persistent issue rather than a one-off."
     )
     return "\n".join(lines)
+
+
+def _workflow_prefix_choice_answer(session_id: str, prefix: str, not_found_id: str | None) -> str:
+    """Search imported workflow IDs starting with `prefix`; register a
+    pending choice and ask which one, or say plainly that nothing matches.
+    Never silently substitutes a guessed ID for the one actually typed --
+    even a single candidate is offered as a question, not an assumption."""
+    candidates = search_workflow_ids(prefix, limit=15)
+    truncated = len(candidates) > 15
+    candidates = candidates[:15]
+    lead = f"Workflow `{not_found_id}` is not reported in the imported RelVal records. " if not_found_id else ""
+    if not candidates:
+        return f"{lead}No imported workflow starts with `{prefix}` either."
+    _pending_workflow_choices[session_id] = {"candidates": candidates}
+    choice_text = ", ".join(f"`{c['workflow_id']}`" for c in candidates)
+    truncated_note = " (more than 15 match -- add more digits to narrow it down)" if truncated else ""
+    return f"{lead}Did you mean one of these: {choice_text}{truncated_note}?"
+
+
+def _recurring_failure_answer(question: str, session_id: str) -> str | None:
+    """Has this workflow failed before, across every imported IB -- not just
+    the one currently being discussed? With no specific workflow named,
+    ranks which workflows fail most often instead. An unrecognized or
+    wildcard-style workflow ID (e.g. "140.999", "140.xx") triggers a prefix
+    search and a "did you mean" choice instead of a dead end -- computed at
+    query time (§5 tier 3: mined patterns) rather than by a scheduled job;
+    always reflects whatever has been ingested so far."""
+    if (
+        not _RECURRING_FAILURE_INTENT_RE.search(question)
+        and session_id not in _pending_frequent_failure_scopes
+        and session_id not in _pending_workflow_choices
+    ):
+        return None
+    if session_id in _pending_frequent_failure_scopes:
+        return _frequent_failures_report(question, session_id)
+
+    exact_match = re.search(r"\b(\d{3,6}\.\d+)\b", question)
+    wildcard_match = _WORKFLOW_WILDCARD_RE.search(question)
+
+    pending_workflow = _pending_workflow_choices.get(session_id)
+    if pending_workflow:
+        candidate_ids = {candidate["workflow_id"] for candidate in pending_workflow["candidates"]}
+        if exact_match and exact_match.group(1) in candidate_ids:
+            _pending_workflow_choices.pop(session_id, None)
+            return _workflow_recurrence_answer(
+                exact_match.group(1), get_relval_recurrence(exact_match.group(1)), session_id
+            )
+        if exact_match or wildcard_match:
+            # A fresh, different workflow-ID-shaped token -- abandon the
+            # stale pending choice rather than force the user back into it.
+            _pending_workflow_choices.pop(session_id, None)
+            pending_workflow = None
+        else:
+            choice_text = ", ".join(f"`{c['workflow_id']}`" for c in pending_workflow["candidates"])
+            return f"Choose one of these: {choice_text}, or name a different workflow ID."
+
+    if wildcard_match:
+        return _workflow_prefix_choice_answer(session_id, f"{wildcard_match.group(1)}.", not_found_id=None)
+
+    if not exact_match:
+        return _frequent_failures_report(question, session_id)
+
+    workflow_id = exact_match.group(1)
+    recurrence = get_relval_recurrence(workflow_id)
+    if not recurrence["total_appearances"]:
+        return _workflow_prefix_choice_answer(
+            session_id, f"{workflow_id.split('.')[0]}.", not_found_id=workflow_id
+        )
+    return _workflow_recurrence_answer(workflow_id, recurrence, session_id)
 
 
 def _relval_exception_answer(question: str, context: dict[str, str | None] | None) -> str | None:
@@ -2597,53 +2729,16 @@ def _clang_warning_comparison_answer(question: str) -> str | None:
                coalesce(sum(warning.count), 0) AS occurrences
         ORDER BY tag
     """
-    changed_query = """
-        MATCH (before:IB {tag:$before_tag, arch:$arch})-[:REPORTED]->(before_warning:Warning)
-        MATCH (after:IB {tag:$after_tag, arch:$arch})-[:REPORTED]->(after_warning:Warning)
-        WHERE before_warning.hash = after_warning.hash AND before_warning.count <> after_warning.count
-        RETURN after_warning.file AS file, after_warning.line AS line, after_warning.flag AS flag,
-               after_warning.message AS message, before_warning.count AS before_count,
-               after_warning.count AS after_count
-        ORDER BY abs(after_warning.count - before_warning.count) DESC, file, line
-        LIMIT 10
-    """
-    new_query = """
-        MATCH (after:IB {tag:$after_tag, arch:$arch})-[:REPORTED]->(warning:Warning)
-        WHERE NOT EXISTS {
-            MATCH (:IB {tag:$before_tag, arch:$arch})-[:REPORTED]->(:Warning {hash:warning.hash})
-        }
-        RETURN warning.file AS file, warning.line AS line, warning.flag AS flag,
-               warning.message AS message, warning.count AS occurrences
-        ORDER BY occurrences DESC, file, line
-        LIMIT 10
-    """
-    resolved_query = """
-        MATCH (before:IB {tag:$before_tag, arch:$arch})-[:REPORTED]->(warning:Warning)
-        WHERE NOT EXISTS {
-            MATCH (:IB {tag:$after_tag, arch:$arch})-[:REPORTED]->(:Warning {hash:warning.hash})
-        }
-        RETURN warning.file AS file, warning.line AS line, warning.flag AS flag,
-               warning.message AS message, warning.count AS occurrences
-        ORDER BY occurrences DESC, file, line
-        LIMIT 10
-    """
     driver = get_driver()
     try:
         with driver.session() as session:
             totals = [dict(record) for record in session.run(totals_query, tags=tags, arch=arch)]
-            changed = [dict(record) for record in session.run(
-                changed_query, before_tag=before_tag, after_tag=after_tag, arch=arch
-            )]
-            new = [dict(record) for record in session.run(
-                new_query, before_tag=before_tag, after_tag=after_tag, arch=arch
-            )]
-            resolved = [dict(record) for record in session.run(
-                resolved_query, before_tag=before_tag, after_tag=after_tag, arch=arch
-            )]
     finally:
         driver.close()
     if len(totals) != 2:
         return f"I found {len(totals)} of the requested Clang builds for **{arch}**."
+    diff = diff_warnings(before_tag, after_tag, arch)
+    new, resolved, changed = diff["new"], diff["resolved"], diff["changed"]
 
     before, after = totals
     lines = [
@@ -2766,6 +2861,202 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _diff_failing_relvals(
+    before_failures: list[dict], after_failures: list[dict]
+) -> list[tuple[str, dict | None, dict | None]]:
+    """Diff two failing-RelVal snapshots by workflow_id. Returns
+    (workflow_id, before_row_or_None, after_row_or_None) tuples for every
+    workflow whose failure record changed (newly failing, resolved, or
+    same-workflow detail changed), sorted by workflow_id."""
+    previous = {item["workflow_id"]: item for item in before_failures}
+    later = {item["workflow_id"]: item for item in after_failures}
+    return [
+        (workflow_id, previous.get(workflow_id), later.get(workflow_id))
+        for workflow_id in sorted(set(previous) | set(later))
+        if previous.get(workflow_id) != later.get(workflow_id)
+    ]
+
+
+def _split_relval_diff(
+    diff: list[tuple[str, dict | None, dict | None]]
+) -> tuple[list[dict], list[dict]]:
+    """Split a _diff_failing_relvals result into (newly_failing, resolved) row lists."""
+    newly_failing = [after for _, before, after in diff if after and not before]
+    resolved = [before for _, before, after in diff if before and not after]
+    return newly_failing, resolved
+
+
+def _ib_pair_architectures(previous_tag: str, latest_tag: str) -> list[str]:
+    """Distinct architectures with an imported record for either tag."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB) WHERE ib.tag IN $tags RETURN DISTINCT ib.arch AS arch ORDER BY arch",
+                tags=[previous_tag, latest_tag],
+            )]
+    finally:
+        driver.close()
+    return [row["arch"] for row in rows]
+
+
+def _group_relvals_by_variant(rows: list[dict]) -> dict[str, list[dict]]:
+    """Group get_failing_relvals() rows by sub-IB variant ('' for a primary
+    run) so a diff pairs the same track (e.g. NONLTO-vs-NONLTO) across two
+    timestamps instead of conflating unrelated variants that happen to share
+    a workflow_id."""
+    by_variant: dict[str, list[dict]] = {}
+    for row in rows:
+        by_variant.setdefault(row.get("variant") or "", []).append(row)
+    return by_variant
+
+
+def _relval_table(rows: list[dict], exit_code_names: dict[int, str]) -> list[str]:
+    if not rows:
+        return ["None."]
+    lines = ["| Workflow | Name | Errors | Exit code |", "| --- | --- | ---: | ---: |"]
+    lines.extend(
+        f"| `{row['workflow_id']}` | {row['name']} | {row.get('errors') or 0} | "
+        f"{_format_exit_code(row['exitcode'], exit_code_names) if row.get('exitcode') else 0} |"
+        for row in rows
+    )
+    return lines
+
+
+def _warning_list(rows: list[dict], label: str) -> list[str]:
+    if not rows:
+        return ["None."]
+    lines = []
+    for row in rows:
+        location = f"`{row['file']}:{row['line']}`"
+        checker = f" [{row['flag']}]" if row.get("flag") else ""
+        if label == "changed":
+            detail = f"{row['before_count']:,} to {row['after_count']:,} occurrence(s)"
+        else:
+            detail = f"{row['occurrences']:,} occurrence(s)"
+        lines.append(f"- {location}{checker}: {detail}; {row['message']}")
+    return lines
+
+
+_RECURRENCE_EVIDENCE_CAVEAT = (
+    "These links establish relevance only and do not prove a PR caused or fixed a failure."
+)
+
+
+def _newly_failing_workflow_evidence(workflow_id: str, row: dict, latest_tag: str) -> list[str]:
+    """Recurrence + PR + Concept evidence for one newly-failing workflow.
+    Every claim here is relevance/history, never causality -- see the module
+    docstring's evidence-only invariant."""
+    series_match = re.match(r"^CMSSW_(\d+)_(\d+)_", latest_tag)
+    series_prefix = f"CMSSW_{series_match.group(1)}_{series_match.group(2)}_" if series_match else None
+
+    lines = [f"#### `{workflow_id}` - {row['name']}"]
+
+    recurrence = get_relval_recurrence(workflow_id)
+    if not recurrence.get("total_appearances"):
+        lines.append("- **Recurrence:** no prior appearance of this exact workflow ID found in the imported graph.")
+    else:
+        failed_tags = recurrence.get("failed_tags", [])
+        # failed_tags can repeat the same tag once per architecture that failed --
+        # dedupe for display, preserving get_relval_recurrence's most-recent-first order.
+        in_series = list(dict.fromkeys(
+            tag for tag in failed_tags if series_prefix and tag.startswith(series_prefix)
+        ))
+        if in_series:
+            lines.append(
+                f"- **Recurrence:** failed in {len(in_series)} prior build(s) within this release series "
+                f"(most recent: {', '.join(f'`{tag}`' for tag in in_series[:5])}). "
+                f"Full history: {recurrence['failed_appearances']} failure(s) across "
+                f"{recurrence['total_appearances']} imported appearance(s) of this workflow ID overall."
+            )
+        else:
+            lines.append(
+                f"- **Recurrence:** no prior failure of this exact workflow ID within the current release series, "
+                f"but it has failed {recurrence['failed_appearances']} time(s) across "
+                f"{recurrence['total_appearances']} appearance(s) elsewhere in the imported graph."
+            )
+
+    pr_rows = find_prs_for_error(workflow_id, limit=5)
+    if not pr_rows:
+        lines.append("- **PR evidence:** no PR in the imported graph matches this workflow ID.")
+    else:
+        pr_mentions = ", ".join(
+            f"`{pr['repo']} #{pr['pr_number']}` ({', '.join(pr['evidence'])})" for pr in pr_rows
+        )
+        lines.append(f"- **PR evidence:** {pr_mentions}. {_RECURRENCE_EVIDENCE_CAVEAT}")
+
+    # search_concepts requires a leading-letter term (see its docstring's caveat) -- a bare
+    # numeric workflow_id never survives that filter, so also search on the workflow's name.
+    concept_rows = search_concepts(f"{workflow_id} {row['name']}", limit=3)
+    if not concept_rows:
+        lines.append(
+            "- **Stored knowledge:** no expert-corrected fact currently matches this workflow ID or name "
+            "(this is a weak text search over stored corrections, not a confirmed absence)."
+        )
+    else:
+        excerpt = concept_rows[0]["definition"]
+        lines.append(f"- **Stored knowledge:** {excerpt}")
+    return lines
+
+
+def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None = None) -> str:
+    """Compose a virtual-shifter digest for latest_tag vs previous_tag: per-arch
+    newly-failing/resolved RelVals, per-arch new/resolved/changed Clang warnings,
+    and for each distinct newly-failing workflow, release-series-scoped
+    recurrence plus best-effort PR/Concept evidence. Every evidence-bearing
+    section stays relevance-only -- never "caused"/"fixed"."""
+    architectures = [arch] if arch else _ib_pair_architectures(previous_tag, latest_tag)
+    if not architectures:
+        return f"Neither `{previous_tag}` nor `{latest_tag}` has any imported architecture in the graph."
+
+    exit_code_names = get_exit_code_names()
+    lines = [f"## Shift summary: {previous_tag} -> {latest_tag}"]
+    newly_failing_by_workflow: dict[str, dict] = {}
+
+    for one_arch in architectures:
+        before_rows = get_failing_relvals(previous_tag, arch=one_arch, limit=200)
+        after_rows = get_failing_relvals(latest_tag, arch=one_arch, limit=200)
+        before_by_variant = _group_relvals_by_variant(before_rows)
+        after_by_variant = _group_relvals_by_variant(after_rows)
+        newly_failing_arch: list[dict] = []
+        resolved_arch: list[dict] = []
+        for variant in sorted(set(before_by_variant) | set(after_by_variant)):
+            diff = _diff_failing_relvals(before_by_variant.get(variant, []), after_by_variant.get(variant, []))
+            newly, resolved = _split_relval_diff(diff)
+            newly_failing_arch.extend(newly)
+            resolved_arch.extend(resolved)
+        warnings_diff = diff_warnings(previous_tag, latest_tag, one_arch)
+
+        lines.extend(["", f"### `{one_arch}`", "", "#### Newly failing RelVal workflows"])
+        lines.extend(_relval_table(newly_failing_arch, exit_code_names))
+        lines.extend(["", "#### Resolved RelVal workflows"])
+        lines.extend(_relval_table(resolved_arch, exit_code_names))
+        lines.extend(["", "#### New Clang warning locations"])
+        lines.extend(_warning_list(warnings_diff["new"], "new"))
+        lines.extend(["", "#### Resolved Clang warning locations"])
+        lines.extend(_warning_list(warnings_diff["resolved"], "resolved"))
+        lines.extend(["", "#### Changed Clang warning occurrences"])
+        lines.extend(_warning_list(warnings_diff["changed"], "changed"))
+
+        for row in newly_failing_arch:
+            newly_failing_by_workflow.setdefault(row["workflow_id"], row)
+
+    if newly_failing_by_workflow:
+        lines.extend(["", "### Newly failing workflow evidence"])
+        for workflow_id, row in sorted(newly_failing_by_workflow.items()):
+            lines.append("")
+            lines.extend(_newly_failing_workflow_evidence(workflow_id, row, latest_tag))
+
+    lines.extend([
+        "",
+        "---",
+        "Recurrence and PR/Concept evidence establish relevance and historical pattern only -- they do "
+        "not prove a PR caused or fixed a failure. Recurrence is scoped to the current release series "
+        "where noted; full cross-release history is summarized alongside it.",
+    ])
+    return "\n".join(lines)
+
+
 def _ib_comparison_answer(question: str) -> str | None:
     """Compare relval and unit-test outcomes for two IBs without LLM tool calling."""
     if not re.search(r"\b(?:compare|comparison|delta|deltas)\b", question, re.IGNORECASE):
@@ -2845,13 +3136,7 @@ def _ib_comparison_answer(question: str) -> str | None:
         f"| {label} | {before[key]:,} | {after[key]:,} | {after[key] - before[key]:+,} |"
         for label, key in metrics
     )
-    previous_failures = {item["workflow_id"]: item for item in before["failing_relvals"]}
-    later_failures = {item["workflow_id"]: item for item in after["failing_relvals"]}
-    changed_failures = [
-        (workflow_id, previous_failures.get(workflow_id), later_failures.get(workflow_id))
-        for workflow_id in sorted(set(previous_failures) | set(later_failures))
-        if previous_failures.get(workflow_id) != later_failures.get(workflow_id)
-    ]
+    changed_failures = _diff_failing_relvals(before["failing_relvals"], after["failing_relvals"])
     if changed_failures:
         exit_code_names = get_exit_code_names()
         lines.extend(["", "### Changed failing workflows"])
@@ -2878,6 +3163,25 @@ def _ib_comparison_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _shift_summary_answer(arch: str | None) -> str:
+    """Shared by the chat "shift_summary" capability and GET /api/shift-summary
+    (the shifter page) so both serve the identical cache-or-generate logic
+    instead of two independently-typed copies."""
+    tags = _latest_and_previous_ib_tags(arch)
+    if not tags:
+        return (
+            "Not enough Integration Build history is imported yet for the current release "
+            "series to produce a shift summary (at least two builds are required)."
+        )
+    latest_tag, previous_tag = tags
+    # The cached ShiftSummary node covers the combined multi-arch digest only (no
+    # architecture in its key) -- an arch-scoped question always regenerates live,
+    # matching how _all_arch_ib_comparison_answer vs _ib_comparison_answer already
+    # split on the same condition.
+    cached = get_shift_summary(previous_tag, latest_tag) if not arch else None
+    return cached["markdown"] if cached else generate_shift_summary(latest_tag, previous_tag, arch)
+
+
 def _execute_planned_capability(capability: str, question: str, session_id: str) -> tuple[str, list[dict]] | None:
     """Run an approved capability using existing read-only query functions."""
     if capability == "ib_relationship":
@@ -2888,6 +3192,9 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         if menu:
             return menu
         return None
+    if capability == "shift_summary":
+        arch = _requested_ib_arch(question)
+        return (_shift_summary_answer(arch), [])
     if capability == "comparison":
         # `or` short-circuits, unlike `for x in (a(), b(), c())` which builds the
         # tuple eagerly and always runs every call — _ib_comparison_answer's
@@ -2964,7 +3271,7 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
             answer, prs = result
             _pr_contexts[session_id] = prs
             return answer, []
-        result = _pr_evidence_answer(question)
+        result = _pr_evidence_answer(question, _last_workflow_contexts.get(session_id))
         if result:
             answer, prs = result
             _pr_contexts[session_id] = prs
@@ -3201,7 +3508,7 @@ def chat(req: ChatRequest):
     release_artifact_answer = _release_artifact_answer(question)
     if release_artifact_answer:
         return _chat_response(sid, original_question, release_artifact_answer, "deterministic")
-    pr_result = _pr_evidence_answer(question)
+    pr_result = _pr_evidence_answer(question, _last_workflow_contexts.get(sid))
     if pr_result:
         pr_answer, prs = pr_result
         _pr_contexts[sid] = prs
@@ -3472,6 +3779,39 @@ def evaluate_alert_rules_now():
     return {"fired": len(fired), "alerts": fired}
 
 
+class _NullNotifier:
+    """Records fired alerts without writing to the log file or stdout --
+    evaluate_rules() always notifies on every trigger, so GET /api/alerts/status
+    (read on every /shift page load) must not reuse LogNotifier, or loading the
+    shifter page would append duplicate entries to alerts.log.jsonl every time."""
+
+    def __init__(self):
+        self.fired: list[dict] = []
+
+    def notify(self, rule: dict, message: str, evidence: dict) -> None:
+        self.fired.append({"rule": rule, "message": message, "evidence": evidence})
+
+
+@app.get("/api/shift-whoami")
+def shift_whoami(username: str = Depends(require_shifter)):
+    return {"username": username}
+
+
+@app.get("/api/shift-summary")
+def shift_summary(arch: str | None = None, username: str = Depends(require_shifter)):
+    return {"markdown": _shift_summary_answer(arch)}
+
+
+@app.get("/api/alerts/status")
+def alerts_status(username: str = Depends(require_shifter)):
+    """Read-only view of which alert rules are currently triggered, for the
+    shifter page -- unlike POST /api/alerts/evaluate, never writes to the
+    alert log (see _NullNotifier)."""
+    notifier = _NullNotifier()
+    evaluate_rules(notifier)
+    return {"fired": len(notifier.fired), "alerts": notifier.fired}
+
+
 @app.delete("/api/chat/{session_id}")
 def reset(session_id: str):
     _sessions.pop(session_id, None)
@@ -3480,6 +3820,8 @@ def reset(session_id: str):
     _failed_relval_contexts.pop(session_id, None)
     _pending_relval_scopes.pop(session_id, None)
     _pending_unittest_scopes.pop(session_id, None)
+    _pending_workflow_choices.pop(session_id, None)
+    _last_workflow_contexts.pop(session_id, None)
     _pending_frequent_failure_scopes.pop(session_id, None)
     _latest_ib_contexts.pop(session_id, None)
     _relval_exception_contexts.pop(session_id, None)

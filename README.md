@@ -55,10 +55,11 @@ outside `cmsrepo` and must have this layout:
 
 The CMSSDT logreader (`cmssdt.cern.ch/SDT/cgi-bin/logreader/...`) requires a
 CERN SSO login, so exceptions are sourced from Elasticsearch instead: run
-cms-bot's `es-cmssw-exceptions.py` and redirect its output to a file —
+cms-bot's `es-cmssw-exceptions.py` and redirect its output to a file, kept at
+the fixed path `/home/rao/CHAT-BOT-AI/exceptions-json-file/exceptions.json` —
 
 ```bash
-es-cmssw-exceptions.py > exceptions.JSON
+es-cmssw-exceptions.py > /home/rao/CHAT-BOT-AI/exceptions-json-file/exceptions.json
 ```
 
 — then pass that file with `--es-exceptions-json`. Ingestion parses each
@@ -68,12 +69,14 @@ links them to the matching `RelVal` via `HAS_EXCEPTION`. There's no exact
 source-line citation this way (an ES document is a structured field, not a
 byte offset into a real log file), but coverage is far broader than manually
 staging individual logs, since one export can span many releases and
-architectures at once:
+architectures at once. The whole file is tracked as a single hashed source,
+so overwriting it with a fresh export and re-running ingestion picks up the
+update automatically — no code changes needed:
 
 ```bash
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
   --cmsrepo cmsrepo \
-  --es-exceptions-json /home/rao/CHAT-BOT-AI/NEO4J/cms-bot/exceptions.JSON \
+  --es-exceptions-json /home/rao/CHAT-BOT-AI/exceptions-json-file/exceptions.json \
   --reconcile
 ```
 
@@ -199,6 +202,32 @@ the graph is always the one deciding.
 `CONCEPT_TTL_DAYS` (default 14) and `CONCEPT_PENDING_GRACE_DAYS` (default 3)
 control the expiry and grace windows; `--limit` bounds how many rows a single
 run re-checks, since each re-check may cost an LLM call.
+
+## Router shadow mode
+
+The deterministic router is regex/keyword-based, so it only ever recognizes
+the phrasings someone has already tested — a phrasing it doesn't recognize
+either gets no answer or falls to the constrained LLM investigation path.
+Rather than hand-patching a new regex for every new phrasing forever
+(unbounded, no stopping point), `ENABLE_ROUTER_SHADOW=true` logs an
+independent LLM classification of every question next to the deterministic
+router's choice (`RouterShadowLog` nodes) — purely for comparison, **never**
+used to answer. This is the evidence to look at before ever considering
+promoting an LLM router to *select* a capability more robustly than regex
+matching — the answer itself must always stay Cypher-only, that doesn't
+change either way.
+
+Summarize accumulated agreement/disagreement:
+
+```bash
+NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/summarize_router_shadow.py --days 7
+```
+
+`ENABLE_ANSWER_SYNTHESIS=true` is a separate, independent flag: it lets an
+LLM rephrase an already-deterministic answer into more natural prose,
+verified to preserve every number in it before being shown, falling back to
+the original deterministic text otherwise. Both flags are off by default in
+`.env.example` since each costs a real per-message LLM call.
 
 ## Log RAG platform
 
