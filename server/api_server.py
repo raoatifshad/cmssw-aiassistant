@@ -2923,6 +2923,13 @@ def _relval_table(rows: list[dict], exit_code_names: dict[int, str]) -> list[str
     return lines
 
 
+def _table_cell(text: str) -> str:
+    """A pipe-table cell must stay single-line with no literal '|' -- the
+    frontend's table parser splits naively on '|' with no escape handling,
+    so strip/collapse rather than trying to escape."""
+    return text.replace("|", "/").replace("\n", " ").strip()
+
+
 def _warning_list(rows: list[dict], label: str) -> list[str]:
     if not rows:
         return ["None."]
@@ -2943,18 +2950,19 @@ _RECURRENCE_EVIDENCE_CAVEAT = (
 )
 
 
-def _newly_failing_workflow_evidence(workflow_id: str, row: dict, latest_tag: str) -> list[str]:
-    """Recurrence + PR + Concept evidence for one newly-failing workflow.
-    Every claim here is relevance/history, never causality -- see the module
-    docstring's evidence-only invariant."""
+def _workflow_evidence_cells(workflow_id: str, row: dict, latest_tag: str) -> tuple[str, str, str]:
+    """(recurrence, pr_evidence, stored_knowledge) cell text for one newly-failing
+    workflow, each a single sanitized table-cell line. Every claim here is
+    relevance/history, never causality -- see the module docstring's
+    evidence-only invariant. Computed once per distinct workflow_id by the
+    caller (generate_shift_summary), not once per architecture row, since
+    the same workflow can newly-fail on several architectures at once."""
     series_match = re.match(r"^CMSSW_(\d+)_(\d+)_", latest_tag)
     series_prefix = f"CMSSW_{series_match.group(1)}_{series_match.group(2)}_" if series_match else None
 
-    lines = [f"#### `{workflow_id}` - {row['name']}"]
-
     recurrence = get_relval_recurrence(workflow_id)
     if not recurrence.get("total_appearances"):
-        lines.append("- **Recurrence:** no prior appearance of this exact workflow ID found in the imported graph.")
+        recurrence_cell = "No prior appearance of this workflow ID in the imported graph."
     else:
         failed_tags = recurrence.get("failed_tags", [])
         # failed_tags can repeat the same tag once per architecture that failed --
@@ -2963,39 +2971,51 @@ def _newly_failing_workflow_evidence(workflow_id: str, row: dict, latest_tag: st
             tag for tag in failed_tags if series_prefix and tag.startswith(series_prefix)
         ))
         if in_series:
-            lines.append(
-                f"- **Recurrence:** failed in {len(in_series)} prior build(s) within this release series "
-                f"(most recent: {', '.join(f'`{tag}`' for tag in in_series[:5])}). "
-                f"Full history: {recurrence['failed_appearances']} failure(s) across "
-                f"{recurrence['total_appearances']} imported appearance(s) of this workflow ID overall."
+            recurrence_cell = (
+                f"Failed in {len(in_series)} prior build(s) this series (most recent {in_series[0]}); "
+                f"{recurrence['failed_appearances']}/{recurrence['total_appearances']} overall."
             )
         else:
-            lines.append(
-                f"- **Recurrence:** no prior failure of this exact workflow ID within the current release series, "
-                f"but it has failed {recurrence['failed_appearances']} time(s) across "
-                f"{recurrence['total_appearances']} appearance(s) elsewhere in the imported graph."
+            recurrence_cell = (
+                f"No prior failure this series; "
+                f"{recurrence['failed_appearances']}/{recurrence['total_appearances']} overall."
             )
 
     pr_rows = find_prs_for_error(workflow_id, limit=5)
     if not pr_rows:
-        lines.append("- **PR evidence:** no PR in the imported graph matches this workflow ID.")
+        pr_cell = "No PR in the imported graph matches this workflow ID."
     else:
-        pr_mentions = ", ".join(
-            f"`{pr['repo']} #{pr['pr_number']}` ({', '.join(pr['evidence'])})" for pr in pr_rows
-        )
-        lines.append(f"- **PR evidence:** {pr_mentions}. {_RECURRENCE_EVIDENCE_CAVEAT}")
+        pr_mentions = ", ".join(f"{pr['repo']} #{pr['pr_number']} ({', '.join(pr['evidence'])})" for pr in pr_rows)
+        pr_cell = f"{pr_mentions} -- relevance only, {_RECURRENCE_EVIDENCE_CAVEAT.split(' and ')[-1]}"
 
     # search_concepts requires a leading-letter term (see its docstring's caveat) -- a bare
     # numeric workflow_id never survives that filter, so also search on the workflow's name.
     concept_rows = search_concepts(f"{workflow_id} {row['name']}", limit=3)
-    if not concept_rows:
+    knowledge_cell = concept_rows[0]["definition"] if concept_rows else "No stored expert-corrected fact matches."
+
+    return _table_cell(recurrence_cell), _table_cell(pr_cell), _table_cell(knowledge_cell)
+
+
+def _newly_failing_relval_table(
+    rows: list[dict], exit_code_names: dict[int, str], evidence: dict[str, tuple[str, str, str]],
+) -> list[str]:
+    """Like _relval_table, but with three extra evidence columns the frontend
+    auto-hides behind a per-row "Show evidence" toggle -- everything past the
+    first four (always-visible) columns is exactly that kind of drill-down
+    detail, never the primary at-a-glance read."""
+    if not rows:
+        return ["None."]
+    lines = [
+        "| Workflow | Name | Errors | Exit code | Recurrence | PR evidence | Stored knowledge |",
+        "| --- | --- | ---: | ---: | --- | --- | --- |",
+    ]
+    for row in rows:
+        recurrence_cell, pr_cell, knowledge_cell = evidence[row["workflow_id"]]
         lines.append(
-            "- **Stored knowledge:** no expert-corrected fact currently matches this workflow ID or name "
-            "(this is a weak text search over stored corrections, not a confirmed absence)."
+            f"| `{row['workflow_id']}` | {row['name']} | {row.get('errors') or 0} | "
+            f"{_format_exit_code(row['exitcode'], exit_code_names) if row.get('exitcode') else 0} | "
+            f"{recurrence_cell} | {pr_cell} | {knowledge_cell} |"
         )
-    else:
-        excerpt = concept_rows[0]["definition"]
-        lines.append(f"- **Stored knowledge:** {excerpt}")
     return lines
 
 
@@ -3011,8 +3031,9 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
 
     exit_code_names = get_exit_code_names()
     lines = [f"## Shift summary: {previous_tag} -> {latest_tag}"]
-    newly_failing_by_workflow: dict[str, dict] = {}
 
+    per_arch: list[tuple[str, list[dict], list[dict], dict]] = []
+    newly_failing_by_workflow: dict[str, dict] = {}
     for one_arch in architectures:
         before_rows = get_failing_relvals(previous_tag, arch=one_arch, limit=200)
         after_rows = get_failing_relvals(latest_tag, arch=one_arch, limit=200)
@@ -3026,9 +3047,22 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
             newly_failing_arch.extend(newly)
             resolved_arch.extend(resolved)
         warnings_diff = diff_warnings(previous_tag, latest_tag, one_arch)
+        per_arch.append((one_arch, newly_failing_arch, resolved_arch, warnings_diff))
+        for row in newly_failing_arch:
+            newly_failing_by_workflow.setdefault(row["workflow_id"], row)
 
+    # Evidence is computed once per distinct workflow_id (not once per architecture
+    # row -- the same workflow can newly-fail on several architectures at once) and
+    # embedded directly as extra table columns, which the frontend auto-hides behind
+    # a per-row "Show evidence" toggle rather than a separate always-open section.
+    evidence = {
+        workflow_id: _workflow_evidence_cells(workflow_id, row, latest_tag)
+        for workflow_id, row in newly_failing_by_workflow.items()
+    }
+
+    for one_arch, newly_failing_arch, resolved_arch, warnings_diff in per_arch:
         lines.extend(["", f"### `{one_arch}`", "", "#### Newly failing RelVal workflows"])
-        lines.extend(_relval_table(newly_failing_arch, exit_code_names))
+        lines.extend(_newly_failing_relval_table(newly_failing_arch, exit_code_names, evidence))
         lines.extend(["", "#### Resolved RelVal workflows"])
         lines.extend(_relval_table(resolved_arch, exit_code_names))
         lines.extend(["", "#### New Clang warning locations"])
@@ -3038,21 +3072,12 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
         lines.extend(["", "#### Changed Clang warning occurrences"])
         lines.extend(_warning_list(warnings_diff["changed"], "changed"))
 
-        for row in newly_failing_arch:
-            newly_failing_by_workflow.setdefault(row["workflow_id"], row)
-
-    if newly_failing_by_workflow:
-        lines.extend(["", "### Newly failing workflow evidence"])
-        for workflow_id, row in sorted(newly_failing_by_workflow.items()):
-            lines.append("")
-            lines.extend(_newly_failing_workflow_evidence(workflow_id, row, latest_tag))
-
     lines.extend([
         "",
         "---",
-        "Recurrence and PR/Concept evidence establish relevance and historical pattern only -- they do "
-        "not prove a PR caused or fixed a failure. Recurrence is scoped to the current release series "
-        "where noted; full cross-release history is summarized alongside it.",
+        "Recurrence and PR/Concept evidence (Newly failing RelVal workflows table) establish relevance "
+        "and historical pattern only -- they do not prove a PR caused or fixed a failure. Recurrence is "
+        "scoped to the current release series where noted; full cross-release history is included alongside it.",
     ])
     return "\n".join(lines)
 

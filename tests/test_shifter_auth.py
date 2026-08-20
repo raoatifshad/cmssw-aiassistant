@@ -25,7 +25,29 @@ class ShifterAllowlistTests(unittest.TestCase):
 
 
 class RequireShifterTests(unittest.TestCase):
-    def test_no_session_raises_401(self):
+    # SSO_CONFIGURED/DEV_SHIFTER_LOGIN are module-level constants resolved from
+    # live env vars at import time -- explicitly patch both in every case here
+    # rather than relying on whatever this test process's actual .env happens
+    # to have set, matching this project's own test_router_shadow.py lesson.
+    @patch("server.shifter_auth.DEV_SHIFTER_LOGIN", True)
+    def test_no_session_raises_401_when_a_login_path_exists(self):
+        with self.assertRaises(HTTPException) as ctx:
+            require_shifter(_request())
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    @patch("server.shifter_auth.SSO_CONFIGURED", False)
+    @patch("server.shifter_auth.DEV_SHIFTER_LOGIN", False)
+    def test_no_session_raises_503_when_nothing_is_configured(self):
+        # /api/shift-whoami must be able to report "not set up" on its own --
+        # /shift/login's 503 alone isn't enough, since that's a full-page
+        # navigation target the frontend's fetch-based logic can't inspect.
+        with self.assertRaises(HTTPException) as ctx:
+            require_shifter(_request())
+        self.assertEqual(ctx.exception.status_code, 503)
+
+    @patch("server.shifter_auth.SSO_CONFIGURED", True)
+    @patch("server.shifter_auth.DEV_SHIFTER_LOGIN", False)
+    def test_no_session_raises_401_when_real_sso_is_configured(self):
         with self.assertRaises(HTTPException) as ctx:
             require_shifter(_request())
         self.assertEqual(ctx.exception.status_code, 401)

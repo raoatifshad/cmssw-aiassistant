@@ -112,10 +112,18 @@ async def shift_logout(request: Request):
 
 
 def require_shifter(request: Request) -> str:
-    """FastAPI dependency for every protected shifter route. 401 if not
-    signed in; 403 if signed in but not (or no longer) on the allowlist."""
+    """FastAPI dependency for every protected shifter route. 503 if there's
+    no session yet AND no way to start one (neither real SSO nor the dev
+    bypass is configured) -- this is the only place that combination is
+    checked, so /api/shift-whoami and friends can report it directly instead
+    of only surfacing on /shift/login, a full-page navigation target the
+    frontend's fetch-based logic can't otherwise inspect. 401 if not signed
+    in but a login path exists; 403 if signed in but not (or no longer) on
+    the allowlist."""
     username = request.session.get("shifter_username")
     if not username:
+        if not SSO_CONFIGURED and not DEV_SHIFTER_LOGIN:
+            raise HTTPException(503, "CERN SSO is not configured on this deployment (missing client credentials).")
         raise HTTPException(401, "Not signed in. Visit /shift/login first.")
     if username not in shifter_allowlist():
         raise HTTPException(403, "This CERN account is not on the shifter allowlist.")
