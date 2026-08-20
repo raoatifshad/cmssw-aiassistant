@@ -127,13 +127,19 @@ MERGE/CREATE/DELETE/SET/REMOVE/DROP/`CALL db.`).
    `synthesize_evidence_answer` turns the evidence into prose. The LLM is
    never allowed to answer from its own knowledge — only from tool evidence.
 
-Two experimental phases are gated by env vars and off by default because they
-add a real per-message LLM call: `ENABLE_ROUTER_SHADOW` (logs an independent
-LLM classification against the deterministic planner's choice for later
-promotion-gate comparison, never used to answer) and `ENABLE_ANSWER_SYNTHESIS`
-(LLM rephrases an already-correct deterministic answer, verified to preserve
+Two experimental phases are gated by env vars, each adding a real per-message
+LLM call: `ENABLE_ROUTER_SHADOW` (logs an independent LLM classification
+against the deterministic planner's choice for later promotion-gate
+comparison, never used to answer — this deployment's `.env` has it **on**,
+deliberately, to accumulate real agreement data instead of hand-patching
+another regex for every new phrasing forever; summarize with
+`ingestion/summarize_router_shadow.py`) and `ENABLE_ANSWER_SYNTHESIS` (LLM
+rephrases an already-correct deterministic answer, verified to preserve
 every number via `_extract_numbers` before being shown — falls back to the
-original text on any mismatch).
+original text on any mismatch; still off). Don't assume either is off by
+default when writing tests — `tests/test_router_shadow.py` learned this the
+hard way; test the parsing/behavior explicitly with `@patch(...)`, never by
+asserting the live imported constant.
 
 ### Agent loop (`server/agent.py`)
 
