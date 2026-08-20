@@ -5,10 +5,14 @@ from server.api_server import ANSWER_SYNTHESIS_ENABLED, ROUTER_SHADOW_ENABLED, _
 
 
 class RouterShadowFlagTests(unittest.TestCase):
-    def test_both_llm_features_default_off(self):
-        # These must default off: each costs a real per-message LLM call with
-        # no user-visible benefit until explicitly opted into.
-        self.assertFalse(ROUTER_SHADOW_ENABLED)
+    def test_answer_synthesis_defaults_off(self):
+        # Must default off: costs a real per-message LLM call with no
+        # user-visible benefit until explicitly opted into. ROUTER_SHADOW_ENABLED
+        # is not asserted here -- it's a live import of this deployment's
+        # actual .env value, and this deployment deliberately sets
+        # ENABLE_ROUTER_SHADOW=true to accumulate real router-agreement data
+        # (see ingestion/summarize_router_shadow.py) -- asserting it's False
+        # would just be asserting today's .env content, not real behavior.
         self.assertFalse(ANSWER_SYNTHESIS_ENABLED)
 
     @patch("server.api_server.get_driver")
@@ -27,9 +31,11 @@ class RouterShadowFlagTests(unittest.TestCase):
         get_driver.return_value.close.assert_called_once()
 
     @patch("server.api_server.get_driver")
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.ROUTER_SHADOW_ENABLED", False)
     def test_is_a_no_op_when_disabled(self, get_driver):
-        # ROUTER_SHADOW_ENABLED is false by default in this test process --
-        # no LLM call, no graph write, no driver ever opened.
+        # Explicitly patched to False regardless of this deployment's actual
+        # .env value -- no LLM call, no graph write, no driver ever opened.
         _log_router_shadow_decision("how many relvals failing", "deterministic", "relval", "shadow-sid-2")
 
         get_driver.assert_not_called()

@@ -1,10 +1,10 @@
 import unittest
 from unittest.mock import patch
 
-from graph.tools import get_relval_recurrence, top_recurring_relval_failures
+from graph.tools import get_relval_recurrence, search_workflow_ids, top_recurring_relval_failures
 from server.api_server import (
-    _execute_planned_capability, _frequent_failures_report, _parse_recency_window_days,
-    _pending_frequent_failure_scopes, _recurring_failure_answer,
+    _execute_planned_capability, _frequent_failures_report, _last_workflow_contexts, _parse_recency_window_days,
+    _pending_frequent_failure_scopes, _pending_workflow_choices, _recurring_failure_answer,
 )
 
 
@@ -37,6 +37,37 @@ class RecurringFailureTests(unittest.TestCase):
         self.assertIsNone(_recurring_failure_answer("what does workflow 140.051 do", "s1"))
 
     @patch("server.api_server.get_relval_recurrence")
+    def test_recurring_failure_answer_recognizes_when_did_it_start_failing_phrasing(self, recurrence):
+        # Regression: a real user asked "when the WF starts failing 140.0" --
+        # no "recurring"/"how often"/etc. keyword -- and it fell through to
+        # the fallback clarification instead of looking up the workflow.
+        recurrence.return_value = {
+            "workflow_id": "140.0", "name": "SomeWorkflow",
+            "total_appearances": 10, "failed_appearances": 4,
+            "failed_tags": ["CMSSW_20_1_X_2026-08-18-2300"],
+        }
+
+        answer = _recurring_failure_answer("when the WF starts failing 140.0", "s1")
+
+        self.assertIn("4 of 10", answer)
+
+    @patch("server.api_server.get_relval_recurrence")
+    def test_recurring_failure_answer_when_phrasing_survives_a_decimal_workflow_id(self, recurrence):
+        # Regression: the bounded gap between "when" and "fail" excluded "."
+        # to avoid crossing sentence boundaries, but workflow IDs are decimal
+        # numbers (e.g. "140.0") -- the exclusion broke on the ID's own
+        # period, not a real sentence break, so this never matched at all.
+        recurrence.return_value = {
+            "workflow_id": "140.0", "name": "SomeWorkflow",
+            "total_appearances": 10, "failed_appearances": 4,
+            "failed_tags": ["CMSSW_20_1_X_2026-08-18-2300"],
+        }
+
+        answer = _recurring_failure_answer("when the workflow 140.0 start failing in the Ibs", "s1")
+
+        self.assertIn("4 of 10", answer)
+
+    @patch("server.api_server.get_relval_recurrence")
     def test_recurring_failure_answer_reports_the_rate(self, recurrence):
         recurrence.return_value = {
             "workflow_id": "140.051", "name": "RunMuonEG2022C",
@@ -48,6 +79,21 @@ class RecurringFailureTests(unittest.TestCase):
 
         self.assertIn("258 of 441", answer)
         self.assertIn("59%", answer)
+
+    @patch("server.api_server.get_relval_recurrence")
+    def test_recurring_failure_answer_remembers_the_workflow_for_pr_evidence_followups(self, recurrence):
+        # Regression: "is there any issue/pr open for it?" as a follow-up
+        # needs to know what "it" refers to -- _pr_evidence_answer has no
+        # session memory of its own, so this must be recorded here.
+        recurrence.return_value = {
+            "workflow_id": "140.0", "name": "SomeWorkflow",
+            "total_appearances": 14, "failed_appearances": 0, "failed_tags": [],
+        }
+
+        _recurring_failure_answer("when does workflow 140.0 start failing", "s-remember")
+
+        self.assertEqual(_last_workflow_contexts.get("s-remember"), "140.0")
+        _last_workflow_contexts.pop("s-remember", None)
 
     @patch("server.api_server._recurring_failure_answer", return_value="recurrence evidence")
     @patch("server.api_server._pr_evidence_answer", return_value=None)
@@ -193,6 +239,118 @@ class FrequentFailuresTests(unittest.TestCase):
         answer = _recurring_failure_answer("el9_amd64_gcc14", "freq-session")
 
         self.assertEqual(answer, "frequent failures report")
+
+
+class WorkflowDisambiguationTests(unittest.TestCase):
+    """A typed workflow ID that's wrong or written as a wildcard (e.g.
+    "140.999", "140.xx") must trigger a prefix search and a "did you mean"
+    choice instead of a dead end -- never silently guess which one."""
+
+    def tearDown(self):
+        _pending_workflow_choices.pop("s1", None)
+
+    @patch("graph.tools.get_driver")
+    def test_search_workflow_ids_matches_by_prefix(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"workflow_id": "140.001", "name": "RunMinimumBias2022A"},
+            {"workflow_id": "140.051", "name": "RunMuonEG2022C"},
+        ]
+
+        results = search_workflow_ids("140.", limit=15)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(session.run.call_args.args[1]["prefix"], "140.")
+
+    @patch("server.api_server.search_workflow_ids")
+    def test_wildcard_with_multiple_candidates_asks_which_one(self, search_ids):
+        search_ids.return_value = [
+            {"workflow_id": "140.001", "name": "RunMinimumBias2022A"},
+            {"workflow_id": "140.051", "name": "RunMuonEG2022C"},
+        ]
+
+        answer = _recurring_failure_answer("when does workflow 140.xx start failing", "s1")
+
+        self.assertIn("140.001", answer)
+        self.assertIn("140.051", answer)
+        self.assertIn("s1", _pending_workflow_choices)
+        search_ids.assert_called_once_with("140.", limit=15)
+
+    @patch("server.api_server.search_workflow_ids", return_value=[])
+    def test_wildcard_with_no_candidates_says_so_plainly(self, search_ids):
+        answer = _recurring_failure_answer("when does workflow 99999.xx start failing", "s1")
+
+        self.assertIn("No imported workflow starts with `99999.`", answer)
+        self.assertNotIn("s1", _pending_workflow_choices)
+
+    @patch("server.api_server.search_workflow_ids")
+    @patch("server.api_server.get_relval_recurrence")
+    def test_not_found_exact_id_falls_back_to_prefix_search(self, recurrence, search_ids):
+        recurrence.return_value = {"workflow_id": "140.999", "total_appearances": 0}
+        search_ids.return_value = [{"workflow_id": "140.051", "name": "RunMuonEG2022C"}]
+
+        answer = _recurring_failure_answer("has workflow 140.999 recurred before?", "s1")
+
+        self.assertIn("Workflow `140.999` is not reported", answer)
+        self.assertIn("140.051", answer)
+        search_ids.assert_called_once_with("140.", limit=15)
+
+    @patch("server.api_server.get_relval_recurrence")
+    def test_found_exact_id_answers_directly_without_searching(self, recurrence):
+        recurrence.return_value = {
+            "workflow_id": "140.0", "name": "SomeWorkflow",
+            "total_appearances": 10, "failed_appearances": 0, "failed_tags": [],
+        }
+
+        answer = _recurring_failure_answer("has workflow 140.0 recurred before?", "s1")
+
+        self.assertIn("0 of 10", answer)
+        self.assertNotIn("s1", _pending_workflow_choices)
+
+    @patch("server.api_server.get_relval_recurrence")
+    def test_choosing_a_listed_workflow_resolves_the_pending_choice(self, recurrence):
+        _pending_workflow_choices["s1"] = {
+            "candidates": [
+                {"workflow_id": "140.001", "name": "RunMinimumBias2022A"},
+                {"workflow_id": "140.051", "name": "RunMuonEG2022C"},
+            ],
+        }
+        recurrence.return_value = {
+            "workflow_id": "140.051", "name": "RunMuonEG2022C",
+            "total_appearances": 221, "failed_appearances": 131, "failed_tags": [],
+        }
+
+        answer = _recurring_failure_answer("140.051", "s1")
+
+        self.assertIn("131 of 221", answer)
+        self.assertNotIn("s1", _pending_workflow_choices)
+        recurrence.assert_called_once_with("140.051")
+
+    @patch("server.api_server.search_workflow_ids")
+    @patch("server.api_server.get_relval_recurrence")
+    def test_naming_a_fresh_workflow_id_abandons_the_stale_pending_choice(self, recurrence, search_ids):
+        _pending_workflow_choices["s1"] = {
+            "candidates": [{"workflow_id": "140.001", "name": "RunMinimumBias2022A"}],
+        }
+        recurrence.return_value = {
+            "workflow_id": "37634.0", "name": "TTbar_14TeV+Run4D127",
+            "total_appearances": 150, "failed_appearances": 44, "failed_tags": [],
+        }
+
+        answer = _recurring_failure_answer("has workflow 37634.0 recurred before?", "s1")
+
+        self.assertIn("44 of 150", answer)
+        search_ids.assert_not_called()
+
+    def test_unmatched_reply_re_shows_the_pending_choice(self):
+        _pending_workflow_choices["s1"] = {
+            "candidates": [{"workflow_id": "140.001", "name": "RunMinimumBias2022A"}],
+        }
+
+        answer = _recurring_failure_answer("I'm not sure", "s1")
+
+        self.assertIn("140.001", answer)
+        self.assertIn("s1", _pending_workflow_choices)
 
 
 if __name__ == "__main__":
