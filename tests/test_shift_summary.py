@@ -109,12 +109,15 @@ class GenerateShiftSummaryTests(unittest.TestCase):
 
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
 
-        self.assertIn("Newly failing workflow evidence", markdown)
-        self.assertIn("`140.51` - RunMuonEG2022C", markdown)
+        # Evidence is embedded as extra columns on the newly-failing table (the
+        # frontend auto-hides anything past the first four columns behind a
+        # per-row toggle), not a separate always-open section.
+        self.assertIn("Recurrence | PR evidence | Stored knowledge", markdown)
+        self.assertIn("`140.51` | RunMuonEG2022C", markdown)
         self.assertIn("cmssw #45213", markdown)
-        self.assertIn("relevance only and do not prove a PR caused or fixed a failure", markdown)
+        self.assertIn("relevance only, do not prove a PR caused or fixed a failure", markdown)
         # the out-of-series tag must not be counted as an in-series recurrence
-        self.assertIn("failed in 2 prior build(s) within this release series", markdown)
+        self.assertIn("Failed in 2 prior build(s) this series", markdown)
 
     @patch("server.api_server.search_concepts", return_value=[])
     @patch("server.api_server.find_prs_for_error", return_value=[])
@@ -133,8 +136,8 @@ class GenerateShiftSummaryTests(unittest.TestCase):
 
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
 
-        self.assertIn("no prior appearance of this exact workflow ID", markdown)
-        self.assertIn("no PR in the imported graph matches this workflow ID", markdown)
+        self.assertIn("No prior appearance of this workflow ID in the imported graph", markdown)
+        self.assertIn("No PR in the imported graph matches this workflow ID", markdown)
 
     @patch("server.api_server.search_concepts", return_value=[])
     @patch("server.api_server.find_prs_for_error", return_value=[])
