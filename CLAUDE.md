@@ -42,11 +42,21 @@ curl http://localhost:8001/api/health
 PYTHONPATH=ingestion python -m unittest discover -s tests
 PYTHONPATH=ingestion python -m unittest tests.test_chat_routing -v
 PYTHONPATH=ingestion python -m unittest tests.test_chat_routing.LatestIbRankingTests.test_sort_key_ranks_release_series_before_timestamp
+
+# live end-to-end validation against a *running* server + real graph data
+# (catches things the mocked suite above can't -- see "Capability-handler
+# coverage" below). Needs `uvicorn server.api_server:app --port 8001` running.
+venv/bin/python scripts/validate_bot.py
+venv/bin/python scripts/validate_bot.py --base-url http://localhost:8002  # non-default port
 ```
 
 Tests mock the Neo4j driver / LLM client rather than requiring a live
 database — see the `unittest.mock.patch` usage at the top of
 `tests/test_chat_routing.py` and `tests/test_graph_tools.py` for the pattern.
+`scripts/validate_bot.py` is the complementary live layer: it drives real
+multi-turn conversations against a running server and real Neo4j data,
+templated against whatever tag the server itself reports as "latest" so it
+stays valid as the graph is refreshed.
 
 ## Architecture
 
@@ -140,6 +150,83 @@ original text on any mismatch; still off). Don't assume either is off by
 default when writing tests — `tests/test_router_shadow.py` learned this the
 hard way; test the parsing/behavior explicitly with `@patch(...)`, never by
 asserting the live imported constant.
+
+### Capability-handler coverage — a recurring bug class, and how to test for it
+
+`RequestPlanner` correctly recognizing a capability (e.g. `"relval"`,
+`"clang"`, `"build"`) does **not** guarantee `_execute_planned_capability`
+(`server/api_server.py`) can actually answer it — each capability branch
+there is its own short-circuiting `or` chain of `_*_answer()` helpers, and a
+real phrasing can fall through all of them even though the router picked the
+right capability. When that happens the user sees a flat "No imported local
+evidence is available for the selected `X` request" — which reads as "no
+data exists" even when the data is there and the router worked correctly;
+only that specific helper chain was incomplete. Two concrete ways this has
+happened in practice (both found and fixed in the same session, 2026-08-25):
+
+1. **No session-tag fallback.** A capability's helpers only look for an IB
+   tag in the *current* question text, so a natural follow-up that doesn't
+   repeat the tag ("what about unit tests", "show me the clang warnings
+   again") dead-ends even though the tag was already established earlier in
+   the same session (`_latest_ib_contexts[sid]`). `_unittest_summary_answer`
+   and `_ib_results_summary_answer` already took a `context_tag` fallback
+   parameter; `_relval_*`, `_build_warning_answer`, and the new
+   `_clang_warning_answer` were retrofitted to do the same — thread
+   `_latest_ib_contexts.get(session_id)` through as the tag when
+   `IB_TAG_RE.search(question)` finds nothing.
+2. **A whole phrasing shape has no handler at all**, not just a missing
+   fallback. `"clang warnings for <tag>"` — the same "`X` for `<tag>`" shape
+   that already worked for build/relval/unit-test — had zero matching
+   function in the `"clang"` branch (only "latest" and two-tag-comparison
+   handlers existed) and failed on the very first turn, tag included. This
+   one was only found by testing against a live server with real data, not
+   by mocked unit tests, since nobody had written a test asserting the gap
+   existed to catch it.
+3. **A later handler in the chain never runs at all once an earlier one
+   matches**, even when the question asked for both. `"pr_evidence"`'s chain
+   was `_pr_number_answer or _pr_evidence_answer or _recurring_failure_answer`
+   — `_open_issue_answer` wasn't in it. A real question ("any information
+   about ticl::AssociationMap any PR/issue open?") explicitly asked for open
+   Issues too, but once `_pr_evidence_answer` matched on the PR side, Issues
+   were never even searched — the answer looked complete (a real PR list)
+   while silently omitting a whole evidence category the graph actually had
+   (confirmed live: Issues #42737, #37821, #34000 all mention the term and
+   are open). Fixed by running both `_pr_evidence_answer` and
+   `_open_issue_answer` and concatenating when both match, instead of a bare
+   `or` chain — see `_execute_planned_capability`'s `"pr_evidence"` branch.
+   The lesson generalizes beyond this one branch: an `or` chain is fine when
+   the helpers are mutually exclusive interpretations of the same question,
+   but wrong when a question can legitimately want evidence from more than
+   one of them at once.
+
+**Two complementary test layers exist specifically to catch this class of
+bug going forward — extend both when adding or changing a capability:**
+
+- **Mocked, fast, CI-safe** (`tests/test_chat_routing.py`): call
+  `_execute_planned_capability(capability, question, session_id)` directly.
+  For any capability whose helpers accept an IB tag, add a test that sets
+  `_latest_ib_contexts[session_id]` and asks a tag-less follow-up, asserting
+  a real (non-`None`) answer — see
+  `test_relval_capability_lists_failing_workflows_without_repeating_tag`,
+  `test_unittest_capability_uses_session_ib_context_when_tag_omitted`,
+  `test_clang_capability_uses_session_ib_context_when_tag_omitted`, and
+  `test_build_capability_uses_session_ib_context_when_tag_omitted` as the
+  pattern to copy. For the "combine, don't short-circuit" gap, see
+  `test_pr_evidence_capability_combines_pr_and_open_issue_evidence`.
+- **Live, against a running server + real graph** (`scripts/validate_bot.py`):
+  add a `Scenario` to `build_scenarios()` for the new phrasing/capability,
+  including a multi-turn variant that establishes a tag in one turn and asks
+  a tag-less follow-up in the next — this is what actually caught finding
+  #2 above. Run it after any change to `_execute_planned_capability` or a
+  capability's helper chain, not just the mocked suite; the mocked suite
+  proves "the code I wrote does what I mocked it to do," the live script
+  proves "a real phrasing against real data actually gets an answer."
+
+If a capability legitimately has no handler for some phrasing yet, prefer
+adding the handler (mirroring `_clang_warning_answer` as the template: same
+`"X for <tag>"` shape as its siblings, `context_tag` fallback parameter,
+default-architecture + `all`/`everything` scope handling) over leaving the
+flat "No imported local evidence" message as the answer.
 
 ### Agent loop (`server/agent.py`)
 

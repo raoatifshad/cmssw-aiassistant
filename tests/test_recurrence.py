@@ -96,14 +96,21 @@ class RecurringFailureTests(unittest.TestCase):
         _last_workflow_contexts.pop("s-remember", None)
 
     @patch("server.api_server._recurring_failure_answer", return_value="recurrence evidence")
+    @patch("server.api_server._artifact_search_answer", return_value=None)
+    @patch("server.api_server._release_artifact_answer", return_value=None)
+    @patch("server.api_server._workflow_artifact_answer", return_value=None)
+    @patch("server.api_server._batch_workflow_pr_answer", return_value=None)
     @patch("server.api_server._pr_evidence_answer", return_value=None)
     @patch("server.api_server._pr_number_answer", return_value=None)
     def test_known_issue_phrasing_falls_through_to_recurrence_not_shadowed(
-        self, pr_number, pr_evidence, recurring
+        self, pr_number, pr_evidence, batch_workflow, workflow_artifact,
+        release_artifact, artifact_search, recurring,
     ):
         # Regression: "is this a known issue" contains the word "issue", which
         # routes it to the pr_evidence capability — it must not dead-end there
-        # once PR/Issue evidence itself finds nothing.
+        # once every PR/Issue evidence lookup in that capability's chain (see
+        # CLAUDE.md's "Capability-handler coverage" section for the full list)
+        # finds nothing.
         answer, _ = _execute_planned_capability(
             "pr_evidence", "is workflow 140.051 a known issue?", "known-issue-session",
         )

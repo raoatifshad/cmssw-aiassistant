@@ -116,6 +116,7 @@ _latest_ib_contexts: dict[str, str] = {}
 _latest_ib_arch_contexts: dict[str, str] = {}
 _relval_exception_contexts: dict[str, dict[str, str | None]] = {}
 _pasted_exception_search_contexts: dict[str, dict[str, int | str]] = {}
+_last_issue_contexts: dict[str, int] = {}
 _llm_client = None
 _pipeline: LogRAGPipeline | None = None
 _retriever: HybridRetriever | None = None
@@ -162,6 +163,7 @@ PR_QUERY_STOP_WORDS = {
     "open", "opened", "merged", "status", "state", "what", "why", "is", "it",
     "a", "an", "and", "do", "does", "issue", "issues", "of", "on", "or", "please",
     "them", "their", "they", "to", "us", "we", "will", "would",
+    "workflow", "workflows",
 }
 
 app = FastAPI(title="CMSSDT KG Chatbot API")
@@ -1086,11 +1088,25 @@ def _pr_search_terms(question: str) -> list[str]:
     ]
     words = re.findall(r"[A-Za-z][A-Za-z0-9_.-]*", question)
     standalone = [word for word in words if word.lower() not in PR_QUERY_STOP_WORDS]
+    # A real CMSSW package path (e.g. "RecoTracker/TrackProducer") never has
+    # a plain-English stop word as any of its slash-separated segments --
+    # without this filter, ordinary phrasing like "PR/Issue" or "error/
+    # warning" matches the same shape and gets treated as if it were a
+    # specific identifier, producing a nonsense search term and an
+    # irrelevant PR match instead of the real workflow/tag/number in the
+    # question. Found live: "...any PR/Issue created for this?" searched for
+    # literal `PR/Issue` and returned an unrelated PR.
+    package_paths = (
+        match for match in re.findall(
+            r"\b[A-Za-z][A-Za-z0-9_]*/[A-Za-z][A-Za-z0-9_]*(?:/[A-Za-z][A-Za-z0-9_]*)*\b", question
+        )
+        if not any(segment.lower() in PR_QUERY_STOP_WORDS for segment in match.split("/"))
+    )
     candidates = {
         *quoted,
         *re.findall(r"\bCMSSW_\d+_\d+(?:_[A-Za-z0-9]+)+\b", question),
         *re.findall(r"\b\d{4,6}\.\d+\b", question),
-        *re.findall(r"\b[A-Za-z][A-Za-z0-9_]*/[A-Za-z][A-Za-z0-9_]*(?:/[A-Za-z][A-Za-z0-9_]*)*\b", question),
+        *package_paths,
         *(word for word in standalone if any(char.isupper() or char.isdigit() for char in word)),
     }
     identifiers = sorted(
@@ -1311,6 +1327,36 @@ def _pr_evidence_answer(question: str, fallback_term: str | None = None) -> tupl
         return "\n".join(lines), rows
     if terms:
         return f"No PR evidence matching `{terms[0]}` exists in the imported graph.", []
+    return None
+
+
+def _pr_and_issue_evidence_answer(question: str, session_id: str) -> tuple[str, list[dict]] | None:
+    """Combined PR + open-Issue text-search evidence, shared by the
+    "pr_evidence" and "relval" capability branches of
+    _execute_planned_capability. _open_issue_answer only ever returns
+    non-None once its own trigger (an explicit "issue" + "open"/
+    "unresolved"/"active") matches -- a plain "any PRs for this fix"
+    question leaves it None and this is a no-op. When both fire (e.g. "any
+    PR/issue open?"), combine them rather than a bare `or`: a question
+    asking about both PRs and open Issues must not silently get only PR
+    evidence back, with matching open Issues never even searched for once
+    _pr_evidence_answer matched first -- the "capability matched, one
+    handler in its chain swallowed the rest" bug class documented in
+    CLAUDE.md's "Capability-handler coverage" section. "relval" also falls
+    back to this: a workflow-focused question ("any PR/Issue open for
+    Workflow <id>?") can legitimately want PR/Issue evidence even when it
+    has no IB tag and matches no relval-failure-specific phrasing, but
+    "relval" outranks "pr_evidence" in RequestPlanner's static priority
+    whenever a question mentions both a workflow and PR/Issue evidence."""
+    pr_result = _pr_evidence_answer(question, _last_workflow_contexts.get(session_id))
+    issue_answer = _open_issue_answer(question, _failed_relval_contexts.get(session_id))
+    if pr_result and issue_answer:
+        pr_answer, prs = pr_result
+        return f"{pr_answer}\n\n{issue_answer}", prs
+    if pr_result:
+        return pr_result
+    if issue_answer:
+        return issue_answer, []
     return None
 
 
@@ -1743,17 +1789,46 @@ def _artifact_search_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
-def _issue_author_answer(question: str) -> str | None:
-    """Report who opened an explicitly named imported CMSSW Issue."""
-    if not re.search(r"\b(?:who\s+(?:opened|created|filed|reported)|author|creator)\b", question, re.IGNORECASE):
+_ISSUE_NUMBER_RE = re.compile(
+    r"(?:issue\s*)?#(\d+)\b|github\.com/[\w.-]+/[\w.-]+/issues/(\d+)\b",
+    re.IGNORECASE,
+)
+# A bare number with no "#", no "issue" word, and no GitHub Issues URL is
+# ambiguous -- it could be a PR or Issue number, both referenced as bare
+# "#N" in this domain. Excludes decimal-shaped tokens (lookbehind/lookahead
+# reject a "." immediately before or a ".digit" immediately after) so a
+# workflow ID's segments (e.g. "136" or "899" inside "136.899", "2025" inside
+# "2025.0010001") are never misread as an artifact number.
+_BARE_ARTIFACT_NUMBER_RE = re.compile(r"(?<![.\d])\b(\d{3,6})\b(?!\.\d)")
+
+
+def _resolve_issue_number(question: str, context_number: int | None) -> int | None:
+    """An explicit `#N` or GitHub Issues URL in the question always wins over
+    remembered session context (same rule as every other context-fallback in
+    this file, e.g. IB tags) -- only fall back to context_number when the
+    question names no issue at all."""
+    match = _ISSUE_NUMBER_RE.search(question)
+    if not match:
+        return context_number
+    return int(match.group(1) or match.group(2))
+
+
+def _issue_author_answer(question: str, context_number: int | None = None) -> str | None:
+    """Report who opened an explicitly named (or session-remembered) imported
+    CMSSW Issue."""
+    # "who" and the verb aren't always adjacent in natural phrasing -- "who
+    # has created", "who was it that filed" -- so tolerate an auxiliary
+    # verb (is/was/has/did) between them instead of requiring "who opened"
+    # verbatim.
+    if not re.search(
+        r"\bwho\s+(?:is\s+|was\s+|has\s+|did\s+)?(?:opened|created|filed|reported)\b|\bauthor\b|\bcreator\b",
+        question, re.IGNORECASE,
+    ):
         return None
-    if not re.search(r"\bissue\b", question, re.IGNORECASE):
-        return None
-    number_match = re.search(r"(?:issue\s*)?#(\d+)\b", question, re.IGNORECASE)
-    if not number_match:
+    number = _resolve_issue_number(question, context_number)
+    if number is None:
         return None
 
-    number = int(number_match.group(1))
     driver = get_driver()
     try:
         with driver.session() as session:
@@ -1770,6 +1845,99 @@ def _issue_author_answer(question: str) -> str | None:
     if not record["author"]:
         return f"Issue #{number} is present in the imported graph, but its author was not imported."
     return f"**Issue #{number}** was opened by **{record['author']}**."
+
+
+def _issue_detail_answer(question: str, context_number: int | None = None) -> str | None:
+    """Report an explicitly named (or session-remembered) Issue's title and
+    state -- or, for a bare unqualified number, whichever of an Issue/PR with
+    that number actually exists. Closes the same "no handler exists at all
+    for this phrasing" gap as _latest_issue_answer -- nothing answered "what
+    is the title of issue #X" before this, and _issue_author_answer only ever
+    reports the author, never the title. context_number lets a bare
+    follow-up ("what is the title", "do you have info about it") resolve to
+    whichever Issue was last explicitly named in the session
+    (_last_issue_contexts), the same pronoun-resolution pattern
+    _latest_ib_contexts already provides for IBs."""
+    if not re.search(
+        r"\btitle\b|\babout\b|\bdetails?\b|\bdescribe\b|\bsummary\b|\bwhat\s+is\s+it\b|\btell\s+me\b",
+        question, re.IGNORECASE,
+    ):
+        return None
+    explicit_number = _resolve_issue_number(question, None)
+    if explicit_number is not None:
+        number, ambiguous = explicit_number, False
+    else:
+        # No "#"/"issue"/URL qualifier at all -- e.g. "what is the title of
+        # 51640" -- found live: a real question phrased exactly this way,
+        # with the "#" dropped, fell all the way through to the generic
+        # "I couldn't match that" fallback. Since a bare number here could
+        # be either a PR or an Issue, check both instead of assuming Issue.
+        bare_match = _BARE_ARTIFACT_NUMBER_RE.search(question)
+        number = int(bare_match.group(1)) if bare_match else context_number
+        ambiguous = True
+    if number is None:
+        return None
+
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            issue_record = session.run(
+                "MATCH (issue:Issue {repo:'cmssw', number:$number}) "
+                "RETURN issue.title AS title, issue.state AS state, issue.created_at AS created_at",
+                number=number,
+            ).single()
+            pr_record = None
+            if ambiguous and not issue_record:
+                pr_record = session.run(
+                    "MATCH (pr:PR {number:$number}) "
+                    "RETURN pr.repo AS repo, pr.title AS title, pr.merged_at AS merged_at",
+                    number=number,
+                ).single()
+    finally:
+        driver.close()
+    if issue_record:
+        return (
+            f"**Issue #{number}** - {issue_record['title']} "
+            f"(state: `{issue_record['state']}`, created {issue_record['created_at'] or 'unknown'})."
+        )
+    if pr_record:
+        merged = f"merged {pr_record['merged_at']}" if pr_record["merged_at"] else "not merged"
+        return f"**{pr_record['repo']} PR #{number}** - {pr_record['title']} ({merged})."
+    if ambiguous:
+        return f"Neither an Issue nor a PR numbered #{number} is present in the imported graph."
+    return f"Issue #{number} is not present in the imported CMSSW graph."
+
+
+def _latest_issue_answer(question: str) -> str | None:
+    """Report the most recently imported CMSSW Issue. Mirrors
+    _latest_clang_warning_answer's shape -- another instance of the "no
+    handler exists at all for this phrasing" gap (see CLAUDE.md's
+    "Capability-handler coverage" section): nothing answered "what is the
+    latest issue" before this, only a *named* Issue's author
+    (_issue_author_answer) or open-Issue text search (_open_issue_answer)."""
+    if not re.search(r"\b(?:latest|newest|most\s+recent|current)\b", question, re.IGNORECASE):
+        return None
+    if not re.search(r"\bissues?\b", question, re.IGNORECASE):
+        return None
+
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            record = session.run(
+                "MATCH (issue:Issue {repo:'cmssw'}) "
+                "RETURN issue.number AS number, issue.title AS title, "
+                "issue.state AS state, issue.created_at AS created_at "
+                "ORDER BY issue.number DESC LIMIT 1"
+            ).single()
+    finally:
+        driver.close()
+    if not record:
+        return "No CMSSW Issues are imported in the graph."
+    return (
+        f"The most recently imported CMSSW Issue is **#{record['number']}** - {record['title']} "
+        f"(state: `{record['state']}`, created {record['created_at'] or 'unknown'}). "
+        "This is the newest Issue in the local imported snapshot, not necessarily the newest one on GitHub right now."
+    )
 
 
 def _batch_workflow_pr_answer(question: str) -> str | None:
@@ -1832,7 +2000,7 @@ def _warning_count_answer(question: str) -> str | None:
     )
 
 
-def _build_warning_answer(question: str) -> str | None:
+def _build_warning_answer(question: str, context_tag: str | None = None) -> str | None:
     """Answer CMSSW build-status compilation warnings for a named IB."""
     if re.search(r"\bclang\b", question, re.IGNORECASE):
         return None
@@ -1841,7 +2009,8 @@ def _build_warning_answer(question: str) -> str | None:
     if not re.search(r"\bwarnings?\b", question, re.IGNORECASE):
         return None
     tag_match = IB_TAG_RE.search(question)
-    if not tag_match:
+    tag = tag_match.group(1) if tag_match else context_tag
+    if not tag:
         return None
 
     driver = get_driver()
@@ -1855,12 +2024,12 @@ def _build_warning_answer(question: str) -> str | None:
                 "coalesce(ib.ignored_warnings, 0) AS ignored_warnings, "
                 "coalesce(ib.is_relval_default, false) AS is_default "
                 "ORDER BY arch",
-                tag=tag_match.group(1),
+                tag=tag,
             )]
     finally:
         driver.close()
     if not rows:
-        return f"No CMS build-status warning record is imported for **{tag_match.group(1)}**."
+        return f"No CMS build-status warning record is imported for **{tag}**."
     requested_arch = _requested_ib_arch(question)
     if requested_arch:
         rows = [row for row in rows if row["arch"] == requested_arch]
@@ -1869,7 +2038,7 @@ def _build_warning_answer(question: str) -> str | None:
         if default_rows:
             rows = default_rows
 
-    lines = [f"CMS build-status warnings for **{tag_match.group(1)}**:"]
+    lines = [f"CMS build-status warnings for **{tag}**:"]
     for row in rows:
         prefix = "Yes" if row["comp_warnings"] else "No"
         lines.append(
@@ -2771,6 +2940,68 @@ def _clang_warning_comparison_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _clang_warning_answer(question: str, context_tag: str | None = None) -> str | None:
+    """Report parsed Clang warning counts for one named IB. The "clang"
+    capability otherwise only covers "latest" (_latest_clang_warning_answer)
+    and two-tag comparisons (_clang_warning_comparison_answer) -- a plain
+    "clang warnings for <tag>" question, the same phrasing shape that already
+    works for build/relval/unit-test answers, had no handler at all until
+    this was added (found live: it failed on the very first turn, tag and
+    all, not just as a follow-up)."""
+    if not re.search(r"\bclang\b", question, re.IGNORECASE):
+        return None
+    if not re.search(r"\bwarnings?\b", question, re.IGNORECASE):
+        return None
+    if re.search(
+        r"\b(?:latest|newest|most\s+recent|current|compare|comparison|delta|deltas)\b",
+        question, re.IGNORECASE,
+    ):
+        return None
+    tag_match = IB_TAG_RE.search(question)
+    tag = tag_match.group(1) if tag_match else context_tag
+    if not tag:
+        return None
+
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB {tag:$tag}) "
+                "OPTIONAL MATCH (ib)-[:REPORTED]->(warning:Warning) "
+                "WITH ib, count(warning) AS locations, coalesce(sum(warning.count), 0) AS occurrences "
+                "RETURN ib.arch AS arch, coalesce(ib.is_relval_default, false) AS is_default, "
+                "locations, occurrences ORDER BY arch",
+                tag=tag,
+            )]
+    finally:
+        driver.close()
+    if not rows:
+        return f"No imported IB record was found for `{tag}`."
+
+    requested_arch = _requested_ib_arch(question)
+    if requested_arch:
+        rows = [row for row in rows if row["arch"] == requested_arch]
+        if not rows:
+            return f"That architecture is not available for `{tag}`."
+    elif not re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE):
+        default_rows = [row for row in rows if row["is_default"]]
+        if default_rows:
+            rows = default_rows
+
+    lines = [
+        f"Parsed Clang warning data for `{tag}`:",
+        "",
+        "| Architecture | Distinct warning locations | Warning occurrences |",
+        "| --- | ---: | ---: |",
+    ]
+    lines.extend(
+        f"| `{row['arch']}` | {row['locations']:,} | {row['occurrences']:,} |"
+        for row in rows
+    )
+    lines.append("These are parsed Clang diagnostics, not CMS build-status compilation-warning counts.")
+    return "\n".join(lines)
+
+
 def _pending_ib_comparison(question: str) -> dict[str, object] | None:
     """Capture a two-build comparison that still needs an architecture."""
     tags = list(dict.fromkeys(IB_TAG_RE.findall(question)))
@@ -3232,6 +3463,23 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         )
         return (answer, []) if answer else None
     if capability == "relval":
+        # A follow-up naming no IB at all ("give the workflows that are
+        # failing", "workflow names") still carries the "relval" category, so
+        # the planner routes it here -- but every relval-* helper below only
+        # ever looks for a tag in the current question text. Without this,
+        # the tag established by an earlier turn in this same session
+        # (_latest_ib_contexts, set whenever any question mentions one
+        # explicitly) is invisible here even though _unittest_summary_answer
+        # and _ib_results_summary_answer already thread the equivalent
+        # fallback through explicitly for their own capabilities.
+        scoped_question = question
+        if not IB_TAG_RE.search(question):
+            context_tag = _latest_ib_contexts.get(session_id)
+            if context_tag:
+                context_arch = _latest_ib_arch_contexts.get(session_id)
+                scoped_question = f"{question} {context_tag}"
+                if context_arch:
+                    scoped_question = f"{scoped_question} {context_arch}"
         # Mirror the legacy waterfall's context bookkeeping (below, in chat()):
         # a natural non-keyword follow-up like "why are they failing" has no
         # "relval" category of its own, so RequestPlanner can't route it here
@@ -3239,31 +3487,67 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         # which needs _failed_relval_contexts[session_id] already populated
         # from this question to answer it. Without this, that follow-up would
         # have no session memory of what "they" refers to.
-        relval_context = _failing_relval_context(question)
+        relval_context = _failing_relval_context(scoped_question)
         if relval_context:
             _failed_relval_contexts[session_id] = relval_context
         # Exception lookups are tried first and specifically: a generic RelVal
         # question ("relval results for <tag>") should fall through to the
         # summary below, but "relval exception for <tag>/<workflow>" must not
         # be swallowed by that summary before reaching the exception answer.
-        exception_context = _relval_exception_context(question)
+        exception_context = _relval_exception_context(scoped_question)
         if exception_context:
             _relval_exception_contexts[session_id] = exception_context
         exception_scope = _relval_exception_contexts.get(session_id) or _failed_relval_contexts.get(session_id)
+        # "report/present/run" + explicit workflow ID, and PR evidence for the
+        # active failing-RelVal context, both need their own return-shape
+        # handling (a bare string, and a (text, prs) tuple respectively) so
+        # they can't join the single short-circuiting `or` chain below.
+        workflow_reported_answer = _workflow_reported_answer(scoped_question)
+        if workflow_reported_answer:
+            return (workflow_reported_answer, [])
+        relval_pr_result = _failed_relval_pr_answer(scoped_question, _failed_relval_contexts.get(session_id))
+        if relval_pr_result:
+            pr_answer, prs = relval_pr_result
+            _pr_contexts[session_id] = prs
+            return (pr_answer, [])
         # Sequential, short-circuiting: `for x in (a(), b(), ...)` builds the whole
         # tuple eagerly and runs every function regardless of an earlier match —
         # several of these run real graph queries, so that would mean up to 6
         # queries per relval question even when the first one already answered.
+        # _relval_ib_summary_answer is the generic tag+keyword catch-all and
+        # must stay last, or it would swallow a specific request (like listing
+        # the failing workflows themselves) with a plain count summary before
+        # the more specific answer below ever runs.
         answer = (
-            _relval_exception_list_answer(question, exception_scope)
-            or _relval_exception_answer(question, exception_scope)
-            or _recurring_failure_answer(question, session_id)
-            or _relval_failure_count_answer(question, session_id)
-            or _relval_data_availability_answer(question, session_id)
-            or _relval_error_count_answer(question, session_id)
-            or _relval_ib_summary_answer(question, session_id)
+            _relval_exception_list_answer(scoped_question, exception_scope)
+            or _relval_exception_answer(scoped_question, exception_scope)
+            or _recurring_failure_answer(scoped_question, session_id)
+            or _relval_failure_count_answer(scoped_question, session_id)
+            or _relval_data_availability_answer(scoped_question, session_id)
+            or _relval_error_count_answer(scoped_question, session_id)
+            or _failed_relval_list_answer(scoped_question, _failed_relval_contexts.get(session_id))
+            or _relval_ib_summary_answer(scoped_question, session_id)
         )
-        return (answer, []) if answer else None
+        if answer:
+            return (answer, [])
+        # Last resort: "relval" outranks "pr_evidence" in RequestPlanner's
+        # static priority whenever a question mentions both a workflow and
+        # PR/Issue evidence (e.g. "any PR/Issue open for Workflow <id>?"),
+        # even with no IB tag and no relval-failure-specific phrasing at all
+        # -- give PR/Issue evidence a chance before giving up, instead of
+        # hard-failing under the "relval" label for a question that was
+        # never really about RelVal pass/fail counts. _workflow_artifact_answer
+        # (an exact-workflow-ID text/provenance search) is more targeted than
+        # the generic term-search combo below, so it's tried first.
+        workflow_artifact_answer = _workflow_artifact_answer(scoped_question)
+        if workflow_artifact_answer:
+            return (workflow_artifact_answer, [])
+        result = _pr_and_issue_evidence_answer(scoped_question, session_id)
+        if result:
+            pr_answer, prs = result
+            _pr_contexts[session_id] = prs
+            return (pr_answer, [])
+        return None
     if capability == "unittest":
         answer = _unittest_summary_answer(question, _latest_ib_contexts.get(session_id), session_id)
         return (answer, []) if answer else None
@@ -3272,11 +3556,12 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
             _clang_warning_comparison_answer(question)
             or _build_summary_answer(question)
             or _latest_clang_warning_answer(question)
+            or _clang_warning_answer(question, _latest_ib_contexts.get(session_id))
         )
         return (answer, []) if answer else None
     if capability == "build":
         answer = (
-            _build_warning_answer(question)
+            _build_warning_answer(question, _latest_ib_contexts.get(session_id))
             or _build_summary_answer(question)
             or _warning_count_answer(question)
         )
@@ -3296,11 +3581,59 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
             answer, prs = result
             _pr_contexts[session_id] = prs
             return answer, []
-        result = _pr_evidence_answer(question, _last_workflow_contexts.get(session_id))
+        # An explicit `#N` in this question refreshes the session's "last
+        # discussed Issue" memory -- lets a later bare follow-up ("what is
+        # the title", "who created it") resolve without repeating the
+        # number, the same pronoun-resolution pattern _latest_ib_contexts
+        # already provides for IB tags.
+        explicit_issue_number = _resolve_issue_number(question, None)
+        if explicit_issue_number is not None:
+            _last_issue_contexts[session_id] = explicit_issue_number
+        context_number = _last_issue_contexts.get(session_id)
+        # Same coverage-gap class as the PR/open-issue combining fix above:
+        # _issue_author_answer existed only in the legacy waterfall, so a
+        # "who created issue #X" question -- which the planner correctly
+        # routes to "pr_evidence" via its "issue" category -- hard-failed
+        # with the flat no-evidence message instead of ever reaching it.
+        issue_author_answer = _issue_author_answer(question, context_number)
+        if issue_author_answer:
+            return issue_author_answer, []
+        # _issue_detail_answer closes a "no handler exists at all" gap (see
+        # CLAUDE.md's "Capability-handler coverage" section): nothing ever
+        # answered "what is the title of issue #X", only who opened it.
+        issue_detail_answer = _issue_detail_answer(question, context_number)
+        if issue_detail_answer:
+            return issue_detail_answer, []
+        latest_issue_answer = _latest_issue_answer(question)
+        if latest_issue_answer:
+            return latest_issue_answer, []
+        # The next two existed only in the legacy waterfall, unreachable once
+        # the planner routed here deterministically -- same coverage-gap
+        # class as everything above. Ordered before the generic term-search
+        # combo since both are more specific (an exact workflow-ID text/
+        # provenance hit, or a pasted batch of workflow names).
+        batch_workflow_pr_answer = _batch_workflow_pr_answer(question)
+        if batch_workflow_pr_answer:
+            return batch_workflow_pr_answer, []
+        workflow_artifact_answer = _workflow_artifact_answer(question)
+        if workflow_artifact_answer:
+            return workflow_artifact_answer, []
+        result = _pr_and_issue_evidence_answer(question, session_id)
         if result:
             answer, prs = result
             _pr_contexts[session_id] = prs
             return answer, []
+        # _release_artifact_answer and _artifact_search_answer are tried last
+        # (also legacy-waterfall-only until now): both are broader/less
+        # precise than the combo above (fulltext + fallback CONTAINS search,
+        # vs. the combo's targeted term extraction), so they only get a turn
+        # once the more specific paths have already found nothing.
+        release_artifact_answer = _release_artifact_answer(question)
+        if release_artifact_answer:
+            return release_artifact_answer, []
+        artifact_search_answer = _artifact_search_answer(question)
+        if artifact_search_answer:
+            return artifact_search_answer, []
         # "is this a known issue" contains the word "issue", routing here even
         # though it's really a recurrence question, not a GitHub Issue lookup —
         # try it once PR/Issue evidence itself found nothing.
@@ -3475,7 +3808,7 @@ def chat(req: ChatRequest):
     ib_comparison_answer = _ib_comparison_answer(question)
     if ib_comparison_answer:
         return _chat_response(sid, original_question, ib_comparison_answer, "deterministic")
-    build_warning_answer = _build_warning_answer(question)
+    build_warning_answer = _build_warning_answer(question, _latest_ib_contexts.get(sid))
     if build_warning_answer:
         return _chat_response(sid, original_question, build_warning_answer, "deterministic")
     build_summary_answer = _build_summary_answer(question)
@@ -3487,6 +3820,9 @@ def chat(req: ChatRequest):
     latest_clang_warning_answer = _latest_clang_warning_answer(question)
     if latest_clang_warning_answer:
         return _chat_response(sid, original_question, latest_clang_warning_answer, "deterministic")
+    clang_warning_answer = _clang_warning_answer(question, _latest_ib_contexts.get(sid))
+    if clang_warning_answer:
+        return _chat_response(sid, original_question, clang_warning_answer, "deterministic")
     latest_ib_answer = _latest_ib_answer(question)
     if latest_ib_answer:
         return _chat_response(sid, original_question, latest_ib_answer, "deterministic")
@@ -3524,9 +3860,25 @@ def chat(req: ChatRequest):
     artifact_search_answer = _artifact_search_answer(question)
     if artifact_search_answer:
         return _chat_response(sid, original_question, artifact_search_answer, "deterministic")
-    issue_author_answer = _issue_author_answer(question)
+    explicit_issue_number = _resolve_issue_number(question, None)
+    if explicit_issue_number is not None:
+        _last_issue_contexts[sid] = explicit_issue_number
+    issue_context_number = _last_issue_contexts.get(sid)
+    issue_author_answer = _issue_author_answer(question, issue_context_number)
     if issue_author_answer:
         return _chat_response(sid, original_question, issue_author_answer, "deterministic")
+    # A bare pronoun follow-up ("what is the title", "do you have info about
+    # it") has no "issue"/"pr" word of its own, so RequestPlanner can't
+    # classify it into any capability at all -- it lands here in the legacy
+    # chain by default, which is exactly where issue_context_number
+    # (refreshed above whenever a `#N` is named) lets it resolve to whatever
+    # Issue was last discussed instead of dead-ending.
+    issue_detail_answer = _issue_detail_answer(question, issue_context_number)
+    if issue_detail_answer:
+        return _chat_response(sid, original_question, issue_detail_answer, "deterministic")
+    latest_issue_answer = _latest_issue_answer(question)
+    if latest_issue_answer:
+        return _chat_response(sid, original_question, latest_issue_answer, "deterministic")
     batch_workflow_pr_answer = _batch_workflow_pr_answer(question)
     if batch_workflow_pr_answer:
         return _chat_response(sid, original_question, batch_workflow_pr_answer, "deterministic")
