@@ -619,7 +619,27 @@ def _is_relval_failure_count_question(question: str) -> bool:
     )
 
 
-def _relval_scope_summary(records: list[dict], heading: str) -> str:
+def _relval_sub_ib_variant_names(tag: str) -> list[str]:
+    """Distinct sub-IB variant names (ASAN, UBSAN, ROOT6, ...) imported for
+    a primary tag -- used only to mention their existence alongside a
+    primary-tag summary, never to merge their RelVal counts into it. Per
+    CLAUDE.md's "IB (tag, architecture) pairs are never merged" invariant: a
+    sanitizer build's failure profile isn't comparable to the primary
+    build's (e.g. UBSAN/ROOT6 routinely differ from DEFAULT by 10-1000x)."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = session.run(
+                "MATCH (ib:IB {parent_tag:$tag}) WHERE ib.variant IS NOT NULL "
+                "RETURN DISTINCT ib.variant AS variant ORDER BY variant",
+                tag=tag,
+            )
+            return [row["variant"] for row in rows]
+    finally:
+        driver.close()
+
+
+def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: list[str] | None = None) -> str:
     """Format a complete RelVal count without merging architecture-specific facts."""
     total = sum(record["relval_total"] or 0 for record in records)
     failed = sum(record["failed_relvals"] or 0 for record in records)
@@ -636,6 +656,14 @@ def _relval_scope_summary(records: list[dict], heading: str) -> str:
         f"{record['passed_relvals'] or 0:,} | {record['relval_total'] or 0:,} |"
         for record in records
     )
+    if sub_ib_variants:
+        lines.append("")
+        lines.append(
+            f"`{records[0]['tag']}` also has {len(sub_ib_variants)} sub-IB variant(s) not included above "
+            "(each is a separate build with its own results, not merged into these numbers): "
+            + ", ".join(f"`{variant}`" for variant in sub_ib_variants)
+            + ". Ask about a specific variant by name (e.g. its full IB tag) for its own results."
+        )
     return "\n".join(lines)
 
 
@@ -668,20 +696,25 @@ def _relval_arch_choice_answer(tag: str, records: list[dict]) -> str:
 
 
 def _relval_scope_or_choice(session_id: str, tag: str, records: list[dict], all_requested: bool) -> list[dict] | str:
-    """Filter to is_relval_default architectures; if more than one remains
-    and the user didn't say "all", register a pending choice -- resumed by
-    _relval_failure_count_answer, which always runs first in every dispatch
-    path, regardless of which caller created the pending state -- and return
-    the prompt instead of resolved records. Shared by every relval
-    summary-style answer so architecture ambiguity is never silently
+    """Ask only when it's genuinely ambiguous which architecture represents
+    "the" build -- more than one architecture flagged is_relval_default at
+    once (a real incident: a production IB had 4 simultaneously, which used
+    to be silently summed as if they were one build; see
+    _unittest_summary_answer for the same rule applied there). Otherwise
+    return every imported architecture directly. Deliberately does NOT
+    narrow to a single is_relval_default architecture and silently drop the
+    rest -- found live: a primary tag's only is_relval_default architecture
+    had 51/951 RelVal failures while two other, non-default architectures
+    had 1/951 each and were never shown or mentioned at all. Shared by every
+    relval summary-style answer so architecture ambiguity is never silently
     resolved differently in different places."""
-    default_records = [record for record in records if record.get("is_relval_default")]
-    if default_records and not all_requested:
-        records = default_records
-    if len(records) == 1:
+    if all_requested:
         return records
-    _pending_relval_scopes[session_id] = {"root_tag": tag, "stage": "arch", "records": records}
-    return _relval_arch_choice_answer(tag, records)
+    default_records = [record for record in records if record.get("is_relval_default")]
+    if len(default_records) > 1:
+        _pending_relval_scopes[session_id] = {"root_tag": tag, "stage": "arch", "records": default_records}
+        return _relval_arch_choice_answer(tag, default_records)
+    return records
 
 
 def _relval_failure_count_answer(question: str, session_id: str) -> str | None:
@@ -735,7 +768,7 @@ def _relval_failure_count_answer(question: str, session_id: str) -> str | None:
     resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
     if isinstance(resolved, str):
         return resolved
-    return _relval_scope_summary(resolved, f"RelVal results for `{tag}`")
+    return _relval_scope_summary(resolved, f"RelVal results for `{tag}`", _relval_sub_ib_variant_names(tag))
 
 
 def _relval_data_availability_answer(question: str, session_id: str) -> str | None:
@@ -754,7 +787,7 @@ def _relval_data_availability_answer(question: str, session_id: str) -> str | No
     resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
     if isinstance(resolved, str):
         return resolved
-    return _relval_scope_summary(resolved, f"Imported RelVal data for `{tag}`")
+    return _relval_scope_summary(resolved, f"Imported RelVal data for `{tag}`", _relval_sub_ib_variant_names(tag))
 
 
 def _relval_ib_summary_answer(question: str, session_id: str) -> str | None:
@@ -775,7 +808,7 @@ def _relval_ib_summary_answer(question: str, session_id: str) -> str | None:
     resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
     if isinstance(resolved, str):
         return resolved
-    return _relval_scope_summary(resolved, f"Imported RelVal results for `{tag}`")
+    return _relval_scope_summary(resolved, f"Imported RelVal results for `{tag}`", _relval_sub_ib_variant_names(tag))
 
 
 def _unittest_scope_records(tag: str) -> list[dict]:
