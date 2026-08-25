@@ -2279,7 +2279,14 @@ def _workflow_reported_answer(question: str) -> str | None:
 
 def _failed_relval_list_answer(question: str, context: dict[str, str] | None) -> str | None:
     """List failures from the last queried RelVal IB instead of delegating to the LLM."""
-    if not context or not re.search(r"\b(?:list|show|give)\b", question, re.IGNORECASE):
+    # "what workflows/relvals are failing" is asking for the same thing as
+    # "list/show/give the failing workflows" -- found live: without this,
+    # it fell through to the generic pass/fail-count summary instead of the
+    # actual list of failing workflow names, even though the intent was
+    # unambiguous ("what X are failing" is a request for X, not a count).
+    if not context or not re.search(
+        r"\b(?:list|show|give)\b|\bwhat\b.*\bfailing\b", question, re.IGNORECASE
+    ):
         return None
     if not re.search(r"\b(?:errors?|fail(?:ing|ures?)?|relvals?)\b", question, re.IGNORECASE):
         return None
