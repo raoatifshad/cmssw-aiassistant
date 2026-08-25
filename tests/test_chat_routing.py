@@ -443,6 +443,31 @@ class ChatRoutingTests(unittest.TestCase):
 
     @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_failing_relvals")
+    def test_relval_capability_lists_failing_workflows_for_what_are_failing_phrasing(
+        self, get_failing_relvals, get_exit_code_names
+    ):
+        # Regression: found live -- "what workflows are failing in
+        # <tag>" gave the generic pass/fail-count summary table instead of
+        # the actual list of failing workflow names. _failed_relval_list_answer
+        # only recognized an imperative "list/show/give", not "what X are
+        # failing" -- the same request, phrased as a question instead of a
+        # command.
+        tag = "CMSSW_20_1_X_2026-08-24-2300"
+        get_failing_relvals.return_value = [
+            {"ib_tag": tag, "name": "140.0", "workflow_id": "140.0", "errors": 2, "exitcode": 1},
+        ]
+
+        result = _execute_planned_capability(
+            "relval", f"what workflows are failing in the {tag}", "relval-what-are-failing"
+        )
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("140.0", answer)
+        self.assertIn("failing RelVals for", answer)  # the list heading, not the count-table heading
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_relvals")
     def test_relval_capability_lists_failing_workflows_with_explicit_tag(
         self, get_failing_relvals, get_exit_code_names
     ):
