@@ -8,6 +8,10 @@ from server.api_server import (
     _pending_ib_comparisons,
     _latest_ib_answer,
     _issue_author_answer,
+    _issue_detail_answer,
+    _resolve_issue_number,
+    _latest_issue_answer,
+    _last_issue_contexts,
     _open_issue_answer,
     _artifact_search_answer,
     _build_warning_answer,
@@ -34,7 +38,9 @@ from server.api_server import (
     _requested_ib_arch,
     _execute_planned_capability,
     _failing_relval_context,
+    _failed_relval_contexts,
     _fallback_clarification,
+    _latest_ib_contexts,
     _request_planner,
     chat,
     record_feedback,
@@ -169,6 +175,27 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(
             _pr_search_terms(question),
             ["CMSSW_20_1_X_2026-08-04-2300", "36834.0"],
+        )
+
+    def test_search_terms_reject_stop_word_package_paths(self):
+        # Regression: found live -- "...any PR/Issue created for this?" was
+        # searched as the literal term `PR/Issue`, returning an unrelated PR
+        # (#29067) instead of the actual workflow ID in the question. The
+        # package-path regex (meant for "RecoTracker/TrackProducer") had no
+        # stop-word filtering, so any "word/word"-shaped phrase matched.
+        # "Workflow" alone must also not survive as a pseudo-identifier --
+        # it's a generic domain word, not a specific one, the same class of
+        # gap _RELVAL_KEYWORD_RE already treats as a synonym everywhere else.
+        question = "why it didnt answer. is this reported Workflow 2025.0010001?? and s there any PR/Issue created for this ?"
+
+        self.assertEqual(_pr_search_terms(question), ["2025.0010001"])
+
+    def test_search_terms_keep_genuine_package_paths(self):
+        # The stop-word filter must not reject a real CMSSW package path just
+        # because it has the same "word/word" shape as "PR/Issue".
+        self.assertEqual(
+            _pr_search_terms("RecoTracker/TrackProducer warnings"),
+            ["RecoTracker/TrackProducer"],
         )
 
     @patch("server.api_server.find_prs_for_error")
@@ -379,6 +406,253 @@ class ChatRoutingTests(unittest.TestCase):
                 "what relval exceptions does CMSSW_20_1_CLANG_X_2026-08-16-2300 have", context
             )
         )
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_relvals")
+    def test_relval_capability_lists_failing_workflows_without_repeating_tag(
+        self, get_failing_relvals, get_exit_code_names
+    ):
+        # Regression: a real session asked "how many relvals are failing in
+        # <tag>" (which sets _latest_ib_contexts[sid]), then followed up with
+        # "can you give the workflow that are failing" -- no tag repeated.
+        # This used to hard-fail with "No imported local evidence is
+        # available for the selected `relval` request" because (a) none of
+        # the relval-* helpers consulted the session's last-mentioned tag,
+        # and (b) even a same-turn explicit-tag phrasing of the same request
+        # never reached _failed_relval_list_answer, since that function
+        # wasn't in the planner's "relval" capability chain at all.
+        session_id = "relval-followup-no-tag"
+        tag = "CMSSW_20_1_ASAN_X_2026-08-24-2300"
+        get_failing_relvals.return_value = [
+            {"ib_tag": tag, "name": "136.899", "workflow_id": "136.899", "errors": 3, "exitcode": 1},
+        ]
+        try:
+            _latest_ib_contexts[session_id] = tag
+            result = _execute_planned_capability(
+                "relval", "can you give the workflow that are failing", session_id
+            )
+        finally:
+            _latest_ib_contexts.pop(session_id, None)
+            _failed_relval_contexts.pop(session_id, None)
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("136.899", answer)
+        get_failing_relvals.assert_called_once_with(tag, arch=None, limit=100)
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_relvals")
+    def test_relval_capability_lists_failing_workflows_with_explicit_tag(
+        self, get_failing_relvals, get_exit_code_names
+    ):
+        # Same gap as above, but for a single-turn question that already
+        # names the tag -- the generic _relval_ib_summary_answer catch-all
+        # used to answer first with a bare pass/fail count table instead of
+        # ever reaching the actual workflow list.
+        session_id = "relval-explicit-tag-list"
+        tag = "CMSSW_20_1_ASAN_X_2026-08-24-2300"
+        get_failing_relvals.return_value = [
+            {"ib_tag": tag, "name": "136.899", "workflow_id": "136.899", "errors": 3, "exitcode": 1},
+        ]
+        try:
+            result = _execute_planned_capability(
+                "relval", f"can you give the workflow that are failing in relvals {tag}", session_id
+            )
+        finally:
+            _failed_relval_contexts.pop(session_id, None)
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("136.899", answer)
+        self.assertNotIn("across", answer)  # not the generic scope-summary heading
+
+    @patch("server.api_server._workflow_artifact_answer", return_value=None)
+    @patch("server.api_server.get_driver")
+    @patch("server.api_server.find_prs_for_error")
+    def test_relval_capability_falls_back_to_pr_and_issue_evidence(
+        self, find_prs_for_error, get_driver, workflow_artifact_answer
+    ):
+        # Regression: found live -- "any PR/Issue open for Workflow
+        # 2025.0010001?" hard-failed with "No imported local evidence is
+        # available for the selected `relval` request". RequestPlanner routes
+        # this to "relval" (not "pr_evidence") because "Workflow" triggers
+        # the relval category, which statically outranks pr_evidence -- but
+        # there's no IB tag and no relval-failure-specific phrasing, so every
+        # relval-specific helper returns None. The question was never really
+        # about RelVal pass/fail counts; _pr_and_issue_evidence_answer is now
+        # tried as a last resort before giving up under the "relval" label.
+        # (_workflow_artifact_answer, the more specific exact-text search
+        # tried just before this fallback, is stubbed out here so this test
+        # isolates the generic-term-search fallback specifically; see
+        # test_relval_capability_finds_exact_workflow_text_match below for
+        # that more specific path.)
+        find_prs_for_error.return_value = [{
+            "repo": "cmssw", "pr_number": 51000, "title": "Fix workflow 2025.0010001 step2",
+            "merged_at": "2026-08-01T00:00:00Z", "evidence": ["pr_title"],
+            "matched_files": [], "matched_unit_tests": [], "matched_unit_test_packages": [],
+            "matched_unit_test_ibs": [], "matched_warnings": None, "matched_occurrences": None,
+        }]
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = []
+
+        result = _execute_planned_capability(
+            "relval", "any PR/Issue open for Workflow 2025.0010001?", "relval-pr-issue-fallback"
+        )
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("51000", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_relval_capability_finds_exact_workflow_text_match(self, get_driver):
+        # Sweep finding: _workflow_artifact_answer (exact workflow-ID text
+        # match in imported PR/Issue title/body/comments, with a
+        # commit-provenance fallback) existed only in the legacy waterfall,
+        # unreachable once the planner routed to "relval" or "pr_evidence"
+        # deterministically -- same coverage-gap class as everything above,
+        # found by auditing every _*_answer() function against
+        # _execute_planned_capability's branches instead of one query at a
+        # time. It's more specific than the generic term-search fallback
+        # (_pr_and_issue_evidence_answer), so it's tried first.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{
+            "kind": "Issue", "number": 51640,
+            "title": "Workflow 2025.0010001 step2 produces different sized files for different runs",
+            "state": "open", "merged_at": None, "matched_field": "title",
+        }]
+
+        result = _execute_planned_capability(
+            "relval", "any PR/Issue open for Workflow 2025.0010001?", "relval-workflow-artifact"
+        )
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("51640", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_unittest_capability_uses_session_ib_context_when_tag_omitted(self, get_driver):
+        # Regression guard: unlike "relval" (fixed above), the "unittest"
+        # capability already threads _latest_ib_contexts.get(session_id) as a
+        # fallback tag (_unittest_summary_answer's `context_tag` parameter).
+        # Pins that behavior so a future refactor can't silently drop it.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"arch": "el9_amd64_gcc14", "is_default": True, "total": 10, "failed": 1, "passed": 9, "errors": 2},
+        ]
+        session_id = "unittest-followup-no-tag"
+        tag = "CMSSW_20_1_ASAN_X_2026-08-24-2300"
+        try:
+            _latest_ib_contexts[session_id] = tag
+            result = _execute_planned_capability("unittest", "what about unit tests", session_id)
+        finally:
+            _latest_ib_contexts.pop(session_id, None)
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn(tag, answer)
+
+    @patch("server.api_server.get_driver")
+    def test_clang_capability_uses_session_ib_context_when_tag_omitted(self, get_driver):
+        # Regression: fixed alongside the "relval" bug above. A tag-less
+        # clang follow-up ("show me the clang warnings again") used to
+        # dead-end even with a tag already established this session, because
+        # none of the "clang" capability's handlers accepted a fallback tag.
+        # _clang_warning_answer (added for the no-handler-at-all gap below)
+        # now takes context_tag the same way _unittest_summary_answer does.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"arch": "el9_amd64_gcc14", "is_default": True, "locations": 3, "occurrences": 7},
+        ]
+        session_id = "clang-followup-no-tag"
+        tag = "CMSSW_20_1_ASAN_X_2026-08-24-2300"
+        try:
+            _latest_ib_contexts[session_id] = tag
+            result = _execute_planned_capability("clang", "show me the clang warnings again", session_id)
+        finally:
+            _latest_ib_contexts.pop(session_id, None)
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn(tag, answer)
+
+    @patch("server.api_server.get_driver")
+    def test_clang_warning_answer_handles_plain_tag_qualified_question(self, get_driver):
+        # Regression: found live against the real server, not by any mock --
+        # "clang warnings for <tag>" failed on its very first turn, tag and
+        # all, because the "clang" capability only ever had handlers for
+        # "latest" and two-tag comparisons, none for "warnings for this one
+        # named IB" (the same phrasing shape that already worked for
+        # build/relval/unit-test). _clang_warning_answer closes that gap.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"arch": "el9_amd64_gcc14", "is_default": True, "locations": 3, "occurrences": 7},
+        ]
+        tag = "CMSSW_20_1_X_2026-08-24-2300"
+
+        result = _execute_planned_capability("clang", f"clang warnings for {tag}", "clang-plain-tag")
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn(tag, answer)
+        self.assertIn("7", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_build_capability_uses_session_ib_context_when_tag_omitted(self, get_driver):
+        # Regression: fixed alongside the "relval" bug above -- a tag-less
+        # follow-up that still names the "build" domain (_build_warning_answer
+        # requires that word, separately from the tag, to disambiguate from
+        # Clang warnings -- untouched by this fix) used to dead-end even with
+        # a tag already established this session, because the function only
+        # ever looked for a tag in the current question text.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"arch": "el9_amd64_gcc14", "status": "PASSED", "comp_warnings": 2, "ignored_warnings": 1, "is_default": True},
+        ]
+        session_id = "build-followup-no-tag"
+        tag = "CMSSW_20_1_ASAN_X_2026-08-24-2300"
+        try:
+            _latest_ib_contexts[session_id] = tag
+            result = _execute_planned_capability("build", "what about build warnings", session_id)
+        finally:
+            _latest_ib_contexts.pop(session_id, None)
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn(tag, answer)
+
+    @patch("server.api_server.get_driver")
+    @patch("server.api_server.find_prs_for_error")
+    def test_pr_evidence_capability_combines_pr_and_open_issue_evidence(self, find_prs_for_error, get_driver):
+        # Regression: found live -- "any information about ticl::AssociationMap
+        # any PR/issue open?" returned only PR evidence. The "pr_evidence"
+        # capability's chain was `_pr_number_answer or _pr_evidence_answer or
+        # _recurring_failure_answer`, so once _pr_evidence_answer matched,
+        # _open_issue_answer was never even called -- open Issues mentioning
+        # the same term (confirmed in the live graph: #42737, #37821, #34000
+        # all mention AssociationMap and are open) were silently dropped, not
+        # absent. Same "capability matched, one handler swallowed the rest"
+        # bug class as the relval/clang/build fixes.
+        find_prs_for_error.return_value = [{
+            "repo": "cmssw", "pr_number": 51649,
+            "title": "Rename SimDataformats TICL associator as TICLAssociationMap",
+            "merged_at": "2026-08-21T07:33:48+00:00", "evidence": ["pr_title"],
+            "matched_files": [], "matched_unit_tests": [], "matched_unit_test_packages": [],
+            "matched_unit_test_ibs": [], "matched_warnings": None, "matched_occurrences": None,
+        }]
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"number": 42737, "title": "edm::RefToBase is deprecated", "state": "open",
+             "matched_terms": ["AssociationMap"]},
+        ]
+
+        result = _execute_planned_capability(
+            "pr_evidence", "any information about ticl::AssociationMap any PR/issue open?", "pr-issue-combo"
+        )
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("51649", answer)
+        self.assertIn("42737", answer)
 
     def test_workflow_exception_search_requires_ib_context(self):
         self.assertEqual(
@@ -930,6 +1204,253 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(answer, "**Issue #51354** was opened by **cms-bot**.")
         self.assertEqual(session.run.call_args.kwargs["number"], 51354)
         get_driver.return_value.close.assert_called_once()
+
+    def test_issue_author_recognizes_auxiliary_verb_phrasing(self):
+        # Regression: a real question, "who has created the issue #51756",
+        # didn't match the old trigger regex `who\s+(?:opened|created|...)`
+        # because of the auxiliary "has" between "who" and "created" -- not
+        # a data gap (the issue in question genuinely isn't imported), but a
+        # phrasing gap that made even an imported issue's author unreachable
+        # this way. _issue_author_answer's own driver-backed "not present"
+        # path is covered by test_named_issue_author_is_deterministic; this
+        # only pins the trigger regex, so no Neo4j mock is needed here --
+        # returning non-None at all proves the regex matched.
+        self.assertIsNotNone(_issue_author_answer("who has created the issue #51756?"))
+
+    @patch("server.api_server.get_driver")
+    def test_pr_evidence_capability_answers_issue_author_questions(self, get_driver):
+        # Regression: same coverage-gap class as
+        # test_pr_evidence_capability_combines_pr_and_open_issue_evidence --
+        # _issue_author_answer lived only in the legacy waterfall, so once
+        # the planner routed "who has created the issue #51756" to the
+        # "pr_evidence" capability (matches on the "issue" category), it
+        # hard-failed with "No imported local evidence is available for the
+        # selected `pr_evidence` request" -- the real bug this reproduces,
+        # not the issue's genuine absence from the imported graph.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = None
+
+        result = _execute_planned_capability(
+            "pr_evidence", "who has created the issue #51756?", "issue-author-combo"
+        )
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertEqual(answer, "Issue #51756 is not present in the imported CMSSW graph.")
+
+    @patch("server.api_server.get_driver")
+    def test_issue_detail_answer_reports_title_and_state(self, get_driver):
+        # Regression: no function anywhere answered "what is the title of
+        # issue #X" or "do you have info about issue #X" -- only who opened
+        # it existed (_issue_author_answer). Same "no handler exists at all"
+        # gap class as _latest_issue_answer.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "title": "Workflow 2025.0010001 step2 produces different sized files for different runs",
+            "state": "open", "created_at": "2026-08-19T00:00:00Z",
+        }
+
+        answer = _issue_detail_answer("what is the title of issue #51640?")
+
+        self.assertIn("#51640", answer)
+        self.assertIn("Workflow 2025.0010001", answer)
+
+    def test_issue_number_recognizes_github_issues_url(self):
+        # A pasted GitHub Issues URL is unambiguous -- no need to fall back
+        # to the PR/Issue-ambiguous bare-number heuristic for this shape.
+        self.assertEqual(
+            _resolve_issue_number("you have no info about https://github.com/cms-sw/cmssw/issues/51640", None),
+            51640,
+        )
+
+    @patch("server.api_server.get_driver")
+    def test_issue_detail_answer_resolves_bare_number_to_issue(self, get_driver):
+        # Regression: found live -- "what is the title of 51640" (no "#", no
+        # "issue" word) fell all the way through to the generic "I couldn't
+        # match that" fallback even though Issue #51640 is imported. The
+        # "#"-only extraction regex simply never fired.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "title": "Workflow 2025.0010001 step2 produces different sized files for different runs",
+            "state": "open", "created_at": "2026-08-19T00:00:00Z",
+        }
+
+        answer = _issue_detail_answer("what is the title of 51640")
+
+        self.assertIn("#51640", answer)
+        self.assertIn("Workflow 2025.0010001", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_issue_detail_answer_bare_number_falls_back_to_pr(self, get_driver):
+        # A bare number is ambiguous between a PR and an Issue -- when no
+        # Issue with that number exists, check the PR table before giving up.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.side_effect = [
+            None,  # no matching Issue
+            {"repo": "cmssw", "title": "Fix workflow 2025.0010001 step2", "merged_at": "2026-08-01T00:00:00Z"},
+        ]
+
+        answer = _issue_detail_answer("what is the title of 51397")
+
+        self.assertIn("cmssw PR #51397", answer)
+        self.assertIn("Fix workflow 2025.0010001", answer)
+
+    def test_issue_detail_answer_ignores_workflow_id_segments(self):
+        # "136.899" is a workflow ID, not an Issue/PR number -- neither "136"
+        # nor "899" (its dot-separated segments) may be misread as a bare
+        # artifact number, or a routine workflow question would misfire this
+        # handler and query for a nonexistent Issue/PR #136 or #899.
+        self.assertIsNone(_issue_detail_answer("tell me about workflow 136.899"))
+
+    @patch("server.api_server.get_driver")
+    def test_pr_evidence_capability_resolves_bare_followup_to_last_discussed_issue(self, get_driver):
+        # Regression: found live. A real conversation named an explicit
+        # issue ("who created the issue #51640" -> answered correctly), then
+        # asked a bare follow-up with no number and no "issue"/"pr" word at
+        # all ("what is the title") -- RequestPlanner can't even classify
+        # that into a capability (empty categories), so it fell all the way
+        # through to the generic "I couldn't match that" fallback instead of
+        # resolving to Issue #51640 via session memory the way IB-tag
+        # follow-ups already do via _latest_ib_contexts. _last_issue_contexts
+        # now provides the same pronoun resolution for Issues.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {"title": "opened-by-name", "author": "Dr15Jones"}
+        session_id = "issue-followup-no-number"
+        try:
+            first = _execute_planned_capability(
+                "pr_evidence", "who created the issue #51640", session_id
+            )
+            self.assertIsNotNone(first)
+
+            session.run.return_value.single.return_value = {
+                "title": "Workflow 2025.0010001 step2 produces different sized files for different runs",
+                "state": "open", "created_at": "2026-08-19T00:00:00Z",
+            }
+            second = _execute_planned_capability("pr_evidence", "what is the title", session_id)
+        finally:
+            _last_issue_contexts.pop(session_id, None)
+
+        # Note: "what is the title" alone has no "issue"/"pr" word, so in the
+        # real chat() flow RequestPlanner can't classify it into any
+        # capability at all -- it's the legacy-waterfall wiring (not this
+        # capability branch) that actually reaches _issue_detail_answer for
+        # that exact phrasing. This test isolates the handler + session
+        # memory logic itself, which both paths share.
+        self.assertIsNotNone(second)
+        answer, _ = second
+        self.assertIn("#51640", answer)
+        self.assertIn("Workflow 2025.0010001", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_bare_title_followup_resolves_via_chat_legacy_waterfall(self, get_driver):
+        # End-to-end reproduction of the exact reported conversation: "who
+        # created the issue #51640" (answers correctly) followed by a bare
+        # "what is the title" with no number and no "issue"/"pr" word at
+        # all. RequestPlanner can't classify that second question into any
+        # capability (empty categories -> PlanKind.LLM), so it's the
+        # unconditional legacy-waterfall wiring in chat() -- not the
+        # "pr_evidence" capability branch -- that must reach
+        # _issue_detail_answer via _last_issue_contexts. Before this fix it
+        # fell through everything to "I couldn't match that to a specific
+        # local answer."
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session_id = "bare-title-followup-e2e"
+        try:
+            session.run.return_value.single.return_value = {"title": "n/a", "author": "Dr15Jones"}
+            first = chat(ChatRequest(question="who created the issue #51640", session_id=session_id))
+            self.assertIn("Dr15Jones", first.answer)
+
+            session.run.return_value.single.return_value = {
+                "title": "Workflow 2025.0010001 step2 produces different sized files for different runs",
+                "state": "open", "created_at": "2026-08-19T00:00:00Z",
+            }
+            second = chat(ChatRequest(question="what is the title", session_id=session_id))
+        finally:
+            _last_issue_contexts.pop(session_id, None)
+
+        self.assertIn("#51640", second.answer)
+        self.assertIn("Workflow 2025.0010001", second.answer)
+
+    @patch("server.api_server.get_driver")
+    def test_chat_handles_github_issues_url_without_crashing(self, get_driver):
+        # Regression: found live -- a question containing a GitHub Issues
+        # URL ("...cmssw/issues/51640") crashed with a 500 (TypeError:
+        # int() argument ... not 'NoneType'). _ISSUE_NUMBER_RE gained a
+        # second alternative/capture group for GitHub URLs, but two call
+        # sites in _execute_planned_capability and the legacy waterfall
+        # still read match.group(1) directly -- None whenever the URL
+        # alternative matched instead of the "#N" one. The URL's own
+        # "issues" segment satisfies RequestPlanner's "pr_evidence" category
+        # on its own, so this question routes deterministically straight
+        # into the code path that crashed.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "title": "Workflow 2025.0010001 step2 produces different sized files for different runs",
+            "state": "open", "created_at": "2026-08-19T00:00:00Z",
+        }
+
+        result = chat(ChatRequest(
+            question="you have no info about https://github.com/cms-sw/cmssw/issues/51640"
+        ))
+
+        self.assertIn("#51640", result.answer)
+
+    @patch("server.api_server.get_driver")
+    def test_latest_issue_answer_reports_newest_imported_issue(self, get_driver):
+        # Regression: "what is the latest issue available in the database?"
+        # hard-failed -- no function anywhere answered "latest Issue" at all
+        # (only a *named* Issue's author, or open-Issue text search existed).
+        # Same "no handler exists for this phrasing" gap as the clang fix.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "number": 51644, "title": "HGCAL digis are not reproducible across multithreaded runs",
+            "state": "open", "created_at": "2026-08-07T03:23:46Z",
+        }
+
+        answer = _latest_issue_answer("what is the latest issue available in the database?")
+
+        self.assertIn("#51644", answer)
+        self.assertIn("HGCAL digis", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_pr_evidence_capability_answers_latest_issue_questions(self, get_driver):
+        # Same coverage-gap class as the other "pr_evidence" capability
+        # fixes: confirms the planner's deterministic route actually reaches
+        # _latest_issue_answer instead of hard-failing before ever calling it.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "number": 51644, "title": "HGCAL digis are not reproducible across multithreaded runs",
+            "state": "open", "created_at": "2026-08-07T03:23:46Z",
+        }
+
+        result = _execute_planned_capability(
+            "pr_evidence", "what is the latest issue available in the database?", "latest-issue"
+        )
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("#51644", answer)
+
+    @patch("server.api_server.find_prs_for_error")
+    def test_pr_evidence_capability_answers_batch_workflow_questions(self, find_prs_for_error):
+        # Sweep finding: _batch_workflow_pr_answer (exact PR evidence for a
+        # pasted list of >=2 backtick-quoted failed workflow names) existed
+        # only in the legacy waterfall, unreachable once the planner routed
+        # to "pr_evidence" deterministically (it requires the word "pr",
+        # which is also exactly what triggers that category).
+        find_prs_for_error.side_effect = lambda workflow: (
+            [{"repo": "cmssw", "pr_number": 51000, "title": f"Fix {workflow}",
+              "evidence": ["pr_title"]}] if workflow == "140.051" else []
+        )
+
+        result = _execute_planned_capability(
+            "pr_evidence", "any PR fixing `140.051` or `150.2`?", "batch-workflow-pr"
+        )
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("140.051", answer)
+        self.assertIn("51000", answer)
 
     @patch("server.api_server.get_driver")
     def test_artifact_search_returns_fuzzy_merged_pr_match(self, get_driver):
