@@ -50,7 +50,7 @@ from server.api_server import (
     chat,
     record_feedback,
 )
-from server.request_planner import RequestContext
+from server.request_planner import Plan, PlanKind, RequestContext
 from server.agent import KGChatSession
 from graph.tools import TOOLS, get_failing_relvals, search_issues_by_text
 from ingestion.build_graph import ib_parent_tag
@@ -1726,6 +1726,72 @@ class ChatRoutingTests(unittest.TestCase):
         answer, _ = second
         self.assertIn("#51640", answer)
         self.assertIn("Workflow 2025.0010001", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_ib_relationship_answer_reachable_via_legacy_waterfall(self, get_driver):
+        # Sweep finding: _ib_relationship_answer existed only inside
+        # _execute_planned_capability, with no fallback in the legacy
+        # waterfall unlike every other major answer function. In practice
+        # its trigger is perfectly synced with "ib_relationship"'s own
+        # planner scoring condition (both use the identical why/parent/
+        # sub-ib/variant regex), so RequestPlanner realistically never fails
+        # to classify a question this function would answer -- this is pure
+        # defensive coverage against that sync drifting apart later (the
+        # same kind of drift behind several bugs found earlier this
+        # session), tested here by forcing PlanKind.LLM directly rather than
+        # via a real under-classified phrasing, since none exists today.
+        tag = "CMSSW_20_1_TF_X_2026-08-14-1100"
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "tag": tag, "parent_tag": "CMSSW_20_1_X_2026-08-14-1100", "variant": "TF",
+        }
+        question = f"why did {tag} show as a sub IB?"
+
+        with patch.object(
+            _request_planner, "plan",
+            return_value=Plan(PlanKind.LLM, confidence=0.0, context=RequestContext.extract(question)),
+        ):
+            result = chat(ChatRequest(question=question))
+
+        self.assertIn("sub-IB", result.answer)
+        self.assertIn(tag, result.answer)
+
+    @patch("server.api_server.get_driver")
+    def test_ib_results_summary_answer_reachable_via_legacy_waterfall(self, get_driver):
+        # Same gap as above for _ib_results_summary_answer -- placed last in
+        # the legacy chain (see the comment at its call site) since its
+        # trigger matches any bare tag mention alone, the same low-priority
+        # catch-all role "ib_summary" has in the planner (priority 50).
+        # Placing it earlier in an initial attempt at this fix let it shadow
+        # _merged_prs_for_build_answer for "how many merged in <tag>" --
+        # exactly the "capability matched, but the wrong handler answered"
+        # bug class this whole sweep exists to catch, reintroduced by hand
+        # this time instead of found live. Forces PlanKind.LLM directly,
+        # same as the ib_relationship test above -- defensive coverage in
+        # case a future capability-scoring change (or a competing
+        # capability outscoring "ib_summary") ever leaves a real
+        # summary-shaped question unclassified.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        tag = "CMSSW_20_1_X_2026-08-25-2300"
+        session.run.return_value = [
+            {"ib_tag": tag, "variant": None, "arch": "el9_amd64_gcc14", "is_default": True,
+             "build_status": "passed", "build_warnings": 0, "ignored_warnings": 2,
+             "relval_total": 950, "relval_failed": 3, "unit_test_total": 372, "unit_test_failed": 0,
+             "unit_test_errors": 0},
+        ]
+        # "all" (not "summary") avoids the earlier _build_summary_answer's
+        # own "summary/analysis" trigger, which would otherwise intercept
+        # first with an unrelated "no local log-analysis artifact" answer.
+        question = f"{tag} all"
+
+        with patch.object(
+            _request_planner, "plan",
+            return_value=Plan(PlanKind.LLM, confidence=0.0, context=RequestContext.extract(question)),
+        ):
+            result = chat(ChatRequest(question=question))
+
+        self.assertIn("primary IB", result.answer)
+        self.assertIn(tag, result.answer)
 
     @patch("server.api_server.get_driver")
     def test_bare_title_followup_resolves_via_chat_legacy_waterfall(self, get_driver):
