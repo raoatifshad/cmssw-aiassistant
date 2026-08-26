@@ -1481,12 +1481,12 @@ def _merged_prs_for_build_answer(question: str) -> tuple[str, list[dict]] | None
             "cover every historical tag.",
             [],
         )
-    lines = [f"PRs merged into `{tag}` since the previous build:"]
-    lines.extend(
-        f"- **{row['repo']} #{row['pr_number']}** - {row['title']}"
-        + (f" (by {row['author']})" if row["author"] else "")
-        for row in rows
-    )
+    lines = [f"PRs merged into `{tag}` since the previous build, newest first:"]
+    for row in rows:
+        detail = f"merged {row['merged_at']}" if row["merged_at"] else "merge date unknown"
+        if row["author"]:
+            detail += f"; by {row['author']}"
+        lines.append(f"- **{row['repo']} #{row['pr_number']}** - {row['title']} ({detail})")
     return "\n".join(lines), rows
 
 
@@ -2869,14 +2869,15 @@ def _ib_results_summary_answer(
         if not rows:
             return f"No imported record was found for `{tag}` on `{selected_arch}`."
         scope_description = f"requested architecture `{selected_arch}`"
-    elif not all_requested:
-        primary_rows = [row for row in rows if row["ib_tag"] == tag]
-        variant_rows = [row for row in rows if row["ib_tag"] != tag]
-        primary_defaults = [row for row in primary_rows if row["is_default"]]
-        variant_defaults = [row for row in variant_rows if row["is_default"]]
-        rows = (primary_defaults or primary_rows) + (variant_defaults or variant_rows)
-        scope_description = "imported DEFAULT architecture markers"
     else:
+        # Never silently narrow to just the is_default-flagged architectures
+        # -- same bug class already fixed for RelVal/unit-test summaries
+        # (see _relval_scope_or_choice and _unittest_summary_answer): this
+        # narrowing had no ask-when-ambiguous guard at all, so even a single
+        # default architecture always hid every other imported one with no
+        # indication they existed. Found live via "give the summary for
+        # latest IB": 2 of 4 known architectures (el8_amd64_gcc14,
+        # el9_amd64_gcc14) were missing from the primary-IB table.
         scope_description = "all imported architectures"
 
     def format_rows(section_rows: list[dict]) -> list[str]:

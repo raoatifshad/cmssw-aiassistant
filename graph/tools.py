@@ -513,10 +513,12 @@ def find_prs_before_ib(ib_tag: str, arch: str | None = None, limit: int = 20) ->
     A PR merge is architecture-independent, so ingest_merged_prs attaches
     MERGED_BEFORE to every architecture's IB node sharing this tag -- DISTINCT
     collapses those back to one row per PR instead of one per architecture.
-    Ordered by PR number ascending -- merged_prs_summary.json carries no
-    per-PR merge timestamp, so p.merged_at (populated by the separate PR
-    import, not this relationship) is null for most of these rows and
-    ordering by it produced an effectively arbitrary sequence."""
+    Newest merged_at first; `p.merged_at IS NULL` sorts first so undated PRs
+    (a real minority -- merged_prs_summary.json itself carries no per-PR
+    timestamp, so a PR missing one from its own separate import falls back
+    to this) are pushed to the end rather than floating to the top, which is
+    where openCypher's default null-is-largest ordering would otherwise put
+    them under a plain `ORDER BY p.merged_at DESC`."""
     limit = min(limit, MAX_ROWS)
     return _run_query(
         "MATCH (p:PR)-[:MERGED_BEFORE]->(ib:IB {tag:$t}) "
@@ -524,7 +526,7 @@ def find_prs_before_ib(ib_tag: str, arch: str | None = None, limit: int = 20) ->
         "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
         "RETURN DISTINCT p.repo AS repo, p.number AS pr_number, p.title AS title, "
         "       p.merged_at AS merged_at, a.name AS author "
-        "ORDER BY p.number ASC LIMIT $lim",
+        "ORDER BY p.merged_at IS NULL, p.merged_at DESC LIMIT $lim",
         {"t": ib_tag, "arch": arch, "lim": limit},
     )
 
