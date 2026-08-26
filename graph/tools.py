@@ -68,6 +68,10 @@ EDGES:
     ((PR|Issue))-[:REFERENCES {source:'github_body'}]->((PR|Issue))
     (GitHubComment)-[:REFERENCES {source:'github_comment'}]->((PR|Issue))
     (PR)-[:MERGED_BEFORE]->(IB)
+        — this PR was newly merged as of this IB build (the same "recently merged"
+        list the CMSSDT dashboard shows per tag). Sourced from cms-sw.github.io's
+        merged_prs_summary.json (ingest_merged_prs); a PR only attaches if it's
+        already imported and the target tag matches an already-imported IB.
     (PR)-[:CHANGED_FILE {evidence:'github_changed_file'}]->(SourceFile)
     (PR)-[:MATCHES_WARNING {evidence:'changed_file'}]->(Warning)
 
@@ -505,13 +509,16 @@ def get_failing_unittests(ib_tag: str, arch: str | None = None, limit: int = 50)
 
 
 def find_prs_before_ib(ib_tag: str, arch: str | None = None, limit: int = 20) -> list[dict]:
-    """PRs that merged right before this IB — the first-pass attribution."""
+    """PRs that merged right before this IB — the first-pass attribution.
+    A PR merge is architecture-independent, so ingest_merged_prs attaches
+    MERGED_BEFORE to every architecture's IB node sharing this tag -- DISTINCT
+    collapses those back to one row per PR instead of one per architecture."""
     limit = min(limit, MAX_ROWS)
     return _run_query(
         "MATCH (p:PR)-[:MERGED_BEFORE]->(ib:IB {tag:$t}) "
         "WHERE $arch IS NULL OR ib.arch = $arch "
         "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
-        "RETURN p.repo AS repo, p.number AS pr_number, p.title AS title, "
+        "RETURN DISTINCT p.repo AS repo, p.number AS pr_number, p.title AS title, "
         "       p.merged_at AS merged_at, a.name AS author "
         "ORDER BY p.merged_at DESC LIMIT $lim",
         {"t": ib_tag, "arch": arch, "lim": limit},
