@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "graph"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from tools import (  # noqa: E402
     TOOLS, GRAPH_SCHEMA, count_warnings_by_package, diff_warnings, find_prs_before_ib, find_prs_for_error,
-    get_exit_code_names, get_failing_relvals, get_relval_recurrence, get_shift_summary,
+    get_exit_code_names, get_failing_relvals, get_failing_unittests, get_relval_recurrence, get_shift_summary,
     relval_failure_architectures, search_concepts, search_workflow_ids, store_shift_summary,
     top_recurring_relval_failures,
 )
@@ -861,12 +861,19 @@ def _unittest_summary_from_records(tag: str, records: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _unittest_summary_answer(question: str, context_tag: str | None, session_id: str) -> str | None:
+def _unittest_summary_answer(
+    question: str, context_tag: str | None, session_id: str, context_arch: str | None = None
+) -> str | None:
     """Resolve architecture scope before answering -- never silently sum
     every "default" architecture into one combined headline number, the same
     rule applied to every other IB summary answer (see _relval_scope_or_choice).
     A real production IB had 4 architectures marked default simultaneously,
-    which used to be added together as if they were one build."""
+    which used to be added together as if they were one build. context_arch
+    (the session's last-mentioned architecture, e.g. from an earlier question
+    naming both a tag and an architecture inline) is only a *fallback* for
+    the fresh-question path below -- once a pending choice exists, an earlier
+    turn already showed the real options and it must not silently skip past
+    that prompt."""
     pending = _pending_unittest_scopes.get(session_id)
     all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
     selected_arch = _requested_ib_arch(question)
@@ -900,18 +907,74 @@ def _unittest_summary_answer(question: str, context_tag: str | None, session_id:
     records = _unittest_scope_records(tag)
     if not records:
         return f"No imported unit-test records were found for `{tag}`."
+    # An explicit tag in *this* question always wins over remembered
+    # session context, but a tag-less follow-up naming no architecture
+    # either ("what 3 failed unit tests?") should still resolve to whatever
+    # architecture was last mentioned in the session, the same
+    # pronoun-resolution pattern _latest_ib_contexts already provides for
+    # tags -- found live: this fell through to a fresh "choose an
+    # architecture" prompt instead, discarding the architecture the user
+    # had already named one turn earlier.
+    if not selected_arch and not tag_match:
+        selected_arch = context_arch
     if selected_arch:
         selected_records = [record for record in records if record["arch"] == selected_arch]
         if not selected_records:
             return _unittest_arch_choice_answer(tag, records)
         return _unittest_summary_from_records(tag, selected_records)
+    # Only ask when it's genuinely ambiguous which architecture is "the"
+    # build -- more than one flagged is_default simultaneously (the real
+    # incident this function's docstring describes). Otherwise return every
+    # imported architecture directly, mirroring _relval_scope_or_choice's
+    # fix for the same bug: found live -- this used to narrow to just the
+    # tied defaults even when "all" was said, because the pending state
+    # itself was already pre-filtered before "all" was ever offered as an
+    # option, so a 4-architecture build's "all" answer only ever showed 2.
     default_records = [record for record in records if record["is_default"]]
-    if default_records and not all_requested:
-        records = default_records
-    if len(records) == 1:
-        return _unittest_summary_from_records(tag, records)
-    _pending_unittest_scopes[session_id] = {"tag": tag, "records": records}
-    return _unittest_arch_choice_answer(tag, records)
+    if len(default_records) > 1 and not all_requested:
+        _pending_unittest_scopes[session_id] = {"tag": tag, "records": records}
+        return _unittest_arch_choice_answer(tag, default_records)
+    return _unittest_summary_from_records(tag, records)
+
+
+def _failed_unittest_list_answer(
+    question: str, context_tag: str | None, context_arch: str | None
+) -> str | None:
+    """List failed unit-test package names (not just the count) for a named
+    IB. Closes a "no handler exists at all" gap: get_failing_unittests was
+    already registered as an LLM tool, but nothing in the deterministic path
+    ever called it -- only the aggregate count/errors summary existed
+    (_unittest_summary_answer), the same "designed but only half-built"
+    pattern as MERGED_BEFORE. UnitTest results are package-level aggregates
+    (see CLAUDE.md), so "failed packages" and "failed unit tests" are the
+    same list at this granularity -- both phrasings resolve here."""
+    if not re.search(r"\b(?:list|show|give)\b|\bwhat\b.*\bfail", question, re.IGNORECASE):
+        return None
+    if not re.search(r"\b(?:packages?|unit(?:\s*tests?)?)\b", question, re.IGNORECASE):
+        return None
+    tag_match = IB_TAG_RE.search(question)
+    tag = tag_match.group(1) if tag_match else context_tag
+    if not tag:
+        return None
+    requested_arch = _requested_ib_arch(question) or (context_arch if not tag_match else None)
+    archs = [requested_arch] if requested_arch else [
+        record["arch"] for record in _unittest_scope_records(tag)
+    ]
+    if not archs:
+        return f"No imported unit-test records were found for `{tag}`."
+
+    lines = [f"Failed unit-test packages for `{tag}`:"]
+    found_any = False
+    for arch in archs:
+        rows = get_failing_unittests(tag, arch=arch, limit=100)
+        if not rows:
+            continue
+        found_any = True
+        lines.append(f"\n**{arch}** ({len(rows)} failed):")
+        lines.extend(f"- {row['name']} (errors: {row['errors'] or 0})" for row in rows)
+    if not found_any:
+        return f"No failed unit-test packages were found for `{tag}`."
+    return "\n".join(lines)
 
 
 _PRIMARY_IB_TAG_RE = re.compile(r"^CMSSW_(\d+)_(\d+)_X_(\d{4}-\d{2}-\d{2}-\d{4})$")
@@ -3628,7 +3691,19 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
             return (pr_answer, [])
         return None
     if capability == "unittest":
-        answer = _unittest_summary_answer(question, _latest_ib_contexts.get(session_id), session_id)
+        # _failed_unittest_list_answer (a specific list-of-package-names
+        # request) is tried before the generic summary so it isn't shadowed
+        # for a phrasing both would otherwise match (e.g. "what 3 failed
+        # unit tests?") -- same ordering rule as _failed_relval_list_answer
+        # vs. _relval_ib_summary_answer.
+        answer = (
+            _failed_unittest_list_answer(
+                question, _latest_ib_contexts.get(session_id), _latest_ib_arch_contexts.get(session_id)
+            )
+            or _unittest_summary_answer(
+                question, _latest_ib_contexts.get(session_id), session_id, _latest_ib_arch_contexts.get(session_id)
+            )
+        )
         return (answer, []) if answer else None
     if capability == "clang":
         answer = (
@@ -3862,7 +3937,14 @@ def chat(req: ChatRequest):
     relval_data_availability_answer = _relval_data_availability_answer(question, sid)
     if relval_data_availability_answer:
         return _chat_response(sid, original_question, relval_data_availability_answer, "deterministic")
-    unittest_summary_answer = _unittest_summary_answer(question, _latest_ib_contexts.get(sid), sid)
+    failed_unittest_list_answer = _failed_unittest_list_answer(
+        question, _latest_ib_contexts.get(sid), _latest_ib_arch_contexts.get(sid)
+    )
+    if failed_unittest_list_answer:
+        return _chat_response(sid, original_question, failed_unittest_list_answer, "deterministic")
+    unittest_summary_answer = _unittest_summary_answer(
+        question, _latest_ib_contexts.get(sid), sid, _latest_ib_arch_contexts.get(sid)
+    )
     if unittest_summary_answer:
         return _chat_response(sid, original_question, unittest_summary_answer, "deterministic")
     relval_error_count_answer = _relval_error_count_answer(question, sid)
@@ -3959,6 +4041,22 @@ def chat(req: ChatRequest):
     open_issue_answer = _open_issue_answer(question, _failed_relval_contexts.get(sid))
     if open_issue_answer:
         return _chat_response(sid, original_question, open_issue_answer, "deterministic")
+    # Tried before _artifact_search_answer: found live -- "how many merged in
+    # <tag>" has no "PR" word, so it never reaches the deterministic
+    # "pr_evidence"/"clang"/"build"/"relval" capability branches (where this
+    # is already tried first) and lands here instead. _artifact_search_scope
+    # treats bare "merged" as its own trigger, and a full timestamped IB tag
+    # is a real _pr_search_terms identifier, so _artifact_search_answer
+    # would otherwise "win" first with a technically-true but useless
+    # "No imported Issues or PRs match `<tag>`" -- a fuzzy text search for
+    # the literal tag string in PR/Issue bodies, which was never what this
+    # question was asking, instead of the structured MERGED_BEFORE lookup
+    # this specific phrasing shape actually needs.
+    merged_prs_result = _merged_prs_for_build_answer(question)
+    if merged_prs_result:
+        merged_prs_answer, prs = merged_prs_result
+        _pr_contexts[sid] = prs
+        return _chat_response(sid, original_question, merged_prs_answer, "deterministic")
     artifact_search_answer = _artifact_search_answer(question)
     if artifact_search_answer:
         return _chat_response(sid, original_question, artifact_search_answer, "deterministic")
@@ -3987,11 +4085,6 @@ def chat(req: ChatRequest):
     release_artifact_answer = _release_artifact_answer(question)
     if release_artifact_answer:
         return _chat_response(sid, original_question, release_artifact_answer, "deterministic")
-    merged_prs_result = _merged_prs_for_build_answer(question)
-    if merged_prs_result:
-        merged_prs_answer, prs = merged_prs_result
-        _pr_contexts[sid] = prs
-        return _chat_response(sid, original_question, merged_prs_answer, "deterministic")
     pr_result = _pr_evidence_answer(question, _last_workflow_contexts.get(sid))
     if pr_result:
         pr_answer, prs = pr_result

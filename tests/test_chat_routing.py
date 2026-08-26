@@ -35,6 +35,7 @@ from server.api_server import (
     _relval_ib_summary_answer,
     _relval_scope_or_choice,
     _unittest_summary_answer,
+    _failed_unittest_list_answer,
     _workflow_reported_answer,
     _workflow_artifact_answer,
     _requested_ib_arch,
@@ -42,6 +43,7 @@ from server.api_server import (
     _failing_relval_context,
     _failed_relval_contexts,
     _fallback_clarification,
+    _latest_ib_arch_contexts,
     _latest_ib_contexts,
     _request_planner,
     chat,
@@ -578,6 +580,28 @@ class ChatRoutingTests(unittest.TestCase):
         answer, _ = result
         self.assertIn(tag, answer)
 
+    @patch("server.api_server.get_failing_unittests")
+    def test_unittest_capability_answers_failed_package_list_questions(self, get_failing_unittests):
+        # Confirms _failed_unittest_list_answer is actually reachable through
+        # the planner's deterministic "unittest" capability route, not just
+        # callable in isolation, and that it's tried before the generic
+        # summary for a phrasing both could match ("what 3 failed unit
+        # tests?").
+        get_failing_unittests.return_value = [{"name": "DQM/Physics", "errors": 5}]
+        session_id = "unittest-failed-list-capability"
+        tag = "CMSSW_20_1_X_2026-08-25-2300"
+        try:
+            _latest_ib_contexts[session_id] = tag
+            _latest_ib_arch_contexts[session_id] = "el9_aarch64_gcc14"
+            result = _execute_planned_capability("unittest", "what 3 failed unit tests?", session_id)
+        finally:
+            _latest_ib_contexts.pop(session_id, None)
+            _latest_ib_arch_contexts.pop(session_id, None)
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("DQM/Physics", answer)
+
     @patch("server.api_server.get_driver")
     def test_clang_capability_uses_session_ib_context_when_tag_omitted(self, get_driver):
         # Regression: fixed alongside the "relval" bug above. A tag-less
@@ -737,6 +761,34 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNotNone(result)
         answer, _ = result
         self.assertIn("51750", answer)
+
+    @patch("server.api_server._artifact_search_answer", return_value="WRONG: fuzzy text match answer")
+    @patch("server.api_server.get_driver")
+    @patch("server.api_server.find_prs_before_ib")
+    def test_chat_prefers_merged_prs_answer_over_generic_artifact_search(
+        self, find_prs_before_ib, get_driver, artifact_search_answer
+    ):
+        # Regression: found live -- "how many merged in <tag>" has no "PR"
+        # word, so RequestPlanner can't classify it into any capability at
+        # all, and it falls to the legacy waterfall. _artifact_search_scope
+        # treats bare "merged" as its own trigger and a full timestamped IB
+        # tag is a real _pr_search_terms identifier, so _artifact_search_answer
+        # used to run first and "win" with a technically-true but useless
+        # "No imported Issues or PRs match `<tag>`" (a fuzzy text search for
+        # the literal tag string in PR/Issue bodies) instead of the
+        # structured MERGED_BEFORE lookup this phrasing actually needs.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.__iter__.return_value = iter([])
+        session.run.return_value.single.return_value = None
+        find_prs_before_ib.return_value = [
+            {"repo": "cmssw", "pr_number": 51750, "title": "Remove testSkipEvent_cfg.py as obsolete",
+             "merged_at": None, "author": "makortel"},
+        ]
+
+        result = chat(ChatRequest(question="how many merged in CMSSW_20_1_MULTIARCHS_X_2026-08-25-2300"))
+
+        self.assertIn("51750", result.answer)
+        artifact_search_answer.assert_not_called()
 
     def test_workflow_exception_search_requires_ib_context(self):
         self.assertEqual(
@@ -1058,6 +1110,100 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertNotIn("el9_amd64_gcc13", answer)
         self.assertIn("s-multi-unittest", _pending_unittest_scopes)
         _pending_unittest_scopes.pop("s-multi-unittest", None)
+
+    @patch("server.api_server._unittest_scope_records")
+    def test_unittest_summary_never_hides_non_default_architectures(self, scope_records):
+        # Regression: a build with only ONE architecture flagged is_default
+        # among several imported used to silently narrow to just that one,
+        # dropping the rest with no indication they existed -- the same bug
+        # already fixed for RelVals
+        # (test_relval_failure_count_never_hides_non_default_architectures).
+        # Distinct from the >1-simultaneous-default "ask" case, covered by
+        # test_unittest_summary_asks_when_multiple_default_architectures_exist
+        # and test_unittest_summary_all_recovers_full_architecture_set below.
+        scope_records.return_value = [
+            {"arch": "el8_amd64_gcc14", "is_default": False, "total": 373, "failed": 2, "passed": 371, "errors": 2},
+            {"arch": "el9_amd64_gcc14", "is_default": False, "total": 373, "failed": 2, "passed": 371, "errors": 2},
+            {"arch": "el9_aarch64_gcc14", "is_default": True, "total": 366, "failed": 3, "passed": 363, "errors": 15},
+        ]
+
+        answer = _unittest_summary_answer("and unit tests", "CMSSW_20_1_X_2026-08-25-2300", "s-4arch-unittest")
+
+        self.assertIn("el8_amd64_gcc14", answer)
+        self.assertIn("el9_amd64_gcc14", answer)
+        self.assertIn("el9_aarch64_gcc14", answer)
+        self.assertIn("7 failed", answer)  # 2+2+3
+
+    @patch("server.api_server._unittest_scope_records")
+    def test_unittest_summary_all_recovers_full_architecture_set(self, scope_records):
+        # Regression: found live -- replying "all" to the multi-default
+        # choice prompt only returned the pre-filtered tied-default subset
+        # (2 of 4 architectures), because the pending state itself was
+        # already narrowed before "all" was ever offered as an option.
+        session_id = "s-4arch-all-unittest"
+        scope_records.return_value = [
+            {"arch": "el8_amd64_gcc14", "is_default": False, "total": 373, "failed": 2, "passed": 371, "errors": 2},
+            {"arch": "el9_amd64_gcc14", "is_default": False, "total": 373, "failed": 2, "passed": 371, "errors": 2},
+            {"arch": "el9_aarch64_gcc14", "is_default": True, "total": 366, "failed": 3, "passed": 363, "errors": 15},
+            {"arch": "el10_amd64_gcc15", "is_default": True, "total": 368, "failed": 4, "passed": 364, "errors": 16},
+        ]
+        try:
+            first = _unittest_summary_answer("and unit tests", "CMSSW_20_1_X_2026-08-25-2300", session_id)
+            self.assertIn("Choose one", first)
+
+            answer = _unittest_summary_answer("all", None, session_id)
+        finally:
+            _pending_unittest_scopes.pop(session_id, None)
+
+        self.assertIn("el8_amd64_gcc14", answer)
+        self.assertIn("el9_amd64_gcc14", answer)
+        self.assertIn("el9_aarch64_gcc14", answer)
+        self.assertIn("el10_amd64_gcc15", answer)
+        self.assertIn("11 failed", answer)
+
+    @patch("server.api_server._unittest_scope_records")
+    def test_unittest_summary_remembers_session_architecture_for_tagless_followup(self, scope_records):
+        # Regression: found live -- "how many unit tests failing in <tag>
+        # <arch>" (explicit tag+arch) resolved fine, but a tag-less,
+        # arch-less follow-up in the same session ("what 3 failed unit
+        # tests?") re-asked "choose an architecture" from scratch instead of
+        # reusing the architecture already named this session, the same
+        # pronoun-resolution pattern _latest_ib_contexts provides for tags.
+        scope_records.return_value = [
+            {"arch": "el9_aarch64_gcc14", "is_default": True, "total": 366, "failed": 3, "passed": 363, "errors": 15},
+            {"arch": "el10_amd64_gcc15", "is_default": True, "total": 368, "failed": 4, "passed": 364, "errors": 16},
+        ]
+
+        answer = _unittest_summary_answer(
+            "what 3 failed unit tests", "CMSSW_20_1_X_2026-08-25-2300", "s-remembered-arch",
+            context_arch="el9_aarch64_gcc14",
+        )
+
+        self.assertIn("3 failed", answer)
+        self.assertNotIn("Choose one", answer)
+
+    @patch("server.api_server.get_failing_unittests")
+    def test_failed_unittest_list_answer_lists_package_names(self, get_failing_unittests):
+        # Regression: found live -- get_failing_unittests was already
+        # registered as an LLM tool, but nothing in the deterministic path
+        # ever called it; only the aggregate count existed
+        # (_unittest_summary_answer), never the actual failed package
+        # names, the same "designed but only half-built" pattern as
+        # MERGED_BEFORE.
+        get_failing_unittests.return_value = [
+            {"name": "DQM/Physics", "errors": 5},
+            {"name": "RecoTracker/TrackProducer", "errors": 2},
+        ]
+
+        answer = _failed_unittest_list_answer(
+            "what 3 failed packages?", "CMSSW_20_1_X_2026-08-25-2300", "el9_aarch64_gcc14",
+        )
+
+        self.assertIn("DQM/Physics", answer)
+        self.assertIn("RecoTracker/TrackProducer", answer)
+        get_failing_unittests.assert_called_once_with(
+            "CMSSW_20_1_X_2026-08-25-2300", arch="el9_aarch64_gcc14", limit=100
+        )
 
     @patch("server.api_server._unittest_scope_records")
     def test_unittest_summary_resolves_after_choosing_an_architecture(self, scope_records):
