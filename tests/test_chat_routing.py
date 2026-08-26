@@ -2368,6 +2368,13 @@ class ShiftSummaryCapabilityTests(unittest.TestCase):
             "what are the new failures",
             "any new errors",
             "what are the new failures/errors",
+            # Regression: found live -- "new <noun> [are/is] failing" (not
+            # just the exact-noun "new failures/errors" form above) also
+            # asks for the previous-vs-latest delta ("only those absent in
+            # the previous release"), the same generate_shift_summary
+            # request, just phrased around a different noun (workflows).
+            "what new workflows are failing in the latest ib",
+            "what new relvals are failing",
         ]:
             with self.subTest(question=question):
                 self.assertTrue(RequestContext.extract(question).has_shift_summary_request)

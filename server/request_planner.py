@@ -24,8 +24,14 @@ SHIFT_SUMMARY_RE = re.compile(
     # "what are the new failures/errors" is the same request as "what
     # changed since the last IB" -- "new" only means something relative to
     # a previous build, so this is inherently a previous-vs-latest
-    # comparison request, not a plain failure-count question.
-    r"\bnew\s+(?:failures?|errors?|warnings?|issues?)\b",
+    # comparison request, not a plain failure-count question. Also covers
+    # "new <noun> [are/is] failing" (e.g. "what new workflows are failing")
+    # -- found live: the exact-noun form above didn't cover this shape, so
+    # it fell through to the raw list of *every* currently-failing workflow
+    # instead of the previous-vs-latest delta the question actually asked
+    # for ("only those absent in the previous release").
+    r"\bnew\s+(?:failures?|errors?|warnings?|issues?)\b|"
+    r"\bnew\b[^?!]{0,30}\bfailing\b",
     re.IGNORECASE,
 )
 
