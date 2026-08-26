@@ -948,7 +948,7 @@ def _failed_unittest_list_answer(
     pattern as MERGED_BEFORE. UnitTest results are package-level aggregates
     (see CLAUDE.md), so "failed packages" and "failed unit tests" are the
     same list at this granularity -- both phrasings resolve here."""
-    if not re.search(r"\b(?:list|show|give)\b|\bwhat\b.*\bfail", question, re.IGNORECASE):
+    if not re.search(r"\b(?:list|show|give)\b|\b(?:what|which)\b.*\bfail", question, re.IGNORECASE):
         return None
     if not re.search(r"\b(?:packages?|unit(?:\s*tests?)?)\b", question, re.IGNORECASE):
         return None
@@ -2382,7 +2382,7 @@ def _failed_relval_list_answer(question: str, context: dict[str, str] | None) ->
     # actual list of failing workflow names, even though the intent was
     # unambiguous ("what X are failing" is a request for X, not a count).
     if not context or not re.search(
-        r"\b(?:list|show|give)\b|\bwhat\b.*\bfailing\b", question, re.IGNORECASE
+        r"\b(?:list|show|give)\b|\b(?:what|which)\b.*\bfailing\b", question, re.IGNORECASE
     ):
         return None
     if not re.search(r"\b(?:errors?|fail(?:ing|ures?)?|relvals?)\b", question, re.IGNORECASE):

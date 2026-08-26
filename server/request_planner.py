@@ -68,7 +68,7 @@ class RequestContext:
         categories: set[str] = set()
         if re.search(r"\brel[\s-]*vals?\b", lowered) or re.search(r"\b(?:wfs?|work\s*flows?)\b", lowered):
             categories.add("relval")
-        if re.search(r"\bunit(?:[\s-]*tests?)?\b", lowered):
+        if re.search(r"\bunit(?:[\s-]*tests?)?\b", lowered) or re.search(r"\bpackages?\b", lowered):
             categories.add("unittest")
         if re.search(r"\bclang\b", lowered):
             categories.add("clang")

@@ -29,6 +29,7 @@ from server.api_server import (
     _pr_search_terms,
     _pending_relval_scopes,
     _pending_unittest_scopes,
+    _failed_relval_list_answer,
     _relval_data_availability_answer,
     _relval_error_count_answer,
     _relval_failure_count_answer,
@@ -468,6 +469,23 @@ class ChatRoutingTests(unittest.TestCase):
         answer, _ = result
         self.assertIn("140.0", answer)
         self.assertIn("failing RelVals for", answer)  # the list heading, not the count-table heading
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_relvals")
+    def test_relval_list_answer_recognizes_which_phrasing(self, get_failing_relvals, get_exit_code_names):
+        # Same gap as the "what X are failing" fix above, for "which" --
+        # found live for the unittest-side equivalent ("which packages are
+        # failing"), fixed for both at once since they share the same
+        # narrow what-only regex.
+        context = {"tag": "CMSSW_20_1_X_2026-08-24-2300", "arch": None}
+        get_failing_relvals.return_value = [
+            {"ib_tag": context["tag"], "name": "140.0", "workflow_id": "140.0", "errors": 2, "exitcode": 1},
+        ]
+
+        answer = _failed_relval_list_answer("which workflows are failing?", context)
+
+        self.assertIsNotNone(answer)
+        self.assertIn("140.0", answer)
 
     @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_failing_relvals")
@@ -1204,6 +1222,21 @@ class ChatRoutingTests(unittest.TestCase):
         get_failing_unittests.assert_called_once_with(
             "CMSSW_20_1_X_2026-08-25-2300", arch="el9_aarch64_gcc14", limit=100
         )
+
+    @patch("server.api_server.get_failing_unittests")
+    def test_failed_unittest_list_answer_recognizes_which_phrasing(self, get_failing_unittests):
+        # Regression: found live -- "which packages are failing" has neither
+        # "list/show/give" nor "what", only "which"; the trigger only
+        # recognized "what X are failing", the same narrow-synonym gap
+        # already fixed for _failed_relval_list_answer's "which workflows
+        # are failing" equivalent.
+        get_failing_unittests.return_value = [{"name": "DQM/Physics", "errors": 5}]
+
+        answer = _failed_unittest_list_answer(
+            "which packages are failing?", "CMSSW_20_1_X_2026-08-25-2300", "el9_aarch64_gcc14",
+        )
+
+        self.assertIn("DQM/Physics", answer)
 
     @patch("server.api_server._unittest_scope_records")
     def test_unittest_summary_resolves_after_choosing_an_architecture(self, scope_records):
