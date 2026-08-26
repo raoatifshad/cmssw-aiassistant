@@ -535,9 +535,20 @@ class FeedbackRequest(BaseModel):
     ib_tag: str | None = None
 
 
+# "lastest" (found live) is a common enough typo/blend of "last" and
+# "latest" that it's worth tolerating explicitly everywhere "latest" is
+# recognized, not just the one spot it happened to be noticed -- this
+# pattern had drifted into 5 separate copies (_is_latest_ib_question,
+# _is_latest_comparison_question, _latest_clang_warning_answer,
+# _latest_issue_answer, _clang_warning_answer's "not latest" exclusion)
+# before only one got the typo fix, exactly the kind of silent divergence
+# several bugs this session came from. One shared fragment now.
+_LATEST_WORD_RE = r"latest|lastest|newest|most\s+recent|current"
+
+
 def _is_latest_ib_question(question: str) -> bool:
     return bool(
-        re.search(r"\b(?:latest|newest|most\s+recent|current|last)\b", question, re.IGNORECASE)
+        re.search(rf"\b(?:{_LATEST_WORD_RE}|last)\b", question, re.IGNORECASE)
         and re.search(r"\b(?:ib|integration\s+build)\b", question, re.IGNORECASE)
         and not re.search(r"\b(?:clang|warning)\b", question, re.IGNORECASE)
     )
@@ -1105,7 +1116,7 @@ def _is_latest_comparison_question(question: str) -> bool:
     return bool(
         re.search(r"\b(?:compare|comparison|delta|deltas|versus|vs)\b", question, re.IGNORECASE)
         and re.search(
-            r"\b(?:latest|newest|most\s+recent|current|previous|prior|last\s+two)\b",
+            rf"\b(?:{_LATEST_WORD_RE}|previous|prior|last\s+two)\b",
             question, re.IGNORECASE,
         )
     )
@@ -1139,7 +1150,7 @@ def _latest_ib_answer(question: str) -> str | None:
 
 def _latest_clang_warning_answer(question: str) -> str | None:
     """Summarize the newest IB with imported parsed Clang diagnostics."""
-    if not re.search(r"\b(?:latest|newest|most\s+recent|current)\b", question, re.IGNORECASE):
+    if not re.search(rf"\b(?:{_LATEST_WORD_RE})\b", question, re.IGNORECASE):
         return None
     if not re.search(r"\bclang\b", question, re.IGNORECASE):
         return None
@@ -2045,7 +2056,7 @@ def _latest_issue_answer(question: str) -> str | None:
     "Capability-handler coverage" section): nothing answered "what is the
     latest issue" before this, only a *named* Issue's author
     (_issue_author_answer) or open-Issue text search (_open_issue_answer)."""
-    if not re.search(r"\b(?:latest|newest|most\s+recent|current)\b", question, re.IGNORECASE):
+    if not re.search(rf"\b(?:{_LATEST_WORD_RE})\b", question, re.IGNORECASE):
         return None
     if not re.search(r"\bissues?\b", question, re.IGNORECASE):
         return None
@@ -3091,7 +3102,7 @@ def _clang_warning_answer(question: str, context_tag: str | None = None) -> str 
     if not re.search(r"\bwarnings?\b", question, re.IGNORECASE):
         return None
     if re.search(
-        r"\b(?:latest|newest|most\s+recent|current|compare|comparison|delta|deltas)\b",
+        rf"\b(?:{_LATEST_WORD_RE}|compare|comparison|delta|deltas)\b",
         question, re.IGNORECASE,
     ):
         return None

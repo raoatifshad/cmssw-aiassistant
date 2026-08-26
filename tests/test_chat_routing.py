@@ -6,7 +6,11 @@ from server.api_server import (
     FeedbackRequest,
     SYSTEM_PROMPT,
     _pending_ib_comparisons,
+    _is_latest_ib_question,
+    _is_latest_comparison_question,
     _latest_ib_answer,
+    _latest_clang_warning_answer,
+    _clang_warning_answer,
     _issue_author_answer,
     _issue_detail_answer,
     _merged_prs_for_build_answer,
@@ -2299,6 +2303,54 @@ class ChatRoutingTests(unittest.TestCase):
                  "question": "what are the frequent failures over the last week"},
             ],
         )
+
+
+class LatestTypoToleranceTests(unittest.TestCase):
+    """Regression: found live -- "what workflows are failing in the lastest
+    IB" (typo: "lastest", not "latest") hard-failed, because
+    _is_latest_ib_question's trigger regex didn't recognize it, so the
+    "latest IB" tag-resolution special-case never fired and the question
+    reached the "relval" capability with no tag at all. The same word list
+    had drifted into 5 separate copies (one per function below) before only
+    the first one got fixed -- now a single shared _LATEST_WORD_RE."""
+
+    def test_is_latest_ib_question_tolerates_the_typo(self):
+        self.assertTrue(_is_latest_ib_question("what workflows are failing in the lastest IB"))
+
+    def test_is_latest_comparison_question_tolerates_the_typo(self):
+        self.assertTrue(_is_latest_comparison_question("compare the lastest IB with the previous one"))
+
+    @patch("server.api_server.get_driver")
+    def test_latest_clang_warning_answer_tolerates_the_typo(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"tag": "CMSSW_20_1_X_2026-08-25-2300", "release": "CMSSW_20_1_X",
+             "arch": "el9_amd64_gcc14", "locations": 3, "occurrences": 7},
+        ]
+
+        answer = _latest_clang_warning_answer("what are the lastest clang warnings")
+
+        self.assertIsNotNone(answer)
+
+    @patch("server.api_server.get_driver")
+    def test_latest_issue_answer_tolerates_the_typo(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "number": 51644, "title": "x", "state": "open", "created_at": None,
+        }
+
+        answer = _latest_issue_answer("what is the lastest issue")
+
+        self.assertIsNotNone(answer)
+
+    def test_clang_warning_answer_still_excludes_the_typo(self):
+        # _clang_warning_answer must NOT answer a "lastest clang warnings"
+        # question itself -- that's _latest_clang_warning_answer's job; this
+        # only pins that the exclusion check also recognizes the typo (an
+        # un-excluded "lastest" would let this generic handler answer with a
+        # count-table instead of a "latest" one, an inconsistency, not a
+        # dead end).
+        self.assertIsNone(_clang_warning_answer("what are the lastest clang warnings"))
 
 
 class ShiftSummaryCapabilityTests(unittest.TestCase):
