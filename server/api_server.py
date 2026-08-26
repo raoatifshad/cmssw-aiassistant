@@ -632,26 +632,33 @@ def _is_relval_failure_count_question(question: str) -> bool:
     )
 
 
-def _sub_ib_variant_names(tag: str) -> list[str]:
-    """Distinct sub-IB variant names (ASAN, UBSAN, ROOT6, ...) imported for
-    a primary tag -- used only to mention their existence alongside a
-    primary-tag summary (RelVal or unit-test), never to merge their counts
-    into it. Per CLAUDE.md's "IB (tag, architecture) pairs are never merged"
+def _sub_ib_variant_tags(tag: str) -> list[dict]:
+    """Sub-IB variants (ASAN, UBSAN, ROOT6, CLANG, ...) imported for a
+    primary tag, as {"variant", "tag"} pairs -- the full tag lets a caller
+    actually fetch that variant's own separate results, not just name it.
+    Per CLAUDE.md's "IB (tag, architecture) pairs are never merged"
     invariant: a sanitizer/variant build's failure profile isn't comparable
     to the primary build's (e.g. UBSAN/ROOT6 routinely differ from DEFAULT
     by 10-1000x, and CLANG/DEVEL/MULTIARCHS/NONLTO each run their own
-    independent unit-test suite)."""
+    independent unit-test suite) -- callers must present each variant's
+    numbers separately, never summed into the primary tag's totals."""
     driver = get_driver()
     try:
         with driver.session() as session:
             rows = session.run(
                 "MATCH (ib:IB {parent_tag:$tag}) WHERE ib.variant IS NOT NULL "
-                "RETURN DISTINCT ib.variant AS variant ORDER BY variant",
+                "RETURN DISTINCT ib.variant AS variant, ib.tag AS tag ORDER BY variant",
                 tag=tag,
             )
-            return [row["variant"] for row in rows]
+            return [dict(row) for row in rows]
     finally:
         driver.close()
+
+
+def _sub_ib_variant_names(tag: str) -> list[str]:
+    """Just the variant names (see _sub_ib_variant_tags) -- for callers that
+    only need to mention a sub-IB's existence, not fetch its own data."""
+    return [entry["variant"] for entry in _sub_ib_variant_tags(tag)]
 
 
 def _sub_ib_variant_note(tag: str, sub_ib_variants: list[str] | None) -> str | None:
@@ -865,7 +872,7 @@ def _unittest_arch_choice_answer(tag: str, records: list[dict]) -> str:
     )
 
 
-def _unittest_summary_from_records(tag: str, records: list[dict]) -> str:
+def _unittest_summary_from_records(tag: str, records: list[dict], include_sub_ibs: bool = True) -> str:
     total = sum(record["total"] or 0 for record in records)
     failed = sum(record["failed"] or 0 for record in records)
     passed = sum(record["passed"] or 0 for record in records)
@@ -882,15 +889,24 @@ def _unittest_summary_from_records(tag: str, records: list[dict]) -> str:
         f"{record['total'] or 0:,} | {record['errors'] or 0:,} |"
         for record in records
     )
-    # Same "mention, never merge" treatment RelVal already gets (see
-    # _relval_scope_summary) -- found live: a primary tag's unit-test summary
-    # silently said nothing about its CLANG/DEVEL/MULTIARCHS/NONLTO/ROOT6
-    # sub-IB siblings, each of which runs its own separate unit-test suite
-    # with its own failure count (confirmed against the CMSSDT dashboard).
-    note = _sub_ib_variant_note(tag, _sub_ib_variant_names(tag))
-    if note:
-        lines.append("")
-        lines.append(note)
+    # Inline each sub-IB variant's own unit-test results too, never merged
+    # into the numbers above -- each is a genuinely separate build per
+    # CLAUDE.md's IB-identity invariant. Approved 2026-08-26: a plain
+    # "not included above" footnote (RelVal's treatment) wasn't enough here;
+    # the user wanted the variants' own failures shown directly, the same
+    # way the CMSSDT dashboard already shows a distinct Unit count per
+    # variant column. include_sub_ibs=False stops this recursing into a
+    # variant's own (nonexistent) sub-variants.
+    if include_sub_ibs:
+        for entry in _sub_ib_variant_tags(tag):
+            sub_tag, variant = entry["tag"], entry["variant"]
+            sub_records = _unittest_scope_records(sub_tag)
+            lines.append("")
+            lines.append(f"### Sub-IB variant `{variant}` (`{sub_tag}`)")
+            if not sub_records:
+                lines.append(f"No imported unit-test records were found for `{sub_tag}`.")
+            else:
+                lines.append(_unittest_summary_from_records(sub_tag, sub_records, include_sub_ibs=False))
     return "\n".join(lines)
 
 
@@ -970,6 +986,29 @@ def _unittest_summary_answer(
     return _unittest_summary_from_records(tag, records)
 
 
+def _failed_unittest_package_listing(tag: str, requested_arch: str | None) -> str:
+    """Build the failed-package listing for exactly one IB tag/architecture
+    scope -- shared by the primary-tag answer and each inlined sub-IB
+    variant section in _failed_unittest_list_answer."""
+    archs = [requested_arch] if requested_arch else [
+        record["arch"] for record in _unittest_scope_records(tag)
+    ]
+    if not archs:
+        return f"No imported unit-test records were found for `{tag}`."
+    lines = []
+    found_any = False
+    for arch in archs:
+        rows = get_failing_unittests(tag, arch=arch, limit=100)
+        if not rows:
+            continue
+        found_any = True
+        lines.append(f"\n**{arch}** ({len(rows)} failed):")
+        lines.extend(f"- {row['name']} (errors: {row['errors'] or 0})" for row in rows)
+    if not found_any:
+        return f"No failed unit-test packages were found for `{tag}`."
+    return "\n".join(lines)
+
+
 def _failed_unittest_list_answer(
     question: str, context_tag: str | None, context_arch: str | None
 ) -> str | None:
@@ -990,27 +1029,19 @@ def _failed_unittest_list_answer(
     if not tag:
         return None
     requested_arch = _requested_ib_arch(question) or (context_arch if not tag_match else None)
-    archs = [requested_arch] if requested_arch else [
-        record["arch"] for record in _unittest_scope_records(tag)
-    ]
-    if not archs:
-        return f"No imported unit-test records were found for `{tag}`."
 
-    lines = [f"Failed unit-test packages for `{tag}`:"]
-    found_any = False
-    for arch in archs:
-        rows = get_failing_unittests(tag, arch=arch, limit=100)
-        if not rows:
-            continue
-        found_any = True
-        lines.append(f"\n**{arch}** ({len(rows)} failed):")
-        lines.extend(f"- {row['name']} (errors: {row['errors'] or 0})" for row in rows)
-    if not found_any:
-        return f"No failed unit-test packages were found for `{tag}`."
-    note = _sub_ib_variant_note(tag, _sub_ib_variant_names(tag))
-    if note:
-        lines.append("")
-        lines.append(note)
+    lines = [
+        f"Failed unit-test packages for `{tag}`:",
+        "",
+        _failed_unittest_package_listing(tag, requested_arch),
+    ]
+    # Inline each sub-IB variant's own failed-package list too, never merged
+    # into the primary tag's listing -- see _unittest_summary_from_records
+    # for the same treatment and its rationale (approved 2026-08-26).
+    for entry in _sub_ib_variant_tags(tag):
+        sub_tag, variant = entry["tag"], entry["variant"]
+        lines.append(f"\n### Sub-IB variant `{variant}` (`{sub_tag}`)")
+        lines.append(_failed_unittest_package_listing(sub_tag, requested_arch))
     return "\n".join(lines)
 
 

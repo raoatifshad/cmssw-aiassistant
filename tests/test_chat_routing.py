@@ -649,7 +649,8 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn(tag, answer)
 
     @patch("server.api_server.get_failing_unittests")
-    def test_unittest_capability_answers_failed_package_list_questions(self, get_failing_unittests):
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
+    def test_unittest_capability_answers_failed_package_list_questions(self, _sub_ib_variant_tags, get_failing_unittests):
         # Confirms _failed_unittest_list_answer is actually reachable through
         # the planner's deterministic "unittest" capability route, not just
         # callable in isolation, and that it's tried before the generic
@@ -1189,8 +1190,9 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("s-multi-unittest", _pending_unittest_scopes)
         _pending_unittest_scopes.pop("s-multi-unittest", None)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_never_hides_non_default_architectures(self, scope_records):
+    def test_unittest_summary_never_hides_non_default_architectures(self, scope_records, _sub_ib_variant_tags):
         # Regression: a build with only ONE architecture flagged is_default
         # among several imported used to silently narrow to just that one,
         # dropping the rest with no indication they existed -- the same bug
@@ -1212,8 +1214,9 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("el9_aarch64_gcc14", answer)
         self.assertIn("7 failed", answer)  # 2+2+3
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_all_recovers_full_architecture_set(self, scope_records):
+    def test_unittest_summary_all_recovers_full_architecture_set(self, scope_records, _sub_ib_variant_tags):
         # Regression: found live -- replying "all" to the multi-default
         # choice prompt only returned the pre-filtered tied-default subset
         # (2 of 4 architectures), because the pending state itself was
@@ -1239,8 +1242,9 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("el10_amd64_gcc15", answer)
         self.assertIn("11 failed", answer)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_remembers_session_architecture_for_tagless_followup(self, scope_records):
+    def test_unittest_summary_remembers_session_architecture_for_tagless_followup(self, scope_records, _sub_ib_variant_tags):
         # Regression: found live -- "how many unit tests failing in <tag>
         # <arch>" (explicit tag+arch) resolved fine, but a tag-less,
         # arch-less follow-up in the same session ("what 3 failed unit
@@ -1270,18 +1274,26 @@ class ChatRoutingTests(unittest.TestCase):
         # dashboard) -- the same "mention, never merge" treatment RelVal
         # already gets (test_relval_failure_count_mentions_sub_ib_variants).
         tag = "CMSSW_20_1_X_2026-08-25-2300"
-        scope_records.return_value = [
+        # Only the primary tag has records in this fixture -- each sub-IB
+        # variant gets an empty list, so its inlined section reports "no
+        # imported records" instead of (wrongly) reusing the primary's data.
+        primary_records = [
             {"arch": "el9_amd64_gcc14", "is_default": True, "total": 950, "failed": 3, "passed": 947, "errors": 3},
         ]
+        scope_records.side_effect = lambda queried_tag: primary_records if queried_tag == tag else []
         session = get_driver.return_value.session.return_value.__enter__.return_value
-        session.run.return_value = [{"variant": "CLANG"}, {"variant": "DEVEL"}, {"variant": "MULTIARCHS"}]
+        session.run.return_value = [
+            {"variant": "CLANG", "tag": "CMSSW_20_1_CLANG_X_2026-08-25-2300"},
+            {"variant": "DEVEL", "tag": "CMSSW_20_1_DEVEL_X_2026-08-25-2300"},
+            {"variant": "MULTIARCHS", "tag": "CMSSW_20_1_MULTIARCHS_X_2026-08-25-2300"},
+        ]
 
         answer = _unittest_summary_answer("unit tests", tag, "unittest-sub-ib-mention")
 
-        self.assertIn("3 sub-IB variant(s)", answer)
-        self.assertIn("CLANG", answer)
-        self.assertIn("DEVEL", answer)
-        self.assertIn("MULTIARCHS", answer)
+        self.assertIn("CMSSW_20_1_CLANG_X_2026-08-25-2300", answer)
+        self.assertIn("CMSSW_20_1_DEVEL_X_2026-08-25-2300", answer)
+        self.assertIn("CMSSW_20_1_MULTIARCHS_X_2026-08-25-2300", answer)
+        self.assertIn("No imported unit-test records were found for `CMSSW_20_1_CLANG_X_2026-08-25-2300`", answer)
 
     @patch("server.api_server.get_driver")
     @patch("server.api_server.get_failing_unittests")
@@ -1289,17 +1301,21 @@ class ChatRoutingTests(unittest.TestCase):
         tag = "CMSSW_20_1_X_2026-08-25-2300"
         get_failing_unittests.return_value = [{"name": "DQM/Physics", "errors": 5}]
         session = get_driver.return_value.session.return_value.__enter__.return_value
-        session.run.return_value = [{"variant": "ROOT6"}]
+        session.run.return_value = [{"variant": "ROOT6", "tag": "CMSSW_20_1_ROOT6_X_2026-08-25-2300"}]
 
         answer = _failed_unittest_list_answer(
             "what 3 failed packages?", tag, "el9_aarch64_gcc14",
         )
 
-        self.assertIn("1 sub-IB variant(s)", answer)
-        self.assertIn("ROOT6", answer)
+        self.assertIn("Sub-IB variant `ROOT6` (`CMSSW_20_1_ROOT6_X_2026-08-25-2300`)", answer)
+        # DQM/Physics shows up under both the primary tag and the inlined
+        # ROOT6 section since get_failing_unittests is mocked identically
+        # for every tag in this fixture.
+        self.assertEqual(answer.count("DQM/Physics"), 2)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server.get_failing_unittests")
-    def test_failed_unittest_list_answer_lists_package_names(self, get_failing_unittests):
+    def test_failed_unittest_list_answer_lists_package_names(self, get_failing_unittests, _sub_ib_variant_tags):
         # Regression: found live -- get_failing_unittests was already
         # registered as an LLM tool, but nothing in the deterministic path
         # ever called it; only the aggregate count existed
@@ -1321,8 +1337,9 @@ class ChatRoutingTests(unittest.TestCase):
             "CMSSW_20_1_X_2026-08-25-2300", arch="el9_aarch64_gcc14", limit=100
         )
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server.get_failing_unittests")
-    def test_failed_unittest_list_answer_recognizes_which_phrasing(self, get_failing_unittests):
+    def test_failed_unittest_list_answer_recognizes_which_phrasing(self, get_failing_unittests, _sub_ib_variant_tags):
         # Regression: found live -- "which packages are failing" has neither
         # "list/show/give" nor "what", only "which"; the trigger only
         # recognized "what X are failing", the same narrow-synonym gap
