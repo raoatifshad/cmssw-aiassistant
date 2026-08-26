@@ -2243,6 +2243,13 @@ class ShiftSummaryCapabilityTests(unittest.TestCase):
             "what changed since the last build",
             "what changed between builds",
             "any news from the previous IB",
+            # Regression: "new" only means something relative to a previous
+            # build -- "what are the new failures/errors" is the same
+            # request as "what changed since the last IB", just phrased
+            # without any of the words that regex looked for.
+            "what are the new failures",
+            "any new errors",
+            "what are the new failures/errors",
         ]:
             with self.subTest(question=question):
                 self.assertTrue(RequestContext.extract(question).has_shift_summary_request)
