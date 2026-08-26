@@ -21,18 +21,22 @@ class FindPrsBeforeIbTests(unittest.TestCase):
         self.assertIn("RETURN DISTINCT", query)
 
     @patch("graph.tools.get_driver")
-    def test_orders_by_pr_number_ascending(self, get_driver):
-        # merged_prs_summary.json carries no per-PR merge timestamp, so
-        # p.merged_at is null for most of these rows -- ordering by it
-        # produced an effectively arbitrary sequence (found live). PR number
-        # ascending is a stable, always-populated substitute.
+    def test_orders_newest_merged_at_first_with_undated_prs_last(self, get_driver):
+        # Most PRs do have a real merged_at (checked live: 39,005 of 45,904),
+        # so ordering must actually use it, newest first -- but a real
+        # minority have none (merged_prs_summary.json itself carries no
+        # per-PR timestamp, so a PR missing one from its own separate import
+        # falls back to null), and a plain `ORDER BY p.merged_at DESC` would
+        # put those at the very TOP: openCypher treats null as the largest
+        # value, so DESC surfaces it first. `p.merged_at IS NULL` as the
+        # primary sort key pushes undated rows to the end instead.
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value = [{"repo": "cmssw", "pr_number": 51750, "title": "x", "merged_at": None, "author": None}]
 
         find_prs_before_ib("CMSSW_20_1_X_2026-08-25-2300")
 
         query = session.run.call_args.args[0]
-        self.assertIn("ORDER BY p.number ASC", query)
+        self.assertIn("ORDER BY p.merged_at IS NULL, p.merged_at DESC", query)
 
 
 class LatestIbRankingTests(unittest.TestCase):

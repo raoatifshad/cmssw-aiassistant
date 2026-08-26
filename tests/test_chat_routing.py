@@ -96,11 +96,48 @@ class ChatRoutingTests(unittest.TestCase):
         )
 
         self.assertIn("primary IB `CMSSW_20_1_X_2026-08-11-2300`", answer)
-        self.assertIn("Scope: imported DEFAULT architecture markers.", answer)
+        self.assertIn("Scope: all imported architectures.", answer)
         self.assertIn("Imported sub-IB variants", answer)
         self.assertIn("`CMSSW_20_1_ROOT640_X_2026-08-11-2300`", answer)
         self.assertIn("ib.parent_tag = $tag", session.run.call_args.args[0])
         get_driver.return_value.close.assert_called_once()
+
+    @patch("server.api_server.get_driver")
+    def test_ib_summary_never_hides_non_default_architectures(self, get_driver):
+        # Regression: found live via "give the summary for latest IB" -- a
+        # primary tag with 4 imported architectures, only 2 flagged
+        # is_relval_default, showed only those 2 with no indication the
+        # other 2 (el8_amd64_gcc14, el9_amd64_gcc14) existed at all. Unlike
+        # the RelVal/unit-test versions of this bug, this one had no
+        # ask-when-ambiguous guard whatsoever -- it silently narrowed
+        # whenever any default existed, for any count.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        tag = "CMSSW_20_1_X_2026-08-25-2300"
+        session.run.return_value = [
+            {"ib_tag": tag, "variant": None, "arch": "el10_amd64_gcc15", "is_default": True,
+             "build_status": "passed", "build_warnings": 0, "ignored_warnings": 964,
+             "relval_total": 40, "relval_failed": 1, "unit_test_total": 368, "unit_test_failed": 4,
+             "unit_test_errors": 16},
+            {"ib_tag": tag, "variant": None, "arch": "el9_aarch64_gcc14", "is_default": True,
+             "build_status": "passed", "build_warnings": 0, "ignored_warnings": 1528,
+             "relval_total": 951, "relval_failed": 51, "unit_test_total": 366, "unit_test_failed": 3,
+             "unit_test_errors": 15},
+            {"ib_tag": tag, "variant": None, "arch": "el8_amd64_gcc14", "is_default": False,
+             "build_status": "passed", "build_warnings": 0, "ignored_warnings": 900,
+             "relval_total": 951, "relval_failed": 1, "unit_test_total": 373, "unit_test_failed": 2,
+             "unit_test_errors": 14},
+            {"ib_tag": tag, "variant": None, "arch": "el9_amd64_gcc14", "is_default": False,
+             "build_status": "passed", "build_warnings": 0, "ignored_warnings": 2397,
+             "relval_total": 951, "relval_failed": 1, "unit_test_total": 373, "unit_test_failed": 2,
+             "unit_test_errors": 14},
+        ]
+
+        answer = _ib_results_summary_answer(f"give the summary for {tag}", None, None)
+
+        self.assertIn("el10_amd64_gcc15", answer)
+        self.assertIn("el9_aarch64_gcc14", answer)
+        self.assertIn("el8_amd64_gcc14", answer)
+        self.assertIn("el9_amd64_gcc14", answer)
 
     @patch("server.api_server.get_driver")
     def test_sub_ib_question_explains_parent_relationship(self, get_driver):
@@ -731,7 +768,15 @@ class ChatRoutingTests(unittest.TestCase):
         # (previously designed and registered as an LLM tool via
         # find_prs_before_ib, but never actually populated by any ingestion
         # function -- always returned empty).
+        # find_prs_before_ib is responsible for newest-first ordering itself
+        # (see test_orders_newest_merged_at_first_with_undated_prs_last);
+        # this fixture is already in that order to isolate what
+        # _merged_prs_for_build_answer's own formatting adds -- the merge
+        # date, which the user explicitly asked to see displayed, not just
+        # used for sorting.
         find_prs_before_ib.return_value = [
+            {"repo": "cmssw", "pr_number": 51741, "title": "Update the requested memory size in reused blocks",
+             "merged_at": "2026-08-24T17:22:05+00:00", "author": "fwyzard"},
             {"repo": "cmssw", "pr_number": 51750, "title": "Remove testSkipEvent_cfg.py as obsolete",
              "merged_at": None, "author": "makortel"},
         ]
@@ -742,7 +787,9 @@ class ChatRoutingTests(unittest.TestCase):
 
         self.assertIn("51750", answer)
         self.assertIn("makortel", answer)
-        self.assertEqual(len(prs), 1)
+        self.assertIn("2026-08-24T17:22:05+00:00", answer)
+        self.assertIn("merge date unknown", answer)
+        self.assertEqual(len(prs), 2)
         find_prs_before_ib.assert_called_once_with("CMSSW_20_1_X_2026-08-25-2300", limit=100)
 
     def test_merged_prs_for_build_answer_requires_merged_keyword_and_tag(self):
