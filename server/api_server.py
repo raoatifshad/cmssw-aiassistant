@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote_plus
@@ -1076,6 +1077,57 @@ def _latest_and_previous_ib_tags(arch: str | None = None) -> tuple[str, str] | N
     latest_tag = f"CMSSW_{major}_{minor}_X_{timestamps[0]}"
     previous_tag = f"CMSSW_{major}_{minor}_X_{timestamps[1]}"
     return latest_tag, previous_tag
+
+
+def _latest_and_days_ago_ib_tags(days: int, arch: str | None = None) -> tuple[str, str] | None:
+    """Return (latest_tag, anchor_tag): the latest build in the newest
+    release series, paired with the build closest to (at or before) `days`
+    days ago in that same series -- the same "anchor tag"
+    generate_shift_summary needs for a two-build diff, just a wider,
+    explicitly-requested window instead of _latest_and_previous_ib_tags'
+    always-immediately-previous build. Answers "what's newly failing over
+    the past N days" by reusing the exact same diff logic a plain shift
+    summary already uses, just anchored differently.
+
+    Falls back to the oldest imported build in the series when none is old
+    enough to satisfy the requested window, rather than silently narrowing
+    to a shorter window with no indication the full window wasn't covered
+    -- the caller is expected to name the actual anchor tag used, the same
+    "never silently narrow scope" rule the RelVal/unit-test/IB-summary
+    architecture-visibility fixes already follow."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB) "
+                "WHERE ($arch IS NULL OR ib.arch = $arch) "
+                "AND ib.tag =~ '^CMSSW_[0-9]+_[0-9]+_X_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' "
+                "RETURN DISTINCT ib.tag AS tag",
+                arch=arch,
+            )]
+    finally:
+        driver.close()
+    if not rows:
+        return None
+
+    def version_key(tag: str) -> tuple[int, int, str]:
+        major, minor, timestamp = _PRIMARY_IB_TAG_RE.match(tag).groups()
+        return (int(major), int(minor), timestamp)
+
+    keyed = [(version_key(row["tag"]), row["tag"]) for row in rows]
+    newest_series = max(key[:2] for key, _ in keyed)
+    timestamps = sorted({key[2] for key, _ in keyed if key[:2] == newest_series}, reverse=True)
+    if len(timestamps) < 2:
+        return None
+    major, minor = newest_series
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d-%H%M")
+    older_or_equal = [ts for ts in timestamps if ts <= cutoff]
+    anchor_timestamp = older_or_equal[0] if older_or_equal else timestamps[-1]
+    latest_tag = f"CMSSW_{major}_{minor}_X_{timestamps[0]}"
+    anchor_tag = f"CMSSW_{major}_{minor}_X_{anchor_timestamp}"
+    if anchor_tag == latest_tag:
+        return None
+    return latest_tag, anchor_tag
 
 
 def _all_release_series_latest_and_previous(arch: str | None = None) -> list[tuple[str, str]]:
@@ -2441,22 +2493,49 @@ _RECURRING_FAILURE_INTENT_RE = re.compile(
 _WORKFLOW_WILDCARD_RE = re.compile(r"\b(\d{3,6})\.(?:x+|X+|\?+|\*+)\b")
 
 
-def _parse_recency_window_days(question: str) -> int | None:
-    """Parse an explicit recency window from a frequent-failures question.
-    None means "all imported history" -- an explicit all-time request (e.g.
-    "ever", "all time") must not silently fall back to the default window."""
-    if re.search(r"\ball(?:\s+time)?\b|\bever\b", question, re.IGNORECASE):
+# A relative-time signal word -- kept as a prefix requirement for the
+# week/month/day patterns below (not made fully optional) so a question
+# that just happens to mention "week" or "day" for an unrelated reason
+# doesn't get misread as a recency window.
+_RECENCY_PREFIX = r"(?:last|past|previous|within(?:\s+the)?|over(?:\s+the)?(?:\s+last)?)"
+
+
+def _parse_recency_window_days(question: str, default: int | None = 7) -> int | None:
+    """Parse an explicit recency window from a question. None means "all
+    imported history" -- an explicit all-time request (e.g. "ever", "all
+    time") must not silently fall back to a shorter window. `default` is
+    returned when no explicit window is mentioned at all: the
+    frequent-failures feature wants a real window even then (7 days, its
+    long-standing behavior), but a caller for which "no window mentioned"
+    means something different (e.g. a shift-summary request, where it means
+    "compare to the immediately previous build," not "compare to 7 days
+    ago" -- a different, wider request) passes default=None."""
+    # Found live: "list all the new failing workflows..." tripped this --
+    # "all" is a plain determiner there, not an all-time request. "time"
+    # must actually be present for the all-time reading to apply.
+    if re.search(r"\ball\s+time\b|\bever\b", question, re.IGNORECASE):
         return None
-    days_match = re.search(r"\blast\s+(\d+)\s+days?\b", question, re.IGNORECASE)
+    # Found live: "past 15 days" didn't match at all (only literal "last",
+    # not "past", was accepted for the digit-count form, unlike the week/
+    # month/day forms below which already accepted both) -- and a bare
+    # "15 days" with no prefix is still a strong enough recency signal in
+    # this domain to accept on its own, no prefix required.
+    days_match = re.search(rf"\b(?:{_RECENCY_PREFIX}\s+)?(\d+)\s+days?\b", question, re.IGNORECASE)
     if days_match:
         return int(days_match.group(1))
-    if re.search(r"\b(?:last|past)\s+week\b", question, re.IGNORECASE):
+    # Found live: "past one week"/"past one month" (a word-number between
+    # the prefix and the unit) didn't match either, silently falling
+    # through to the 7-day default below -- wrong for "one month" (should
+    # be 30). The word-number alternatives need their own trailing \s+ (the
+    # bare "1\s+" alternative already had one, but "one"/"a" didn't --
+    # "one month" was requiring the literal text "onemonth" to match).
+    if re.search(rf"\b{_RECENCY_PREFIX}\s+(?:(?:one|a|1)\s+)?week\b", question, re.IGNORECASE):
         return 7
-    if re.search(r"\b(?:last|past)\s+month\b", question, re.IGNORECASE):
+    if re.search(rf"\b{_RECENCY_PREFIX}\s+(?:(?:one|a|1)\s+)?month\b", question, re.IGNORECASE):
         return 30
-    if re.search(r"\b(?:last|past)\s+(?:day|24\s*hours?)\b", question, re.IGNORECASE):
+    if re.search(rf"\b{_RECENCY_PREFIX}\s+(?:(?:one|a|1)\s+)?(?:day|24\s*hours?)\b", question, re.IGNORECASE):
         return 1
-    return 7
+    return default
 
 
 def _format_frequent_failures_report(days: int | None, arch: str | None) -> str:
@@ -3568,10 +3647,26 @@ def _ib_comparison_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
-def _shift_summary_answer(arch: str | None) -> str:
+def _shift_summary_answer(arch: str | None, days: int | None = None) -> str:
     """Shared by the chat "shift_summary" capability and GET /api/shift-summary
     (the shifter page) so both serve the identical cache-or-generate logic
-    instead of two independently-typed copies."""
+    instead of two independently-typed copies. `days`, when given, answers
+    "what's newly failing over the past N days" by anchoring the diff to the
+    build from around that many days ago instead of the immediately
+    previous one -- otherwise identical generate_shift_summary diff logic."""
+    if days:
+        tags = _latest_and_days_ago_ib_tags(days, arch)
+        if not tags:
+            return (
+                f"Not enough Integration Build history is imported yet for the current release "
+                f"series to cover a {days}-day window (at least two builds are required)."
+            )
+        latest_tag, anchor_tag = tags
+        return (
+            f"_Comparing against the build closest to {days} days ago (`{anchor_tag}`) -- "
+            "see the heading below for the exact build used._\n\n"
+            + generate_shift_summary(latest_tag, anchor_tag, arch)
+        )
     tags = _latest_and_previous_ib_tags(arch)
     if not tags:
         return (
@@ -3599,7 +3694,8 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         return None
     if capability == "shift_summary":
         arch = _requested_ib_arch(question)
-        return (_shift_summary_answer(arch), [])
+        days = _parse_recency_window_days(question, default=None)
+        return (_shift_summary_answer(arch, days), [])
     if capability == "comparison":
         # `or` short-circuits, unlike `for x in (a(), b(), c())` which builds the
         # tuple eagerly and always runs every call — _ib_comparison_answer's
