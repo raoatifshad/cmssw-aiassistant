@@ -67,6 +67,14 @@ class Scenario:
 
 
 _NO_RELVAL_DATA_YET = ["No imported RelVal records were found", "No failing RelVals were found"]
+# A legitimate, intentional outcome (not a routing dead end): the "latest"
+# tag genuinely has >1 architecture simultaneously flagged
+# is_relval_default, which _relval_scope_or_choice correctly asks about
+# rather than guessing -- see CLAUDE.md's RelVal-architecture-visibility fix.
+# Distinct from _NO_RELVAL_DATA_YET (no data at all) -- this is "data exists
+# but which architecture is ambiguous."
+_RELVAL_ARCH_CHOICE_PENDING = ["are architecture-specific", "Choose a listed architecture"]
+_RELVAL_SCOPE_ALT_OK = _NO_RELVAL_DATA_YET + _RELVAL_ARCH_CHOICE_PENDING
 
 
 def build_scenarios(tag: str, arch: str) -> list[Scenario]:
@@ -74,23 +82,23 @@ def build_scenarios(tag: str, arch: str) -> list[Scenario]:
         Scenario("relval failure count", [
             Turn(
                 f"how many relvals are failing in {tag}",
-                expect_contains=["failing"], alt_ok_contains=_NO_RELVAL_DATA_YET,
+                expect_contains=["failing"], alt_ok_contains=_RELVAL_SCOPE_ALT_OK,
             ),
         ]),
         Scenario("relval workflow list, tag repeated same turn", [
             Turn(
                 f"can you give the workflow that are failing in relvals {tag}",
-                expect_contains=["Workflow ID"], alt_ok_contains=_NO_RELVAL_DATA_YET,
+                expect_contains=["Workflow ID"], alt_ok_contains=_RELVAL_SCOPE_ALT_OK,
             ),
         ]),
         Scenario("relval workflow list, tag carried from earlier turn", [
             Turn(
                 f"how many relvals are failing in {tag}",
-                expect_contains=["failing"], alt_ok_contains=_NO_RELVAL_DATA_YET,
+                expect_contains=["failing"], alt_ok_contains=_RELVAL_SCOPE_ALT_OK,
             ),
             Turn(
                 "can you give the workflow that are failing",
-                expect_contains=["Workflow ID"], alt_ok_contains=_NO_RELVAL_DATA_YET,
+                expect_contains=["Workflow ID"], alt_ok_contains=_RELVAL_SCOPE_ALT_OK,
             ),
             Turn("workflow names", expect_contains=[]),
         ]),
@@ -124,7 +132,7 @@ def build_scenarios(tag: str, arch: str) -> list[Scenario]:
         Scenario("architecture-qualified relval follow-up", [
             Turn(
                 f"how many relvals are failing in {tag}",
-                expect_contains=["failing"], alt_ok_contains=_NO_RELVAL_DATA_YET,
+                expect_contains=["failing"], alt_ok_contains=_RELVAL_SCOPE_ALT_OK,
             ),
             Turn(arch, expect_contains=[]),
         ]),

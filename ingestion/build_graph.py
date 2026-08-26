@@ -401,6 +401,85 @@ def ingest_es_exceptions(driver, path: Path, force: bool = False) -> int:
     return len(records)
 
 
+def merged_pr_records(payload: list) -> list[dict]:
+    """Flatten merged_prs_summary.json into (target_tag, number, author_login,
+    commit_hash) records. Each `comparisons` entry's `compared_tags` is
+    "SOURCE_TAG-->TARGET_TAG"; the PRs in `merged_prs` are new as of the
+    TARGET tag -- the same "PRs merged since the previous build" list the
+    CMSSDT dashboard shows under each IB tag's tab. Skips malformed entries
+    (missing/unparseable `number`, no "-->" in `compared_tags`) the same way
+    every other *_records() parser in this file does."""
+    records = []
+    for branch_entry in payload:
+        for comparison in branch_entry.get("comparisons", []):
+            compared_tags = comparison.get("compared_tags") or ""
+            if "-->" not in compared_tags:
+                continue
+            target_tag = compared_tags.split("-->")[-1].strip()
+            if not target_tag:
+                continue
+            for pr in comparison.get("merged_prs", []):
+                try:
+                    number = int(pr.get("number"))
+                except (TypeError, ValueError):
+                    continue
+                records.append({
+                    "target_tag": target_tag,
+                    "number": number,
+                    "author_login": pr.get("author_login"),
+                    "commit_hash": pr.get("hash"),
+                })
+    return records
+
+
+def ingest_merged_prs(driver, path: Path, force: bool = False) -> int:
+    """Populate (PR)-[:MERGED_BEFORE]->(IB) -- see merged_pr_records() for the
+    parsing rules. This relationship and the graph_tools.find_prs_before_ib()
+    query against it were already designed and registered as an LLM tool;
+    only the ingestion side was never built, so it always returned empty.
+    This is that missing half, sourced from cms-sw.github.io's
+    merged_prs_summary.json (already present in a normal --cmsrepo checkout,
+    no separate flag needed).
+
+    One JSON file is one source (same whole-file-hash pattern as
+    ingest_es_exceptions): any change to the file reprocesses the whole
+    thing. PRs attach to every imported IB node sharing the target tag
+    (architecture-independent source-code fact, not tied to one build's
+    architecture). A PR only attaches if it's already imported (from
+    cmsrepo/data/prs) and the target tag matches an already-imported IB --
+    one without the other is silently skipped, not stored, the same rule
+    RelVal exceptions already follow for their own cross-references."""
+    if not path.is_file():
+        print(f"  merged PRs: path not found {path}")
+        return 0
+    source_id = f"merged-prs:{path.resolve()}"
+    digest = file_hash(path)
+    if not source_needs_import(driver, source_id, digest, force):
+        return 0
+
+    payload = json.loads(path.read_text())
+    records = merged_pr_records(payload)
+
+    with driver.session() as session:
+        session.run(
+            "MATCH (:PR)-[rel:MERGED_BEFORE {source_id:$source_id}]->(:IB) DELETE rel",
+            source_id=source_id,
+        )
+        session.run(
+            "UNWIND $records AS record "
+            "MATCH (pr:PR {repo:'cmssw', number:record.number}) "
+            "MATCH (ib:IB {tag:record.target_tag}) "
+            "MERGE (pr)-[rel:MERGED_BEFORE]->(ib) "
+            "SET rel.source_id=$source_id, rel.commit_author_login=record.author_login, "
+            "rel.commit_hash=record.commit_hash",
+            records=records,
+            source_id=source_id,
+        )
+    mark_source_imported(driver, source_id, digest, "merged-prs", path)
+    print(f"  Merged-PR build attachments imported: {len(records)}")
+    return len(records)
+
+
 def ingest_relvals(driver, root: Path, force: bool = False, reconcile: bool = False):
     if not root.is_dir():
         print(f"  relvals: path not found {root}")
@@ -1275,6 +1354,7 @@ def main():
     ingest_unittests(driver, cmsrepo / "data" / "unitTests", args.force, args.reconcile)
     ingest_prs(driver, cmsrepo / "data" / "prs", args.force, args.reconcile)
     pr_cache = ingest_pr_cache(driver, cmsrepo / "cmssw-prs-cache.json", args.force)
+    ingest_merged_prs(driver, cmsrepo / "data" / "merged_prs_summary.json", args.force)
     ingest_exit_codes(driver, cmsrepo / "exitcodes.json", args.force)
     ingest_commands(
         driver, cmsrepo / "data" / "commands", pr_cache, args.force,

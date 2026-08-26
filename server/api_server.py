@@ -26,9 +26,10 @@ from starlette.middleware.sessions import SessionMiddleware
 sys.path.insert(0, str(Path(__file__).parent.parent / "graph"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from tools import (  # noqa: E402
-    TOOLS, GRAPH_SCHEMA, count_warnings_by_package, diff_warnings, find_prs_for_error, get_exit_code_names,
-    get_failing_relvals, get_relval_recurrence, get_shift_summary, relval_failure_architectures, search_concepts,
-    search_workflow_ids, store_shift_summary, top_recurring_relval_failures,
+    TOOLS, GRAPH_SCHEMA, count_warnings_by_package, diff_warnings, find_prs_before_ib, find_prs_for_error,
+    get_exit_code_names, get_failing_relvals, get_relval_recurrence, get_shift_summary,
+    relval_failure_architectures, search_concepts, search_workflow_ids, store_shift_summary,
+    top_recurring_relval_failures,
 )
 from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # noqa: E402
 from server.llm_client import DEFAULT_MODEL, get_client  # noqa: E402
@@ -1391,6 +1392,39 @@ def _pr_and_issue_evidence_answer(question: str, session_id: str) -> tuple[str, 
     if issue_answer:
         return issue_answer, []
     return None
+
+
+def _merged_prs_for_build_answer(question: str) -> tuple[str, list[dict]] | None:
+    """Report which PRs were newly merged as of an explicitly named IB build
+    -- the same "recently merged" list the CMSSDT dashboard shows under a
+    tag's tab (DEFAULT, CLANG_X, ...). Backed by (PR)-[:MERGED_BEFORE]->(IB),
+    populated by ingest_merged_prs from cms-sw.github.io's
+    merged_prs_summary.json. Architecture-independent (a PR merge is a
+    source-code fact, not tied to one build's architecture), so this
+    deliberately doesn't take an architecture filter the way RelVal/unit-test
+    answers do."""
+    if not re.search(r"\bmerged?\b", question, re.IGNORECASE):
+        return None
+    tag_match = IB_TAG_RE.search(question)
+    if not tag_match:
+        return None
+    tag = tag_match.group(1)
+
+    rows = find_prs_before_ib(tag, limit=100)
+    if not rows:
+        return (
+            f"No imported record of PRs merged specifically into `{tag}` is available. "
+            "This tracks cms-sw.github.io's per-build merged-PR changelog, which may not "
+            "cover every historical tag.",
+            [],
+        )
+    lines = [f"PRs merged into `{tag}` since the previous build:"]
+    lines.extend(
+        f"- **{row['repo']} #{row['pr_number']}** - {row['title']}"
+        + (f" (by {row['author']})" if row["author"] else "")
+        for row in rows
+    )
+    return "\n".join(lines), rows
 
 
 def _release_artifact_answer(question: str) -> str | None:
@@ -3582,6 +3616,11 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         workflow_artifact_answer = _workflow_artifact_answer(scoped_question)
         if workflow_artifact_answer:
             return (workflow_artifact_answer, [])
+        merged_result = _merged_prs_for_build_answer(scoped_question)
+        if merged_result:
+            merged_answer, prs = merged_result
+            _pr_contexts[session_id] = prs
+            return (merged_answer, [])
         result = _pr_and_issue_evidence_answer(scoped_question, session_id)
         if result:
             pr_answer, prs = result
@@ -3598,14 +3637,32 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
             or _latest_clang_warning_answer(question)
             or _clang_warning_answer(question, _latest_ib_contexts.get(session_id))
         )
-        return (answer, []) if answer else None
+        if answer:
+            return answer, []
+        # A sub-IB-flavored question ("Clang CMSSW_..._CLANG_X_... what are
+        # merged") has no "PR"/"issue" word, so it never reaches the
+        # "pr_evidence" branch's version of this fallback -- same
+        # capability-priority pattern as the earlier relval/pr_evidence fix.
+        merged_result = _merged_prs_for_build_answer(question)
+        if merged_result:
+            answer, prs = merged_result
+            _pr_contexts[session_id] = prs
+            return answer, []
+        return None
     if capability == "build":
         answer = (
             _build_warning_answer(question, _latest_ib_contexts.get(session_id))
             or _build_summary_answer(question)
             or _warning_count_answer(question)
         )
-        return (answer, []) if answer else None
+        if answer:
+            return answer, []
+        merged_result = _merged_prs_for_build_answer(question)
+        if merged_result:
+            answer, prs = merged_result
+            _pr_contexts[session_id] = prs
+            return answer, []
+        return None
     if capability == "ib_summary":
         answer = _ib_results_summary_answer(
             question, _latest_ib_contexts.get(session_id), _latest_ib_arch_contexts.get(session_id)
@@ -3619,6 +3676,11 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         result = _pr_number_answer(question)
         if result:
             answer, prs = result
+            _pr_contexts[session_id] = prs
+            return answer, []
+        merged_result = _merged_prs_for_build_answer(question)
+        if merged_result:
+            answer, prs = merged_result
             _pr_contexts[session_id] = prs
             return answer, []
         # An explicit `#N` in this question refreshes the session's "last
@@ -3925,6 +3987,11 @@ def chat(req: ChatRequest):
     release_artifact_answer = _release_artifact_answer(question)
     if release_artifact_answer:
         return _chat_response(sid, original_question, release_artifact_answer, "deterministic")
+    merged_prs_result = _merged_prs_for_build_answer(question)
+    if merged_prs_result:
+        merged_prs_answer, prs = merged_prs_result
+        _pr_contexts[sid] = prs
+        return _chat_response(sid, original_question, merged_prs_answer, "deterministic")
     pr_result = _pr_evidence_answer(question, _last_workflow_contexts.get(sid))
     if pr_result:
         pr_answer, prs = pr_result

@@ -9,6 +9,7 @@ from server.api_server import (
     _latest_ib_answer,
     _issue_author_answer,
     _issue_detail_answer,
+    _merged_prs_for_build_answer,
     _resolve_issue_number,
     _latest_issue_answer,
     _last_issue_contexts,
@@ -679,6 +680,63 @@ class ChatRoutingTests(unittest.TestCase):
         answer, _ = result
         self.assertIn("51649", answer)
         self.assertIn("42737", answer)
+
+    @patch("server.api_server.find_prs_before_ib")
+    def test_merged_prs_for_build_answer_reports_recently_merged_prs(self, find_prs_before_ib):
+        # New feature: "which PRs are merged in <tag>" -- the same "recently
+        # merged" list the CMSSDT dashboard shows under a tag's tab. Backed
+        # by (PR)-[:MERGED_BEFORE]->(IB), populated by ingest_merged_prs
+        # (previously designed and registered as an LLM tool via
+        # find_prs_before_ib, but never actually populated by any ingestion
+        # function -- always returned empty).
+        find_prs_before_ib.return_value = [
+            {"repo": "cmssw", "pr_number": 51750, "title": "Remove testSkipEvent_cfg.py as obsolete",
+             "merged_at": None, "author": "makortel"},
+        ]
+
+        answer, prs = _merged_prs_for_build_answer(
+            "which PR are merged in default CMSSW_20_1_X_2026-08-25-2300"
+        )
+
+        self.assertIn("51750", answer)
+        self.assertIn("makortel", answer)
+        self.assertEqual(len(prs), 1)
+        find_prs_before_ib.assert_called_once_with("CMSSW_20_1_X_2026-08-25-2300", limit=100)
+
+    def test_merged_prs_for_build_answer_requires_merged_keyword_and_tag(self):
+        self.assertIsNone(_merged_prs_for_build_answer("what is CMSSW_20_1_X_2026-08-25-2300"))
+        self.assertIsNone(_merged_prs_for_build_answer("which PRs are merged"))
+
+    @patch("server.api_server.find_prs_before_ib", return_value=[])
+    def test_pr_evidence_capability_answers_merged_prs_questions(self, find_prs_before_ib):
+        result = _execute_planned_capability(
+            "pr_evidence", "which PR are merged in default CMSSW_20_1_X_2026-08-25-2300", "merged-prs-pr-evidence"
+        )
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("No imported record", answer)
+
+    @patch("server.api_server.find_prs_before_ib")
+    def test_clang_capability_answers_merged_prs_questions_without_pr_word(self, find_prs_before_ib):
+        # Regression: found live -- "Clang CMSSW_..._CLANG_X_... what are
+        # merged" has no "PR"/"issue" word (only "clang"), so it routes to
+        # the "clang" capability, not "pr_evidence" -- same
+        # capability-priority pattern as the relval/pr_evidence fix. Without
+        # this wiring it would hard-fail under the "clang" label even though
+        # the merged-PR data itself was found fine.
+        find_prs_before_ib.return_value = [
+            {"repo": "cmssw", "pr_number": 51750, "title": "Remove testSkipEvent_cfg.py as obsolete",
+             "merged_at": None, "author": "makortel"},
+        ]
+
+        result = _execute_planned_capability(
+            "clang", "Clang CMSSW_20_1_CLANG_X_2026-08-25-2300 what are merged", "merged-prs-clang"
+        )
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("51750", answer)
 
     def test_workflow_exception_search_requires_ib_context(self):
         self.assertEqual(

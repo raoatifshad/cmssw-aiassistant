@@ -17,6 +17,7 @@ from build_graph import (
     github_reference_numbers,
     ib_key,
     is_unchanged,
+    merged_pr_records,
     pr_cache_records,
     relval_default_records,
     relval_exception_records,
@@ -212,6 +213,47 @@ class IncrementalGraphTests(unittest.TestCase):
             "comp_warnings": 1,
             "ignored_warnings": 2117,
         }])
+
+    def test_merged_pr_records_attach_to_the_target_tag_of_each_comparison(self):
+        # merged_prs_summary.json's compared_tags is "SOURCE-->TARGET"; the
+        # PRs in merged_prs are new as of TARGET, not SOURCE -- this is the
+        # per-build "recently merged" changelog the CMSSDT dashboard shows
+        # under each IB tag's tab (find_prs_before_ib's missing ingestion
+        # half, see ingest_merged_prs).
+        payload = [{
+            "base_branch": "CMSSW_20_1_X",
+            "comparisons": [{
+                "compared_tags": "CMSSW_20_1_X_2026-08-25-1100-->CMSSW_20_1_X_2026-08-25-2300",
+                "merged_prs": [
+                    {"number": "51750", "author_login": "makortel", "hash": "431734c"},
+                    {"number": "51715", "author_login": "aterigun", "hash": "997d5b7"},
+                ],
+            }],
+        }]
+
+        records = merged_pr_records(payload)
+
+        self.assertEqual(records, [
+            {"target_tag": "CMSSW_20_1_X_2026-08-25-2300", "number": 51750,
+             "author_login": "makortel", "commit_hash": "431734c"},
+            {"target_tag": "CMSSW_20_1_X_2026-08-25-2300", "number": 51715,
+             "author_login": "aterigun", "commit_hash": "997d5b7"},
+        ])
+
+    def test_merged_pr_records_skip_malformed_entries(self):
+        payload = [{
+            "base_branch": "CMSSW_20_1_X",
+            "comparisons": [
+                {"compared_tags": "no-arrow-here", "merged_prs": [{"number": "1"}]},
+                {"compared_tags": "A-->", "merged_prs": [{"number": "2"}]},
+                {"compared_tags": "A-->B", "merged_prs": [{"number": "not-a-number"}]},
+                {"compared_tags": "A-->B", "merged_prs": [{"number": "3"}]},
+            ],
+        }]
+
+        records = merged_pr_records(payload)
+
+        self.assertEqual(records, [{"target_tag": "B", "number": 3, "author_login": None, "commit_hash": None}])
 
     def test_patch_parser_keeps_renamed_and_deleted_paths(self):
         patch = (

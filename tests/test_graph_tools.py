@@ -1,7 +1,24 @@
 import unittest
 from unittest.mock import patch
 
-from graph.tools import _ib_sort_key, diff_warnings, list_ib_tags
+from graph.tools import _ib_sort_key, diff_warnings, find_prs_before_ib, list_ib_tags
+
+
+class FindPrsBeforeIbTests(unittest.TestCase):
+    @patch("graph.tools.get_driver")
+    def test_query_deduplicates_across_architecture_instances(self, get_driver):
+        # ingest_merged_prs attaches MERGED_BEFORE to every architecture's IB
+        # node sharing a tag (a PR merge is architecture-independent), so
+        # without DISTINCT this query would return the same PR once per
+        # imported architecture -- found live: a tag with 4 architectures
+        # returned each of its 7 merged PRs 4 times (28 rows).
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"repo": "cmssw", "pr_number": 51750, "title": "x", "merged_at": None, "author": None}]
+
+        find_prs_before_ib("CMSSW_20_1_X_2026-08-25-2300")
+
+        query = session.run.call_args.args[0]
+        self.assertIn("RETURN DISTINCT", query)
 
 
 class LatestIbRankingTests(unittest.TestCase):
