@@ -3932,6 +3932,23 @@ def chat(req: ChatRequest):
     if ib_action_menu:
         menu_answer, actions = ib_action_menu
         return _chat_response(sid, original_question, menu_answer, "deterministic", actions=actions)
+    # Sweep finding: _ib_relationship_answer existed only inside
+    # _execute_planned_capability -- unlike every other major answer
+    # function, it had no presence in this legacy waterfall safety net. If
+    # RequestPlanner ever fails to score the "ib_relationship" capability
+    # for a real phrasing (the same class of trigger-regex gap found
+    # repeatedly today -- "package", "which X are failing", "new failures"
+    # all needed adding), there was no deterministic fallback at all,
+    # straight to the weaker LLM path instead. (_ib_results_summary_answer
+    # has the same gap -- added much later below, not here: its trigger
+    # matches *any* bare tag mention alone, the same broad low-priority
+    # catch-all role "ib_summary" has in the planner (priority 50, below
+    # every specific category) -- placing it this early would let it shadow
+    # every more specific function below it, exactly the bug this whole
+    # sweep exists to catch.)
+    ib_relationship_answer = _ib_relationship_answer(question)
+    if ib_relationship_answer:
+        return _chat_response(sid, original_question, ib_relationship_answer, "deterministic")
     relval_failure_count_answer = _relval_failure_count_answer(question, sid)
     if relval_failure_count_answer:
         return _chat_response(sid, original_question, relval_failure_count_answer, "deterministic")
@@ -4091,6 +4108,17 @@ def chat(req: ChatRequest):
         pr_answer, prs = pr_result
         _pr_contexts[sid] = prs
         return _chat_response(sid, original_question, pr_answer, "deterministic")
+    # Sweep finding: _ib_results_summary_answer existed only inside
+    # _execute_planned_capability -- placed last (mirroring "ib_summary"'s
+    # lowest-of-the-specific-categories priority=50 in the planner) so its
+    # broad "any bare tag mention" trigger can't shadow a more specific
+    # function above it, the same mistake an earlier placement of this same
+    # call made during this sweep (see the comment near _ib_relationship_answer).
+    ib_results_summary_answer = _ib_results_summary_answer(
+        question, _latest_ib_contexts.get(sid), _latest_ib_arch_contexts.get(sid)
+    )
+    if ib_results_summary_answer:
+        return _chat_response(sid, original_question, ib_results_summary_answer, "deterministic")
     concept_answer = _concept_answer(question)
     if concept_answer:
         return _chat_response(sid, original_question, concept_answer, "deterministic")
