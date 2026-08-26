@@ -512,7 +512,11 @@ def find_prs_before_ib(ib_tag: str, arch: str | None = None, limit: int = 20) ->
     """PRs that merged right before this IB — the first-pass attribution.
     A PR merge is architecture-independent, so ingest_merged_prs attaches
     MERGED_BEFORE to every architecture's IB node sharing this tag -- DISTINCT
-    collapses those back to one row per PR instead of one per architecture."""
+    collapses those back to one row per PR instead of one per architecture.
+    Ordered by PR number ascending -- merged_prs_summary.json carries no
+    per-PR merge timestamp, so p.merged_at (populated by the separate PR
+    import, not this relationship) is null for most of these rows and
+    ordering by it produced an effectively arbitrary sequence."""
     limit = min(limit, MAX_ROWS)
     return _run_query(
         "MATCH (p:PR)-[:MERGED_BEFORE]->(ib:IB {tag:$t}) "
@@ -520,7 +524,7 @@ def find_prs_before_ib(ib_tag: str, arch: str | None = None, limit: int = 20) ->
         "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
         "RETURN DISTINCT p.repo AS repo, p.number AS pr_number, p.title AS title, "
         "       p.merged_at AS merged_at, a.name AS author "
-        "ORDER BY p.merged_at DESC LIMIT $lim",
+        "ORDER BY p.number ASC LIMIT $lim",
         {"t": ib_tag, "arch": arch, "lim": limit},
     )
 

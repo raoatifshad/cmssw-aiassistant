@@ -20,6 +20,20 @@ class FindPrsBeforeIbTests(unittest.TestCase):
         query = session.run.call_args.args[0]
         self.assertIn("RETURN DISTINCT", query)
 
+    @patch("graph.tools.get_driver")
+    def test_orders_by_pr_number_ascending(self, get_driver):
+        # merged_prs_summary.json carries no per-PR merge timestamp, so
+        # p.merged_at is null for most of these rows -- ordering by it
+        # produced an effectively arbitrary sequence (found live). PR number
+        # ascending is a stable, always-populated substitute.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"repo": "cmssw", "pr_number": 51750, "title": "x", "merged_at": None, "author": None}]
+
+        find_prs_before_ib("CMSSW_20_1_X_2026-08-25-2300")
+
+        query = session.run.call_args.args[0]
+        self.assertIn("ORDER BY p.number ASC", query)
+
 
 class LatestIbRankingTests(unittest.TestCase):
     """Regression coverage for the release-series-vs-timestamp ranking bug:

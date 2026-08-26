@@ -73,6 +73,21 @@ class RequestPlannerTests(unittest.TestCase):
         self.assertIn("unittest", context.categories)
         self.assertEqual(self.planner.plan(context).capability, "unittest_summary")
 
+    def test_package_alone_is_recognized_as_a_unittest_synonym(self):
+        # Regression: found live -- "which packages are failing in <tag>
+        # <arch>" has neither "unit" nor "test" in it at all. UnitTest
+        # results are package-level aggregates in this graph (see
+        # CLAUDE.md), so "package" is as much a unittest synonym here as
+        # "wf"/"workflow" already are for "relval" -- without this, the
+        # question had no recognized category and fell into the ambiguous
+        # "choose a scope" clarification instead of routing directly.
+        context = RequestContext.extract(
+            "which packages are failing in CMSSW_20_1_X_2026-08-25-2300 el9_aarch64_gcc14"
+        )
+
+        self.assertIn("unittest", context.categories)
+        self.assertEqual(self.planner.plan(context).capability, "unittest_summary")
+
     def test_ambiguous_failures_create_deterministic_clarification(self):
         context = RequestContext.extract("failures for CMSSW_20_1_X_2026-08-10-1100")
 
