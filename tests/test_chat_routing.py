@@ -628,8 +628,13 @@ class ChatRoutingTests(unittest.TestCase):
         # fallback tag (_unittest_summary_answer's `context_tag` parameter).
         # Pins that behavior so a future refactor can't silently drop it.
         session = get_driver.return_value.session.return_value.__enter__.return_value
-        session.run.return_value = [
-            {"arch": "el9_amd64_gcc14", "is_default": True, "total": 10, "failed": 1, "passed": 9, "errors": 2},
+        # Two distinct queries now run against this mocked driver: the
+        # unit-test scope records, then _sub_ib_variant_names' separate
+        # "does this tag have sub-IB siblings" lookup -- give each its own
+        # shaped result instead of reusing one list for both.
+        session.run.side_effect = [
+            [{"arch": "el9_amd64_gcc14", "is_default": True, "total": 10, "failed": 1, "passed": 9, "errors": 2}],
+            [],
         ]
         session_id = "unittest-followup-no-tag"
         tag = "CMSSW_20_1_ASAN_X_2026-08-24-2300"
@@ -1254,6 +1259,44 @@ class ChatRoutingTests(unittest.TestCase):
 
         self.assertIn("3 failed", answer)
         self.assertNotIn("Choose one", answer)
+
+    @patch("server.api_server.get_driver")
+    @patch("server.api_server._unittest_scope_records")
+    def test_unittest_summary_mentions_sub_ib_variants(self, scope_records, get_driver):
+        # Regression: found live -- a primary tag's unit-test summary gave no
+        # hint that CLANG/DEVEL/MULTIARCHS/NONLTO/ROOT6 sub-IB variants exist
+        # for the same build, each running its own separate unit-test suite
+        # with its own failure count (confirmed against the CMSSDT
+        # dashboard) -- the same "mention, never merge" treatment RelVal
+        # already gets (test_relval_failure_count_mentions_sub_ib_variants).
+        tag = "CMSSW_20_1_X_2026-08-25-2300"
+        scope_records.return_value = [
+            {"arch": "el9_amd64_gcc14", "is_default": True, "total": 950, "failed": 3, "passed": 947, "errors": 3},
+        ]
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"variant": "CLANG"}, {"variant": "DEVEL"}, {"variant": "MULTIARCHS"}]
+
+        answer = _unittest_summary_answer("unit tests", tag, "unittest-sub-ib-mention")
+
+        self.assertIn("3 sub-IB variant(s)", answer)
+        self.assertIn("CLANG", answer)
+        self.assertIn("DEVEL", answer)
+        self.assertIn("MULTIARCHS", answer)
+
+    @patch("server.api_server.get_driver")
+    @patch("server.api_server.get_failing_unittests")
+    def test_failed_unittest_list_answer_mentions_sub_ib_variants(self, get_failing_unittests, get_driver):
+        tag = "CMSSW_20_1_X_2026-08-25-2300"
+        get_failing_unittests.return_value = [{"name": "DQM/Physics", "errors": 5}]
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"variant": "ROOT6"}]
+
+        answer = _failed_unittest_list_answer(
+            "what 3 failed packages?", tag, "el9_aarch64_gcc14",
+        )
+
+        self.assertIn("1 sub-IB variant(s)", answer)
+        self.assertIn("ROOT6", answer)
 
     @patch("server.api_server.get_failing_unittests")
     def test_failed_unittest_list_answer_lists_package_names(self, get_failing_unittests):

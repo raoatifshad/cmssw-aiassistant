@@ -632,13 +632,15 @@ def _is_relval_failure_count_question(question: str) -> bool:
     )
 
 
-def _relval_sub_ib_variant_names(tag: str) -> list[str]:
+def _sub_ib_variant_names(tag: str) -> list[str]:
     """Distinct sub-IB variant names (ASAN, UBSAN, ROOT6, ...) imported for
     a primary tag -- used only to mention their existence alongside a
-    primary-tag summary, never to merge their RelVal counts into it. Per
-    CLAUDE.md's "IB (tag, architecture) pairs are never merged" invariant: a
-    sanitizer build's failure profile isn't comparable to the primary
-    build's (e.g. UBSAN/ROOT6 routinely differ from DEFAULT by 10-1000x)."""
+    primary-tag summary (RelVal or unit-test), never to merge their counts
+    into it. Per CLAUDE.md's "IB (tag, architecture) pairs are never merged"
+    invariant: a sanitizer/variant build's failure profile isn't comparable
+    to the primary build's (e.g. UBSAN/ROOT6 routinely differ from DEFAULT
+    by 10-1000x, and CLANG/DEVEL/MULTIARCHS/NONLTO each run their own
+    independent unit-test suite)."""
     driver = get_driver()
     try:
         with driver.session() as session:
@@ -650,6 +652,20 @@ def _relval_sub_ib_variant_names(tag: str) -> list[str]:
             return [row["variant"] for row in rows]
     finally:
         driver.close()
+
+
+def _sub_ib_variant_note(tag: str, sub_ib_variants: list[str] | None) -> str | None:
+    """Shared "these sub-IB variants exist separately" caveat, appended (never
+    merged in) alongside a primary-tag RelVal or unit-test summary. Returns
+    None when there's nothing to mention."""
+    if not sub_ib_variants:
+        return None
+    return (
+        f"`{tag}` also has {len(sub_ib_variants)} sub-IB variant(s) not included above "
+        "(each is a separate build with its own results, not merged into these numbers): "
+        + ", ".join(f"`{variant}`" for variant in sub_ib_variants)
+        + ". Ask about a specific variant by name (e.g. its full IB tag) for its own results."
+    )
 
 
 def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: list[str] | None = None) -> str:
@@ -669,14 +685,10 @@ def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: li
         f"{record['passed_relvals'] or 0:,} | {record['relval_total'] or 0:,} |"
         for record in records
     )
-    if sub_ib_variants:
+    note = _sub_ib_variant_note(records[0]["tag"], sub_ib_variants)
+    if note:
         lines.append("")
-        lines.append(
-            f"`{records[0]['tag']}` also has {len(sub_ib_variants)} sub-IB variant(s) not included above "
-            "(each is a separate build with its own results, not merged into these numbers): "
-            + ", ".join(f"`{variant}`" for variant in sub_ib_variants)
-            + ". Ask about a specific variant by name (e.g. its full IB tag) for its own results."
-        )
+        lines.append(note)
     return "\n".join(lines)
 
 
@@ -781,7 +793,7 @@ def _relval_failure_count_answer(question: str, session_id: str) -> str | None:
     resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
     if isinstance(resolved, str):
         return resolved
-    return _relval_scope_summary(resolved, f"RelVal results for `{tag}`", _relval_sub_ib_variant_names(tag))
+    return _relval_scope_summary(resolved, f"RelVal results for `{tag}`", _sub_ib_variant_names(tag))
 
 
 def _relval_data_availability_answer(question: str, session_id: str) -> str | None:
@@ -800,7 +812,7 @@ def _relval_data_availability_answer(question: str, session_id: str) -> str | No
     resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
     if isinstance(resolved, str):
         return resolved
-    return _relval_scope_summary(resolved, f"Imported RelVal data for `{tag}`", _relval_sub_ib_variant_names(tag))
+    return _relval_scope_summary(resolved, f"Imported RelVal data for `{tag}`", _sub_ib_variant_names(tag))
 
 
 def _relval_ib_summary_answer(question: str, session_id: str) -> str | None:
@@ -821,7 +833,7 @@ def _relval_ib_summary_answer(question: str, session_id: str) -> str | None:
     resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
     if isinstance(resolved, str):
         return resolved
-    return _relval_scope_summary(resolved, f"Imported RelVal results for `{tag}`", _relval_sub_ib_variant_names(tag))
+    return _relval_scope_summary(resolved, f"Imported RelVal results for `{tag}`", _sub_ib_variant_names(tag))
 
 
 def _unittest_scope_records(tag: str) -> list[dict]:
@@ -870,6 +882,15 @@ def _unittest_summary_from_records(tag: str, records: list[dict]) -> str:
         f"{record['total'] or 0:,} | {record['errors'] or 0:,} |"
         for record in records
     )
+    # Same "mention, never merge" treatment RelVal already gets (see
+    # _relval_scope_summary) -- found live: a primary tag's unit-test summary
+    # silently said nothing about its CLANG/DEVEL/MULTIARCHS/NONLTO/ROOT6
+    # sub-IB siblings, each of which runs its own separate unit-test suite
+    # with its own failure count (confirmed against the CMSSDT dashboard).
+    note = _sub_ib_variant_note(tag, _sub_ib_variant_names(tag))
+    if note:
+        lines.append("")
+        lines.append(note)
     return "\n".join(lines)
 
 
@@ -986,6 +1007,10 @@ def _failed_unittest_list_answer(
         lines.extend(f"- {row['name']} (errors: {row['errors'] or 0})" for row in rows)
     if not found_any:
         return f"No failed unit-test packages were found for `{tag}`."
+    note = _sub_ib_variant_note(tag, _sub_ib_variant_names(tag))
+    if note:
+        lines.append("")
+        lines.append(note)
     return "\n".join(lines)
 
 
