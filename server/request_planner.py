@@ -20,7 +20,12 @@ PR_RE = re.compile(r"(?:\b(?:pr|mr|pull request|merge request)\s*#?|#)(\d+)\b", 
 WORKFLOW_RE = re.compile(r"\bworkflow\s*#?(\d+(?:\.\d+)?)\b", re.IGNORECASE)
 SHIFT_SUMMARY_RE = re.compile(
     r"\bshift\s*summary\b|\bshift\s*report\b|\bvirtual\s*shift(?:er)?\b|"
-    r"\bwhat\s+changed\s+(?:since|between)\b|\b(?:since|from)\s+the\s+(?:last|previous)\s+(?:ib|build)\b",
+    r"\bwhat\s+changed\s+(?:since|between)\b|\b(?:since|from)\s+the\s+(?:last|previous)\s+(?:ib|build)\b|"
+    # "what are the new failures/errors" is the same request as "what
+    # changed since the last IB" -- "new" only means something relative to
+    # a previous build, so this is inherently a previous-vs-latest
+    # comparison request, not a plain failure-count question.
+    r"\bnew\s+(?:failures?|errors?|warnings?|issues?)\b",
     re.IGNORECASE,
 )
 
