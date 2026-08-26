@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from server.api_server import (
@@ -50,6 +51,9 @@ from server.api_server import (
     _fallback_clarification,
     _latest_ib_arch_contexts,
     _latest_ib_contexts,
+    _parse_recency_window_days,
+    _latest_and_days_ago_ib_tags,
+    _shift_summary_answer,
     _request_planner,
     chat,
     record_feedback,
@@ -2450,6 +2454,165 @@ class ShiftSummaryCapabilityTests(unittest.TestCase):
 
         self.assertIn("Not enough Integration Build history", answer)
         self.assertEqual(actions, [])
+
+
+class RecencyWindowParsingTests(unittest.TestCase):
+    def test_digit_count_accepts_both_last_and_past_prefixes(self):
+        for prefix in ["last", "past", "previous", "within the", "over the"]:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    _parse_recency_window_days(f"new failing workflows {prefix} 15 days"), 15,
+                )
+
+    def test_bare_digit_count_needs_no_prefix(self):
+        self.assertEqual(_parse_recency_window_days("new failing workflows 30 days"), 30)
+
+    def test_word_number_week_and_month_forms(self):
+        self.assertEqual(_parse_recency_window_days("what's new in the past one week"), 7)
+        self.assertEqual(_parse_recency_window_days("what's new in the past one month"), 30)
+        self.assertEqual(_parse_recency_window_days("failures over the last month"), 30)
+        self.assertEqual(_parse_recency_window_days("failures in the last a week"), 7)
+
+    def test_day_and_24_hour_forms(self):
+        self.assertEqual(_parse_recency_window_days("new failures in the last day"), 1)
+        self.assertEqual(_parse_recency_window_days("new failures within the last 24 hours"), 1)
+
+    def test_all_time_phrasing_returns_none_regardless_of_default(self):
+        self.assertIsNone(_parse_recency_window_days("failures of all time", default=7))
+        self.assertIsNone(_parse_recency_window_days("has this ever failed", default=7))
+
+    def test_bare_all_as_a_determiner_is_not_mistaken_for_all_time(self):
+        # Regression: found live -- "list all the new failing workflows for
+        # the past 15 days" tripped the all-time check on the plain
+        # determiner "all", discarding the explicit 15-day window entirely.
+        self.assertEqual(
+            _parse_recency_window_days(
+                "list all the new failing workflows for the past 15 days"
+            ),
+            15,
+        )
+
+    def test_no_window_mentioned_uses_caller_supplied_default(self):
+        # Frequent-failures keeps its long-standing 7-day default...
+        self.assertEqual(_parse_recency_window_days("what fails most often"), 7)
+        # ...but shift-summary passes default=None so a plain "what changed"
+        # falls back to "immediately previous build," not a 7-day window.
+        self.assertIsNone(_parse_recency_window_days("what changed", default=None))
+
+
+class LatestAndDaysAgoIbTagsTests(unittest.TestCase):
+    @patch("server.api_server.get_driver")
+    def test_anchors_to_the_build_closest_to_the_requested_window(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"tag": "CMSSW_20_1_X_2026-08-25-2300"},
+            {"tag": "CMSSW_20_1_X_2026-08-20-2300"},
+            {"tag": "CMSSW_20_1_X_2026-08-10-2300"},
+            {"tag": "CMSSW_20_1_X_2026-08-01-2300"},
+        ]
+
+        with patch("server.api_server.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 8, 25, 23, 0, tzinfo=timezone.utc)
+            result = _latest_and_days_ago_ib_tags(15)
+
+        self.assertEqual(
+            result, ("CMSSW_20_1_X_2026-08-25-2300", "CMSSW_20_1_X_2026-08-10-2300"),
+        )
+        get_driver.return_value.close.assert_called_once()
+
+    @patch("server.api_server.get_driver")
+    def test_falls_back_to_oldest_build_when_none_is_old_enough(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"tag": "CMSSW_20_1_X_2026-08-25-2300"},
+            {"tag": "CMSSW_20_1_X_2026-08-24-2300"},
+        ]
+
+        with patch("server.api_server.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 8, 25, 23, 0, tzinfo=timezone.utc)
+            result = _latest_and_days_ago_ib_tags(30)
+
+        self.assertEqual(
+            result, ("CMSSW_20_1_X_2026-08-25-2300", "CMSSW_20_1_X_2026-08-24-2300"),
+        )
+
+    @patch("server.api_server.get_driver")
+    def test_only_one_build_in_the_newest_series_returns_none(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"tag": "CMSSW_20_1_X_2026-08-25-2300"}]
+
+        result = _latest_and_days_ago_ib_tags(15)
+
+        self.assertIsNone(result)
+
+    @patch("server.api_server.get_driver")
+    def test_picks_the_newest_release_series_not_just_the_newest_timestamp(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"tag": "CMSSW_20_1_X_2026-08-25-2300"},
+            {"tag": "CMSSW_20_1_X_2026-08-10-2300"},
+            {"tag": "CMSSW_20_0_X_2026-08-24-2300"},
+        ]
+
+        with patch("server.api_server.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 8, 25, 23, 0, tzinfo=timezone.utc)
+            result = _latest_and_days_ago_ib_tags(30)
+
+        self.assertEqual(
+            result, ("CMSSW_20_1_X_2026-08-25-2300", "CMSSW_20_1_X_2026-08-10-2300"),
+        )
+
+
+class ShiftSummaryDayWindowTests(unittest.TestCase):
+    def test_trigger_regex_recognizes_day_window_phrasings(self):
+        for question in [
+            "list all the new failing workflows for the past one week",
+            "list all the new failing workflows for the past 15 days",
+            "list all the new failing workflows for the past 30 days",
+            "list all the new failing workflows for the past one month",
+        ]:
+            with self.subTest(question=question):
+                self.assertTrue(RequestContext.extract(question).has_shift_summary_request)
+
+    @patch("server.api_server.generate_shift_summary", return_value="15-day digest")
+    @patch("server.api_server._latest_and_days_ago_ib_tags")
+    def test_execute_planned_capability_threads_the_day_window_through(
+        self, days_ago, generate,
+    ):
+        days_ago.return_value = ("CMSSW_20_1_X_2026-08-25-2300", "CMSSW_20_1_X_2026-08-10-2300")
+
+        answer, actions = _execute_planned_capability(
+            "shift_summary",
+            "list all the new failing workflows for the past 15 days",
+            "s1",
+        )
+
+        days_ago.assert_called_once_with(15, None)
+        generate.assert_called_once_with(
+            "CMSSW_20_1_X_2026-08-25-2300", "CMSSW_20_1_X_2026-08-10-2300", None,
+        )
+        self.assertIn("15-day digest", answer)
+        self.assertIn("CMSSW_20_1_X_2026-08-10-2300", answer)
+        self.assertEqual(actions, [])
+
+    @patch("server.api_server._latest_and_previous_ib_tags")
+    def test_plain_shift_summary_question_still_uses_immediately_previous_build(
+        self, latest_and_previous,
+    ):
+        # Regression guard: default=None must mean "no window mentioned falls
+        # back to the immediately-previous-build comparison," not "7 days."
+        latest_and_previous.return_value = None
+
+        _execute_planned_capability("shift_summary", "give me a shift summary", "s1")
+
+        latest_and_previous.assert_called_once_with(None)
+
+    @patch("server.api_server._latest_and_days_ago_ib_tags", return_value=None)
+    def test_not_enough_history_for_the_window_returns_graceful_message(self, days_ago):
+        answer, actions = _shift_summary_answer(None, days=15), []
+
+        self.assertIn("Not enough Integration Build history", answer)
+        self.assertIn("15-day window", answer)
 
 
 if __name__ == "__main__":
