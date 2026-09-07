@@ -29,9 +29,21 @@ SHIFT_SUMMARY_RE = re.compile(
     # -- found live: the exact-noun form above didn't cover this shape, so
     # it fell through to the raw list of *every* currently-failing workflow
     # instead of the previous-vs-latest delta the question actually asked
-    # for ("only those absent in the previous release").
-    r"\bnew\s+(?:failures?|errors?|warnings?|issues?)\b|"
-    r"\bnew\b[^?!]{0,30}\bfailing\b",
+    # for ("only those absent in the previous release"). A bounded gap
+    # (rather than requiring "new" and the failure noun to be adjacent) also
+    # covers a category noun in between -- "new relval failures", "new unit
+    # test failures", "new build warnings" -- found live: naming two IBs and
+    # asking for one category's new failures ("what are the new relval
+    # failures between <A> and <B>") fell through to the two-IB
+    # comparison-or-single-build clarification instead of answering, because
+    # the old exact-adjacency pattern only matched "new failures" with
+    # nothing in between.
+    r"\bnew\b[^?!]{0,20}\b(?:failures?|errors?|warnings?|issues?)\b|"
+    r"\bnew\b[^?!]{0,30}\bfailing\b|"
+    # Reversed order: "relval failures are new [between <A> and <B>]" --
+    # found live alongside the gap above, same underlying question, just
+    # phrased with the category noun and "new" swapped.
+    r"\b(?:failures?|errors?|warnings?|issues?)\b[^?!]{0,10}\b(?:is|are)\s+new\b",
     re.IGNORECASE,
 )
 
@@ -265,7 +277,15 @@ class RequestPlanner:
                     ("Combined summary", f"summary for {context.tag}"),
                 ),
             )
-        if len(context.ib_tags) > 1 and not context.has_comparison_request:
+        if (
+            len(context.ib_tags) > 1 and not context.has_comparison_request
+            and not context.has_shift_summary_request
+        ):
+            # Mirrors the single-tag guard above: "what's new failing between
+            # <A> and <B>" is already an unambiguous shift-summary request
+            # (has_shift_summary_request), just like "shift summary for <tag>"
+            # is unambiguous for the single-tag case -- neither needs the
+            # generic "comparison or single build?" clarification.
             return Clarification(
                 missing_field="intent",
                 question="Do you want a comparison of these Integration Builds, or results for one specific build?",
