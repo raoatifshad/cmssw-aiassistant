@@ -3,8 +3,15 @@ import unittest
 from unittest.mock import patch
 
 from server.api_server import (
+    _addon_shift_table,
+    _build_shift_table,
     _diff_failing_relvals,
+    _diff_failing_unittests,
+    _plain_shift_table,
     _split_relval_diff,
+    _split_unittest_diff,
+    _status_diff_rows,
+    _unittest_shift_table,
     generate_shift_summary,
 )
 
@@ -57,6 +64,90 @@ class SplitRelvalDiffTests(unittest.TestCase):
         self.assertEqual(resolved, [])
 
 
+class DiffFailingUnittestsTests(unittest.TestCase):
+    def test_detects_newly_failing_and_resolved(self):
+        before = [{"name": "test_a", "errors": 1}]
+        after = [{"name": "test_a", "errors": 1}, {"name": "test_b", "errors": 2}]
+        diff = _diff_failing_unittests(before, after)
+        self.assertEqual([name for name, _, _ in diff], ["test_b"])
+
+    def test_unchanged_test_is_excluded(self):
+        row = {"name": "test_a", "errors": 1}
+        diff = _diff_failing_unittests([row], [dict(row)])
+        self.assertEqual(diff, [])
+
+
+class SplitUnittestDiffTests(unittest.TestCase):
+    def test_partitions_newly_failing_and_resolved(self):
+        before = [{"name": "test_a", "errors": 1}]
+        after = [{"name": "test_b", "errors": 2}]
+        diff = _diff_failing_unittests(before, after)
+
+        newly_failing, resolved = _split_unittest_diff(diff)
+
+        self.assertEqual([row["name"] for row in newly_failing], ["test_b"])
+        self.assertEqual([row["name"] for row in resolved], ["test_a"])
+
+
+class PlainShiftTableTests(unittest.TestCase):
+    def test_empty_rows_render_header_and_separator_only_no_none_text(self):
+        # Unlike _relval_table/_warning_list's "None." fallback, the new
+        # Build/Unit-Test/AddOn digest sections use a bare header+separator
+        # table for "nothing this shift" -- the frontend's row-count-based
+        # stat/alert detection expects a real (zero-row) table, not text.
+        lines = _plain_shift_table(["Name", "Errors"], [])
+        self.assertEqual(lines, ["| Name | Errors |", "| --- | --- |"])
+        self.assertNotIn("None.", lines)
+
+    def test_rows_are_rendered_as_table_cells(self):
+        lines = _plain_shift_table(["Name", "Errors"], [["test_something_LST", "Segmentation fault"]])
+        self.assertIn("| test_something_LST | Segmentation fault |", lines)
+
+    def test_unittest_shift_table_defaults_missing_errors_to_zero(self):
+        lines = _unittest_shift_table([{"name": "test_a"}])
+        self.assertIn("| test_a | 0 |", lines)
+
+
+class StatusDiffRowsTests(unittest.TestCase):
+    """Build and AddOn are both a single whole-architecture flag transition,
+    not a per-item list -- see _build_and_addon_status's docstring."""
+
+    def test_transition_into_error_is_newly_failing(self):
+        newly_failing, resolved = _status_diff_rows("passed", "error", "el9_amd64_gcc13")
+        self.assertEqual(newly_failing, {"arch": "el9_amd64_gcc13", "status": "error"})
+        self.assertIsNone(resolved)
+
+    def test_transition_out_of_error_is_resolved(self):
+        newly_failing, resolved = _status_diff_rows("error", "passed", "el9_amd64_gcc13")
+        self.assertIsNone(newly_failing)
+        self.assertEqual(resolved, {"arch": "el9_amd64_gcc13", "status": "passed"})
+
+    def test_staying_in_error_is_neither(self):
+        # Still broken on both sides isn't a "this shift" event for either table.
+        newly_failing, resolved = _status_diff_rows("error", "error", "el9_amd64_gcc13")
+        self.assertIsNone(newly_failing)
+        self.assertIsNone(resolved)
+
+    def test_missing_status_on_both_sides_triggers_nothing(self):
+        # Neither tag ever recorded a status for this arch (e.g. addon tests
+        # never ran there) -- None must not be misread as "not failing" in a
+        # way that fabricates a resolved/newly-failing row.
+        newly_failing, resolved = _status_diff_rows(None, None, "el9_amd64_gcc13")
+        self.assertIsNone(newly_failing)
+        self.assertIsNone(resolved)
+
+
+class BuildAndAddonShiftTableTests(unittest.TestCase):
+    def test_build_shift_table_names_the_architecture(self):
+        lines = _build_shift_table([{"arch": "el9_amd64_gcc13", "status": "error"}])
+        self.assertIn("| el9_amd64_gcc13 | build status: error |", lines)
+
+    def test_addon_shift_table_has_three_columns_with_na_exit_code(self):
+        lines = _addon_shift_table([{"arch": "el9_amd64_gcc13", "status": "error"}])
+        self.assertEqual(lines[0], "| Name | Errors | Exit code |")
+        self.assertIn("| el9_amd64_gcc13 | addon status: error | n/a |", lines)
+
+
 EMPTY_WARNINGS_DIFF = {"new": [], "resolved": [], "changed": []}
 
 
@@ -72,9 +163,11 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server.find_prs_for_error", return_value=[])
     @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
     @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
+    @patch("server.api_server.get_failing_unittests", return_value=[])
     @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
     @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server._build_and_addon_status", return_value={})
     def test_no_new_failures_renders_none_sections_and_no_evidence_block(self, *_mocks):
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
 
@@ -89,8 +182,11 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server.get_failing_relvals")
     @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
     @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._build_and_addon_status", return_value={})
     def test_new_failure_with_recurrence_and_pr_evidence(
-        self, get_exit_code_names, arch, get_failing, diff_w, recurrence, find_prs, search_c
+        self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
+        recurrence, find_prs, search_c
     ):
         new_row = _failing_row()
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
@@ -126,8 +222,11 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server.get_failing_relvals")
     @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
     @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._build_and_addon_status", return_value={})
     def test_new_failure_with_no_recurrence_and_no_pr_evidence(
-        self, get_exit_code_names, arch, get_failing, diff_w, recurrence, find_prs, search_c
+        self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
+        recurrence, find_prs, search_c
     ):
         new_row = _failing_row(workflow_id="999.0", name="BrandNewWorkflow")
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
@@ -146,8 +245,11 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server.get_failing_relvals")
     @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
     @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._build_and_addon_status", return_value={})
     def test_resolved_workflow_appears_only_in_resolved_table(
-        self, get_exit_code_names, arch, get_failing, diff_w, recurrence, find_prs, search_c
+        self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
+        recurrence, find_prs, search_c
     ):
         resolved_row = _failing_row(workflow_id="1.0", name="OldFlakyWorkflow")
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
@@ -166,8 +268,11 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server.get_failing_relvals")
     @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
     @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._build_and_addon_status", return_value={})
     def test_never_asserts_causality_for_pr_evidence(
-        self, get_exit_code_names, arch, get_failing, diff_w, recurrence, find_prs, search_c
+        self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
+        recurrence, find_prs, search_c
     ):
         new_row = _failing_row()
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
@@ -186,6 +291,75 @@ class GenerateShiftSummaryTests(unittest.TestCase):
                 self.assertTrue("relevance only" in line or "do not prove" in line)
                 if "caused" in line:
                     self.assertIn("not prove", line)
+
+    @patch("server.api_server.search_concepts", return_value=[])
+    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
+    @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
+    @patch("server.api_server.get_failing_relvals", return_value=[])
+    @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_unittests")
+    @patch("server.api_server._build_and_addon_status", return_value={})
+    def test_unit_test_sections_show_newly_failing_and_resolved_rows(
+        self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
+        recurrence, find_prs, search_c
+    ):
+        get_failing_unittests.side_effect = lambda tag, arch=None, limit=None: (
+            [{"name": "OldFlakyTest", "errors": 1}] if tag == "CMSSW_20_1_X_2026-08-19-1100"
+            else [{"name": "test_something_LST", "errors": "Segmentation fault"}]
+        )
+
+        markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
+
+        self.assertIn("#### Newly failing Unit Tests", markdown)
+        self.assertIn("| test_something_LST | Segmentation fault |", markdown)
+        self.assertIn("#### Resolved Unit Tests", markdown)
+        self.assertIn("| OldFlakyTest | 1 |", markdown)
+
+    @patch("server.api_server.search_concepts", return_value=[])
+    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
+    @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
+    @patch("server.api_server.get_failing_relvals", return_value=[])
+    @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._build_and_addon_status", return_value={})
+    def test_unit_test_sections_have_no_none_text_when_empty(self, *_mocks):
+        markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
+
+        newly_index = markdown.index("#### Newly failing Unit Tests")
+        resolved_index = markdown.index("#### Resolved Unit Tests")
+        newly_section = markdown[newly_index:resolved_index]
+        self.assertIn("| Name | Errors |", newly_section)
+        self.assertNotIn("None.", newly_section)
+
+    @patch("server.api_server.search_concepts", return_value=[])
+    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
+    @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
+    @patch("server.api_server.get_failing_relvals", return_value=[])
+    @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._build_and_addon_status")
+    def test_build_and_addon_sections_show_status_transitions(self, build_and_addon_status, *_mocks):
+        build_and_addon_status.return_value = {
+            ("CMSSW_20_1_X_2026-08-19-1100", "el9_amd64_gcc14"): {"build_status": "passed", "addon_status": "passed"},
+            ("CMSSW_20_1_X_2026-08-19-2300", "el9_amd64_gcc14"): {"build_status": "error", "addon_status": "error"},
+        }
+
+        markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
+
+        self.assertIn("#### Newly failing Build", markdown)
+        self.assertIn("| el9_amd64_gcc14 | build status: error |", markdown)
+        self.assertIn("#### Newly failing AddOn", markdown)
+        self.assertIn("| el9_amd64_gcc14 | addon status: error | n/a |", markdown)
+        # nothing regressed out of error, so both Resolved sections stay empty
+        resolved_build_idx = markdown.index("#### Resolved Build")
+        newly_unit_idx = markdown.index("#### Newly failing Unit Tests")
+        self.assertNotIn("el9_amd64_gcc14", markdown[resolved_build_idx:newly_unit_idx])
 
 
 if __name__ == "__main__":

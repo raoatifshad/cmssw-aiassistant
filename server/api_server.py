@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote_plus
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from neo4j.exceptions import ClientError, ServiceUnavailable
@@ -27,9 +27,9 @@ from starlette.middleware.sessions import SessionMiddleware
 sys.path.insert(0, str(Path(__file__).parent.parent / "graph"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from tools import (  # noqa: E402
-    TOOLS, GRAPH_SCHEMA, count_warnings_by_package, diff_warnings, find_prs_before_ib, find_prs_for_error,
-    get_exit_code_names, get_failing_relvals, get_failing_unittests, get_relval_recurrence, get_shift_summary,
-    relval_failure_architectures, search_concepts, search_workflow_ids, store_shift_summary,
+    TOOLS, GRAPH_SCHEMA, _ib_sort_key, count_warnings_by_package, diff_warnings, find_prs_before_ib,
+    find_prs_for_error, get_exit_code_names, get_failing_relvals, get_failing_unittests, get_relval_recurrence,
+    get_shift_summary, relval_failure_architectures, search_concepts, search_workflow_ids, store_shift_summary,
     top_recurring_relval_failures,
 )
 from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # noqa: E402
@@ -521,7 +521,10 @@ class SearchRequest(BaseModel):
 
 class AlertRuleRequest(BaseModel):
     name: str
-    rule_type: Literal["relval_failure_count", "relval_recurrence", "latest_ib_stalled"]
+    rule_type: Literal[
+        "relval_failure_count", "relval_recurrence", "latest_ib_stalled",
+        "unittest_failure_count", "build_failure_count",
+    ]
     params: dict
     threshold: float
     channel: str = "log"
@@ -1218,6 +1221,35 @@ def _all_release_series_latest_and_previous(arch: str | None = None) -> list[tup
         if len(ordered) >= 2:
             pairs.append((f"CMSSW_{major}_{minor}_X_{ordered[0]}", f"CMSSW_{major}_{minor}_X_{ordered[1]}"))
     return pairs
+
+
+def _list_shift_summary_windows() -> list[dict]:
+    """Every imported primary IB tag, across all release series, newest build
+    first -- the shifter page's window picker uses these as valid `from`/`to`
+    values for GET /api/shift-summary. Sorted by build timestamp alone (not
+    release-series-first like _latest_ib_records) since a human browsing past
+    windows expects plain reverse-chronological order, not series priority."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB) "
+                "WHERE ib.tag =~ '^CMSSW_[0-9]+_[0-9]+_X_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' "
+                "RETURN DISTINCT ib.tag AS tag"
+            )]
+    finally:
+        driver.close()
+    tags = sorted(
+        {row["tag"] for row in rows},
+        key=lambda tag: _PRIMARY_IB_TAG_RE.match(tag).group(3),
+        reverse=True,
+    )
+    windows = []
+    for tag in tags:
+        timestamp = _PRIMARY_IB_TAG_RE.match(tag).group(3)
+        date_part, time_part = timestamp.rsplit("-", 1)
+        windows.append({"release_name": tag, "label": f"{date_part} {time_part[:2]}:{time_part[2:]}"})
+    return windows
 
 
 def _is_latest_comparison_question(question: str) -> bool:
@@ -3534,12 +3566,105 @@ def _newly_failing_relval_table(
     return lines
 
 
+def _diff_failing_unittests(
+    before_failures: list[dict], after_failures: list[dict]
+) -> list[tuple[str, dict | None, dict | None]]:
+    """Diff two failing-unit-test snapshots by name -- same shape as
+    _diff_failing_relvals, keyed by name since UnitTest rows have no
+    workflow_id."""
+    previous = {item["name"]: item for item in before_failures}
+    later = {item["name"]: item for item in after_failures}
+    return [
+        (name, previous.get(name), later.get(name))
+        for name in sorted(set(previous) | set(later))
+        if previous.get(name) != later.get(name)
+    ]
+
+
+def _split_unittest_diff(
+    diff: list[tuple[str, dict | None, dict | None]]
+) -> tuple[list[dict], list[dict]]:
+    """Split a _diff_failing_unittests result into (newly_failing, resolved) row lists."""
+    newly_failing = [after for _, before, after in diff if after and not before]
+    resolved = [before for _, before, after in diff if before and not after]
+    return newly_failing, resolved
+
+
+def _plain_shift_table(headers: list[str], rows: list[list]) -> list[str]:
+    """A |-delimited table with no "None." text fallback -- an empty table
+    (header + separator, zero data rows) IS the "nothing this shift" state
+    the frontend's row-count-based stat/alert detection expects for the
+    Unit-Test digest section (distinct from _relval_table/_warning_list's
+    "None." convention, which predates this contract)."""
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"]
+    lines.extend("| " + " | ".join(_table_cell(str(cell)) for cell in row) + " |" for row in rows)
+    return lines
+
+
+def _unittest_shift_table(rows: list[dict]) -> list[str]:
+    return _plain_shift_table(["Name", "Errors"], [[row["name"], row.get("errors") or 0] for row in rows])
+
+
+def _build_and_addon_status(previous_tag: str, latest_tag: str) -> dict[tuple[str, str], dict]:
+    """Per (tag, arch) build_status/addon_status for a shift-summary pair --
+    one query instead of one per architecture. Both are whole-architecture
+    flags only (no per-package/per-test detail exists for either -- see
+    build_status_records in ingestion/build_graph.py and Release Explorer's
+    summarizeArchCell, which already renders both as a plain badge)."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB) WHERE ib.tag IN $tags "
+                "RETURN ib.tag AS tag, ib.arch AS arch, ib.build_status AS build_status, "
+                "ib.addon_status AS addon_status",
+                tags=[previous_tag, latest_tag],
+            )]
+    finally:
+        driver.close()
+    return {(row["tag"], row["arch"]): row for row in rows}
+
+
+def _status_diff_rows(
+    before_status: str | None, after_status: str | None, arch: str,
+) -> tuple[dict | None, dict | None]:
+    """(newly_failing_row, resolved_row) for one whole-architecture
+    build_status/addon_status transition -- shared shape for Build and
+    AddOn since both are the same "single flag per architecture" data."""
+    newly_failing = (
+        {"arch": arch, "status": after_status}
+        if after_status == "error" and before_status != "error" else None
+    )
+    resolved = (
+        {"arch": arch, "status": after_status}
+        if before_status == "error" and after_status != "error" else None
+    )
+    return newly_failing, resolved
+
+
+def _build_shift_table(rows: list[dict]) -> list[str]:
+    return _plain_shift_table(
+        ["Name", "Errors"],
+        [[row["arch"], f"build status: {row['status'] or 'unknown'}"] for row in rows],
+    )
+
+
+def _addon_shift_table(rows: list[dict]) -> list[str]:
+    return _plain_shift_table(
+        ["Name", "Errors", "Exit code"],
+        [[row["arch"], f"addon status: {row['status'] or 'unknown'}", "n/a"] for row in rows],
+    )
+
+
 def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None = None) -> str:
     """Compose a virtual-shifter digest for latest_tag vs previous_tag: per-arch
-    newly-failing/resolved RelVals, per-arch new/resolved/changed Clang warnings,
-    and for each distinct newly-failing workflow, release-series-scoped
-    recurrence plus best-effort PR/Concept evidence. Every evidence-bearing
-    section stays relevance-only -- never "caused"/"fixed"."""
+    newly-failing/resolved RelVals and UnitTests (real per-item detail), new/
+    resolved/changed Clang warnings, whole-architecture Build/AddOn status
+    transitions (a single badge per architecture only -- no per-package or
+    per-test detail exists for either, see _build_and_addon_status), and for
+    each distinct newly-failing workflow, release-series-scoped recurrence
+    plus best-effort PR/Concept evidence. Every evidence-bearing section
+    stays relevance-only -- never "caused"/"fixed"."""
     architectures = [arch] if arch else _ib_pair_architectures(previous_tag, latest_tag)
     if not architectures:
         return f"Neither `{previous_tag}` nor `{latest_tag}` has any imported architecture in the graph."
@@ -3547,7 +3672,8 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
     exit_code_names = get_exit_code_names()
     lines = [f"## Shift summary: {previous_tag} -> {latest_tag}"]
 
-    per_arch: list[tuple[str, list[dict], list[dict], dict]] = []
+    status_by_tag_arch = _build_and_addon_status(previous_tag, latest_tag)
+    per_arch: list[dict] = []
     newly_failing_by_workflow: dict[str, dict] = {}
     for one_arch in architectures:
         before_rows = get_failing_relvals(previous_tag, arch=one_arch, limit=200)
@@ -3562,7 +3688,28 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
             newly_failing_arch.extend(newly)
             resolved_arch.extend(resolved)
         warnings_diff = diff_warnings(previous_tag, latest_tag, one_arch)
-        per_arch.append((one_arch, newly_failing_arch, resolved_arch, warnings_diff))
+        before_unittests = get_failing_unittests(previous_tag, arch=one_arch, limit=200)
+        after_unittests = get_failing_unittests(latest_tag, arch=one_arch, limit=200)
+        newly_failing_unittests, resolved_unittests = _split_unittest_diff(
+            _diff_failing_unittests(before_unittests, after_unittests)
+        )
+        before_status = status_by_tag_arch.get((previous_tag, one_arch), {})
+        after_status = status_by_tag_arch.get((latest_tag, one_arch), {})
+        newly_failing_build, resolved_build = _status_diff_rows(
+            before_status.get("build_status"), after_status.get("build_status"), one_arch,
+        )
+        newly_failing_addon, resolved_addon = _status_diff_rows(
+            before_status.get("addon_status"), after_status.get("addon_status"), one_arch,
+        )
+        per_arch.append({
+            "arch": one_arch, "newly_failing_relvals": newly_failing_arch, "resolved_relvals": resolved_arch,
+            "warnings_diff": warnings_diff,
+            "newly_failing_unittests": newly_failing_unittests, "resolved_unittests": resolved_unittests,
+            "newly_failing_build": [row for row in [newly_failing_build] if row],
+            "resolved_build": [row for row in [resolved_build] if row],
+            "newly_failing_addon": [row for row in [newly_failing_addon] if row],
+            "resolved_addon": [row for row in [resolved_addon] if row],
+        })
         for row in newly_failing_arch:
             newly_failing_by_workflow.setdefault(row["workflow_id"], row)
 
@@ -3575,17 +3722,31 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
         for workflow_id, row in newly_failing_by_workflow.items()
     }
 
-    for one_arch, newly_failing_arch, resolved_arch, warnings_diff in per_arch:
+    for arch_result in per_arch:
+        one_arch = arch_result["arch"]
+        warnings_diff = arch_result["warnings_diff"]
         lines.extend(["", f"### `{one_arch}`", "", "#### Newly failing RelVal workflows"])
-        lines.extend(_newly_failing_relval_table(newly_failing_arch, exit_code_names, evidence))
+        lines.extend(_newly_failing_relval_table(arch_result["newly_failing_relvals"], exit_code_names, evidence))
         lines.extend(["", "#### Resolved RelVal workflows"])
-        lines.extend(_relval_table(resolved_arch, exit_code_names))
+        lines.extend(_relval_table(arch_result["resolved_relvals"], exit_code_names))
         lines.extend(["", "#### New Clang warning locations"])
         lines.extend(_warning_list(warnings_diff["new"], "new"))
         lines.extend(["", "#### Resolved Clang warning locations"])
         lines.extend(_warning_list(warnings_diff["resolved"], "resolved"))
         lines.extend(["", "#### Changed Clang warning occurrences"])
         lines.extend(_warning_list(warnings_diff["changed"], "changed"))
+        lines.extend(["", "#### Newly failing Build"])
+        lines.extend(_build_shift_table(arch_result["newly_failing_build"]))
+        lines.extend(["", "#### Resolved Build"])
+        lines.extend(_build_shift_table(arch_result["resolved_build"]))
+        lines.extend(["", "#### Newly failing Unit Tests"])
+        lines.extend(_unittest_shift_table(arch_result["newly_failing_unittests"]))
+        lines.extend(["", "#### Resolved Unit Tests"])
+        lines.extend(_unittest_shift_table(arch_result["resolved_unittests"]))
+        lines.extend(["", "#### Newly failing AddOn"])
+        lines.extend(_addon_shift_table(arch_result["newly_failing_addon"]))
+        lines.extend(["", "#### Resolved AddOn"])
+        lines.extend(_addon_shift_table(arch_result["resolved_addon"]))
 
     lines.extend([
         "",
@@ -3750,6 +3911,15 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         return None
     if capability == "shift_summary":
         arch = _requested_ib_arch(question)
+        explicit_tags = tuple(dict.fromkeys(IB_TAG_RE.findall(question)))
+        if len(explicit_tags) == 2:
+            # A shifter naming two IBs directly ("what's new failing between
+            # <A> and <B>") wants the diff for exactly those builds, not the
+            # session's current-latest-vs-previous default -- order by
+            # _ib_sort_key (not question word order) since "between" doesn't
+            # imply which one the shifter typed first is the newer build.
+            previous_tag, latest_tag = sorted(explicit_tags, key=_ib_sort_key)
+            return (generate_shift_summary(latest_tag, previous_tag, arch), [])
         days = _parse_recency_window_days(question, default=None)
         return (_shift_summary_answer(arch, days), [])
     if capability == "comparison":
@@ -4566,8 +4736,30 @@ def shift_whoami(username: str = Depends(require_shifter)):
     return {"username": username}
 
 
+@app.get("/api/shift-summary/windows")
+def shift_summary_windows(username: str = Depends(require_shifter)):
+    """Valid `from`/`to` values for GET /api/shift-summary, newest first."""
+    return {"windows": _list_shift_summary_windows()}
+
+
 @app.get("/api/shift-summary")
-def shift_summary(arch: str | None = None, username: str = Depends(require_shifter)):
+def shift_summary(
+    arch: str | None = None,
+    from_tag: str | None = Query(None, alias="from"),
+    to_tag: str | None = Query(None, alias="to"),
+    username: str = Depends(require_shifter),
+):
+    """`from`/`to` (release_name values from GET /api/shift-summary/windows)
+    request a digest for that explicit window instead of the current default
+    (latest vs. previous build). Omitting both keeps today's default
+    behavior. generate_shift_summary already renders an in-band "no imported
+    architecture" markdown message for an unknown tag rather than raising, so
+    an invalid from/to still returns the same {"markdown": ...} shape the
+    frontend already parses -- no separate error path to handle."""
+    if from_tag or to_tag:
+        if not (from_tag and to_tag):
+            raise HTTPException(422, "Both 'from' and 'to' must be given together.")
+        return {"markdown": generate_shift_summary(to_tag, from_tag, arch)}
     return {"markdown": _shift_summary_answer(arch)}
 
 

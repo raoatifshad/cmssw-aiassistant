@@ -116,14 +116,25 @@ class ProtectedEndpointTests(unittest.TestCase):
         self.client = TestClient(app)
         self.addCleanup(app.dependency_overrides.clear)
 
+    # DEV_SHIFTER_LOGIN patched True in every case below: these assert 401
+    # specifically (a login path exists but no session was presented), which
+    # requires *some* login path to be configured -- without patching, this
+    # instead depends on whatever this test process's ambient .env happens to
+    # have set (401 locally where DEV_SHIFTER_LOGIN=true, but 503 in CI where
+    # nothing is configured), the same lesson RequireShifterTests already
+    # documents and applies to itself above -- found live in CI, where these
+    # three failed with "503 != 401" for exactly that reason.
+    @patch("server.shifter_auth.DEV_SHIFTER_LOGIN", True)
     def test_shift_page_without_a_session_is_refused(self):
         response = self.client.get("/shift", follow_redirects=False)
         self.assertEqual(response.status_code, 401)
 
+    @patch("server.shifter_auth.DEV_SHIFTER_LOGIN", True)
     def test_shift_summary_api_without_a_session_is_refused(self):
         response = self.client.get("/api/shift-summary", follow_redirects=False)
         self.assertEqual(response.status_code, 401)
 
+    @patch("server.shifter_auth.DEV_SHIFTER_LOGIN", True)
     def test_alerts_status_api_without_a_session_is_refused(self):
         response = self.client.get("/api/alerts/status", follow_redirects=False)
         self.assertEqual(response.status_code, 401)
@@ -149,6 +160,55 @@ class ProtectedEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         notifier_used = evaluate_rules.call_args.args[0]
         self.assertEqual(notifier_used.__class__.__name__, "_NullNotifier")
+
+    @patch("server.shifter_auth.DEV_SHIFTER_LOGIN", True)
+    def test_shift_summary_windows_api_without_a_session_is_refused(self):
+        response = self.client.get("/api/shift-summary/windows", follow_redirects=False)
+        self.assertEqual(response.status_code, 401)
+
+    @patch(
+        "server.api_server._list_shift_summary_windows",
+        return_value=[{"release_name": "CMSSW_20_1_X_2026-09-03-2300", "label": "2026-09-03 23:00"}],
+    )
+    def test_shift_summary_windows_api_serves_the_window_list(self, windows):
+        app.dependency_overrides[require_shifter] = lambda: "alice"
+
+        response = self.client.get("/api/shift-summary/windows")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"windows": [{"release_name": "CMSSW_20_1_X_2026-09-03-2300", "label": "2026-09-03 23:00"}]},
+        )
+
+    @patch("server.api_server.generate_shift_summary", return_value="custom window digest")
+    def test_shift_summary_api_uses_explicit_from_to_window(self, generate):
+        app.dependency_overrides[require_shifter] = lambda: "alice"
+
+        response = self.client.get(
+            "/api/shift-summary",
+            params={
+                "from": "CMSSW_20_1_X_2026-08-20-2300",
+                "to": "CMSSW_20_1_X_2026-08-27-2300",
+                "arch": "el10_amd64_gcc15",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"markdown": "custom window digest"})
+        # to_tag is latest_tag (first arg), from_tag is previous_tag (second arg) --
+        # generate_shift_summary's own title line reads "previous_tag -> latest_tag",
+        # so this ordering is what makes the response read "from -> to".
+        generate.assert_called_once_with(
+            "CMSSW_20_1_X_2026-08-27-2300", "CMSSW_20_1_X_2026-08-20-2300", "el10_amd64_gcc15",
+        )
+
+    def test_shift_summary_api_rejects_from_without_to(self):
+        app.dependency_overrides[require_shifter] = lambda: "alice"
+
+        response = self.client.get("/api/shift-summary", params={"from": "CMSSW_20_1_X_2026-08-20-2300"})
+
+        self.assertEqual(response.status_code, 422)
 
 
 if __name__ == "__main__":

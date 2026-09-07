@@ -212,7 +212,28 @@ class IncrementalGraphTests(unittest.TestCase):
             "status": "warning",
             "comp_warnings": 1,
             "ignored_warnings": 2117,
+            "addon_status": None,
         }])
+
+    def test_build_status_records_translate_addon_pass_fail_booleans(self):
+        # The 'addons' list is a separate array in the same queue-summary
+        # entry, keyed by arch -- 'passed' there is a genuine JSON boolean,
+        # unlike builds[].passed which is a status string ('passed'/'warning'/
+        # 'error'). No per-test detail exists in this source at all (details
+        # is always {}), so this stays a whole-architecture flag.
+        records = build_status_records([{
+            "release_name": "CMSSW_20_1_X_2026-08-07-2300",
+            "builds": [
+                {"arch": "el9_amd64_gcc13", "passed": "passed", "details": {}},
+                {"arch": "el8_amd64_gcc14", "passed": "passed", "details": {}},
+            ],
+            "addons": [
+                {"arch": "el9_amd64_gcc13", "passed": False, "details": {}},
+            ],
+        }])
+
+        by_arch = {record["arch"]: record["addon_status"] for record in records}
+        self.assertEqual(by_arch, {"el9_amd64_gcc13": "error", "el8_amd64_gcc14": None})
 
     def test_merged_pr_records_attach_to_the_target_tag_of_each_comparison(self):
         # merged_prs_summary.json's compared_tags is "SOURCE-->TARGET"; the
