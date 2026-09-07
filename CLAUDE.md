@@ -48,6 +48,13 @@ PYTHONPATH=ingestion python -m unittest tests.test_chat_routing.LatestIbRankingT
 # coverage" below). Needs `uvicorn server.api_server:app --port 8001` running.
 venv/bin/python scripts/validate_bot.py
 venv/bin/python scripts/validate_bot.py --base-url http://localhost:8002  # non-default port
+
+# live structural correctness check for GET /api/shift-summary specifically --
+# parses the digest the same way the Shift Console frontend does and asserts
+# it isn't internally self-contradictory (e.g. a workflow appearing as both
+# newly-failing and resolved). Needs DEV_SHIFTER_LOGIN=true (or --username
+# set to a real logged-in identity).
+venv/bin/python scripts/validate_shift_summary.py
 ```
 
 Tests mock the Neo4j driver / LLM client rather than requiring a live
@@ -56,7 +63,19 @@ database — see the `unittest.mock.patch` usage at the top of
 `scripts/validate_bot.py` is the complementary live layer: it drives real
 multi-turn conversations against a running server and real Neo4j data,
 templated against whatever tag the server itself reports as "latest" so it
-stays valid as the graph is refreshed.
+stays valid as the graph is refreshed. `scripts/validate_shift_summary.py` is
+the same idea scoped to `GET /api/shift-summary`: it re-implements the
+frontend's own markdown parser (`shiftMarkdown.js`'s `##`/`###`/`####`/`|`-table
+walk) in Python and checks structural invariants a mocked unit test can't
+catch on synthetic data alone — e.g. the "Variant" column being present and
+non-empty on every RelVal row (added after a real workflow with multiple
+sub-IB variants rendered as unlabeled, seemingly-duplicate/contradictory
+rows), and that no identity is listed as both newly-failing and resolved for
+the same architecture in the same digest. Coordinate with whoever owns the
+Shift Console frontend (a separate repo, `cmssdt-18V` — see
+`reference-shift-console-frontend` in project memory) before changing the
+digest's column shape, since their parser and this script both hard-code the
+same contract.
 
 ## Architecture
 
