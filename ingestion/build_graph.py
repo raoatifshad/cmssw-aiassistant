@@ -603,7 +603,13 @@ def ingest_unittests(driver, root: Path, force: bool = False, reconcile: bool = 
 
 
 def build_status_records(entries: list[dict] | dict) -> list[dict]:
-    """Extract per-architecture compilation status from a CMS queue summary."""
+    """Extract per-architecture compilation and addon-test status from a CMS
+    queue summary. addon_status is a whole-architecture pass/fail flag only
+    (from the separate 'addons' list in the same source entry, same shape
+    Release Explorer's summarizeArchCell already renders as a plain badge
+    with no per-test detail) -- the addOnTests.log files themselves are never
+    staged or parsed here, so no per-test name/error/exit-code exists,
+    unlike RelVal/UnitTest."""
     release_name = None
     if isinstance(entries, dict):
         release_name = entries.get("release_name")
@@ -613,11 +619,16 @@ def build_status_records(entries: list[dict] | dict) -> list[dict]:
         tag = entry.get("release_name") or release_name
         if not tag:
             continue
+        addon_by_arch = {
+            addon.get("arch"): addon.get("passed")
+            for addon in entry.get("addons", []) if addon.get("arch")
+        }
         for build in entry.get("builds", []):
             arch = build.get("arch")
             if not arch:
                 continue
             details = build.get("details") or {}
+            addon_passed = addon_by_arch.get(arch)
             records.append({
                 "tag": tag,
                 "arch": arch,
@@ -627,6 +638,7 @@ def build_status_records(entries: list[dict] | dict) -> list[dict]:
                 "status": build.get("passed"),
                 "comp_warnings": details.get("compWarning", 0),
                 "ignored_warnings": details.get("ignoreWarning", 0),
+                "addon_status": None if addon_passed is None else ("passed" if addon_passed else "error"),
             })
     return records
 
@@ -640,7 +652,8 @@ def _ingest_build_status_file(driver, path: Path, force: bool) -> tuple[int, str
     with driver.session() as session:
         session.run(
             "MATCH (ib:IB {build_status_source_id:$source_id}) "
-            "REMOVE ib.build_status, ib.comp_warnings, ib.ignored_warnings, ib.build_status_source_id",
+            "REMOVE ib.build_status, ib.comp_warnings, ib.ignored_warnings, ib.addon_status, "
+            "ib.build_status_source_id",
             source_id=source_id,
         )
         session.run(
@@ -649,7 +662,8 @@ def _ingest_build_status_file(driver, path: Path, force: bool) -> tuple[int, str
             "SET ib.tag=raw.tag, ib.arch=raw.arch, ib.release=raw.release, "
             "ib.parent_tag=raw.parent_tag, ib.variant=raw.variant, "
             "ib.build_status=raw.status, ib.comp_warnings=raw.comp_warnings, "
-            "ib.ignored_warnings=raw.ignored_warnings, ib.build_status_source_id=$source_id",
+            "ib.ignored_warnings=raw.ignored_warnings, ib.addon_status=raw.addon_status, "
+            "ib.build_status_source_id=$source_id",
             records=records,
             source_id=source_id,
         )
