@@ -20,10 +20,15 @@ from typing import Protocol
 
 sys.path.insert(0, str(Path(__file__).parent))
 from neo4j_conn import get_driver  # noqa: E402
-from tools import get_failing_relvals, get_relval_recurrence, list_ib_tags  # noqa: E402
+from tools import (  # noqa: E402
+    get_build_failures, get_failing_relvals, get_failing_unittests, get_relval_recurrence, list_ib_tags,
+)
 
 
-RULE_TYPES = {"relval_failure_count", "relval_recurrence", "latest_ib_stalled"}
+RULE_TYPES = {
+    "relval_failure_count", "relval_recurrence", "latest_ib_stalled",
+    "unittest_failure_count", "build_failure_count",
+}
 
 
 def create_rule(
@@ -105,6 +110,35 @@ def _check_relval_recurrence(params: dict, threshold: float) -> tuple[bool, str,
     return triggered, message, {"rate": rate, "failed": failed, "total": total}
 
 
+def _check_unittest_failure_count(params: dict, threshold: float) -> tuple[bool, str, dict]:
+    tag = params["tag"]
+    arch = params.get("arch")
+    failing = get_failing_unittests(tag, arch=arch, limit=100)
+    count = len(failing)
+    triggered = count >= threshold
+    message = (
+        f"`{tag}`{f' on `{arch}`' if arch else ''} has {count} failing unit test(s) "
+        f"(threshold {threshold:g})."
+    )
+    return triggered, message, {"count": count}
+
+
+def _check_build_failure_count(params: dict, threshold: float) -> tuple[bool, str, dict]:
+    """Queue-summary build_status == 'error' domain, not parsed Clang
+    diagnostics -- see the "two warning domains" note in graph/tools.py."""
+    tag = params["tag"]
+    arch = params.get("arch")
+    failing = get_build_failures(tag, arch=arch, limit=100)
+    count = len(failing)
+    triggered = count >= threshold
+    architectures = ", ".join(f"`{row['arch']}`" for row in failing) if failing else "none"
+    message = (
+        f"`{tag}`{f' on `{arch}`' if arch else ''} has {count} architecture(s) with a failed build "
+        f"(threshold {threshold:g}): {architectures}."
+    )
+    return triggered, message, {"count": count, "architectures": [row["arch"] for row in failing]}
+
+
 def _check_latest_ib_stalled(params: dict, threshold: float) -> tuple[bool, str, dict]:
     """Threshold is hours since the newest imported IB timestamp."""
     latest = list_ib_tags(limit=1)
@@ -129,6 +163,8 @@ _CHECKS = {
     "relval_failure_count": _check_relval_failure_count,
     "relval_recurrence": _check_relval_recurrence,
     "latest_ib_stalled": _check_latest_ib_stalled,
+    "unittest_failure_count": _check_unittest_failure_count,
+    "build_failure_count": _check_build_failure_count,
 }
 
 

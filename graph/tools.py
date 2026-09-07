@@ -508,6 +508,23 @@ def get_failing_unittests(ib_tag: str, arch: str | None = None, limit: int = 50)
     )
 
 
+def get_build_failures(ib_tag: str, arch: str | None = None, limit: int = 50) -> list[dict]:
+    """Architectures with a queue-summary compilation build_status of 'error'
+    for an IB, including sub-IBs when given a primary tag. This is the
+    queue-summary compWarning/build-status domain, not parsed Clang
+    diagnostics -- see the "two warning domains" note in the module docs."""
+    limit = min(limit, MAX_ROWS)
+    return _run_query(
+        "MATCH (ib:IB) "
+        "WHERE (ib.tag = $t OR ib.parent_tag = $t) AND ib.build_status = 'error' "
+        "AND ($arch IS NULL OR ib.arch = $arch) "
+        "RETURN ib.tag AS ib_tag, ib.variant AS variant, ib.arch AS arch, "
+        "coalesce(ib.comp_warnings, 0) AS comp_warnings, coalesce(ib.ignored_warnings, 0) AS ignored_warnings "
+        "ORDER BY ib.tag, ib.arch LIMIT $lim",
+        {"t": ib_tag, "arch": arch, "lim": limit},
+    )
+
+
 def find_prs_before_ib(ib_tag: str, arch: str | None = None, limit: int = 20) -> list[dict]:
     """PRs that merged right before this IB — the first-pass attribution.
     A PR merge is architecture-independent, so ingest_merged_prs attaches
@@ -717,6 +734,7 @@ TOOLS = {
     "top_packages_by_warnings": top_packages_by_warnings,
     "get_failing_relvals": get_failing_relvals,
     "get_failing_unittests": get_failing_unittests,
+    "get_build_failures": get_build_failures,
     "find_prs_before_ib": find_prs_before_ib,
     "search_issues_by_text": search_issues_by_text,
     "find_prs_for_error": find_prs_for_error,
