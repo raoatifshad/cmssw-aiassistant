@@ -945,8 +945,9 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("126", answer)
         scope_records.assert_called_once_with("CMSSW_20_1_EVTGEN3_X_2026-08-09-2300", include_sub_ibs=True)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_primary_relval_failure_count_lists_every_architecture_up_front(self, scope_records):
+    def test_primary_relval_failure_count_lists_every_architecture_up_front(self, scope_records, _sub_ib_variant_tags):
         # A plain question with no architecture marked is_relval_default at
         # all is no longer ambiguous enough to justify a round-trip -- with
         # nothing to guess as "the" architecture, show every one directly
@@ -1060,8 +1061,9 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("ASAN", answer)
         self.assertIn("UBSAN", answer)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_sub_ib_relval_failure_count_lists_every_architecture_up_front(self, scope_records):
+    def test_sub_ib_relval_failure_count_lists_every_architecture_up_front(self, scope_records, _sub_ib_variant_tags):
         session_id = "relval-sub-ib-scope"
         sub_ib = "CMSSW_20_1_CLANG_X_2026-08-13-2300"
         scope_records.return_value = [
@@ -1124,8 +1126,9 @@ class ChatRoutingTests(unittest.TestCase):
         finally:
             _pending_relval_scopes.pop(session_id, None)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_any_failing_relvals_with_one_architecture_returns_exact_ib(self, scope_records):
+    def test_any_failing_relvals_with_one_architecture_returns_exact_ib(self, scope_records, _sub_ib_variant_tags):
         session_id = "relval-any-scope"
         scope_records.return_value = [{
             "tag": "CMSSW_20_1_X_2026-08-10-1100",
@@ -1146,8 +1149,9 @@ class ChatRoutingTests(unittest.TestCase):
         finally:
             _pending_relval_scopes.pop(session_id, None)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_relval_failure_count_never_hides_non_default_architectures(self, scope_records):
+    def test_relval_failure_count_never_hides_non_default_architectures(self, scope_records, _sub_ib_variant_tags):
         # Regression: found live -- a primary tag's only is_relval_default
         # architecture had 51/951 RelVal failures while two other, non-default
         # architectures had 1/951 each. The old logic narrowed to just the
@@ -1353,8 +1357,9 @@ class ChatRoutingTests(unittest.TestCase):
 
         self.assertIn("DQM/Physics", answer)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_resolves_after_choosing_an_architecture(self, scope_records):
+    def test_unittest_summary_resolves_after_choosing_an_architecture(self, scope_records, _sub_ib_variant_tags):
         scope_records.return_value = [
             {"arch": "el9_amd64_gcc15", "is_default": True, "total": 950, "failed": 3, "passed": 947, "errors": 3},
             {"arch": "el9_amd64_gcc16", "is_default": True, "total": 950, "failed": 4, "passed": 946, "errors": 4},
@@ -1366,8 +1371,9 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("4 failed", answer)
         self.assertNotIn("s-resume-unittest", _pending_unittest_scopes)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_honors_an_explicit_architecture_up_front(self, scope_records):
+    def test_unittest_summary_honors_an_explicit_architecture_up_front(self, scope_records, _sub_ib_variant_tags):
         # An architecture named directly in the first question must resolve
         # immediately -- no reason to ask when the user already said which one.
         scope_records.return_value = [
@@ -1382,8 +1388,9 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("4 failed", answer)
         self.assertNotIn("s-explicit-unittest", _pending_unittest_scopes)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_recognizes_unit_without_the_word_test(self, scope_records):
+    def test_unittest_summary_recognizes_unit_without_the_word_test(self, scope_records, _sub_ib_variant_tags):
         # Regression: a real user asked "unit failures in <tag>" -- no "test"
         # word at all -- and the old \bunit\s*tests?\b regex required "test"
         # to be present, so this fell through to the ambiguous-category
@@ -1433,8 +1440,9 @@ class ChatRoutingTests(unittest.TestCase):
         finally:
             _pending_relval_scopes.pop(session_id, None)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_relval_data_availability_is_graph_backed(self, scope_records):
+    def test_relval_data_availability_is_graph_backed(self, scope_records, _sub_ib_variant_tags):
         scope_records.return_value = [{
             "tag": "CMSSW_20_1_X_2026-08-10-1100",
             "arch": "el9_amd64_gcc14",
@@ -1482,8 +1490,9 @@ class ChatRoutingTests(unittest.TestCase):
         scope_records.assert_called_once_with(tag, include_sub_ibs=True)
         _pending_relval_scopes.pop("s-errcount-multi", None)
 
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_ambiguous_named_relval_question_defaults_to_graph_summary(self, scope_records):
+    def test_ambiguous_named_relval_question_defaults_to_graph_summary(self, scope_records, _sub_ib_variant_tags):
         scope_records.return_value = [{
             "tag": "CMSSW_20_1_X_2026-08-10-1100",
             "arch": "el9_amd64_gcc14",
@@ -1659,16 +1668,21 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(session.run.call_args.kwargs["number"], 51354)
         get_driver.return_value.close.assert_called_once()
 
-    def test_issue_author_recognizes_auxiliary_verb_phrasing(self):
+    @patch("server.api_server.get_driver")
+    def test_issue_author_recognizes_auxiliary_verb_phrasing(self, get_driver):
         # Regression: a real question, "who has created the issue #51756",
         # didn't match the old trigger regex `who\s+(?:opened|created|...)`
         # because of the auxiliary "has" between "who" and "created" -- not
         # a data gap (the issue in question genuinely isn't imported), but a
         # phrasing gap that made even an imported issue's author unreachable
-        # this way. _issue_author_answer's own driver-backed "not present"
-        # path is covered by test_named_issue_author_is_deterministic; this
-        # only pins the trigger regex, so no Neo4j mock is needed here --
-        # returning non-None at all proves the regex matched.
+        # this way. This only pins the trigger regex, so the driver is
+        # mocked to the real "not imported" shape (a driver call still
+        # happens once the regex matches -- a prior version of this test
+        # skipped the mock on the assumption it wouldn't, and only passed
+        # because Neo4j happened to be reachable locally).
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = None
+
         self.assertIsNotNone(_issue_author_answer("who has created the issue #51756?"))
 
     @patch("server.api_server.get_driver")
@@ -2439,6 +2453,18 @@ class ShiftSummaryCapabilityTests(unittest.TestCase):
             # request, just phrased around a different noun (workflows).
             "what new workflows are failing in the latest ib",
             "what new relvals are failing",
+            # Regression: found live -- naming two IBs directly and asking
+            # for one category's new failures fell through to the two-IB
+            # comparison-or-single-build clarification instead of routing to
+            # shift_summary, because the old pattern required "new" and the
+            # failure noun to be adjacent with nothing (like a category
+            # noun) in between, and had no reversed-order form at all.
+            "what are the new relval failures between CMSSW_20_1_X_2026-08-17-1100 "
+            "and CMSSW_20_1_X_2026-08-17-2300",
+            "new unit test failures since the last build",
+            "what relval failures are new between CMSSW_20_1_X_2026-08-17-1100 "
+            "and CMSSW_20_1_X_2026-08-17-2300",
+            "any unit test errors are new in the latest ib",
         ]:
             with self.subTest(question=question):
                 self.assertTrue(RequestContext.extract(question).has_shift_summary_request)
@@ -2506,6 +2532,27 @@ class ShiftSummaryCapabilityTests(unittest.TestCase):
         get_cached.assert_not_called()
         generate.assert_called_once_with(
             "CMSSW_20_1_X_2026-08-17-2300", "CMSSW_20_1_X_2026-08-17-1100", "el9_amd64_gcc14",
+        )
+
+    @patch("server.api_server.generate_shift_summary", return_value="named-pair digest")
+    def test_two_explicit_ibs_route_directly_to_generate_shift_summary(self, generate):
+        # A shifter naming two IBs directly wants the diff for exactly those
+        # builds, not the session's latest-vs-previous default -- and the
+        # cache lookup (keyed only on latest-vs-previous) must not be
+        # consulted for an arbitrary named pair.
+        answer, actions = _execute_planned_capability(
+            "shift_summary",
+            "what are the new relval failures between CMSSW_20_1_X_2026-08-17-2300 "
+            "and CMSSW_20_1_X_2026-08-17-1100",
+            "s1",
+        )
+
+        self.assertEqual(answer, "named-pair digest")
+        self.assertEqual(actions, [])
+        # Ordered by _ib_sort_key, not question word order: the 2300 tag was
+        # typed first but is the newer build, so it must land as latest_tag.
+        generate.assert_called_once_with(
+            "CMSSW_20_1_X_2026-08-17-2300", "CMSSW_20_1_X_2026-08-17-1100", None,
         )
 
     @patch("server.api_server._latest_and_previous_ib_tags", return_value=None)
