@@ -159,8 +159,10 @@ def _failing_row(workflow_id="140.51", name="RunMuonEG2022C", variant=None, erro
 
 
 class GenerateShiftSummaryTests(unittest.TestCase):
+    @patch("server.api_server.get_unittest_names", return_value=[])
+    @patch("server.api_server.get_relval_workflow_ids", return_value=[])
     @patch("server.api_server.search_concepts", return_value=[])
-    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.get_relval_exception_evidence", return_value=[])
     @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
     @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
     @patch("server.api_server.get_failing_unittests", return_value=[])
@@ -175,8 +177,10 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         self.assertNotIn("Newly failing workflow evidence", markdown)
         self.assertIn("relevance and historical pattern only", markdown)
 
+    @patch("server.api_server.get_unittest_names", return_value=[])
+    @patch("server.api_server.get_relval_workflow_ids", return_value=[])
     @patch("server.api_server.search_concepts", return_value=[])
-    @patch("server.api_server.find_prs_for_error")
+    @patch("server.api_server.get_relval_exception_evidence")
     @patch("server.api_server.get_relval_recurrence")
     @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
     @patch("server.api_server.get_failing_relvals")
@@ -186,7 +190,7 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server._build_and_addon_status", return_value={})
     def test_new_failure_with_recurrence_and_pr_evidence(
         self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
-        recurrence, find_prs, search_c
+        recurrence, find_prs, search_c, get_relval_ids, get_ut_names
     ):
         new_row = _failing_row()
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
@@ -200,7 +204,11 @@ class GenerateShiftSummaryTests(unittest.TestCase):
             ],
         }
         find_prs.return_value = [
-            {"repo": "cmssw", "pr_number": 45213, "title": "fix", "evidence": ["warning_changed_file"]},
+            {
+                "category": "LogicError",
+                "exception": "A muon candidate track has more than 5 stations with matching segments.",
+                "matches": [{"kind": "PR", "number": 45213, "title": "fix", "state": "closed", "merged_at": "2026-08-01T00:00:00Z"}],
+            },
         ]
 
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
@@ -208,15 +216,17 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         # Evidence is embedded as extra columns on the newly-failing table (the
         # frontend auto-hides anything past the first four columns behind a
         # per-row toggle), not a separate always-open section.
-        self.assertIn("Recurrence | PR evidence | Stored knowledge", markdown)
+        self.assertIn("Recurrence | PR/Issue evidence | Stored knowledge", markdown)
         self.assertIn("`140.51` | RunMuonEG2022C", markdown)
-        self.assertIn("cmssw #45213", markdown)
-        self.assertIn("relevance only, do not prove a PR caused or fixed a failure", markdown)
+        self.assertIn("cmssw PR #45213", markdown)
+        self.assertIn("relevance only, do not prove a PR or Issue caused or fixed a failure", markdown)
         # the out-of-series tag must not be counted as an in-series recurrence
         self.assertIn("Failed in 2 prior build(s) this series", markdown)
 
+    @patch("server.api_server.get_unittest_names", return_value=[])
+    @patch("server.api_server.get_relval_workflow_ids", return_value=[])
     @patch("server.api_server.search_concepts", return_value=[])
-    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.get_relval_exception_evidence", return_value=[])
     @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
     @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
     @patch("server.api_server.get_failing_relvals")
@@ -226,7 +236,7 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server._build_and_addon_status", return_value={})
     def test_new_failure_with_no_recurrence_and_no_pr_evidence(
         self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
-        recurrence, find_prs, search_c
+        recurrence, find_prs, search_c, get_relval_ids, get_ut_names
     ):
         new_row = _failing_row(workflow_id="999.0", name="BrandNewWorkflow")
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
@@ -236,10 +246,12 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
 
         self.assertIn("No prior appearance of this workflow ID in the imported graph", markdown)
-        self.assertIn("No PR in the imported graph matches this workflow ID", markdown)
+        self.assertIn("No PR/Issue in the imported graph matches this workflow's exception signature", markdown)
 
+    @patch("server.api_server.get_unittest_names", return_value=[])
+    @patch("server.api_server.get_relval_workflow_ids")
     @patch("server.api_server.search_concepts", return_value=[])
-    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.get_relval_exception_evidence", return_value=[])
     @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
     @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
     @patch("server.api_server.get_failing_relvals")
@@ -249,20 +261,66 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server._build_and_addon_status", return_value={})
     def test_resolved_workflow_appears_only_in_resolved_table(
         self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
-        recurrence, find_prs, search_c
+        recurrence, find_prs, search_c, get_relval_ids, get_ut_names
     ):
         resolved_row = _failing_row(workflow_id="1.0", name="OldFlakyWorkflow")
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
             [resolved_row] if tag == "CMSSW_20_1_X_2026-08-19-1100" else []
         )
+        # "Resolved" now requires positive proof the workflow actually ran at latest_tag
+        # (see get_relval_workflow_ids) - absence from the failing list alone isn't
+        # enough, since it could also mean latest_tag hasn't been ingested yet.
+        get_relval_ids.return_value = [{"variant": None, "workflow_id": "1.0"}]
 
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
 
         self.assertIn("OldFlakyWorkflow", markdown)
         self.assertNotIn("Newly failing workflow evidence", markdown)
 
+    @patch("server.api_server.get_unittest_names", return_value=[])
+    @patch("server.api_server.get_relval_workflow_ids")
     @patch("server.api_server.search_concepts", return_value=[])
-    @patch("server.api_server.find_prs_for_error")
+    @patch("server.api_server.get_relval_exception_evidence", return_value=[])
+    @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
+    @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
+    @patch("server.api_server.get_failing_relvals")
+    @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._build_and_addon_status", return_value={})
+    def test_same_workflow_resolved_on_two_sub_ib_variants_is_labeled_per_variant(
+        self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
+        recurrence, find_prs, search_c, get_relval_ids, get_ut_names
+    ):
+        # Regression: get_failing_relvals() includes sub-IB rows alongside the
+        # primary run (WHERE ib.tag = $t OR ib.parent_tag = $t), and
+        # generate_shift_summary diffs each sub-IB variant's track separately
+        # so an unrelated workflow_id collision across variants isn't
+        # misread as "unchanged" -- but the rendered table used to drop the
+        # variant field entirely, so the same workflow_id resolving
+        # independently on two variants rendered as two identical-looking
+        # "duplicate" rows with no way to tell them apart (found live against
+        # a real deployment: 140.051 appeared 6 times in one table).
+        primary_row = _failing_row(workflow_id="140.051", variant=None, errors=120)
+        nonlto_row = _failing_row(workflow_id="140.051", variant="NONLTO", errors=121)
+        get_failing.side_effect = lambda tag, arch=None, limit=None: (
+            [primary_row, nonlto_row] if tag == "CMSSW_20_1_X_2026-08-19-1100" else []
+        )
+        # Both variants' tracks genuinely ran (and passed) at latest_tag.
+        get_relval_ids.return_value = [
+            {"variant": None, "workflow_id": "140.051"},
+            {"variant": "NONLTO", "workflow_id": "140.051"},
+        ]
+
+        markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
+
+        self.assertIn("| `140.051` | RunMuonEG2022C | 120 | 16640 | primary |", markdown)
+        self.assertIn("| `140.051` | RunMuonEG2022C | 121 | 16640 | NONLTO |", markdown)
+
+    @patch("server.api_server.get_unittest_names", return_value=[])
+    @patch("server.api_server.get_relval_workflow_ids", return_value=[])
+    @patch("server.api_server.search_concepts", return_value=[])
+    @patch("server.api_server.get_relval_exception_evidence")
     @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
     @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
     @patch("server.api_server.get_failing_relvals")
@@ -272,28 +330,34 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server._build_and_addon_status", return_value={})
     def test_never_asserts_causality_for_pr_evidence(
         self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
-        recurrence, find_prs, search_c
+        recurrence, find_prs, search_c, get_relval_ids, get_ut_names
     ):
         new_row = _failing_row()
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
             [] if tag == "CMSSW_20_1_X_2026-08-19-1100" else [new_row]
         )
         find_prs.return_value = [
-            {"repo": "cmssw", "pr_number": 1, "title": "t", "evidence": ["pr_title"]},
+            {
+                "category": "LogicError",
+                "exception": "boom",
+                "matches": [{"kind": "Issue", "number": 1, "title": "t", "state": "open", "merged_at": None}],
+            },
         ]
 
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
 
-        # every "PR #" mention must sit in a sentence hedged with "not prove"/"relevance only",
-        # never an unhedged "caused"/"fixed by" claim.
+        # every "PR #"/"Issue #" mention must sit in a sentence hedged with "not prove"/
+        # "relevance only", never an unhedged "caused"/"fixed by" claim.
         for line in markdown.splitlines():
-            if re.search(r"\bcmssw #\d+\b", line):
+            if re.search(r"\bcmssw (?:PR|Issue) #\d+\b", line):
                 self.assertTrue("relevance only" in line or "do not prove" in line)
                 if "caused" in line:
                     self.assertIn("not prove", line)
 
+    @patch("server.api_server.get_unittest_names")
+    @patch("server.api_server.get_relval_workflow_ids", return_value=[])
     @patch("server.api_server.search_concepts", return_value=[])
-    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.get_relval_exception_evidence", return_value=[])
     @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
     @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
     @patch("server.api_server.get_failing_relvals", return_value=[])
@@ -303,12 +367,14 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server._build_and_addon_status", return_value={})
     def test_unit_test_sections_show_newly_failing_and_resolved_rows(
         self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
-        recurrence, find_prs, search_c
+        recurrence, find_prs, search_c, get_relval_ids, get_ut_names
     ):
         get_failing_unittests.side_effect = lambda tag, arch=None, limit=None: (
             [{"name": "OldFlakyTest", "errors": 1}] if tag == "CMSSW_20_1_X_2026-08-19-1100"
             else [{"name": "test_something_LST", "errors": "Segmentation fault"}]
         )
+        # "Resolved" now requires positive proof the test actually ran at latest_tag.
+        get_ut_names.return_value = [{"name": "OldFlakyTest"}, {"name": "test_something_LST"}]
 
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
 
@@ -317,8 +383,10 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         self.assertIn("#### Resolved Unit Tests", markdown)
         self.assertIn("| OldFlakyTest | 1 |", markdown)
 
+    @patch("server.api_server.get_unittest_names", return_value=[])
+    @patch("server.api_server.get_relval_workflow_ids", return_value=[])
     @patch("server.api_server.search_concepts", return_value=[])
-    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.get_relval_exception_evidence", return_value=[])
     @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
     @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
     @patch("server.api_server.get_failing_relvals", return_value=[])
@@ -335,8 +403,10 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         self.assertIn("| Name | Errors |", newly_section)
         self.assertNotIn("None.", newly_section)
 
+    @patch("server.api_server.get_unittest_names", return_value=[])
+    @patch("server.api_server.get_relval_workflow_ids", return_value=[])
     @patch("server.api_server.search_concepts", return_value=[])
-    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.get_relval_exception_evidence", return_value=[])
     @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
     @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
     @patch("server.api_server.get_failing_relvals", return_value=[])
