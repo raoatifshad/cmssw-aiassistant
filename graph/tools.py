@@ -508,6 +508,51 @@ def get_failing_unittests(ib_tag: str, arch: str | None = None, limit: int = 50)
     )
 
 
+def get_relval_workflow_ids(ib_tag: str, arch: str | None = None) -> list[dict]:
+    """Every RelVal workflow_id/variant actually ingested for an IB (any status, not
+    just FAILED), including sub-IBs when given a primary tag. This is the "did it
+    actually run" signal the shift-summary resolved/failing diff needs: a workflow
+    absent from get_failing_relvals's FAILED-only list could mean it passed, or it
+    could mean this architecture hasn't ingested RelVal results for ib_tag yet (e.g.
+    the build is still in progress) -- those two cases must not both read as
+    "resolved". Bypasses _run_query's MAX_ROWS cap, like get_exit_code_names: this
+    needs the full identity set (an architecture can have ~1000 workflows) to gate a
+    correctness check, not a capped sample for a chat answer.
+    """
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB)-[:RAN_RELVAL]->(rv:RelVal) "
+                "WHERE (ib.tag = $t OR ib.parent_tag = $t) "
+                "AND ($arch IS NULL OR ib.arch = $arch) "
+                "RETURN DISTINCT ib.variant AS variant, rv.workflow_id AS workflow_id",
+                t=ib_tag, arch=arch,
+            )]
+    finally:
+        driver.close()
+    return rows
+
+
+def get_unittest_names(ib_tag: str, arch: str | None = None) -> list[dict]:
+    """Every UnitTest name actually ingested for an IB (any status) - the same "did it
+    actually run" signal as get_relval_workflow_ids, for the Unit Tests resolved/failing
+    diff. Bypasses _run_query's MAX_ROWS cap for the same reason.
+    """
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB {tag:$t})-[:RAN_UNITTEST]->(ut:UnitTest) "
+                "WHERE $arch IS NULL OR ib.arch = $arch "
+                "RETURN DISTINCT ut.name AS name",
+                t=ib_tag, arch=arch,
+            )]
+    finally:
+        driver.close()
+    return rows
+
+
 def get_build_failures(ib_tag: str, arch: str | None = None, limit: int = 50) -> list[dict]:
     """Architectures with a queue-summary compilation build_status of 'error'
     for an IB, including sub-IBs when given a primary tag. This is the
@@ -682,6 +727,126 @@ def find_prs_for_error(error: str, ib_tag: str | None = None, limit: int = 20) -
         key=lambda row: (row["matched_occurrences"], row["matched_warnings"], row["merged_at"] or ""),
         reverse=True,
     )[:limit]
+
+
+def get_relval_exception_evidence(workflow_id: str, ib_tag: str | None = None, limit: int = 5) -> list[dict]:
+    """Exception text/module + matching GitHub Issues/PRs for a failed RelVal workflow.
+
+    Searches Issue/PR title+body+non-bot-comments for three terms, ranked by how
+    specific a match on each one actually is:
+      1. the bare workflow_id (e.g. "140.051") - a *human* writing it in a title/body/
+         comment is a strong, deliberate signal (e.g. an Issue titled "Workflow 12846.0
+         step 3 crashed..."), unlike cms-bot pasting every tested workflow ID into a
+         routine CI comment on every PR, which is why id-only matching (what
+         find_prs_for_error was previously called with here) used to be useless - the
+         bot noise buried the rare genuine hit. Excluding bot comments (below) fixes that.
+      2. the exact exception text (e.g. "LogicError: A muon candidate track has more
+         than 5 stations with matching segments...")
+      3. the module it failed in (e.g. "EvaluateMuonMVAID") - the weakest/most generic
+         of the three, since a module name alone can coincidentally appear in an
+         unrelated item.
+    Only the single most-specific match per exception signature is returned (workflow_id
+    match > exact-text match > module-only match) rather than every coincidental hit, so
+    a shifter sees the one item actually worth opening. Also covers Issues, not just
+    PRs, since a bug report frequently exists before any fix PR does.
+
+    Queries RelValException by its own workflow_id/ib_tag properties directly, not via
+    a (RelVal)-[:HAS_EXCEPTION]->(RelValException) traversal - despite that relationship
+    being documented in the schema and used by _relval_exception_answer/_relval_exception_
+    list_answer, it is never actually created anywhere in the ingestion pipeline (verified
+    live: 0 HAS_EXCEPTION relationships exist in the graph even though RelValException
+    nodes are correctly populated). That's a separate, pre-existing ingestion gap - also
+    affecting those two chat-interface functions - out of scope for this fix.
+    """
+    # context (which run/lumi/event it happened on) differs per occurrence even when the
+    # exception signature itself is identical, so DISTINCT on all three columns doesn't
+    # collapse repeat occurrences of the same failure - fetch a wider raw sample and dedupe
+    # on (category, exception) alone below, so a workflow with one dominant failure mode
+    # doesn't drown out a second, genuinely different one within a small LIMIT.
+    # exception.message (e.g. "A muon candidate track has more than 5 stations...") is
+    # used as the search term, not exception.text (which prefixes it with "<category>: ",
+    # e.g. "LogicError: A muon..." - that prefix is never how the message is actually
+    # quoted verbatim in a GitHub Issue's "Exception Message:" section, so text-with-
+    # prefix silently never matches anything; message-alone does).
+    exception_query = (
+        "MATCH (exception:RelValException {workflow_id:$workflow_id}) "
+        "WHERE $ib_tag IS NULL OR exception.ib_tag = $ib_tag "
+        "RETURN exception.message AS exception, exception.category AS category, exception.context AS context "
+        "ORDER BY exception LIMIT 20"
+    )
+    artifact_query = (
+        "MATCH (item) WHERE item.repo = 'cmssw' AND (item:Issue OR item:PR) "
+        # cmsbuild is cms-bot: it posts a "Failed Tests" comment on every PR dumping the
+        # full exception traceback of *any currently-broken baseline test* as routine CI
+        # status, regardless of whether that PR relates to the failure at all (verified
+        # live: PR #51375, "MatrixUtil: ibeos-lfn-sort", matched workflow 140.051's
+        # LogicError purely because cms-bot's boilerplate comment happened to quote it).
+        # Excluding bot comments here keeps this a genuine-discussion signal.
+        "OPTIONAL MATCH (item)-[:HAS_COMMENT]->(comment:GitHubComment) WHERE comment.author <> 'cmsbuild' "
+        "WITH item, collect(coalesce(comment.body, '')) AS comment_bodies "
+        "WITH item, [term IN $terms WHERE "
+        "toLower(coalesce(item.title, '')) CONTAINS toLower(term) "
+        "OR toLower(coalesce(item.body, '')) CONTAINS toLower(term) "
+        "OR any(comment_body IN comment_bodies WHERE toLower(comment_body) CONTAINS toLower(term))] AS matched_terms "
+        "WHERE size(matched_terms) > 0 "
+        "RETURN CASE WHEN item:Issue THEN 'Issue' ELSE 'PR' END AS kind, "
+        "item.number AS number, item.title AS title, "
+        "coalesce(item.state, item.github_state, 'unknown') AS state, "
+        "item.merged_at AS merged_at, matched_terms AS matched_terms "
+        "ORDER BY number DESC LIMIT $limit"
+    )
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            exceptions = [dict(record) for record in session.run(
+                exception_query, workflow_id=workflow_id, ib_tag=ib_tag,
+            )]
+            seen = set()
+            deduped = []
+            for row in exceptions:
+                key = (row.get("category"), row["exception"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(row)
+            exceptions = deduped[:3]
+
+            results = []
+            for row in exceptions:
+                exception = row["exception"]
+                module_match = re.search(r"Calling method for module\s+([\w:]+)/", row.get("context") or "")
+                module = module_match.group(1) if module_match else None
+                terms = {value for value in (workflow_id, exception, module) if value}
+                if not terms:
+                    continue
+                candidates = [dict(record) for record in session.run(
+                    artifact_query, terms=list(terms), limit=limit,
+                )]
+                matches = [match for match in candidates if terms & set(match["matched_terms"])]
+                if not matches:
+                    continue
+
+                # The exact exception message is the most reliable signal - it's a long,
+                # distinctive sentence essentially never quoted for an unrelated reason.
+                # A bare workflow_id mention ranks below it: even human-authored (not
+                # cms-bot noise, already excluded above), a developer can still cite a
+                # workflow number as an arbitrary example when testing something
+                # unrelated (verified live: PR #51375's author used "140.051" purely as
+                # a convenient test case for an --ibeos/LFN-sorting change, unrelated to
+                # this exception). Module name alone is the weakest/most generic.
+                def specificity(match: dict) -> int:
+                    matched = set(match["matched_terms"])
+                    if exception in matched:
+                        return 3
+                    if workflow_id in matched:
+                        return 2
+                    return 1
+
+                best = max(matches, key=specificity)
+                results.append({"category": row.get("category"), "exception": exception, "matches": [best]})
+    finally:
+        driver.close()
+    return results
 
 
 def shared_header_packages(file_path: str) -> list[dict]:

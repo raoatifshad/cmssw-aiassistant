@@ -28,9 +28,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "graph"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from tools import (  # noqa: E402
     TOOLS, GRAPH_SCHEMA, _ib_sort_key, count_warnings_by_package, diff_warnings, find_prs_before_ib,
-    find_prs_for_error, get_exit_code_names, get_failing_relvals, get_failing_unittests, get_relval_recurrence,
-    get_shift_summary, relval_failure_architectures, search_concepts, search_workflow_ids, store_shift_summary,
-    top_recurring_relval_failures,
+    find_prs_for_error, get_exit_code_names, get_failing_relvals, get_failing_unittests,
+    get_relval_exception_evidence, get_relval_recurrence, get_relval_workflow_ids, get_shift_summary,
+    get_unittest_names, relval_failure_architectures, search_concepts,
+    search_workflow_ids, store_shift_summary, top_recurring_relval_failures,
 )
 from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # noqa: E402
 from server.llm_client import DEFAULT_MODEL, get_client  # noqa: E402
@@ -3458,13 +3459,23 @@ def _group_relvals_by_variant(rows: list[dict]) -> dict[str, list[dict]]:
     return by_variant
 
 
+def _group_ids_by_variant(rows: list[dict]) -> dict[str, set[str]]:
+    """Same grouping as _group_relvals_by_variant, but for get_relval_workflow_ids()'s
+    "did this workflow actually run" rows (any status) - {variant: {workflow_id, ...}}."""
+    by_variant: dict[str, set[str]] = {}
+    for row in rows:
+        by_variant.setdefault(row.get("variant") or "", set()).add(row["workflow_id"])
+    return by_variant
+
+
 def _relval_table(rows: list[dict], exit_code_names: dict[int, str]) -> list[str]:
     if not rows:
         return ["None."]
-    lines = ["| Workflow | Name | Errors | Exit code |", "| --- | --- | ---: | ---: |"]
+    lines = ["| Workflow | Name | Errors | Exit code | Variant |", "| --- | --- | ---: | ---: | --- |"]
     lines.extend(
         f"| `{row['workflow_id']}` | {row['name']} | {row.get('errors') or 0} | "
-        f"{_format_exit_code(row['exitcode'], exit_code_names) if row.get('exitcode') else 0} |"
+        f"{_format_exit_code(row['exitcode'], exit_code_names) if row.get('exitcode') else 0} | "
+        f"{row.get('variant') or 'primary'} |"
         for row in rows
     )
     return lines
@@ -3493,7 +3504,7 @@ def _warning_list(rows: list[dict], label: str) -> list[str]:
 
 
 _RECURRENCE_EVIDENCE_CAVEAT = (
-    "These links establish relevance only and do not prove a PR caused or fixed a failure."
+    "These links establish relevance only and do not prove a PR or Issue caused or fixed a failure."
 )
 
 
@@ -3528,12 +3539,21 @@ def _workflow_evidence_cells(workflow_id: str, row: dict, latest_tag: str) -> tu
                 f"{recurrence['failed_appearances']}/{recurrence['total_appearances']} overall."
             )
 
-    pr_rows = find_prs_for_error(workflow_id, limit=5)
-    if not pr_rows:
-        pr_cell = "No PR in the imported graph matches this workflow ID."
+    # Searches Issue/PR text for the workflow's actual exception message and the module
+    # it failed in - not the bare workflow_id, which a PR/Issue essentially never quotes
+    # (cms-bot posts every tested workflow ID in routine PR CI comments, so id-only
+    # matching is noise, not evidence - see get_relval_exception_evidence's docstring).
+    exception_evidence = get_relval_exception_evidence(workflow_id, limit=5)
+    mentions = []
+    for entry in exception_evidence:
+        category = f"[{entry['category']}] " if entry.get("category") else ""
+        for match in entry["matches"][:3]:
+            state = "merged" if match["kind"] == "PR" and match.get("merged_at") else str(match.get("state") or "unknown")
+            mentions.append(f"{category}cmssw {match['kind']} #{match['number']} ({state})")
+    if not mentions:
+        pr_cell = "No PR/Issue in the imported graph matches this workflow's exception signature."
     else:
-        pr_mentions = ", ".join(f"{pr['repo']} #{pr['pr_number']} ({', '.join(pr['evidence'])})" for pr in pr_rows)
-        pr_cell = f"{pr_mentions} -- relevance only, {_RECURRENCE_EVIDENCE_CAVEAT.split(' and ')[-1]}"
+        pr_cell = f"{', '.join(mentions[:5])} -- relevance only, {_RECURRENCE_EVIDENCE_CAVEAT.split(' and ')[-1]}"
 
     # search_concepts requires a leading-letter term (see its docstring's caveat) -- a bare
     # numeric workflow_id never survives that filter, so also search on the workflow's name.
@@ -3548,19 +3568,20 @@ def _newly_failing_relval_table(
 ) -> list[str]:
     """Like _relval_table, but with three extra evidence columns the frontend
     auto-hides behind a per-row "Show evidence" toggle -- everything past the
-    first four (always-visible) columns is exactly that kind of drill-down
+    first five (always-visible) columns is exactly that kind of drill-down
     detail, never the primary at-a-glance read."""
     if not rows:
         return ["None."]
     lines = [
-        "| Workflow | Name | Errors | Exit code | Recurrence | PR evidence | Stored knowledge |",
-        "| --- | --- | ---: | ---: | --- | --- | --- |",
+        "| Workflow | Name | Errors | Exit code | Variant | Recurrence | PR/Issue evidence | Stored knowledge |",
+        "| --- | --- | ---: | ---: | --- | --- | --- | --- |",
     ]
     for row in rows:
         recurrence_cell, pr_cell, knowledge_cell = evidence[row["workflow_id"]]
         lines.append(
             f"| `{row['workflow_id']}` | {row['name']} | {row.get('errors') or 0} | "
             f"{_format_exit_code(row['exitcode'], exit_code_names) if row.get('exitcode') else 0} | "
+            f"{row.get('variant') or 'primary'} | "
             f"{recurrence_cell} | {pr_cell} | {knowledge_cell} |"
         )
     return lines
@@ -3663,7 +3684,7 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
     transitions (a single badge per architecture only -- no per-package or
     per-test detail exists for either, see _build_and_addon_status), and for
     each distinct newly-failing workflow, release-series-scoped recurrence
-    plus best-effort PR/Concept evidence. Every evidence-bearing section
+    plus best-effort PR/Issue/Concept evidence. Every evidence-bearing section
     stays relevance-only -- never "caused"/"fixed"."""
     architectures = [arch] if arch else _ib_pair_architectures(previous_tag, latest_tag)
     if not architectures:
@@ -3680,27 +3701,42 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
         after_rows = get_failing_relvals(latest_tag, arch=one_arch, limit=200)
         before_by_variant = _group_relvals_by_variant(before_rows)
         after_by_variant = _group_relvals_by_variant(after_rows)
+        # A workflow_id absent from after_rows could mean it passed, or it could mean this
+        # architecture hasn't ingested RelVal results for latest_tag yet (e.g. the build's
+        # still running) - those must not both read as "resolved". Only count a workflow
+        # as resolved once we have positive proof it actually ran at latest_tag.
+        after_ran_by_variant = _group_ids_by_variant(get_relval_workflow_ids(latest_tag, arch=one_arch))
         newly_failing_arch: list[dict] = []
         resolved_arch: list[dict] = []
         for variant in sorted(set(before_by_variant) | set(after_by_variant)):
             diff = _diff_failing_relvals(before_by_variant.get(variant, []), after_by_variant.get(variant, []))
             newly, resolved = _split_relval_diff(diff)
+            ran_ids = after_ran_by_variant.get(variant, set())
             newly_failing_arch.extend(newly)
-            resolved_arch.extend(resolved)
+            resolved_arch.extend(row for row in resolved if row["workflow_id"] in ran_ids)
         warnings_diff = diff_warnings(previous_tag, latest_tag, one_arch)
         before_unittests = get_failing_unittests(previous_tag, arch=one_arch, limit=200)
         after_unittests = get_failing_unittests(latest_tag, arch=one_arch, limit=200)
-        newly_failing_unittests, resolved_unittests = _split_unittest_diff(
+        newly_failing_unittests, resolved_unittests_diff = _split_unittest_diff(
             _diff_failing_unittests(before_unittests, after_unittests)
         )
+        # Same "positive proof it ran" guard as RelVal above, keyed by test name.
+        after_ran_unittests = {row["name"] for row in get_unittest_names(latest_tag, arch=one_arch)}
+        resolved_unittests = [row for row in resolved_unittests_diff if row["name"] in after_ran_unittests]
         before_status = status_by_tag_arch.get((previous_tag, one_arch), {})
-        after_status = status_by_tag_arch.get((latest_tag, one_arch), {})
-        newly_failing_build, resolved_build = _status_diff_rows(
-            before_status.get("build_status"), after_status.get("build_status"), one_arch,
-        )
-        newly_failing_addon, resolved_addon = _status_diff_rows(
-            before_status.get("addon_status"), after_status.get("addon_status"), one_arch,
-        )
+        after_status_entry = status_by_tag_arch.get((latest_tag, one_arch))
+        if after_status_entry is None:
+            # No IB node ingested yet for latest_tag on this architecture at all - there's
+            # no live data to compare against, so don't claim anything newly failing or
+            # resolved (same principle as the RelVal/UnitTest guards above).
+            newly_failing_build = resolved_build = newly_failing_addon = resolved_addon = None
+        else:
+            newly_failing_build, resolved_build = _status_diff_rows(
+                before_status.get("build_status"), after_status_entry.get("build_status"), one_arch,
+            )
+            newly_failing_addon, resolved_addon = _status_diff_rows(
+                before_status.get("addon_status"), after_status_entry.get("addon_status"), one_arch,
+            )
         per_arch.append({
             "arch": one_arch, "newly_failing_relvals": newly_failing_arch, "resolved_relvals": resolved_arch,
             "warnings_diff": warnings_diff,
@@ -3751,8 +3787,8 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
     lines.extend([
         "",
         "---",
-        "Recurrence and PR/Concept evidence (Newly failing RelVal workflows table) establish relevance "
-        "and historical pattern only -- they do not prove a PR caused or fixed a failure. Recurrence is "
+        "Recurrence and PR/Issue/Concept evidence (Newly failing RelVal workflows table) establish relevance "
+        "and historical pattern only -- they do not prove a PR or Issue caused or fixed a failure. Recurrence is "
         "scoped to the current release series where noted; full cross-release history is included alongside it.",
     ])
     return "\n".join(lines)
