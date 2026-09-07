@@ -55,6 +55,8 @@ from server.api_server import (
     _latest_and_days_ago_ib_tags,
     _shift_summary_answer,
     _request_planner,
+    _evidence_grounded,
+    _format_raw_evidence,
     chat,
     record_feedback,
 )
@@ -2240,6 +2242,81 @@ class ChatRoutingTests(unittest.TestCase):
         propose_plan.assert_called_once()
         actions = chat_response.call_args.kwargs["actions"]
         self.assertIn({"label": "Latest IB", "question": "what is the latest IB"}, actions)
+
+    @patch("server.api_server._retriever", None)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.synthesize_evidence_answer")
+    @patch("server.api_server.execute_read_only_plan")
+    @patch("server.request_planner.validate_llm_plan")
+    @patch("server.api_server.propose_investigation_plan", return_value={"capability": "investigation"})
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_llm_fallback_answer_rejected_when_not_grounded_in_evidence(
+        self, concepts, propose_plan, validate_plan, execute_plan, synthesize,
+        store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # Regression guard for the one path with no other verification: the
+        # final LLM-fallback synthesizes free prose over real tool evidence,
+        # so a fabricated number in that prose must not reach the user as if
+        # it were a graph fact.
+        validate_plan.return_value.capability = "investigation"
+        validate_plan.return_value.tool_calls = []
+        evidence = [{"tool": "get_ib_summary", "arguments": {},
+                     "result": {"tag": "CMSSW_20_1_X_2026-08-17-2300", "failing_count": 5}}]
+        execute_plan.return_value = evidence
+        synthesize.return_value = "There are 42 failing workflows on CMSSW_20_1_X_2026-08-17-2300."
+
+        result = chat(ChatRequest(question="Explain the graph topology", session_id="llm-fallback-ungrounded"))
+
+        self.assertEqual(result.route, "llm_ungrounded_fallback")
+        self.assertNotIn("42", result.answer)
+        self.assertIn("could not be safely summarized", result.answer)
+        self.assertIn("failing_count", result.answer)
+
+    @patch("server.api_server._retriever", None)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.synthesize_evidence_answer")
+    @patch("server.api_server.execute_read_only_plan")
+    @patch("server.request_planner.validate_llm_plan")
+    @patch("server.api_server.propose_investigation_plan", return_value={"capability": "investigation"})
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_llm_fallback_answer_accepted_when_grounded_in_evidence(
+        self, concepts, propose_plan, validate_plan, execute_plan, synthesize,
+        store_chat_turns, restore, store_decision, clear_pending
+    ):
+        validate_plan.return_value.capability = "investigation"
+        validate_plan.return_value.tool_calls = []
+        evidence = [{"tool": "get_ib_summary", "arguments": {},
+                     "result": {"tag": "CMSSW_20_1_X_2026-08-17-2300", "failing_count": 5}}]
+        execute_plan.return_value = evidence
+        synthesize.return_value = "There are 5 failing workflows on CMSSW_20_1_X_2026-08-17-2300."
+
+        result = chat(ChatRequest(question="Explain the graph topology", session_id="llm-fallback-grounded"))
+
+        self.assertEqual(result.route, "llm_validated")
+        self.assertEqual(result.answer, synthesize.return_value)
+
+    def test_evidence_grounded_accepts_numbers_present_in_evidence(self):
+        evidence = [{"tool": "t", "arguments": {}, "result": {"failing_count": 5, "tag": "CMSSW_20_1_X"}}]
+        self.assertTrue(_evidence_grounded("There are 5 failures in CMSSW_20_1_X.", evidence))
+
+    def test_evidence_grounded_rejects_fabricated_number(self):
+        evidence = [{"tool": "t", "arguments": {}, "result": {"failing_count": 5}}]
+        self.assertFalse(_evidence_grounded("There are 42 failures.", evidence))
+
+    def test_format_raw_evidence_includes_tool_name_and_result(self):
+        evidence = [{"tool": "get_ib_summary", "arguments": {"tag": "CMSSW_20_1_X"}, "result": {"failing_count": 5}}]
+        rendered = _format_raw_evidence(evidence)
+        self.assertIn("get_ib_summary", rendered)
+        self.assertIn("failing_count", rendered)
+        self.assertIn("5", rendered)
 
     # -- Regression tests for bugs found and fixed this session (Phase 0 golden set) --
 

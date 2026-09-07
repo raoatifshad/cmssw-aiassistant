@@ -237,6 +237,12 @@ class ChatAction(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     session_id: str
+    # How this answer was produced -- "deterministic" (graph fact, highest
+    # trust), "llm_validated" (LLM picked the plan and wrote prose over real
+    # tool evidence -- lower trust, verified but not graph-fact-certain),
+    # "fallback_clarification", or "clarification". Lets a frontend visually
+    # flag lower-trust answers instead of showing every route identically.
+    route: str
     citations: list[dict] = []
     github_matches: list[GitHubMatch] | None = None
     actions: list[ChatAction] = []
@@ -463,6 +469,34 @@ def _synthesize_if_safe(question: str, deterministic_answer: str) -> str:
         return deterministic_answer
 
 
+def _format_raw_evidence(tool_evidence: list[dict]) -> str:
+    """Render tool evidence as plain fact, not LLM prose -- used when a
+    synthesized answer fails grounding verification, so a shifter still sees
+    the real evidence instead of nothing."""
+    lines = ["Evidence was found, but it could not be safely summarized into "
+             "prose (the generated answer mentioned a number not present in "
+             "the evidence). Showing the raw evidence instead:", ""]
+    for item in tool_evidence:
+        tool = item.get("tool", "unknown_tool")
+        arguments = item.get("arguments", {})
+        lines.append(f"**{tool}**({json.dumps(arguments, default=str)})")
+        lines.append("```json")
+        lines.append(json.dumps(item.get("result"), default=str, indent=2))
+        lines.append("```")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _evidence_grounded(answer: str, tool_evidence: list[dict]) -> bool:
+    """Reject a synthesized answer that states a number not present anywhere
+    in the tool evidence it was supposedly synthesized from -- catches the
+    LLM-fallback path (server/agent.py's synthesize_evidence_answer)
+    fabricating or misreading a count/id/timestamp, which has no other
+    verification unlike the deterministic-answer-rephrasing path above."""
+    evidence_numbers = _extract_numbers(json.dumps(tool_evidence, default=str))
+    return _extract_numbers(answer).issubset(evidence_numbers)
+
+
 def _chat_response(session_id: str, original_question: str, answer: str,
                    route: str, citations: list[dict] | None = None,
                    github_matches: list[dict] | None = None,
@@ -477,6 +511,7 @@ def _chat_response(session_id: str, original_question: str, answer: str,
     return ChatResponse(
         answer=answer,
         session_id=session_id,
+        route=route,
         citations=citations,
         github_matches=github_matches,
         actions=actions,
@@ -4516,6 +4551,10 @@ def chat(req: ChatRequest):
     answer = synthesize_evidence_answer(_llm_client, DEFAULT_MODEL, SYSTEM_PROMPT, question, tool_evidence)
     if not answer:
         answer = "The approved local evidence could not be synthesized into an answer."
+        return _chat_response(sid, original_question, answer, "llm_validated", citations)
+    if not _evidence_grounded(answer, tool_evidence):
+        answer = _format_raw_evidence(tool_evidence)
+        return _chat_response(sid, original_question, answer, "llm_ungrounded_fallback", citations)
     return _chat_response(sid, original_question, answer, "llm_validated", citations)
 
 
