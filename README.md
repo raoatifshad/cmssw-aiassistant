@@ -135,6 +135,14 @@ The graph retains explicit `#number` and CMSSW GitHub URL references found in
 PR/Issue bodies and comments. These links are textual facts, not evidence that
 one PR caused, fixed, or depends on another item.
 
+Unlike `cmsrepo` and the exceptions feed, **this source has no automatic
+refresh** and will silently go stale. The live export lives on
+`cmssdt9-02.cern.ch:/data/sdt/SDT/public/github/cms-sw/cmssw/issues`; see
+"Raw CMSSW GitHub export" in `docs/cmssdt-pipeline-guide.md` for the full
+sync procedure (freshness check via `issues/latest.txt`, why the sync must be
+pushed *from* `cmssdt9-02` rather than pulled, and the exact `rsync`/ingest
+commands).
+
 ## Run the API server
 
 ```bash

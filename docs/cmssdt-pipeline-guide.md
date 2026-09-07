@@ -148,6 +148,61 @@ A raw export provides `issue.json` and `comments.json` data, either in a
 directory or a tar archive. The importer classifies pull requests and ordinary
 Issues, imports their authors and labels, and stores discussion comments.
 
+Unlike `cmsrepo` (git submodule, bumped regularly) and the exceptions feed
+(refreshed via a routine `--es-exceptions-json` run), **this source has no
+automatic refresh** — it drifts until someone manually re-syncs it. Check
+staleness before assuming an answer about "the latest Issue/PR" is current.
+
+**Where the live data lives:** `cmssdt9-02.cern.ch`, path
+`/data/sdt/SDT/public/github/cms-sw/cmssw/issues` (owned by `cmsbuild`; needs
+a `cmsbld`/root shell on that host to read). It's produced by `cms-bot`'s
+`github_backup.py`, which is itself incremental — it only re-fetches issues
+updated since its own checkpoint. That checkpoint lives at
+`issues/latest.txt` on `cmssdt9-02` as a Unix timestamp; decode it to sanity-check
+freshness before syncing:
+
+```bash
+# on cmssdt9-02
+cat /data/sdt/SDT/public/github/cms-sw/cmssw/issues/latest.txt
+date -d @<value> -u
+```
+
+If that date isn't recent, the upstream backup job hasn't run — syncing won't
+add anything new until someone re-runs it there.
+
+**Direct inbound SSH from a normal dev machine to `cmssdt9-02` does not
+work** (confirmed: the connection closes mid-GSSAPI-handshake, from both a
+direct attempt and via an `lxplus` jump host) — it looks like `cmssdt9-02`
+restricts inbound SSH to an allowlist that doesn't include general logins.
+The sync has to be **pushed from `cmssdt9-02` outward** instead, which does
+work:
+
+```bash
+# run this ON cmssdt9-02 (as cmsbld/root), pushing OUT to the chatbot host
+rsync -avz --info=progress2 \
+  /data/sdt/SDT/public/github/cms-sw/cmssw/issues/ \
+  <local-user>@<local-host-ip>:/home/rao/CHAT-BOT-AI/GITHUB-ISSUES/issues/
+```
+
+Then, back on the chatbot host, ingest it:
+
+```bash
+PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
+  --cmsrepo cmsrepo \
+  --github-issues /home/rao/CHAT-BOT-AI/GITHUB-ISSUES/issues \
+  --reconcile
+```
+
+Watch the printed `GitHub raw PRs imported: N; issues imported: M; comment
+files imported: K` line — since imports are content-hashed per Issue/PR, `N`
+and `M` reflect only what actually changed, not the full export size. Verify
+in Neo4j afterward if needed:
+
+```cypher
+MATCH (i:Issue {repo:'cmssw'}) RETURN max(i.number), count(i)
+MATCH (p:PR {repo:'cmssw'}) RETURN max(p.number), count(p)
+```
+
 ### External Clang logs
 
 Clang diagnostics are kept independently of `cmsrepo` under this layout:
