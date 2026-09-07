@@ -266,9 +266,12 @@ contradicted, one grace period if newly undecidable). `search_concepts`
 ### Alerts (`graph/alerts.py`)
 
 `AlertRule` nodes define threshold checks (`relval_failure_count`,
-`relval_recurrence`, `latest_ib_stalled`) evaluated on demand via
-`evaluate_rules()` (`POST /api/alerts/evaluate`), notifying through a
-`Notifier` protocol (currently only `LogNotifier`).
+`relval_recurrence`, `latest_ib_stalled`, `unittest_failure_count`,
+`build_failure_count`) evaluated on demand via `evaluate_rules()`
+(`POST /api/alerts/evaluate`), notifying through a `Notifier` protocol
+(currently only `LogNotifier`). There is deliberately no `addon_*` rule type:
+addon test results are not imported into the graph at all (no ingestion path
+exists for them), so an addon alert would have nothing to check against.
 
 ### Log RAG (`log_rag/`)
 
