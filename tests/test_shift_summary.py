@@ -216,9 +216,11 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         # Evidence is embedded as extra columns on the newly-failing table (the
         # frontend auto-hides anything past the first four columns behind a
         # per-row toggle), not a separate always-open section.
-        self.assertIn("Recurrence | PR/Issue evidence | Stored knowledge", markdown)
+        self.assertIn("Recurrence | PR/Issue evidence |", markdown)
+        self.assertNotIn("Stored knowledge", markdown)
         self.assertIn("`140.51` | RunMuonEG2022C", markdown)
         self.assertIn("cmssw PR #45213", markdown)
+        self.assertIn("(https://github.com/cms-sw/cmssw/pull/45213)", markdown)
         self.assertIn("relevance only, do not prove a PR or Issue caused or fixed a failure", markdown)
         # the out-of-series tag must not be counted as an in-series recurrence
         self.assertIn("Failed in 2 prior build(s) this series", markdown)
