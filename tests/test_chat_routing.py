@@ -2978,8 +2978,9 @@ class IbComparisonAnswerTests(unittest.TestCase):
     primary tag, which never equals a sub-IB tag typed by the caller. Found live
     (2026-09-09) comparing CMSSW_20_1_CLANG_X_2026-09-04-2300 vs ...-09-06-2300."""
 
+    @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_driver")
-    def test_failing_workflows_section_lists_every_category_by_name(self, get_driver):
+    def test_failing_workflows_section_lists_every_category_by_name(self, get_driver, get_exit_code_names):
         # A shifter needs the full picture: which workflows are brand new, which were
         # already failing before this window (so a persistent failure doesn't look
         # like something new), and which just got fixed -- not only the ones whose
@@ -3051,8 +3052,9 @@ class IbComparisonAnswerTests(unittest.TestCase):
             },
         ]
 
+    @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_driver")
-    def test_matches_when_both_requested_tags_are_sub_ib_tags(self, get_driver):
+    def test_matches_when_both_requested_tags_are_sub_ib_tags(self, get_driver, get_exit_code_names):
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value = self._sub_ib_rows(before_failed=1, after_failed=1)
 
@@ -3069,9 +3071,10 @@ class IbComparisonAnswerTests(unittest.TestCase):
         self.assertIn("Failed RelVals still 1", answer)
         self.assertNotIn("| Failed RelVals |", answer)
 
+    @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.find_prs_merged_between")
     @patch("server.api_server.get_driver")
-    def test_lists_merged_prs_when_relval_failures_increased(self, get_driver, find_prs_merged_between):
+    def test_lists_merged_prs_when_relval_failures_increased(self, get_driver, find_prs_merged_between, get_exit_code_names):
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value = self._sub_ib_rows(before_failed=1, after_failed=2)
         find_prs_merged_between.return_value = [
@@ -3093,9 +3096,10 @@ class IbComparisonAnswerTests(unittest.TestCase):
         self.assertIn("PR #51659", answer)
         self.assertIn("do not prove a PR or Issue caused or fixed a failure", answer)
 
+    @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.find_prs_merged_between")
     @patch("server.api_server.get_driver")
-    def test_skips_merged_pr_lookup_when_nothing_regressed(self, get_driver, find_prs_merged_between):
+    def test_skips_merged_pr_lookup_when_nothing_regressed(self, get_driver, find_prs_merged_between, get_exit_code_names):
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value = self._sub_ib_rows(before_failed=1, after_failed=1)
 
@@ -3106,9 +3110,12 @@ class IbComparisonAnswerTests(unittest.TestCase):
         find_prs_merged_between.assert_not_called()
         self.assertNotIn("PRs merged between", answer)
 
+    @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.find_prs_merged_between", return_value=[])
     @patch("server.api_server.get_driver")
-    def test_omits_merged_pr_section_when_regressed_but_no_pr_recorded(self, get_driver, find_prs_merged_between):
+    def test_omits_merged_pr_section_when_regressed_but_no_pr_recorded(
+        self, get_driver, find_prs_merged_between, get_exit_code_names
+    ):
         # Different code path than "nothing regressed": a real regression happened
         # (relval_failed went up), so the lookup IS made, but the graph has no PR
         # recorded as merged for this exact tag pair (verified live -- 81 of 98 real
@@ -3128,8 +3135,9 @@ class IbComparisonAnswerTests(unittest.TestCase):
         )
         self.assertNotIn("PRs merged between", answer)
 
+    @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_driver")
-    def test_all_arch_comparison_matches_when_both_requested_tags_are_sub_ib_tags(self, get_driver):
+    def test_all_arch_comparison_matches_when_both_requested_tags_are_sub_ib_tags(self, get_driver, get_exit_code_names):
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value = [
             {
