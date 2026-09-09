@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "graph"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from tools import (  # noqa: E402
     TOOLS, GRAPH_SCHEMA, _ib_sort_key, count_warnings_by_package, diff_warnings, find_prs_before_ib,
+    find_prs_merged_between,
     find_prs_for_error, get_exit_code_names, get_failing_relvals, get_failing_unittests,
     get_relval_exception_evidence, get_relval_recurrence, get_relval_workflow_ids, get_shift_summary,
     get_unittest_names, relval_failure_architectures, search_concepts,
@@ -3465,7 +3466,7 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
         WITH ib, relvals, collect(DISTINCT unit_test) AS unit_tests
         OPTIONAL MATCH (ib)-[:REPORTED]->(warning:Warning)
         WITH ib, relvals, unit_tests, collect(DISTINCT warning) AS warnings
-        RETURN coalesce(ib.parent_tag, ib.tag) AS primary_tag, ib.arch AS arch,
+        RETURN ib.tag AS tag, coalesce(ib.parent_tag, ib.tag) AS primary_tag, ib.arch AS arch,
                coalesce(ib.variant, 'primary') AS variant,
                coalesce(ib.comp_warnings, 0) AS build_warnings,
                coalesce(ib.ignored_warnings, 0) AS ignored_warnings,
@@ -3490,10 +3491,16 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
     if not rows:
         return "Neither requested Integration Build is present in the imported graph."
 
+    # Same "which of the two requested tags does this row belong to" logic as
+    # _ib_comparison_answer: key by the row's own tag when the caller named a sub-IB
+    # tag directly, else by its resolved primary_tag -- keying by primary_tag alone
+    # silently drops every row (and reports "not present") when both requested tags
+    # are themselves sub-IB tags, since neither ever equals a row's primary_tag.
     by_arch_variant: dict[str, dict[str, dict[str, dict]]] = {}
     for row in rows:
-        by_arch_variant.setdefault(row["arch"], {}).setdefault(row["variant"], {})[row["primary_tag"]] = row
-    before_tag, after_tag = sorted(tags)
+        key = row["tag"] if row["tag"] in tags else row["primary_tag"]
+        by_arch_variant.setdefault(row["arch"], {}).setdefault(row["variant"], {})[key] = row
+    before_tag, after_tag = sorted(tags, key=_ib_sort_key)
     metrics = [
         ("Build warnings", "build_warnings"),
         ("Ignored build warnings", "ignored_warnings"),
@@ -3970,7 +3977,7 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
         WITH ib, collect(DISTINCT rv) AS relvals
         OPTIONAL MATCH (ib)-[:RAN_UNITTEST]->(ut:UnitTest)
         WITH ib, relvals, collect(DISTINCT ut) AS unit_tests
-        RETURN coalesce(ib.parent_tag, ib.tag) AS primary_tag,
+        RETURN ib.tag AS tag, coalesce(ib.parent_tag, ib.tag) AS primary_tag,
                coalesce(ib.variant, 'primary') AS variant,
                size(relvals) AS relval_total,
                size([relval IN relvals WHERE relval.status = 'FAILED'
@@ -3996,11 +4003,21 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
     if not rows:
         return f"I found neither requested IB for **{arch}** (including any sub-IBs).", []
 
+    # Group by whichever of the two requested tags a row actually belongs to: a row's
+    # own `tag` when the caller named a sub-IB tag directly (e.g. comparing two dated
+    # builds of the same CLANG_X series), else its resolved `primary_tag` (when the
+    # caller named the two primary tags and this row is one of their sub-IBs, pulled
+    # in via ib.parent_tag IN $tags above). Keying by primary_tag alone here used to
+    # silently drop every row when both requested tags were themselves sub-IB tags --
+    # neither ever equals a row's primary_tag, so the comparison always reported
+    # "neither requested IB is present" even though both builds were fully imported.
     by_variant: dict[str, dict[str, dict]] = {}
     for row in rows:
-        by_variant.setdefault(row["variant"], {})[row["primary_tag"]] = row
+        key = row["tag"] if row["tag"] in tags else row["primary_tag"]
+        by_variant.setdefault(row["variant"], {})[key] = row
     before_tag, after_tag = sorted(tags, key=_ib_sort_key)
-    if before_tag not in {row["primary_tag"] for row in rows} and after_tag not in {row["primary_tag"] for row in rows}:
+    present_tags = {row["tag"] if row["tag"] in tags else row["primary_tag"] for row in rows}
+    if before_tag not in present_tags and after_tag not in present_tags:
         return f"I found neither requested IB for **{arch}** (including any sub-IBs).", []
 
     metrics = [
@@ -4049,6 +4066,25 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
                     lines.append(f"- `{workflow_id}` - {name}: no longer failing in {after_tag}.")
         else:
             lines.extend(["", "No failing workflow changed between these builds."])
+        # Only surfaced when something actually regressed in this block (RelVal or
+        # unit-test failures went up) -- a shifter chasing a regression's likely cause
+        # wants exactly the PRs merged in this window, not a routine "nothing changed"
+        # block. before["tag"]/after["tag"] are this row's own exact IB tag (the sub-IB's
+        # tag when this block is a sub-IB, not the primary), matching how merged-PR
+        # ingestion attaches MERGED_BEFORE per exact tag -- using before_tag/after_tag
+        # (the two tags the user typed) instead would attribute a sub-IB's regression to
+        # PRs merged into a different variant, or vice versa.
+        regressed = after["relval_failed"] > before["relval_failed"] or after["unit_test_failed"] > before["unit_test_failed"]
+        if regressed:
+            merged_prs = find_prs_merged_between(before["tag"], after["tag"])
+            if merged_prs:
+                lines.extend(["", f"**PRs merged between `{before['tag']}` and `{after['tag']}`:**"])
+                for pr in merged_prs[:10]:
+                    author = f" (@{pr['author']})" if pr.get("author") else ""
+                    lines.append(f"- {pr['repo']} PR #{pr['pr_number']} - {pr['title']}{author}")
+                lines.append(
+                    f"Listed because failures increased in this window -- {_RECURRENCE_EVIDENCE_CAVEAT}"
+                )
     if re.search(r"\b(?:addon|build\s*tests?)\b", question, re.IGNORECASE):
         lines.extend([
             "",
