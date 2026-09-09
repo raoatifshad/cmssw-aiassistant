@@ -228,6 +228,7 @@ def _ingest_relval_file(driver, path: Path, arch: str, force: bool) -> tuple[int
                 "SET relval.ib_key=$ib_key, relval.ib_tag=$tag, relval.arch=$arch, "
                 "relval.workflow_id=$workflow_id, relval.name=$name, relval.status=$status, "
                 "relval.exitcode=$exitcode, relval.errors=$errors, relval.warnings=$warnings, "
+                "relval.known_error=$known_error, relval.known_error_message=$known_error_message, "
                 "relval.source_id=$source_id "
                 "MERGE (ib)-[:RAN_RELVAL]->(relval)",
                 ib_key=current_ib_key,
@@ -240,6 +241,17 @@ def _ingest_relval_file(driver, path: Path, arch: str, force: bool) -> tuple[int
                 exitcode=entry.get("exitcode"),
                 errors=sum(step.get("errors", 0) for step in steps),
                 warnings=sum(step.get("warnings", 0) for step in steps),
+                # A workflow can be marked "known_error" for reasons unrelated to the
+                # code under test (e.g. missing grid-pack shared libraries for a build
+                # variant) - the real CMSDT dashboard excludes these from its failing
+                # count/list entirely (verified live: workflow 534.0/536.0 on
+                # CMSSW_20_1_ASAN_X_2026-08-31-2300/el9_amd64_gcc14 both have known_error=1,
+                # "Grid-packs missing asan and non-asan shared libraries", and don't appear
+                # on the real dashboard's 5-row failing list even though our graph's
+                # step-level status derivation correctly marks them FAILED). Storing this
+                # here lets get_failing_relvals match that same exclusion.
+                known_error=bool(entry.get("known_error")),
+                known_error_message=entry.get("known_error_message"),
                 source_id=source_id,
             )
     mark_source_imported(driver, source_id, digest, "relvals", path)

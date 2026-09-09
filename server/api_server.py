@@ -627,22 +627,41 @@ def _relval_scope_records(tag: str, include_sub_ibs: bool) -> list[dict]:
     Includes per-architecture error aggregates (error_count/failed_errors/
     passed_errors) alongside the pass/fail counts, so callers that only need
     failure counts and callers that need error breakdowns (e.g.
-    _relval_error_count_answer) share one query instead of two near-duplicates."""
+    _relval_error_count_answer) share one query instead of two near-duplicates.
+
+    failed_relvals excludes known_error workflows (real CMSDT dashboard behavior -
+    see get_failing_relvals); they're counted separately in known_error_relvals/
+    known_error_errors instead of being folded into either failed_relvals or
+    passed_relvals, so relval_total == failed_relvals + passed_relvals +
+    known_error_relvals always holds and a caller can still mention them if useful."""
     query = """
         MATCH (ib:IB)
         WHERE ib.tag = $tag OR ($include_sub_ibs AND ib.parent_tag = $tag)
         OPTIONAL MATCH (ib)-[:RAN_RELVAL]->(relval:RelVal)
         WITH ib,
             count(relval) AS relval_total,
-            sum(CASE WHEN relval.status = 'FAILED' THEN 1 ELSE 0 END) AS failed_relvals,
+            sum(CASE WHEN relval.status = 'FAILED' AND coalesce(relval.known_error, false) = false
+                     THEN 1 ELSE 0 END) AS failed_relvals,
             sum(CASE WHEN relval.status = 'PASSED' THEN 1 ELSE 0 END) AS passed_relvals,
+            sum(CASE WHEN relval.status = 'FAILED' AND coalesce(relval.known_error, false) = true
+                     THEN 1 ELSE 0 END) AS known_error_relvals,
             coalesce(sum(coalesce(relval.errors, 0)), 0) AS error_count,
-            sum(CASE WHEN relval.status = 'FAILED' THEN coalesce(relval.errors, 0) ELSE 0 END) AS failed_errors,
-            sum(CASE WHEN relval.status = 'PASSED' THEN coalesce(relval.errors, 0) ELSE 0 END) AS passed_errors
+            sum(CASE WHEN relval.status = 'FAILED' AND coalesce(relval.known_error, false) = false
+                     THEN coalesce(relval.errors, 0) ELSE 0 END) AS failed_errors,
+            sum(CASE WHEN relval.status = 'PASSED' THEN coalesce(relval.errors, 0) ELSE 0 END) AS passed_errors,
+            sum(CASE WHEN relval.status = 'FAILED' AND coalesce(relval.known_error, false) = true
+                     THEN coalesce(relval.errors, 0) ELSE 0 END) AS known_error_errors
         WHERE relval_total > 0
         RETURN ib.tag AS tag, ib.arch AS arch, ib.variant AS variant,
             coalesce(ib.is_relval_default, false) AS is_relval_default,
-            relval_total, failed_relvals, passed_relvals, error_count, failed_errors, passed_errors
+            // failed_relvals + passed_relvals + known_error_relvals == relval_total, always -
+            // known_error workflows are split out into their own bucket (they genuinely
+            // failed, just not for reasons a shifter needs to act on - see
+            // ingestion/build_graph.py's known_error note) rather than silently folded into
+            // either failed_relvals (would overcount real problems) or passed_relvals
+            // (would misreport a real failure as a pass).
+            relval_total, failed_relvals, passed_relvals, known_error_relvals,
+            error_count, failed_errors, passed_errors, known_error_errors
         ORDER BY tag, arch
     """
     driver = get_driver()
@@ -719,9 +738,14 @@ def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: li
     total = sum(record["relval_total"] or 0 for record in records)
     failed = sum(record["failed_relvals"] or 0 for record in records)
     passed = sum(record["passed_relvals"] or 0 for record in records)
+    # failed + passed can be less than total when known-error workflows exist (they're
+    # excluded from both - see _relval_scope_records) - naming the count here keeps the
+    # numbers from silently not adding up to `total` on the reader's own arithmetic.
+    known_error = sum(record.get("known_error_relvals") or 0 for record in records)
+    known_error_note = f", {known_error:,} known error" if known_error else ""
     lines = [
         f"{heading}: **{failed:,} failing RelVal(s)** across **{total:,}** RelVal record(s) "
-        f"({passed:,} passed).",
+        f"({passed:,} passed{known_error_note}).",
         "",
         "| IB | Architecture | Failing | Passed | Total |",
         "| --- | --- | ---: | ---: | ---: |",
@@ -2465,13 +2489,19 @@ def _relval_error_count_summary(records: list[dict], tag: str) -> str:
     error_count = sum(record["error_count"] or 0 for record in records)
     failed_errors = sum(record["failed_errors"] or 0 for record in records)
     passed_errors = sum(record["passed_errors"] or 0 for record in records)
+    # error_count == passed_errors + failed_errors only when there are no known-error
+    # RelVals - naming their share here keeps that arithmetic from silently not adding
+    # up (see _relval_scope_records for why they're a third bucket, not folded in).
+    known_error_errors = sum(record.get("known_error_errors") or 0 for record in records)
+    known_error_note = f", and **{known_error_errors:,}** from known-error RelVals" if known_error_errors else ""
     return (
         f"`{tag}` has **{failed_relvals:,} failed RelVal(s)** across "
         f"**{relval_total:,} RelVal record(s)** from **{ib_records:,} IB record(s)**. "
         f"Its **{error_count:,}** "
         f"reported errors are aggregate per-step counters, not a failed-RelVal count: "
         f"**{passed_errors:,}** come from **{passed_relvals:,}** "
-        f"RelVals marked `PASSED`, and **{failed_errors:,}** come from the failed RelVals."
+        f"RelVals marked `PASSED`, and **{failed_errors:,}** come from the failed RelVals"
+        f"{known_error_note}."
     )
 
 
@@ -3062,7 +3092,8 @@ def _ib_results_summary_answer(
                coalesce(ib.comp_warnings, 0) AS build_warnings,
                coalesce(ib.ignored_warnings, 0) AS ignored_warnings,
                size(relvals) AS relval_total,
-               size([item IN relvals WHERE item.status = 'FAILED']) AS relval_failed,
+               size([item IN relvals WHERE item.status = 'FAILED'
+                     AND coalesce(item.known_error, false) = false]) AS relval_failed,
                size(unit_tests) AS unit_test_total,
                size([item IN unit_tests WHERE item.status = 'FAILED']) AS unit_test_failed,
                reduce(total = 0, item IN unit_tests | total + coalesce(item.errors, 0)) AS unit_test_errors
@@ -3368,33 +3399,40 @@ def _pending_ib_comparison(question: str) -> dict[str, object] | None:
 
 
 def _all_arch_ib_comparison_answer(question: str) -> str | None:
-    """Compare imported IB facts across every architecture without LLM tool calls."""
+    """Compare imported IB facts across every architecture (plus each architecture's
+    sub-IBs, e.g. ASAN/CLANG/MULTIARCHS/NONLTO) without LLM tool calls."""
     tags = list(dict.fromkeys(IB_TAG_RE.findall(question)))
     if len(tags) != 2 or not re.search(r"\b(?:all|every)\s+architectures?\b|\beverything\b", question, re.IGNORECASE):
         return None
 
+    # (ib.tag IN $tags OR ib.parent_tag IN $tags) is the same "include sub-IBs" pattern
+    # used everywhere else in this codebase - a bare architecture name (arch, tag) pair
+    # isn't enough to key a comparison anymore once sub-IBs are in scope, since the same
+    # architecture now appears once per sub-IB too; variant disambiguates those rows.
     query = """
         MATCH (ib:IB)
-        WHERE ib.tag IN $tags
+        WHERE (ib.tag IN $tags OR ib.parent_tag IN $tags)
         OPTIONAL MATCH (ib)-[:RAN_RELVAL]->(relval:RelVal)
         WITH ib, collect(DISTINCT relval) AS relvals
         OPTIONAL MATCH (ib)-[:RAN_UNITTEST]->(unit_test:UnitTest)
         WITH ib, relvals, collect(DISTINCT unit_test) AS unit_tests
         OPTIONAL MATCH (ib)-[:REPORTED]->(warning:Warning)
         WITH ib, relvals, unit_tests, collect(DISTINCT warning) AS warnings
-        RETURN ib.tag AS tag, ib.arch AS arch,
+        RETURN coalesce(ib.parent_tag, ib.tag) AS primary_tag, ib.arch AS arch,
+               coalesce(ib.variant, 'primary') AS variant,
                coalesce(ib.comp_warnings, 0) AS build_warnings,
                coalesce(ib.ignored_warnings, 0) AS ignored_warnings,
                size(warnings) AS clang_locations,
                reduce(total = 0, item IN warnings | total + coalesce(item.count, 0)) AS clang_occurrences,
                size(relvals) AS relval_total,
-               size([item IN relvals WHERE item.status = 'FAILED']) AS relval_failed,
+               size([item IN relvals WHERE item.status = 'FAILED'
+                     AND coalesce(item.known_error, false) = false]) AS relval_failed,
                reduce(total = 0, item IN relvals | total + coalesce(item.errors, 0)) AS relval_errors,
                reduce(total = 0, item IN relvals | total + coalesce(item.warnings, 0)) AS relval_warnings,
                size(unit_tests) AS unit_test_total,
                size([item IN unit_tests WHERE item.status = 'FAILED']) AS unit_test_failed,
                reduce(total = 0, item IN unit_tests | total + coalesce(item.errors, 0)) AS unit_test_errors
-        ORDER BY arch, tag
+        ORDER BY arch, variant, primary_tag
     """
     driver = get_driver()
     try:
@@ -3405,9 +3443,9 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
     if not rows:
         return "Neither requested Integration Build is present in the imported graph."
 
-    by_arch: dict[str, dict[str, dict]] = {}
+    by_arch_variant: dict[str, dict[str, dict[str, dict]]] = {}
     for row in rows:
-        by_arch.setdefault(row["arch"], {})[row["tag"]] = row
+        by_arch_variant.setdefault(row["arch"], {}).setdefault(row["variant"], {})[row["primary_tag"]] = row
     before_tag, after_tag = sorted(tags)
     metrics = [
         ("Build warnings", "build_warnings"),
@@ -3422,23 +3460,30 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
         ("Failed unit tests", "unit_test_failed"),
         ("Unit-test errors", "unit_test_errors"),
     ]
-    lines = ["## All-architecture IB comparison"]
-    for arch, records in sorted(by_arch.items()):
+
+    def render_block(records: dict[str, dict]) -> list[str]:
         before = records.get(before_tag)
         after = records.get(after_tag)
-        lines.extend(["", f"### `{arch}`"])
         if not before or not after:
             missing = before_tag if not before else after_tag
-            lines.append(f"`{missing}` has no imported record for this architecture.")
-            continue
-        lines.extend([
+            return [f"`{missing}` has no imported record here."]
+        block = [
             f"| Metric | {before_tag} | {after_tag} | Delta |",
             "| --- | ---: | ---: | ---: |",
-        ])
-        lines.extend(
+        ]
+        block.extend(
             f"| {label} | {before[key]:,} | {after[key]:,} | {after[key] - before[key]:+,} |"
             for label, key in metrics
         )
+        return block
+
+    lines = ["## All-architecture IB comparison"]
+    for arch, by_variant in sorted(by_arch_variant.items()):
+        lines.extend(["", f"### `{arch}`"])
+        lines.extend(render_block(by_variant.get("primary", {})))
+        for variant in sorted(v for v in by_variant if v != "primary"):
+            lines.extend(["", f"#### `{variant}`"])
+            lines.extend(render_block(by_variant[variant]))
     lines.append("")
     lines.append("Build warnings are CMS queue-summary counts; Clang values are parsed diagnostics. Missing values are shown as zero only when that IB architecture record is imported.")
     return "\n".join(lines)
@@ -3543,13 +3588,12 @@ _RECURRENCE_EVIDENCE_CAVEAT = (
 )
 
 
-def _workflow_evidence_cells(workflow_id: str, row: dict, latest_tag: str) -> tuple[str, str, str]:
-    """(recurrence, pr_evidence, stored_knowledge) cell text for one newly-failing
-    workflow, each a single sanitized table-cell line. Every claim here is
-    relevance/history, never causality -- see the module docstring's
-    evidence-only invariant. Computed once per distinct workflow_id by the
-    caller (generate_shift_summary), not once per architecture row, since
-    the same workflow can newly-fail on several architectures at once."""
+def _workflow_evidence_cells(workflow_id: str, row: dict, latest_tag: str) -> tuple[str, str]:
+    """(recurrence, pr_evidence) cell text for one newly-failing workflow, each a single
+    sanitized table-cell line. Every claim here is relevance/history, never causality --
+    see the module docstring's evidence-only invariant. Computed once per distinct
+    workflow_id by the caller (generate_shift_summary), not once per architecture row,
+    since the same workflow can newly-fail on several architectures at once."""
     series_match = re.match(r"^CMSSW_(\d+)_(\d+)_", latest_tag)
     series_prefix = f"CMSSW_{series_match.group(1)}_{series_match.group(2)}_" if series_match else None
 
@@ -3584,40 +3628,39 @@ def _workflow_evidence_cells(workflow_id: str, row: dict, latest_tag: str) -> tu
         category = f"[{entry['category']}] " if entry.get("category") else ""
         for match in entry["matches"][:3]:
             state = "merged" if match["kind"] == "PR" and match.get("merged_at") else str(match.get("state") or "unknown")
-            mentions.append(f"{category}cmssw {match['kind']} #{match['number']} ({state})")
+            # cms-sw/cmssw is the only repo get_relval_exception_evidence's artifact_query
+            # searches (WHERE item.repo = 'cmssw'), so the URL is always this shape.
+            path = "issues" if match["kind"] == "Issue" else "pull"
+            url = f"https://github.com/cms-sw/cmssw/{path}/{match['number']}"
+            mentions.append(f"{category}[cmssw {match['kind']} #{match['number']}]({url}) ({state})")
     if not mentions:
         pr_cell = "No PR/Issue in the imported graph matches this workflow's exception signature."
     else:
         pr_cell = f"{', '.join(mentions[:5])} -- relevance only, {_RECURRENCE_EVIDENCE_CAVEAT.split(' and ')[-1]}"
 
-    # search_concepts requires a leading-letter term (see its docstring's caveat) -- a bare
-    # numeric workflow_id never survives that filter, so also search on the workflow's name.
-    concept_rows = search_concepts(f"{workflow_id} {row['name']}", limit=3)
-    knowledge_cell = concept_rows[0]["definition"] if concept_rows else "No stored expert-corrected fact matches."
-
-    return _table_cell(recurrence_cell), _table_cell(pr_cell), _table_cell(knowledge_cell)
+    return _table_cell(recurrence_cell), _table_cell(pr_cell)
 
 
 def _newly_failing_relval_table(
-    rows: list[dict], exit_code_names: dict[int, str], evidence: dict[str, tuple[str, str, str]],
+    rows: list[dict], exit_code_names: dict[int, str], evidence: dict[str, tuple[str, str]],
 ) -> list[str]:
-    """Like _relval_table, but with three extra evidence columns the frontend
-    auto-hides behind a per-row "Show evidence" toggle -- everything past the
-    first five (always-visible) columns is exactly that kind of drill-down
-    detail, never the primary at-a-glance read."""
+    """Like _relval_table, but with two extra evidence columns the frontend auto-hides
+    behind a per-row "Show evidence" toggle -- everything past the first five
+    (always-visible) columns is exactly that kind of drill-down detail, never the
+    primary at-a-glance read."""
     if not rows:
         return ["None."]
     lines = [
-        "| Workflow | Name | Errors | Exit code | Variant | Recurrence | PR/Issue evidence | Stored knowledge |",
-        "| --- | --- | ---: | ---: | --- | --- | --- | --- |",
+        "| Workflow | Name | Errors | Exit code | Variant | Recurrence | PR/Issue evidence |",
+        "| --- | --- | ---: | ---: | --- | --- | --- |",
     ]
     for row in rows:
-        recurrence_cell, pr_cell, knowledge_cell = evidence[row["workflow_id"]]
+        recurrence_cell, pr_cell = evidence[row["workflow_id"]]
         lines.append(
             f"| `{row['workflow_id']}` | {row['name']} | {row.get('errors') or 0} | "
             f"{_format_exit_code(row['exitcode'], exit_code_names) if row.get('exitcode') else 0} | "
             f"{row.get('variant') or 'primary'} | "
-            f"{recurrence_cell} | {pr_cell} | {knowledge_cell} |"
+            f"{recurrence_cell} | {pr_cell} |"
         )
     return lines
 
@@ -3829,8 +3872,9 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
     return "\n".join(lines)
 
 
-def _ib_comparison_answer(question: str) -> str | None:
-    """Compare relval and unit-test outcomes for two IBs without LLM tool calling."""
+def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
+    """Compare relval and unit-test outcomes for two IBs (plus their sub-IBs, e.g.
+    ASAN/CLANG/MULTIARCHS/NONLTO) without LLM tool calling."""
     if not re.search(r"\b(?:compare|comparison|delta|deltas)\b", question, re.IGNORECASE):
         return None
     tags = list(dict.fromkeys(IB_TAG_RE.findall(question)))
@@ -3849,52 +3893,69 @@ def _ib_comparison_answer(question: str) -> str | None:
             driver.close()
         architectures = [row["arch"] for row in rows]
         if not architectures:
-            return "Neither requested Integration Build is present in the imported graph."
+            return "Neither requested Integration Build is present in the imported graph.", []
+        # Every choice offered as a clickable action (not just named in prose) - "all
+        # architectures" is a real, working answer here (see
+        # _all_arch_ib_comparison_answer's trigger regex) but was previously never
+        # listed anywhere in this message, so a shifter had to already know the magic
+        # phrase to use it instead of being offered it.
+        actions = [
+            {"label": arch, "question": f"compare {tags[0]} and {tags[1]} {arch}"}
+            for arch in architectures
+        ]
+        actions.append({"label": "All architectures", "question": f"compare {tags[0]} and {tags[1]} all architectures"})
         return (
             "Which architecture should I compare? IB data is stored separately for each architecture. "
-            f"Available for these builds: {', '.join(f'`{arch}`' for arch in architectures)}."
+            f"Available for these builds: {', '.join(f'`{arch}`' for arch in architectures)} "
+            "- or compare all architectures at once.",
+            actions,
         )
 
+    arch = arch_match.group(1)
+    # (ib.tag IN $tags OR ib.parent_tag IN $tags) is the same "include sub-IBs" pattern
+    # used everywhere else in this codebase (get_failing_relvals, generate_shift_summary,
+    # ...) - a shifter comparing two builds needs ASAN/CLANG/MULTIARCHS/NONLTO/etc.
+    # included too, not just the two primary IBs, since a regression can be sub-IB-only.
     query = """
         MATCH (ib:IB)
-        WHERE ib.tag IN $tags AND ib.arch = $arch
+        WHERE (ib.tag IN $tags OR ib.parent_tag IN $tags) AND ib.arch = $arch
         OPTIONAL MATCH (ib)-[:RAN_RELVAL]->(rv:RelVal)
         WITH ib, collect(DISTINCT rv) AS relvals
         OPTIONAL MATCH (ib)-[:RAN_UNITTEST]->(ut:UnitTest)
         WITH ib, relvals, collect(DISTINCT ut) AS unit_tests
-        RETURN ib.tag AS tag,
+        RETURN coalesce(ib.parent_tag, ib.tag) AS primary_tag,
+               coalesce(ib.variant, 'primary') AS variant,
                size(relvals) AS relval_total,
-               size([relval IN relvals WHERE relval.status = 'FAILED']) AS relval_failed,
+               size([relval IN relvals WHERE relval.status = 'FAILED'
+                     AND coalesce(relval.known_error, false) = false]) AS relval_failed,
                reduce(total = 0, relval IN relvals | total + coalesce(relval.errors, 0)) AS relval_errors,
                reduce(total = 0, relval IN relvals | total + coalesce(relval.warnings, 0)) AS relval_warnings,
                size(unit_tests) AS unit_test_total,
                size([unit_test IN unit_tests WHERE unit_test.status = 'FAILED']) AS unit_test_failed,
                reduce(total = 0, unit_test IN unit_tests | total + coalesce(unit_test.errors, 0)) AS unit_test_errors,
-               [relval IN relvals WHERE relval.status = 'FAILED' |
+               [relval IN relvals WHERE relval.status = 'FAILED'
+                AND coalesce(relval.known_error, false) = false |
                    {workflow_id: relval.workflow_id, name: relval.name, errors: relval.errors,
                     warnings: relval.warnings, exitcode: relval.exitcode}
                ] AS failing_relvals
-        ORDER BY tag
+        ORDER BY variant, primary_tag
     """
     driver = get_driver()
     try:
         with driver.session() as session:
-            rows = [dict(record) for record in session.run(query, tags=tags, arch=arch_match.group(1))]
+            rows = [dict(record) for record in session.run(query, tags=tags, arch=arch)]
     finally:
         driver.close()
-    if len(rows) != 2:
-        return (
-            f"I found {len(rows)} of the requested IBs for **{arch_match.group(1)}**. "
-            "Both builds need imported RelVal or unit-test data for a comparison."
-        )
+    if not rows:
+        return f"I found neither requested IB for **{arch}** (including any sub-IBs).", []
 
-    before, after = rows
-    lines = [
-        f"## IB comparison: {arch_match.group(1)}",
-        "",
-        f"| Suite | {before['tag']} | {after['tag']} | Delta |",
-        "| --- | ---: | ---: | ---: |",
-    ]
+    by_variant: dict[str, dict[str, dict]] = {}
+    for row in rows:
+        by_variant.setdefault(row["variant"], {})[row["primary_tag"]] = row
+    before_tag, after_tag = sorted(tags, key=_ib_sort_key)
+    if before_tag not in {row["primary_tag"] for row in rows} and after_tag not in {row["primary_tag"] for row in rows}:
+        return f"I found neither requested IB for **{arch}** (including any sub-IBs).", []
+
     metrics = [
         ("RelVals run", "relval_total"),
         ("Failed RelVals", "relval_failed"),
@@ -3904,35 +3965,119 @@ def _ib_comparison_answer(question: str) -> str | None:
         ("Failed unit tests", "unit_test_failed"),
         ("Unit-test errors", "unit_test_errors"),
     ]
-    lines.extend(
-        f"| {label} | {before[key]:,} | {after[key]:,} | {after[key] - before[key]:+,} |"
-        for label, key in metrics
-    )
-    changed_failures = _diff_failing_relvals(before["failing_relvals"], after["failing_relvals"])
-    if changed_failures:
-        exit_code_names = get_exit_code_names()
-        lines.extend(["", "### Changed failing workflows"])
-        for workflow_id, previous, later in changed_failures:
-            name = (later or previous)["name"]
-            if previous and later:
-                lines.append(
-                    f"- `{workflow_id}` - {name}: errors {previous['errors']} to {later['errors']}; "
-                    f"warnings {previous['warnings']} to {later['warnings']}; "
-                    f"exit code {_format_exit_code(previous['exitcode'], exit_code_names)} to "
-                    f"{_format_exit_code(later['exitcode'], exit_code_names)}."
-                )
-            elif later:
-                lines.append(f"- `{workflow_id}` - {name}: newly failing in {after['tag']}.")
-            else:
-                lines.append(f"- `{workflow_id}` - {name}: no longer failing in {after['tag']}.")
-    else:
-        lines.extend(["", "### Changed failing workflows", "No failing workflow changed between these builds."])
+    exit_code_names = get_exit_code_names()
+    lines = [f"## IB comparison: {arch}"]
+    for variant in sorted(by_variant, key=lambda v: (v != "primary", v)):
+        records = by_variant[variant]
+        before = records.get(before_tag)
+        after = records.get(after_tag)
+        lines.extend(["", "### Primary" if variant == "primary" else f"### `{variant}`"])
+        if not before or not after:
+            missing = before_tag if not before else after_tag
+            lines.append(f"`{missing}` has no imported record for this sub-IB on `{arch}`.")
+            continue
+        lines.extend([
+            f"| Suite | {before_tag} | {after_tag} | Delta |",
+            "| --- | ---: | ---: | ---: |",
+        ])
+        lines.extend(
+            f"| {label} | {before[key]:,} | {after[key]:,} | {after[key] - before[key]:+,} |"
+            for label, key in metrics
+        )
+        changed_failures = _diff_failing_relvals(before["failing_relvals"], after["failing_relvals"])
+        if changed_failures:
+            lines.extend(["", "**Changed failing workflows:**"])
+            for workflow_id, previous, later in changed_failures:
+                name = (later or previous)["name"]
+                if previous and later:
+                    lines.append(
+                        f"- `{workflow_id}` - {name}: errors {previous['errors']} to {later['errors']}; "
+                        f"warnings {previous['warnings']} to {later['warnings']}; "
+                        f"exit code {_format_exit_code(previous['exitcode'], exit_code_names)} to "
+                        f"{_format_exit_code(later['exitcode'], exit_code_names)}."
+                    )
+                elif later:
+                    lines.append(f"- `{workflow_id}` - {name}: newly failing in {after_tag}.")
+                else:
+                    lines.append(f"- `{workflow_id}` - {name}: no longer failing in {after_tag}.")
+        else:
+            lines.extend(["", "No failing workflow changed between these builds."])
     if re.search(r"\b(?:addon|build\s*tests?)\b", question, re.IGNORECASE):
         lines.extend([
             "",
             "Addon and build-test results are not present in the imported graph, so their totals and deltas are unavailable.",
         ])
-    return "\n".join(lines)
+    return "\n".join(lines), []
+
+
+def _is_empty_digest_table(body: str) -> bool:
+    """Matches both empty-table conventions generate_shift_summary()'s sections use:
+    a literal "None." line (RelVal/Clang, the older convention) or a |-table with only
+    its header + separator row and zero data rows (Build/Unit Test/AddOn, see
+    _plain_shift_table)."""
+    lines = [line for line in body.strip().split("\n") if line.strip()]
+    if not lines:
+        return True
+    if lines == ["None."]:
+        return True
+    return len(lines) <= 2 and all(line.strip().startswith("|") for line in lines)
+
+
+def _condense_shift_summary_for_chat(markdown: str) -> str:
+    """Strips every genuinely-empty #### section and, in turn, every ### architecture
+    left with nothing in it, from a generate_shift_summary() markdown before it's shown
+    as a chat answer. The full structure (every category, every architecture, even ones
+    with zero changes) is right for the Shift Console's own structured renderer, which
+    turns an empty category into a "no changes" success banner per architecture -
+    genuinely useful there. Dumped as raw text into a chat bubble instead, the same
+    structure is a wall of "None." lines and empty table headers repeated per
+    architecture, which is exactly the unprofessional/no-signal complaint this fixes.
+    Only ever applied at a chat-answer call site - GET /api/shift-summary (consumed by
+    the Shift Console frontend) keeps calling generate_shift_summary()/
+    _shift_summary_answer() directly, unmodified.
+
+    Locates "## Shift summary: ..." by search rather than assuming it's line 0, since
+    the days= path (_shift_summary_answer) prepends an italic "comparing against..."
+    note before it. Passes anything through unchanged if that heading isn't found at
+    all - a graceful message like "Not enough Integration Build history..." never had
+    the digest structure to begin with, and must not get replaced by the "nothing
+    changed" fallback below."""
+    title_match = re.search(r"^## Shift summary: .*$", markdown, re.M)
+    if not title_match:
+        return markdown
+    preamble = markdown[: title_match.start()]
+    title_line = title_match.group(0)
+    body = markdown[title_match.end():]
+
+    footer_match = re.search(r"\n(---\n.*)", body, re.S)
+    footer = footer_match.group(1) if footer_match else ""
+    if footer:
+        body = body[: footer_match.start()]
+
+    kept_blocks = []
+    for arch_block in re.split(r"\n(?=### )", body):
+        heading_match = re.match(r"### (.*)", arch_block.strip())
+        if not heading_match:
+            continue
+        kept_subs = []
+        for sub in re.split(r"\n(?=#### )", arch_block)[1:]:
+            sub_heading_match = re.match(r"#### (.*)", sub)
+            if not sub_heading_match:
+                continue
+            if not _is_empty_digest_table(sub[sub_heading_match.end():]):
+                kept_subs.append(sub.rstrip())
+        if kept_subs:
+            kept_blocks.append(f"### {heading_match.group(1)}\n\n" + "\n\n".join(kept_subs))
+
+    if not kept_blocks:
+        window = title_line.replace("## Shift summary: ", "").strip()
+        message = (
+            f"No newly failing or resolved RelVal workflows, Unit Tests, Builds, AddOn tests, "
+            f"or Clang warnings between {window} across any imported architecture."
+        )
+        return f"{preamble}{message}" if preamble else message
+    result = f"{preamble}{title_line}\n\n" + "\n\n".join(kept_blocks)
+    return f"{result}\n\n{footer}" if footer else result
 
 
 def _shift_summary_answer(arch: str | None, days: int | None = None) -> str:
@@ -3990,20 +4135,22 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
             # _ib_sort_key (not question word order) since "between" doesn't
             # imply which one the shifter typed first is the newer build.
             previous_tag, latest_tag = sorted(explicit_tags, key=_ib_sort_key)
-            return (generate_shift_summary(latest_tag, previous_tag, arch), [])
+            return (_condense_shift_summary_for_chat(generate_shift_summary(latest_tag, previous_tag, arch)), [])
         days = _parse_recency_window_days(question, default=None)
-        return (_shift_summary_answer(arch, days), [])
+        return (_condense_shift_summary_for_chat(_shift_summary_answer(arch, days)), [])
     if capability == "comparison":
-        # `or` short-circuits, unlike `for x in (a(), b(), c())` which builds the
-        # tuple eagerly and always runs every call — _ib_comparison_answer's
-        # architecture-listing fallback does a real graph query, so it must not
-        # run when an earlier answer already resolved the question.
-        answer = (
-            _clang_warning_comparison_answer(question)
-            or _all_arch_ib_comparison_answer(question)
-            or _ib_comparison_answer(question)
-        )
-        return (answer, []) if answer else None
+        # Checked in order (not one eager `or` chain) so a graph query never runs once
+        # an earlier answer already resolved the question. _ib_comparison_answer returns
+        # its own (text, actions) tuple - unlike the other two, its architecture-
+        # disambiguation reply carries real clickable actions (one per architecture, plus
+        # "all") - so it's returned as-is instead of being force-wrapped with actions=[].
+        clang_answer = _clang_warning_comparison_answer(question)
+        if clang_answer:
+            return clang_answer, []
+        all_arch_answer = _all_arch_ib_comparison_answer(question)
+        if all_arch_answer:
+            return all_arch_answer, []
+        return _ib_comparison_answer(question)
     if capability == "relval":
         # A follow-up naming no IB at all ("give the workflows that are
         # failing", "workflow names") still carries the "relval" category, so
@@ -4413,7 +4560,8 @@ def chat(req: ChatRequest):
         return _chat_response(sid, original_question, all_arch_comparison_answer, "deterministic")
     ib_comparison_answer = _ib_comparison_answer(question)
     if ib_comparison_answer:
-        return _chat_response(sid, original_question, ib_comparison_answer, "deterministic")
+        comparison_text, comparison_actions = ib_comparison_answer
+        return _chat_response(sid, original_question, comparison_text, "deterministic", actions=comparison_actions)
     build_warning_answer = _build_warning_answer(question, _latest_ib_contexts.get(sid))
     if build_warning_answer:
         return _chat_response(sid, original_question, build_warning_answer, "deterministic")

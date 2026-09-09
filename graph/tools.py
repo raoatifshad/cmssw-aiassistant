@@ -366,7 +366,8 @@ def relval_failure_architectures(days: int | None = 7) -> list[str]:
     same rule as the rest of this codebase's IB-identity handling."""
     rows = _run_query(
         "MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal {status:'FAILED'}) "
-        "WHERE $cutoff IS NULL OR right(ib.tag, 15) >= $cutoff "
+        "WHERE ($cutoff IS NULL OR right(ib.tag, 15) >= $cutoff) "
+        "AND coalesce(relval.known_error, false) = false "
         "RETURN DISTINCT ib.arch AS arch ORDER BY arch",
         {"cutoff": _recency_cutoff(days)},
     )
@@ -483,12 +484,17 @@ def top_packages_by_warnings(ib_tag: str | None = None, arch: str | None = None,
 
 
 def get_failing_relvals(ib_tag: str, arch: str | None = None, limit: int = 50) -> list[dict]:
-    """Failed RelVals for an IB, including sub-IBs when given a primary tag."""
+    """Failed RelVals for an IB, including sub-IBs when given a primary tag. Excludes
+    known_error=true workflows (e.g. "Grid-packs missing asan and non-asan shared
+    libraries") to match the real CMSDT dashboard's own failing count/list, which
+    excludes them the same way - see ingestion/build_graph.py's _ingest_relval_file for
+    where known_error is captured and the live discrepancy that prompted this."""
     limit = min(limit, MAX_ROWS)
     return _run_query(
         "MATCH (ib:IB)-[:RAN_RELVAL]->(rv:RelVal {status:'FAILED'}) "
         "WHERE (ib.tag = $t OR ib.parent_tag = $t) "
         "AND ($arch IS NULL OR ib.arch = $arch) "
+        "AND coalesce(rv.known_error, false) = false "
         "RETURN ib.tag AS ib_tag, ib.variant AS variant, rv.name AS name, rv.workflow_id AS workflow_id, "
         "rv.errors AS errors, rv.exitcode AS exitcode "
         "ORDER BY ib.tag, rv.workflow_id LIMIT $lim",
@@ -843,7 +849,18 @@ def get_relval_exception_evidence(workflow_id: str, ib_tag: str | None = None, l
                     return 1
 
                 best = max(matches, key=specificity)
-                results.append({"category": row.get("category"), "exception": exception, "matches": [best]})
+                # Only attach the [category] label when the match was actually found via
+                # this exact exception's text - otherwise it's decorative, not descriptive:
+                # a workflow_id/module-only match can come from a *different* exception
+                # occurrence of the same workflow_id (RelValException has no timestamp
+                # ordering guarantee), so labeling it with an unrelated category is
+                # actively misleading (verified live: workflow 539.0's only stored
+                # exception is "XMLDocument: Invalid document structure", but it matched
+                # Issue #45872 - a SIGSEGV bug - purely via a developer's comment naming
+                # "539.0" as an affected workflow; the XMLDocument label had nothing to do
+                # with why that match was found).
+                category = row.get("category") if specificity(best) == 3 else None
+                results.append({"category": category, "exception": exception, "matches": [best]})
     finally:
         driver.close()
     return results
