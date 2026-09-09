@@ -1860,6 +1860,53 @@ def _pasted_exception_signature(question: str) -> str | None:
     return f"An exception of category '{match.group(1)}' occurred while"
 
 
+def _exception_category_from_signature(signature: str) -> str | None:
+    """Recover the bare category name from a _pasted_exception_signature() string
+    (e.g. "An exception of category 'LogicError' occurred while" -> "LogicError")."""
+    match = re.match(r"An exception of category '([^']+)' occurred while", signature)
+    return match.group(1) if match else None
+
+
+def _pasted_exception_workflow_matches(category: str, tag: str, arch: str | None, limit: int = 20) -> str | None:
+    """List imported RelVal workflows (within the session's established IB, including
+    its sub-IBs) whose exception category matches a pasted exception's category --
+    the paste alone only identifies *which category* of exception, never *which
+    workflow or IB* hit it (that's a separate (RelVal)-[:HAS_EXCEPTION]->(RelValException)
+    lookup keyed by tag, not by the GitHub-text search _pasted_exception_search_answer
+    does), so this only fires when a tag is already known from the session context
+    (_latest_ib_contexts) rather than ever guessing one. Returns None (not an empty-
+    result message) when nothing matches, so the caller can treat this as a purely
+    additive extra section on top of the GitHub evidence, never the primary answer."""
+    query = """
+        MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal)-[:HAS_EXCEPTION]->(exception:RelValException)
+        WHERE (ib.tag = $tag OR ib.parent_tag = $tag)
+          AND ($arch IS NULL OR ib.arch = $arch)
+          AND exception.category = $category
+        RETURN DISTINCT ib.arch AS arch, coalesce(ib.variant, 'primary') AS variant,
+               relval.workflow_id AS workflow_id, relval.name AS name, exception.text AS exception
+        ORDER BY arch, variant, workflow_id
+        LIMIT $limit
+    """
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                query, tag=tag, arch=arch, category=category, limit=limit
+            )]
+    finally:
+        driver.close()
+    if not rows:
+        return None
+    lines = [f"Workflows in `{tag}` currently showing a `{category}` exception:"]
+    for row in rows:
+        variant_note = "" if row["variant"] == "primary" else f" (`{row['variant']}`)"
+        lines.append(
+            f"- `{row['arch']}`{variant_note} workflow `{row['workflow_id']}` - {row['name']}: "
+            f"`{row['exception']}`"
+        )
+    return "\n".join(lines)
+
+
 def _exception_evidence_excerpt(evidence: str, exception: str, limit: int = 320) -> str:
     """Return the source text surrounding an exact exception occurrence."""
     normalized_evidence = " ".join(evidence.split())
@@ -4592,6 +4639,18 @@ def chat(req: ChatRequest):
     if exception_signature:
         _pasted_exception_search_contexts[sid] = {"exception": exception_signature, "offset": 0}
         pasted_exception_search_answer, github_matches = _pasted_exception_search_answer(exception_signature)
+        # The paste alone only names an exception *category*, never which workflow or
+        # IB hit it -- that needs a tag, which we only have when this session already
+        # established one (e.g. an earlier "what's failing in <tag>" turn). Additive,
+        # not a replacement: prepended when present, silently skipped when not.
+        context_tag = _latest_ib_contexts.get(sid)
+        if context_tag:
+            category = _exception_category_from_signature(exception_signature)
+            workflow_matches = category and _pasted_exception_workflow_matches(
+                category, context_tag, _latest_ib_arch_contexts.get(sid)
+            )
+            if workflow_matches:
+                pasted_exception_search_answer = f"{workflow_matches}\n\n{pasted_exception_search_answer}"
         return _chat_response(
             sid, original_question, pasted_exception_search_answer, "deterministic", github_matches=github_matches
         )
