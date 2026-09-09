@@ -3070,17 +3070,17 @@ class IbComparisonAnswerTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "- `100.0` - StillUnchanged: still failing (already failing in "
-            "`CMSSW_20_1_CLANG_X_2026-09-04-2300`), unchanged.",
+            "| `100.0` | StillUnchanged | 1 | 1 | Still failing (already failing in "
+            "`CMSSW_20_1_CLANG_X_2026-09-04-2300`) | - | - |",
             answer,
         )
         self.assertIn(
-            "- `200.0` - StillChanged: still failing (already failing in "
-            "`CMSSW_20_1_CLANG_X_2026-09-04-2300`); errors 2 to 5;",
+            "| `200.0` | StillChanged | 5 | 2 | Still failing (already failing in "
+            "`CMSSW_20_1_CLANG_X_2026-09-04-2300`) | - | - |",
             answer,
         )
-        self.assertIn("- `300.0` - WillResolve: no longer failing in CMSSW_20_1_CLANG_X_2026-09-06-2300 (resolved).", answer)
-        self.assertIn("- `400.0` - NewlyFailing: newly failing in CMSSW_20_1_CLANG_X_2026-09-06-2300.", answer)
+        self.assertIn("| `300.0` | WillResolve | 3 | 3 | Resolved | - | - |", answer)
+        self.assertIn("| `400.0` | NewlyFailing | 4 | 4 | Newly failing | - | - |", answer)
 
     @staticmethod
     def _sub_ib_rows(before_failed: int, after_failed: int, before_ut_failed: int = 0, after_ut_failed: int = 0):
@@ -3190,6 +3190,81 @@ class IbComparisonAnswerTests(unittest.TestCase):
         self.assertNotIn("PRs merged between", answer)
 
     @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.find_prs_merged_between", return_value=[])
+    @patch("server.api_server.get_driver")
+    def test_failing_workflows_table_shows_cross_variant_visibility(
+        self, get_driver, find_prs_merged_between, get_exit_code_names
+    ):
+        # Explicit design (agreed with the user): the failing-workflow table stays
+        # per-variant for classification (Newly failing/Still failing/Resolved never
+        # changes based on what other variants show), but two extra columns list
+        # every OTHER variant at this architecture also failing on the same
+        # workflow_id, named by that variant's own full exact tag -- purely
+        # additive visibility, not reclassification.
+        before_tag, after_tag = "CMSSW_20_1_X_2026-09-04-2300", "CMSSW_20_1_X_2026-09-06-2300"
+        asan_before, asan_after = "CMSSW_20_1_ASAN_X_2026-09-04-2300", "CMSSW_20_1_ASAN_X_2026-09-06-2300"
+        clang_before, clang_after = "CMSSW_20_1_CLANG_X_2026-09-04-2300", "CMSSW_20_1_CLANG_X_2026-09-06-2300"
+
+        def row(tag, primary_tag, variant, failed, failing_relvals):
+            return {
+                "tag": tag, "primary_tag": primary_tag, "variant": variant,
+                "relval_total": 10, "relval_failed": failed, "relval_errors": failed,
+                "relval_warnings": failed, "unit_test_total": 1, "unit_test_failed": 0,
+                "unit_test_errors": 0, "failing_relvals": failing_relvals,
+            }
+
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            row(before_tag, before_tag, "primary", 1, [
+                {"workflow_id": "600.0", "name": "NoOverlap", "errors": 1, "warnings": 1, "exitcode": 1},
+            ]),
+            row(after_tag, after_tag, "primary", 2, [
+                {"workflow_id": "600.0", "name": "NoOverlap", "errors": 1, "warnings": 1, "exitcode": 1},
+                {"workflow_id": "500.0", "name": "CrossVariant", "errors": 5, "warnings": 5, "exitcode": 5},
+            ]),
+            # ASAN already had 500.0 failing on BOTH sides -- unrelated to primary's
+            # regression, but visible cross-reference material for primary's row.
+            row(asan_before, before_tag, "ASAN", 1, [
+                {"workflow_id": "500.0", "name": "CrossVariant", "errors": 3, "warnings": 3, "exitcode": 3},
+            ]),
+            row(asan_after, after_tag, "ASAN", 1, [
+                {"workflow_id": "500.0", "name": "CrossVariant", "errors": 3, "warnings": 3, "exitcode": 3},
+            ]),
+            # CLANG never has either workflow failing -- the "-" / no-overlap case.
+            row(clang_before, before_tag, "CLANG", 0, []),
+            row(clang_after, after_tag, "CLANG", 0, []),
+        ]
+
+        answer, actions = _ib_comparison_answer(
+            f"compare {before_tag} and {after_tag} el9_amd64_gcc14"
+        )
+
+        primary_block = answer.split("### `ASAN`")[0]
+        asan_block = answer.split("### `ASAN`")[1].split("### `CLANG`")[0]
+        clang_block = answer.split("### `CLANG`")[1]
+
+        # Primary: 500.0 is newly failing, and ASAN already had it failing on both
+        # sides -- both "Also failing in" columns must name ASAN's own exact tag.
+        self.assertIn(
+            f"| `500.0` | CrossVariant | 5 | 5 | Newly failing | ASAN (`{asan_before}`) | ASAN (`{asan_after}`) |",
+            primary_block,
+        )
+        # 600.0 has no cross-variant overlap anywhere -- both cells read "-".
+        self.assertIn(
+            f"| `600.0` | NoOverlap | 1 | 1 | Still failing (already failing in `{before_tag}`) | - | - |",
+            primary_block,
+        )
+        # ASAN's own row for 500.0: primary only had it failing from after_tag
+        # onward, so primary appears in the after-side column only, not before --
+        # the symmetric reference is real, not a mirrored copy of primary's row.
+        self.assertIn(
+            f"| `500.0` | CrossVariant | 3 | 3 | Still failing (already failing in `{before_tag}`) | "
+            f"- | primary (`{after_tag}`) |",
+            asan_block,
+        )
+        self.assertIn("No RelVal workflow is failing in either build.", clang_block)
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_driver")
     def test_all_arch_comparison_matches_when_both_requested_tags_are_sub_ib_tags(self, get_driver, get_exit_code_names):
         session = get_driver.return_value.session.return_value.__enter__.return_value
@@ -3228,11 +3303,11 @@ class IbComparisonAnswerTests(unittest.TestCase):
         # workflows those counts referred to. Same _render_failing_workflows helper as
         # the single-architecture path now covers this comparison too.
         self.assertIn(
-            "- `140.051` - RunMuonEG2022C: still failing (already failing in "
-            "`CMSSW_20_1_CLANG_X_2026-09-04-2300`), unchanged.",
+            "| `140.051` | RunMuonEG2022C | 1 | 16640 | Still failing (already failing in "
+            "`CMSSW_20_1_CLANG_X_2026-09-04-2300`) | - | - |",
             answer,
         )
-        self.assertIn("- `200.0` - NewWorkflow: newly failing in CMSSW_20_1_CLANG_X_2026-09-06-2300.", answer)
+        self.assertIn("| `200.0` | NewWorkflow | 2 | 1 | Newly failing | - | - |", answer)
 
 
 if __name__ == "__main__":

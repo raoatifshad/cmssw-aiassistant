@@ -3484,43 +3484,92 @@ def _render_metric_deltas(
 
 def _render_failing_workflows(
     before: dict, after: dict, before_tag: str, after_tag: str, exit_code_names: dict[int, str],
+    current_variant: str, by_variant: dict[str, dict[str, dict]],
 ) -> list[str]:
-    """List every RelVal workflow failing in either build, by name, split into newly
-    failing / still failing (carried over from before_tag, whether or not its detail
-    changed) / resolved. Deliberately NOT _diff_failing_relvals (that helper drops any
-    workflow whose before/after records are byte-identical, which is right for a shift
-    digest that only cares about *changes* -- see generate_shift_summary) -- a shifter
-    comparing two builds also needs to know which workflows were *already* failing
-    before this window, not just the ones whose stats happened to move, or a
-    persistently-failing workflow silently vanishes from the answer (found live,
-    2026-09-09: 9 of 12 failing EVTGEN3 workflows had identical stats across both
-    builds and used to disappear entirely)."""
+    """Render every RelVal workflow failing in either build as a table, one row per
+    workflow_id, classified Newly failing / Still failing (carried over from
+    before_tag, whether or not its detail changed) / Resolved. Deliberately NOT
+    _diff_failing_relvals (that helper drops any workflow whose before/after records
+    are byte-identical, which is right for a shift digest that only cares about
+    *changes* -- see generate_shift_summary) -- a shifter comparing two builds also
+    needs to know which workflows were *already* failing before this window, not
+    just the ones whose stats happened to move, or a persistently-failing workflow
+    silently vanishes from the answer (found live, 2026-09-09: 9 of 12 failing
+    EVTGEN3 workflows had identical stats across both builds and used to disappear
+    entirely).
+
+    Two more columns are purely additive cross-variant *visibility*, never
+    reclassification: "Also failing in ({before_tag})"/"Also failing in
+    ({after_tag})" list every OTHER variant (primary or sub-IB) at this
+    architecture where the SAME workflow_id was ALSO failing on that side, each
+    named with its own full exact IB tag (not just the variant name -- a bare
+    "ASAN" doesn't tell a shifter which ASAN build). This needs the full by_variant
+    map for the architecture (every variant's before_tag/after_tag rows), not just
+    this one variant's before/after -- see _ib_comparison_answer's per-variant loop
+    and _all_arch_ib_comparison_answer's render_block for how it's threaded in.
+    What counts as Newly failing/Still failing/Resolved for THIS variant is decided
+    purely from this variant's own before/after, exactly as before; the cross-variant
+    columns never change that classification."""
     before_failing = {item["workflow_id"]: item for item in before["failing_relvals"]}
     after_failing = {item["workflow_id"]: item for item in after["failing_relvals"]}
     all_failing_ids = sorted(set(before_failing) | set(after_failing))
     if not all_failing_ids:
         return ["", "No RelVal workflow is failing in either build."]
-    lines = ["", "**Failing workflows:**"]
+
+    # Precompute once per side (not once per workflow_id below): which OTHER
+    # variants have a row on that side at all, and which workflow_ids each was
+    # failing, keyed by that variant's own exact tag (never before_tag/after_tag --
+    # those are the two tags the caller/user typed, not necessarily this sub-IB's
+    # own tag string).
+    before_ids_by_variant: dict[str, set[str]] = {}
+    before_tag_by_variant: dict[str, str] = {}
+    after_ids_by_variant: dict[str, set[str]] = {}
+    after_tag_by_variant: dict[str, str] = {}
+    for variant, records in by_variant.items():
+        if variant == current_variant:
+            continue
+        before_row = records.get(before_tag)
+        if before_row:
+            before_ids_by_variant[variant] = {item["workflow_id"] for item in before_row["failing_relvals"]}
+            before_tag_by_variant[variant] = before_row["tag"]
+        after_row = records.get(after_tag)
+        if after_row:
+            after_ids_by_variant[variant] = {item["workflow_id"] for item in after_row["failing_relvals"]}
+            after_tag_by_variant[variant] = after_row["tag"]
+
+    def also_failing_cell(workflow_id: str, ids_by_variant: dict[str, set[str]], tag_by_variant: dict[str, str]) -> str:
+        mentions = [
+            f"{variant} (`{tag_by_variant[variant]}`)"
+            for variant in sorted(ids_by_variant)
+            if workflow_id in ids_by_variant[variant]
+        ]
+        return _table_cell(", ".join(mentions)) if mentions else "-"
+
+    lines = [
+        "",
+        "**Failing workflows:**",
+        f"| Workflow | Name | Errors | Exit code | Status | Also failing in ({before_tag}) | "
+        f"Also failing in ({after_tag}) |",
+        "| --- | --- | ---: | ---: | --- | --- | --- |",
+    ]
     for workflow_id in all_failing_ids:
         previous = before_failing.get(workflow_id)
         later = after_failing.get(workflow_id)
-        name = (later or previous)["name"]
+        current = later or previous
+        name = current["name"]
         if previous and later:
-            still_failing = f"still failing (already failing in `{before_tag}`)"
-            if previous == later:
-                lines.append(f"- `{workflow_id}` - {name}: {still_failing}, unchanged.")
-            else:
-                lines.append(
-                    f"- `{workflow_id}` - {name}: {still_failing}; "
-                    f"errors {previous['errors']} to {later['errors']}; "
-                    f"warnings {previous['warnings']} to {later['warnings']}; "
-                    f"exit code {_format_exit_code(previous['exitcode'], exit_code_names)} to "
-                    f"{_format_exit_code(later['exitcode'], exit_code_names)}."
-                )
+            status = f"Still failing (already failing in `{before_tag}`)"
         elif later:
-            lines.append(f"- `{workflow_id}` - {name}: newly failing in {after_tag}.")
+            status = "Newly failing"
         else:
-            lines.append(f"- `{workflow_id}` - {name}: no longer failing in {after_tag} (resolved).")
+            status = "Resolved"
+        exit_code_cell = _format_exit_code(current["exitcode"], exit_code_names)
+        also_before = also_failing_cell(workflow_id, before_ids_by_variant, before_tag_by_variant)
+        also_after = also_failing_cell(workflow_id, after_ids_by_variant, after_tag_by_variant)
+        lines.append(
+            f"| `{workflow_id}` | {name} | {current['errors']} | {exit_code_cell} | {status} | "
+            f"{also_before} | {also_after} |"
+        )
     return lines
 
 
@@ -3599,23 +3648,23 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
     ]
     exit_code_names = get_exit_code_names()
 
-    def render_block(records: dict[str, dict]) -> list[str]:
+    def render_block(variant: str, records: dict[str, dict], all_variants: dict[str, dict[str, dict]]) -> list[str]:
         before = records.get(before_tag)
         after = records.get(after_tag)
         if not before or not after:
             missing = before_tag if not before else after_tag
             return [f"`{missing}` has no imported record here."]
         return _render_metric_deltas(before, after, metrics, before_tag, after_tag) + _render_failing_workflows(
-            before, after, before_tag, after_tag, exit_code_names
+            before, after, before_tag, after_tag, exit_code_names, variant, all_variants
         )
 
     lines = ["## All-architecture IB comparison"]
     for arch, by_variant in sorted(by_arch_variant.items()):
         lines.extend(["", f"### `{arch}`"])
-        lines.extend(render_block(by_variant.get("primary", {})))
+        lines.extend(render_block("primary", by_variant.get("primary", {}), by_variant))
         for variant in sorted(v for v in by_variant if v != "primary"):
             lines.extend(["", f"#### `{variant}`"])
-            lines.extend(render_block(by_variant[variant]))
+            lines.extend(render_block(variant, by_variant[variant], by_variant))
     lines.append("")
     lines.append("Build warnings are CMS queue-summary counts; Clang values are parsed diagnostics. Missing values are shown as zero only when that IB architecture record is imported.")
     return "\n".join(lines)
@@ -4372,7 +4421,9 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
             lines.append(f"`{missing}` has no imported record for this sub-IB on `{arch}`.")
             continue
         lines.extend(_render_metric_deltas(before, after, metrics, before_tag, after_tag))
-        lines.extend(_render_failing_workflows(before, after, before_tag, after_tag, exit_code_names))
+        lines.extend(
+            _render_failing_workflows(before, after, before_tag, after_tag, exit_code_names, variant, by_variant)
+        )
         # Only surfaced when something actually regressed in this block (RelVal or
         # unit-test failures went up) -- a shifter chasing a regression's likely cause
         # wants exactly the PRs merged in this window, not a routine "nothing changed"
