@@ -1,7 +1,9 @@
 import unittest
 from unittest.mock import patch
 
-from graph.tools import _ib_sort_key, diff_warnings, find_prs_before_ib, list_ib_tags
+from graph.tools import (
+    _ib_sort_key, diff_warnings, find_prs_before_ib, find_prs_merged_between, list_ib_tags,
+)
 
 
 class FindPrsBeforeIbTests(unittest.TestCase):
@@ -34,6 +36,41 @@ class FindPrsBeforeIbTests(unittest.TestCase):
         session.run.return_value = [{"repo": "cmssw", "pr_number": 51750, "title": "x", "merged_at": None, "author": None}]
 
         find_prs_before_ib("CMSSW_20_1_X_2026-08-25-2300")
+
+        query = session.run.call_args.args[0]
+        self.assertIn("ORDER BY p.merged_at IS NULL, p.merged_at DESC", query)
+
+
+class FindPrsMergedBetweenTests(unittest.TestCase):
+    @patch("graph.tools.get_driver")
+    def test_excludes_prs_already_merged_before_the_earlier_tag(self, get_driver):
+        # The point of this query is "what's new in this window" -- a PR merged
+        # before *both* builds (i.e. already merged as of before_tag too) must
+        # not show up as if it were introduced between them.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"repo": "cmssw", "pr_number": 51659, "title": "x", "merged_at": None, "author": None}]
+
+        find_prs_merged_between("CMSSW_20_1_CLANG_X_2026-09-04-2300", "CMSSW_20_1_CLANG_X_2026-09-06-2300")
+
+        query, params = session.run.call_args.args
+        self.assertIn("MERGED_BEFORE]->(after_ib:IB {tag:$after_tag})", query)
+        self.assertIn("NOT EXISTS", query)
+        self.assertIn("MERGED_BEFORE]->(:IB {tag:$before_tag})", query)
+        self.assertEqual(
+            params,
+            {
+                "before_tag": "CMSSW_20_1_CLANG_X_2026-09-04-2300",
+                "after_tag": "CMSSW_20_1_CLANG_X_2026-09-06-2300",
+                "lim": 20,
+            },
+        )
+
+    @patch("graph.tools.get_driver")
+    def test_orders_newest_merged_at_first_with_undated_prs_last(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"repo": "cmssw", "pr_number": 51659, "title": "x", "merged_at": None, "author": None}]
+
+        find_prs_merged_between("CMSSW_20_1_CLANG_X_2026-09-04-2300", "CMSSW_20_1_CLANG_X_2026-09-06-2300")
 
         query = session.run.call_args.args[0]
         self.assertIn("ORDER BY p.merged_at IS NULL, p.merged_at DESC", query)

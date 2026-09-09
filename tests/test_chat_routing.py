@@ -26,6 +26,8 @@ from server.api_server import (
     _ib_results_summary_answer,
     _pasted_exception_signature,
     _pasted_exception_search_answer,
+    _pasted_exception_workflow_matches,
+    _exception_category_from_signature,
     _relval_exception_context,
     _relval_exception_list_answer,
     _relval_exception_answer,
@@ -54,6 +56,8 @@ from server.api_server import (
     _parse_recency_window_days,
     _latest_and_days_ago_ib_tags,
     _shift_summary_answer,
+    _ib_comparison_answer,
+    _all_arch_ib_comparison_answer,
     _request_planner,
     _evidence_grounded,
     _format_raw_evidence,
@@ -915,6 +919,119 @@ class ChatRoutingTests(unittest.TestCase):
             session.run.call_args_list[1].kwargs["exception"],
             "An exception of category 'ProductNotFound' occurred while",
         )
+
+    def test_exception_category_from_signature_recovers_bare_category(self):
+        self.assertEqual(
+            _exception_category_from_signature("An exception of category 'LogicError' occurred while"),
+            "LogicError",
+        )
+        self.assertIsNone(_exception_category_from_signature("not a recognized signature"))
+
+    @patch("server.api_server.get_driver")
+    def test_pasted_exception_workflow_matches_lists_workflow_and_sub_ib_variant(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {
+                "arch": "el10_amd64_gcc15", "variant": "primary", "workflow_id": "140.051",
+                "name": "RunMuonEG2022C", "exception": "LogicError: A muon candidate track has too many stations.",
+            },
+            {
+                "arch": "el9_amd64_gcc14", "variant": "CLANG", "workflow_id": "140.051",
+                "name": "RunMuonEG2022C", "exception": "LogicError: A muon candidate track has too many stations.",
+            },
+        ]
+
+        result = _pasted_exception_workflow_matches("LogicError", "CMSSW_20_1_X_2026-09-08-2300", None)
+
+        self.assertIn("`CMSSW_20_1_X_2026-09-08-2300`", result)
+        self.assertIn("`LogicError`", result)
+        self.assertIn("- `el10_amd64_gcc15` workflow `140.051` - RunMuonEG2022C:", result)
+        self.assertIn("- `el9_amd64_gcc14` (`CLANG`) workflow `140.051` - RunMuonEG2022C:", result)
+        self.assertEqual(
+            session.run.call_args.kwargs,
+            {"tag": "CMSSW_20_1_X_2026-09-08-2300", "arch": None, "category": "LogicError", "limit": 20},
+        )
+
+    @patch("server.api_server.get_driver")
+    def test_pasted_exception_workflow_matches_returns_none_without_rows(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = []
+
+        self.assertIsNone(
+            _pasted_exception_workflow_matches("TotallyUnmatchedCategory", "CMSSW_20_1_X_2026-09-08-2300", None)
+        )
+
+    @patch("server.api_server._pasted_exception_workflow_matches")
+    @patch("server.api_server._pasted_exception_search_answer")
+    @patch("server.api_server.get_driver")
+    def test_pasted_exception_search_prepends_session_workflow_matches_when_tag_known(
+        self, get_driver, pasted_exception_search_answer, pasted_exception_workflow_matches
+    ):
+        # A pasted exception alone only names a *category* -- which workflow/IB is
+        # actually hitting it today is a separate lookup that only makes sense once
+        # a tag is already known for the session (an earlier turn named one), the
+        # same _latest_ib_contexts session-fallback pattern used elsewhere in this
+        # file. Driver calls unrelated to this path (planning-decision storage,
+        # pending-clarification bookkeeping) are wrapped in try/except in the real
+        # code and just log a warning on a mismatched mock, so a blanket empty
+        # default is enough for them here.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.__iter__.return_value = iter([])
+        session.run.return_value.single.return_value = None
+
+        pasted_exception_search_answer.return_value = (
+            "Imported GitHub matches 1-1 of 1 for exception `An exception of category 'LogicError' occurred while`:\n"
+            "- **Issue #99999** - Some LogicError issue (state `open`; match: body)",
+            [],
+        )
+        pasted_exception_workflow_matches.return_value = (
+            "Workflows in `CMSSW_20_1_X_2026-09-08-2300` currently showing a `LogicError` exception:\n"
+            "- `el10_amd64_gcc15` workflow `140.051` - RunMuonEG2022C: `LogicError: ...`"
+        )
+
+        session_id = "session-with-established-ib-tag"
+        _latest_ib_contexts[session_id] = "CMSSW_20_1_X_2026-09-08-2300"
+        try:
+            result = chat(ChatRequest(
+                session_id=session_id,
+                question="An exception of category 'LogicError' occurred while .",
+            ))
+        finally:
+            _latest_ib_contexts.pop(session_id, None)
+            _latest_ib_arch_contexts.pop(session_id, None)
+
+        self.assertIn("workflow `140.051`", result.answer)
+        self.assertIn("Imported GitHub matches", result.answer)
+        self.assertLess(
+            result.answer.index("workflow `140.051`"), result.answer.index("Imported GitHub matches"),
+            "the workflow/IB evidence should be prepended ahead of the GitHub evidence",
+        )
+        pasted_exception_workflow_matches.assert_called_once_with("LogicError", "CMSSW_20_1_X_2026-09-08-2300", None)
+
+    @patch("server.api_server._pasted_exception_workflow_matches")
+    @patch("server.api_server._pasted_exception_search_answer")
+    @patch("server.api_server.get_driver")
+    def test_pasted_exception_search_skips_workflow_lookup_without_session_tag(
+        self, get_driver, pasted_exception_search_answer, pasted_exception_workflow_matches
+    ):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.__iter__.return_value = iter([])
+        session.run.return_value.single.return_value = None
+
+        pasted_exception_search_answer.return_value = (
+            "Imported GitHub matches 1-1 of 1 for exception `An exception of category 'LogicError' occurred while`:\n"
+            "- **Issue #99999** - Some LogicError issue (state `open`; match: body)",
+            [],
+        )
+
+        result = chat(ChatRequest(
+            session_id="session-with-no-prior-ib-tag",
+            question="An exception of category 'LogicError' occurred while .",
+        ))
+
+        self.assertIn("Imported GitHub matches", result.answer)
+        self.assertNotIn("Workflows in", result.answer)
+        pasted_exception_workflow_matches.assert_not_called()
 
     def test_variant_ib_has_its_primary_run_as_parent(self):
         self.assertEqual(
@@ -2797,6 +2914,137 @@ class ShiftSummaryDayWindowTests(unittest.TestCase):
 
         self.assertIn("Not enough Integration Build history", answer)
         self.assertIn("15-day window", answer)
+
+
+class IbComparisonAnswerTests(unittest.TestCase):
+    """Regression: comparing two sub-IB tags directly (e.g. two dated builds of the
+    same CLANG_X series) used to silently report "neither requested IB is present"
+    even when both were fully imported -- the grouping keyed rows by their *resolved*
+    primary tag, which never equals a sub-IB tag typed by the caller. Found live
+    (2026-09-09) comparing CMSSW_20_1_CLANG_X_2026-09-04-2300 vs ...-09-06-2300."""
+
+    @staticmethod
+    def _sub_ib_rows(before_failed: int, after_failed: int, before_ut_failed: int = 0, after_ut_failed: int = 0):
+        return [
+            {
+                "tag": "CMSSW_20_1_CLANG_X_2026-09-04-2300", "primary_tag": "CMSSW_20_1_X_2026-09-04-2300",
+                "variant": "CLANG", "relval_total": 10, "relval_failed": before_failed,
+                "relval_errors": 5, "relval_warnings": 2, "unit_test_total": 3,
+                "unit_test_failed": before_ut_failed, "unit_test_errors": 0,
+                "failing_relvals": [
+                    {"workflow_id": "140.051", "name": "RunMuonEG2022C", "errors": 1, "warnings": 1, "exitcode": 16640},
+                ][:before_failed],
+            },
+            {
+                "tag": "CMSSW_20_1_CLANG_X_2026-09-06-2300", "primary_tag": "CMSSW_20_1_X_2026-09-06-2300",
+                "variant": "CLANG", "relval_total": 10, "relval_failed": after_failed,
+                "relval_errors": 6, "relval_warnings": 3, "unit_test_total": 3,
+                "unit_test_failed": after_ut_failed, "unit_test_errors": 0,
+                "failing_relvals": [
+                    {"workflow_id": "140.051", "name": "RunMuonEG2022C", "errors": 1, "warnings": 1, "exitcode": 16640},
+                    {"workflow_id": "37634.911", "name": "TTbar", "errors": 2, "warnings": 0, "exitcode": 1},
+                ][:after_failed],
+            },
+        ]
+
+    @patch("server.api_server.get_driver")
+    def test_matches_when_both_requested_tags_are_sub_ib_tags(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = self._sub_ib_rows(before_failed=1, after_failed=1)
+
+        answer, actions = _ib_comparison_answer(
+            "compare CMSSW_20_1_CLANG_X_2026-09-04-2300 and CMSSW_20_1_CLANG_X_2026-09-06-2300 el9_amd64_gcc14"
+        )
+
+        self.assertNotIn("neither requested IB", answer)
+        self.assertIn("### `CLANG`", answer)
+        self.assertIn("| Failed RelVals | 1 | 1 | +0 |", answer)
+
+    @patch("server.api_server.find_prs_merged_between")
+    @patch("server.api_server.get_driver")
+    def test_lists_merged_prs_when_relval_failures_increased(self, get_driver, find_prs_merged_between):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = self._sub_ib_rows(before_failed=1, after_failed=2)
+        find_prs_merged_between.return_value = [
+            {"repo": "cmssw", "pr_number": 51659, "title": "TICLGeom: parallelize the geometry SoA build",
+             "merged_at": "2026-09-05T10:00:00Z", "author": "felicepantaleo"},
+        ]
+
+        answer, actions = _ib_comparison_answer(
+            "compare CMSSW_20_1_CLANG_X_2026-09-04-2300 and CMSSW_20_1_CLANG_X_2026-09-06-2300 el9_amd64_gcc14"
+        )
+
+        # Must be looked up against this block's own exact tags (the sub-IB's tags),
+        # not the primary tags -- a sub-IB's regression must never be attributed to
+        # PRs merged into a different variant.
+        find_prs_merged_between.assert_called_once_with(
+            "CMSSW_20_1_CLANG_X_2026-09-04-2300", "CMSSW_20_1_CLANG_X_2026-09-06-2300"
+        )
+        self.assertIn("PRs merged between", answer)
+        self.assertIn("PR #51659", answer)
+        self.assertIn("do not prove a PR or Issue caused or fixed a failure", answer)
+
+    @patch("server.api_server.find_prs_merged_between")
+    @patch("server.api_server.get_driver")
+    def test_skips_merged_pr_lookup_when_nothing_regressed(self, get_driver, find_prs_merged_between):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = self._sub_ib_rows(before_failed=1, after_failed=1)
+
+        answer, actions = _ib_comparison_answer(
+            "compare CMSSW_20_1_CLANG_X_2026-09-04-2300 and CMSSW_20_1_CLANG_X_2026-09-06-2300 el9_amd64_gcc14"
+        )
+
+        find_prs_merged_between.assert_not_called()
+        self.assertNotIn("PRs merged between", answer)
+
+    @patch("server.api_server.find_prs_merged_between", return_value=[])
+    @patch("server.api_server.get_driver")
+    def test_omits_merged_pr_section_when_regressed_but_no_pr_recorded(self, get_driver, find_prs_merged_between):
+        # Different code path than "nothing regressed": a real regression happened
+        # (relval_failed went up), so the lookup IS made, but the graph has no PR
+        # recorded as merged for this exact tag pair (verified live -- 81 of 98 real
+        # regressions found in the imported graph on 2026-09-09 have an empty merged-PR
+        # window, e.g. CMSSW_20_1_X_2026-08-20-2300 -> ...-08-25-2300 on el10_amd64_gcc15).
+        # An empty result must not render as an empty/misleading "PRs merged between..."
+        # header with nothing under it.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = self._sub_ib_rows(before_failed=1, after_failed=2)
+
+        answer, actions = _ib_comparison_answer(
+            "compare CMSSW_20_1_CLANG_X_2026-09-04-2300 and CMSSW_20_1_CLANG_X_2026-09-06-2300 el9_amd64_gcc14"
+        )
+
+        find_prs_merged_between.assert_called_once_with(
+            "CMSSW_20_1_CLANG_X_2026-09-04-2300", "CMSSW_20_1_CLANG_X_2026-09-06-2300"
+        )
+        self.assertNotIn("PRs merged between", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_all_arch_comparison_matches_when_both_requested_tags_are_sub_ib_tags(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {
+                "tag": "CMSSW_20_1_CLANG_X_2026-09-04-2300", "primary_tag": "CMSSW_20_1_X_2026-09-04-2300",
+                "arch": "el9_amd64_gcc14", "variant": "CLANG", "build_warnings": 0, "ignored_warnings": 0,
+                "clang_locations": 0, "clang_occurrences": 0, "relval_total": 10, "relval_failed": 1,
+                "relval_errors": 5, "relval_warnings": 2, "unit_test_total": 3, "unit_test_failed": 0,
+                "unit_test_errors": 0,
+            },
+            {
+                "tag": "CMSSW_20_1_CLANG_X_2026-09-06-2300", "primary_tag": "CMSSW_20_1_X_2026-09-06-2300",
+                "arch": "el9_amd64_gcc14", "variant": "CLANG", "build_warnings": 0, "ignored_warnings": 0,
+                "clang_locations": 0, "clang_occurrences": 0, "relval_total": 10, "relval_failed": 2,
+                "relval_errors": 6, "relval_warnings": 3, "unit_test_total": 3, "unit_test_failed": 0,
+                "unit_test_errors": 0,
+            },
+        ]
+
+        answer = _all_arch_ib_comparison_answer(
+            "compare CMSSW_20_1_CLANG_X_2026-09-04-2300 and CMSSW_20_1_CLANG_X_2026-09-06-2300 all architectures"
+        )
+
+        self.assertNotIn("has no imported record here", answer.split("#### `CLANG`")[1])
+        self.assertIn("| Failed RelVals | 1 | 2 | +1 |", answer)
 
 
 if __name__ == "__main__":

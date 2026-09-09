@@ -599,6 +599,30 @@ def find_prs_before_ib(ib_tag: str, arch: str | None = None, limit: int = 20) ->
     )
 
 
+def find_prs_merged_between(before_tag: str, after_tag: str, limit: int = 20) -> list[dict]:
+    """PRs newly merged as of after_tag's build that were NOT yet merged as of
+    before_tag's build -- what changed in the source tree between two specific IB
+    builds of the same series/sub-IB (before_tag and after_tag should be an exact
+    (tag, tag) pair, e.g. the same sub-IB's tag on two different dates, not two
+    different sub-IBs -- comparing across sub-IBs would attribute one variant's
+    merges to a totally different variant's regression). Same MERGED_BEFORE edge
+    find_prs_before_ib uses, just diffed against a second tag instead of listed for
+    one. Like every other PR-attribution helper in this module, a PR merging in this
+    window is temporal/relevance evidence only -- it does not prove that PR caused
+    any regression observed between the two builds; callers must keep pairing this
+    with an explicit non-causal caveat (see the codebase's evidence-only invariant)."""
+    limit = min(limit, MAX_ROWS)
+    return _run_query(
+        "MATCH (p:PR)-[:MERGED_BEFORE]->(after_ib:IB {tag:$after_tag}) "
+        "WHERE NOT EXISTS { MATCH (p)-[:MERGED_BEFORE]->(:IB {tag:$before_tag}) } "
+        "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
+        "RETURN DISTINCT p.repo AS repo, p.number AS pr_number, p.title AS title, "
+        "       p.merged_at AS merged_at, a.name AS author "
+        "ORDER BY p.merged_at IS NULL, p.merged_at DESC LIMIT $lim",
+        {"before_tag": before_tag, "after_tag": after_tag, "lim": limit},
+    )
+
+
 def search_issues_by_text(term: str, include_comments: bool = False, limit: int = 20) -> dict:
     """Search CMSSW Issue titles/bodies, optionally comments; return total and open counts."""
     limit = min(limit, MAX_ROWS)
@@ -918,6 +942,7 @@ TOOLS = {
     "get_failing_unittests": get_failing_unittests,
     "get_build_failures": get_build_failures,
     "find_prs_before_ib": find_prs_before_ib,
+    "find_prs_merged_between": find_prs_merged_between,
     "search_issues_by_text": search_issues_by_text,
     "find_prs_for_error": find_prs_for_error,
     "shared_header_packages": shared_header_packages,
