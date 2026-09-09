@@ -58,6 +58,7 @@ from server.api_server import (
     _shift_summary_answer,
     _ib_comparison_answer,
     _all_arch_ib_comparison_answer,
+    _render_metric_deltas,
     _request_planner,
     _evidence_grounded,
     _format_raw_evidence,
@@ -2916,12 +2917,115 @@ class ShiftSummaryDayWindowTests(unittest.TestCase):
         self.assertIn("15-day window", answer)
 
 
+class RenderMetricDeltasTests(unittest.TestCase):
+    """A real "all architectures" comparison (2026-09-09, CLANG_X) came back with 5 of
+    11 metrics reading "0 | 0 | +0" -- pure noise -- and 2 more ("RelVals run",
+    "Unit tests run") unchanged but nonzero, repeating the same number twice for no
+    reason. User feedback: don't show zero-to-zero at all, and for an unchanged
+    nonzero metric just say the old value and that nothing new happened, instead of a
+    redundant three-column row."""
+
+    METRICS = [("Failed RelVals", "failed"), ("RelVal errors", "errors"), ("RelVals run", "total")]
+
+    def test_omits_zero_to_zero_metrics_entirely(self):
+        before = {"failed": 0, "errors": 5, "total": 10}
+        after = {"failed": 0, "errors": 6, "total": 10}
+        lines = _render_metric_deltas(before, after, self.METRICS, "tagA", "tagB")
+        joined = "\n".join(lines)
+
+        self.assertNotIn("Failed RelVals", joined)
+
+    def test_changed_metric_gets_a_real_table_row(self):
+        before = {"failed": 1, "errors": 5, "total": 10}
+        after = {"failed": 2, "errors": 5, "total": 10}
+        lines = _render_metric_deltas(before, after, self.METRICS, "tagA", "tagB")
+        joined = "\n".join(lines)
+
+        self.assertIn("| Failed RelVals | 1 | 2 | +1 |", joined)
+
+    def test_unchanged_nonzero_metric_becomes_a_compact_note_not_a_row(self):
+        before = {"failed": 1, "errors": 5, "total": 10}
+        after = {"failed": 1, "errors": 6, "total": 10}
+        lines = _render_metric_deltas(before, after, self.METRICS, "tagA", "tagB")
+        joined = "\n".join(lines)
+
+        self.assertNotIn("| Failed RelVals |", joined)
+        self.assertIn("No new failures/errors -- Failed RelVals still 1", joined)
+        self.assertIn("| RelVal errors | 5 | 6 | +1 |", joined)
+
+    def test_all_metrics_unchanged_or_zero_reports_no_changes(self):
+        before = {"failed": 0, "errors": 0, "total": 10}
+        after = {"failed": 0, "errors": 0, "total": 10}
+        lines = _render_metric_deltas(before, after, self.METRICS, "tagA", "tagB")
+
+        self.assertEqual(
+            lines,
+            ["No new failures/errors -- RelVals run still 10."],
+        )
+
+    def test_completely_unchanged_and_zero_reports_no_changes_between_builds(self):
+        before = {"failed": 0, "errors": 0, "total": 0}
+        after = {"failed": 0, "errors": 0, "total": 0}
+        lines = _render_metric_deltas(before, after, self.METRICS, "tagA", "tagB")
+
+        self.assertEqual(lines, ["No changes between these builds."])
+
+
 class IbComparisonAnswerTests(unittest.TestCase):
     """Regression: comparing two sub-IB tags directly (e.g. two dated builds of the
     same CLANG_X series) used to silently report "neither requested IB is present"
     even when both were fully imported -- the grouping keyed rows by their *resolved*
     primary tag, which never equals a sub-IB tag typed by the caller. Found live
     (2026-09-09) comparing CMSSW_20_1_CLANG_X_2026-09-04-2300 vs ...-09-06-2300."""
+
+    @patch("server.api_server.get_driver")
+    def test_failing_workflows_section_lists_every_category_by_name(self, get_driver):
+        # A shifter needs the full picture: which workflows are brand new, which were
+        # already failing before this window (so a persistent failure doesn't look
+        # like something new), and which just got fixed -- not only the ones whose
+        # error/warning counts happened to move. Found live (2026-09-09, EVTGEN3):
+        # 9 of 12 failing workflows were carried over with byte-identical stats and
+        # used to vanish entirely from "Changed failing workflows".
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {
+                "tag": "CMSSW_20_1_CLANG_X_2026-09-04-2300", "primary_tag": "CMSSW_20_1_X_2026-09-04-2300",
+                "variant": "CLANG", "relval_total": 10, "relval_failed": 3, "relval_errors": 5,
+                "relval_warnings": 2, "unit_test_total": 3, "unit_test_failed": 0, "unit_test_errors": 0,
+                "failing_relvals": [
+                    {"workflow_id": "100.0", "name": "StillUnchanged", "errors": 1, "warnings": 1, "exitcode": 1},
+                    {"workflow_id": "200.0", "name": "StillChanged", "errors": 2, "warnings": 2, "exitcode": 2},
+                    {"workflow_id": "300.0", "name": "WillResolve", "errors": 3, "warnings": 3, "exitcode": 3},
+                ],
+            },
+            {
+                "tag": "CMSSW_20_1_CLANG_X_2026-09-06-2300", "primary_tag": "CMSSW_20_1_X_2026-09-06-2300",
+                "variant": "CLANG", "relval_total": 10, "relval_failed": 3, "relval_errors": 6,
+                "relval_warnings": 3, "unit_test_total": 3, "unit_test_failed": 0, "unit_test_errors": 0,
+                "failing_relvals": [
+                    {"workflow_id": "100.0", "name": "StillUnchanged", "errors": 1, "warnings": 1, "exitcode": 1},
+                    {"workflow_id": "200.0", "name": "StillChanged", "errors": 5, "warnings": 2, "exitcode": 2},
+                    {"workflow_id": "400.0", "name": "NewlyFailing", "errors": 4, "warnings": 4, "exitcode": 4},
+                ],
+            },
+        ]
+
+        answer, actions = _ib_comparison_answer(
+            "compare CMSSW_20_1_CLANG_X_2026-09-04-2300 and CMSSW_20_1_CLANG_X_2026-09-06-2300 el9_amd64_gcc14"
+        )
+
+        self.assertIn(
+            "- `100.0` - StillUnchanged: still failing (already failing in "
+            "`CMSSW_20_1_CLANG_X_2026-09-04-2300`), unchanged.",
+            answer,
+        )
+        self.assertIn(
+            "- `200.0` - StillChanged: still failing (already failing in "
+            "`CMSSW_20_1_CLANG_X_2026-09-04-2300`); errors 2 to 5;",
+            answer,
+        )
+        self.assertIn("- `300.0` - WillResolve: no longer failing in CMSSW_20_1_CLANG_X_2026-09-06-2300 (resolved).", answer)
+        self.assertIn("- `400.0` - NewlyFailing: newly failing in CMSSW_20_1_CLANG_X_2026-09-06-2300.", answer)
 
     @staticmethod
     def _sub_ib_rows(before_failed: int, after_failed: int, before_ut_failed: int = 0, after_ut_failed: int = 0):
@@ -2958,7 +3062,12 @@ class IbComparisonAnswerTests(unittest.TestCase):
 
         self.assertNotIn("neither requested IB", answer)
         self.assertIn("### `CLANG`", answer)
-        self.assertIn("| Failed RelVals | 1 | 1 | +0 |", answer)
+        # Failed RelVals is unchanged and nonzero (1 -> 1), so it's folded into the
+        # compact "no new failures" note rather than a redundant "1 | 1 | +0" row --
+        # see _render_metric_deltas.
+        self.assertIn("No new failures/errors -- ", answer)
+        self.assertIn("Failed RelVals still 1", answer)
+        self.assertNotIn("| Failed RelVals |", answer)
 
     @patch("server.api_server.find_prs_merged_between")
     @patch("server.api_server.get_driver")
@@ -3029,6 +3138,9 @@ class IbComparisonAnswerTests(unittest.TestCase):
                 "clang_locations": 0, "clang_occurrences": 0, "relval_total": 10, "relval_failed": 1,
                 "relval_errors": 5, "relval_warnings": 2, "unit_test_total": 3, "unit_test_failed": 0,
                 "unit_test_errors": 0,
+                "failing_relvals": [
+                    {"workflow_id": "140.051", "name": "RunMuonEG2022C", "errors": 1, "warnings": 1, "exitcode": 16640},
+                ],
             },
             {
                 "tag": "CMSSW_20_1_CLANG_X_2026-09-06-2300", "primary_tag": "CMSSW_20_1_X_2026-09-06-2300",
@@ -3036,6 +3148,10 @@ class IbComparisonAnswerTests(unittest.TestCase):
                 "clang_locations": 0, "clang_occurrences": 0, "relval_total": 10, "relval_failed": 2,
                 "relval_errors": 6, "relval_warnings": 3, "unit_test_total": 3, "unit_test_failed": 0,
                 "unit_test_errors": 0,
+                "failing_relvals": [
+                    {"workflow_id": "140.051", "name": "RunMuonEG2022C", "errors": 1, "warnings": 1, "exitcode": 16640},
+                    {"workflow_id": "200.0", "name": "NewWorkflow", "errors": 2, "warnings": 2, "exitcode": 1},
+                ],
             },
         ]
 
@@ -3045,6 +3161,16 @@ class IbComparisonAnswerTests(unittest.TestCase):
 
         self.assertNotIn("has no imported record here", answer.split("#### `CLANG`")[1])
         self.assertIn("| Failed RelVals | 1 | 2 | +1 |", answer)
+        # The "all architectures" comparison used to have no per-workflow breakdown at
+        # all -- only aggregate metric counts -- so a shifter had no way to see which
+        # workflows those counts referred to. Same _render_failing_workflows helper as
+        # the single-architecture path now covers this comparison too.
+        self.assertIn(
+            "- `140.051` - RunMuonEG2022C: still failing (already failing in "
+            "`CMSSW_20_1_CLANG_X_2026-09-04-2300`), unchanged.",
+            answer,
+        )
+        self.assertIn("- `200.0` - NewWorkflow: newly failing in CMSSW_20_1_CLANG_X_2026-09-06-2300.", answer)
 
 
 if __name__ == "__main__":

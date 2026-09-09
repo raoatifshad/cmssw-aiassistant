@@ -3446,6 +3446,84 @@ def _pending_ib_comparison(question: str) -> dict[str, object] | None:
     }
 
 
+def _render_metric_deltas(
+    before: dict, after: dict, metrics: list[tuple[str, str]], before_label: str, after_label: str,
+) -> list[str]:
+    """Render a before/after metrics comparison, keeping only what's actually
+    informative: a metric that changed gets a real table row; a metric that's
+    unchanged but nonzero is folded into one short "no new failures/errors" note
+    instead of a redundant three-column row repeating the same number twice; a
+    metric that's zero on both sides is omitted entirely -- a wall of "0 | 0 | +0"
+    rows (found live: Build warnings, Clang locations/occurrences, Failed unit
+    tests, Unit-test errors were all 0/0 in a real CLANG_X comparison) carries no
+    signal and just makes the real deltas harder to spot."""
+    changed = [(label, key) for label, key in metrics if before[key] != after[key]]
+    unchanged_nonzero = [(label, key) for label, key in metrics if before[key] == after[key] and before[key] != 0]
+    block: list[str] = []
+    if changed:
+        block.extend([
+            f"| Metric | {before_label} | {after_label} | Delta |",
+            "| --- | ---: | ---: | ---: |",
+        ])
+        block.extend(
+            f"| {label} | {before[key]:,} | {after[key]:,} | {after[key] - before[key]:+,} |"
+            for label, key in changed
+        )
+    if unchanged_nonzero:
+        if block:
+            block.append("")
+        block.append(
+            "No new failures/errors -- "
+            + "; ".join(f"{label} still {before[key]:,}" for label, key in unchanged_nonzero)
+            + "."
+        )
+    if not block:
+        block.append("No changes between these builds.")
+    return block
+
+
+def _render_failing_workflows(
+    before: dict, after: dict, before_tag: str, after_tag: str, exit_code_names: dict[int, str],
+) -> list[str]:
+    """List every RelVal workflow failing in either build, by name, split into newly
+    failing / still failing (carried over from before_tag, whether or not its detail
+    changed) / resolved. Deliberately NOT _diff_failing_relvals (that helper drops any
+    workflow whose before/after records are byte-identical, which is right for a shift
+    digest that only cares about *changes* -- see generate_shift_summary) -- a shifter
+    comparing two builds also needs to know which workflows were *already* failing
+    before this window, not just the ones whose stats happened to move, or a
+    persistently-failing workflow silently vanishes from the answer (found live,
+    2026-09-09: 9 of 12 failing EVTGEN3 workflows had identical stats across both
+    builds and used to disappear entirely)."""
+    before_failing = {item["workflow_id"]: item for item in before["failing_relvals"]}
+    after_failing = {item["workflow_id"]: item for item in after["failing_relvals"]}
+    all_failing_ids = sorted(set(before_failing) | set(after_failing))
+    if not all_failing_ids:
+        return ["", "No RelVal workflow is failing in either build."]
+    lines = ["", "**Failing workflows:**"]
+    for workflow_id in all_failing_ids:
+        previous = before_failing.get(workflow_id)
+        later = after_failing.get(workflow_id)
+        name = (later or previous)["name"]
+        if previous and later:
+            still_failing = f"still failing (already failing in `{before_tag}`)"
+            if previous == later:
+                lines.append(f"- `{workflow_id}` - {name}: {still_failing}, unchanged.")
+            else:
+                lines.append(
+                    f"- `{workflow_id}` - {name}: {still_failing}; "
+                    f"errors {previous['errors']} to {later['errors']}; "
+                    f"warnings {previous['warnings']} to {later['warnings']}; "
+                    f"exit code {_format_exit_code(previous['exitcode'], exit_code_names)} to "
+                    f"{_format_exit_code(later['exitcode'], exit_code_names)}."
+                )
+        elif later:
+            lines.append(f"- `{workflow_id}` - {name}: newly failing in {after_tag}.")
+        else:
+            lines.append(f"- `{workflow_id}` - {name}: no longer failing in {after_tag} (resolved).")
+    return lines
+
+
 def _all_arch_ib_comparison_answer(question: str) -> str | None:
     """Compare imported IB facts across every architecture (plus each architecture's
     sub-IBs, e.g. ASAN/CLANG/MULTIARCHS/NONLTO) without LLM tool calls."""
@@ -3479,7 +3557,12 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
                reduce(total = 0, item IN relvals | total + coalesce(item.warnings, 0)) AS relval_warnings,
                size(unit_tests) AS unit_test_total,
                size([item IN unit_tests WHERE item.status = 'FAILED']) AS unit_test_failed,
-               reduce(total = 0, item IN unit_tests | total + coalesce(item.errors, 0)) AS unit_test_errors
+               reduce(total = 0, item IN unit_tests | total + coalesce(item.errors, 0)) AS unit_test_errors,
+               [item IN relvals WHERE item.status = 'FAILED'
+                AND coalesce(item.known_error, false) = false |
+                   {workflow_id: item.workflow_id, name: item.name, errors: item.errors,
+                    warnings: item.warnings, exitcode: item.exitcode}
+               ] AS failing_relvals
         ORDER BY arch, variant, primary_tag
     """
     driver = get_driver()
@@ -3514,6 +3597,7 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
         ("Failed unit tests", "unit_test_failed"),
         ("Unit-test errors", "unit_test_errors"),
     ]
+    exit_code_names = get_exit_code_names()
 
     def render_block(records: dict[str, dict]) -> list[str]:
         before = records.get(before_tag)
@@ -3521,15 +3605,9 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
         if not before or not after:
             missing = before_tag if not before else after_tag
             return [f"`{missing}` has no imported record here."]
-        block = [
-            f"| Metric | {before_tag} | {after_tag} | Delta |",
-            "| --- | ---: | ---: | ---: |",
-        ]
-        block.extend(
-            f"| {label} | {before[key]:,} | {after[key]:,} | {after[key] - before[key]:+,} |"
-            for label, key in metrics
+        return _render_metric_deltas(before, after, metrics, before_tag, after_tag) + _render_failing_workflows(
+            before, after, before_tag, after_tag, exit_code_names
         )
-        return block
 
     lines = ["## All-architecture IB comparison"]
     for arch, by_variant in sorted(by_arch_variant.items()):
@@ -4040,32 +4118,8 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
             missing = before_tag if not before else after_tag
             lines.append(f"`{missing}` has no imported record for this sub-IB on `{arch}`.")
             continue
-        lines.extend([
-            f"| Suite | {before_tag} | {after_tag} | Delta |",
-            "| --- | ---: | ---: | ---: |",
-        ])
-        lines.extend(
-            f"| {label} | {before[key]:,} | {after[key]:,} | {after[key] - before[key]:+,} |"
-            for label, key in metrics
-        )
-        changed_failures = _diff_failing_relvals(before["failing_relvals"], after["failing_relvals"])
-        if changed_failures:
-            lines.extend(["", "**Changed failing workflows:**"])
-            for workflow_id, previous, later in changed_failures:
-                name = (later or previous)["name"]
-                if previous and later:
-                    lines.append(
-                        f"- `{workflow_id}` - {name}: errors {previous['errors']} to {later['errors']}; "
-                        f"warnings {previous['warnings']} to {later['warnings']}; "
-                        f"exit code {_format_exit_code(previous['exitcode'], exit_code_names)} to "
-                        f"{_format_exit_code(later['exitcode'], exit_code_names)}."
-                    )
-                elif later:
-                    lines.append(f"- `{workflow_id}` - {name}: newly failing in {after_tag}.")
-                else:
-                    lines.append(f"- `{workflow_id}` - {name}: no longer failing in {after_tag}.")
-        else:
-            lines.extend(["", "No failing workflow changed between these builds."])
+        lines.extend(_render_metric_deltas(before, after, metrics, before_tag, after_tag))
+        lines.extend(_render_failing_workflows(before, after, before_tag, after_tag, exit_code_names))
         # Only surfaced when something actually regressed in this block (RelVal or
         # unit-test failures went up) -- a shifter chasing a regression's likely cause
         # wants exactly the PRs merged in this window, not a routine "nothing changed"
