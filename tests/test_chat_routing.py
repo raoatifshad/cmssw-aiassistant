@@ -173,16 +173,36 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("get_database_overview", SYSTEM_PROMPT)
         self.assertIn("records from different architectures", SYSTEM_PROMPT)
 
-    @patch("graph.tools._run_query")
-    def test_failing_relvals_for_primary_ib_include_sub_ibs(self, run_query):
-        run_query.return_value = []
+    @patch("graph.tools.get_driver")
+    def test_failing_relvals_for_primary_ib_include_sub_ibs(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = []
 
         get_failing_relvals("CMSSW_20_1_X_2026-08-12-1100", arch="el9_amd64_gcc13")
 
-        cypher, params = run_query.call_args.args
+        cypher, params = session.run.call_args.args
         self.assertIn("ib.parent_tag = $t", cypher)
         self.assertIn("ib.tag AS ib_tag", cypher)
         self.assertEqual(params["t"], "CMSSW_20_1_X_2026-08-12-1100")
+
+    @patch("graph.tools.get_driver")
+    def test_failing_relvals_limit_applies_per_ib_node_not_globally(self, get_driver):
+        # Regression: a single heavily-failing sub-IB (found live, 2026-09-09: UBSAN
+        # with 948/955 RelVals failing) used to consume the entire flat LIMIT before
+        # the query ever reached OTHER variants -- including the primary itself --
+        # silently returning zero rows for them even though they had real failures.
+        # The fix caps rows per matched IB node via a correlated subquery, and reads
+        # via get_driver directly (bypassing _run_query's own MAX_ROWS post-slice,
+        # which would otherwise re-introduce the same crowd-out one layer down).
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = []
+
+        get_failing_relvals("CMSSW_20_1_X_2026-09-07-2300", arch="el9_amd64_gcc14", limit=100)
+
+        cypher, params = session.run.call_args.args
+        self.assertIn("CALL (ib) {", cypher)
+        self.assertIn("LIMIT $lim", cypher)
+        self.assertEqual(params["lim"], 100)
 
     @patch("graph.tools._run_query")
     def test_issue_text_search_returns_counts_and_matches(self, run_query):

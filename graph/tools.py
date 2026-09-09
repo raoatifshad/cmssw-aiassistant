@@ -488,18 +488,42 @@ def get_failing_relvals(ib_tag: str, arch: str | None = None, limit: int = 50) -
     known_error=true workflows (e.g. "Grid-packs missing asan and non-asan shared
     libraries") to match the real CMSDT dashboard's own failing count/list, which
     excludes them the same way - see ingestion/build_graph.py's _ingest_relval_file for
-    where known_error is captured and the live discrepancy that prompted this."""
+    where known_error is captured and the live discrepancy that prompted this.
+
+    `limit` caps rows PER MATCHED IB NODE (via a correlated subquery), not globally
+    across all of them, and this bypasses _run_query's own MAX_ROWS post-slice -
+    otherwise a single heavily-failing sub-IB can consume the entire row budget and
+    silently return zero rows for every OTHER variant, including the primary itself,
+    even though it has real failures too. Found live (2026-09-09): given a primary
+    tag, UBSAN alone had 948/955 RelVals failing; a flat "ORDER BY ib.tag ... LIMIT
+    100" (ib.tag sorts UBSAN before the primary tag's own "..._X_..." string) meant
+    the primary's own single failing workflow never made it into the result at all.
+    generate_shift_summary's diff then saw an empty "before" set for primary and
+    reported an already-failing workflow as brand new -- a false "newly failing"
+    alert. Per-node limiting guarantees every variant present gets its own fair
+    share of the cap instead of one variant starving the rest."""
     limit = min(limit, MAX_ROWS)
-    return _run_query(
-        "MATCH (ib:IB)-[:RAN_RELVAL]->(rv:RelVal {status:'FAILED'}) "
-        "WHERE (ib.tag = $t OR ib.parent_tag = $t) "
-        "AND ($arch IS NULL OR ib.arch = $arch) "
-        "AND coalesce(rv.known_error, false) = false "
-        "RETURN ib.tag AS ib_tag, ib.variant AS variant, rv.name AS name, rv.workflow_id AS workflow_id, "
-        "rv.errors AS errors, rv.exitcode AS exitcode "
-        "ORDER BY ib.tag, rv.workflow_id LIMIT $lim",
-        {"t": ib_tag, "arch": arch, "lim": limit},
-    )
+    driver = get_driver()
+    try:
+        with driver.session() as s:
+            rows = [dict(r) for r in s.run(
+                "MATCH (ib:IB) "
+                "WHERE (ib.tag = $t OR ib.parent_tag = $t) AND ($arch IS NULL OR ib.arch = $arch) "
+                "CALL (ib) { "
+                "  MATCH (ib)-[:RAN_RELVAL]->(rv:RelVal {status:'FAILED'}) "
+                "  WHERE coalesce(rv.known_error, false) = false "
+                "  RETURN rv "
+                "  ORDER BY rv.workflow_id "
+                "  LIMIT $lim "
+                "} "
+                "RETURN ib.tag AS ib_tag, ib.variant AS variant, rv.name AS name, "
+                "rv.workflow_id AS workflow_id, rv.errors AS errors, rv.exitcode AS exitcode "
+                "ORDER BY ib.tag, rv.workflow_id",
+                {"t": ib_tag, "arch": arch, "lim": limit},
+            )]
+    finally:
+        driver.close()
+    return rows
 
 
 def get_failing_unittests(ib_tag: str, arch: str | None = None, limit: int = 50) -> list[dict]:
