@@ -526,16 +526,49 @@ def get_failing_relvals(ib_tag: str, arch: str | None = None, limit: int = 50) -
     return rows
 
 
-def get_failing_unittests(ib_tag: str, arch: str | None = None, limit: int = 50) -> list[dict]:
-    """Unit tests with status=FAILED for a given IB."""
+def get_failing_unittests(
+    ib_tag: str, arch: str | None = None, limit: int = 50, include_sub_ibs: bool = False,
+) -> list[dict]:
+    """Unit tests with status=FAILED for a given IB. include_sub_ibs=True also pulls
+    in every sub-IB whose parent_tag equals ib_tag (same "primary tag expands to its
+    sub-IBs" pattern as get_failing_relvals) -- off by default because some callers
+    (e.g. server.api_server._failed_unittest_package_listing) already loop over each
+    exact sub-IB tag themselves and would double-count sub-IB failures under both
+    their own section and the primary's if this defaulted on.
+
+    When include_sub_ibs=True, `limit` caps rows PER MATCHED IB NODE (via a
+    correlated subquery) rather than globally, and this bypasses _run_query's own
+    MAX_ROWS post-slice -- the identical fix get_failing_relvals needed, for the
+    identical reason: a single heavily-failing sub-IB must not crowd out every
+    other variant's rows (including the primary's) under one flat limit."""
     limit = min(limit, MAX_ROWS)
-    return _run_query(
-        "MATCH (ib:IB {tag:$t})-[:RAN_UNITTEST]->(ut:UnitTest {status:'FAILED'}) "
-        "WHERE $arch IS NULL OR ib.arch = $arch "
-        "RETURN ut.name AS name, ut.errors AS errors "
-        "LIMIT $lim",
-        {"t": ib_tag, "arch": arch, "lim": limit},
-    )
+    if not include_sub_ibs:
+        return _run_query(
+            "MATCH (ib:IB {tag:$t})-[:RAN_UNITTEST]->(ut:UnitTest {status:'FAILED'}) "
+            "WHERE $arch IS NULL OR ib.arch = $arch "
+            "RETURN ut.name AS name, ut.errors AS errors "
+            "LIMIT $lim",
+            {"t": ib_tag, "arch": arch, "lim": limit},
+        )
+    driver = get_driver()
+    try:
+        with driver.session() as s:
+            rows = [dict(r) for r in s.run(
+                "MATCH (ib:IB) "
+                "WHERE (ib.tag = $t OR ib.parent_tag = $t) AND ($arch IS NULL OR ib.arch = $arch) "
+                "CALL (ib) { "
+                "  MATCH (ib)-[:RAN_UNITTEST]->(ut:UnitTest {status:'FAILED'}) "
+                "  RETURN ut "
+                "  ORDER BY ut.name "
+                "  LIMIT $lim "
+                "} "
+                "RETURN ib.tag AS ib_tag, ib.variant AS variant, ut.name AS name, ut.errors AS errors "
+                "ORDER BY ib.tag, ut.name",
+                {"t": ib_tag, "arch": arch, "lim": limit},
+            )]
+    finally:
+        driver.close()
+    return rows
 
 
 def get_relval_workflow_ids(ib_tag: str, arch: str | None = None) -> list[dict]:
@@ -564,20 +597,34 @@ def get_relval_workflow_ids(ib_tag: str, arch: str | None = None) -> list[dict]:
     return rows
 
 
-def get_unittest_names(ib_tag: str, arch: str | None = None) -> list[dict]:
+def get_unittest_names(ib_tag: str, arch: str | None = None, include_sub_ibs: bool = False) -> list[dict]:
     """Every UnitTest name actually ingested for an IB (any status) - the same "did it
     actually run" signal as get_relval_workflow_ids, for the Unit Tests resolved/failing
-    diff. Bypasses _run_query's MAX_ROWS cap for the same reason.
-    """
+    diff. Bypasses _run_query's MAX_ROWS cap for the same reason (needs the full
+    identity set to gate a correctness check, not a capped sample).
+
+    include_sub_ibs=True also pulls in every sub-IB whose parent_tag equals ib_tag
+    (same pattern as get_failing_unittests/get_relval_workflow_ids) and returns
+    `variant` per row -- off by default since the one pre-existing caller expected
+    exact-tag-only, primary-only results."""
     driver = get_driver()
     try:
         with driver.session() as session:
-            rows = [dict(record) for record in session.run(
-                "MATCH (ib:IB {tag:$t})-[:RAN_UNITTEST]->(ut:UnitTest) "
-                "WHERE $arch IS NULL OR ib.arch = $arch "
-                "RETURN DISTINCT ut.name AS name",
-                t=ib_tag, arch=arch,
-            )]
+            if include_sub_ibs:
+                rows = [dict(record) for record in session.run(
+                    "MATCH (ib:IB)-[:RAN_UNITTEST]->(ut:UnitTest) "
+                    "WHERE (ib.tag = $t OR ib.parent_tag = $t) "
+                    "AND ($arch IS NULL OR ib.arch = $arch) "
+                    "RETURN DISTINCT ib.variant AS variant, ut.name AS name",
+                    t=ib_tag, arch=arch,
+                )]
+            else:
+                rows = [dict(record) for record in session.run(
+                    "MATCH (ib:IB {tag:$t})-[:RAN_UNITTEST]->(ut:UnitTest) "
+                    "WHERE $arch IS NULL OR ib.arch = $arch "
+                    "RETURN DISTINCT ut.name AS name",
+                    t=ib_tag, arch=arch,
+                )]
     finally:
         driver.close()
     return rows
