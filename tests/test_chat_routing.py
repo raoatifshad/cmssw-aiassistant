@@ -67,7 +67,7 @@ from server.api_server import (
 )
 from server.request_planner import Plan, PlanKind, RequestContext
 from server.agent import KGChatSession
-from graph.tools import TOOLS, get_failing_relvals, search_issues_by_text
+from graph.tools import TOOLS, get_failing_relvals, get_failing_unittests, search_issues_by_text
 from ingestion.build_graph import ib_parent_tag
 
 
@@ -200,6 +200,40 @@ class ChatRoutingTests(unittest.TestCase):
         get_failing_relvals("CMSSW_20_1_X_2026-09-07-2300", arch="el9_amd64_gcc14", limit=100)
 
         cypher, params = session.run.call_args.args
+        self.assertIn("CALL (ib) {", cypher)
+        self.assertIn("LIMIT $lim", cypher)
+        self.assertEqual(params["lim"], 100)
+
+    @patch("graph.tools.get_driver")
+    def test_failing_unittests_default_stays_exact_tag_only(self, get_driver):
+        # include_sub_ibs defaults to False: _failed_unittest_package_listing already
+        # loops over each exact sub-IB tag itself and would double-count sub-IB
+        # failures under both their own section and the primary's if this pulled in
+        # sub-IBs by default.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = []
+
+        get_failing_unittests("CMSSW_20_1_X_2026-09-07-2300", arch="el9_amd64_gcc14")
+
+        cypher, params = session.run.call_args.args
+        self.assertIn("ib:IB {tag:$t}", cypher)
+        self.assertNotIn("parent_tag", cypher)
+
+    @patch("graph.tools.get_driver")
+    def test_failing_unittests_include_sub_ibs_caps_limit_per_ib_node(self, get_driver):
+        # Same crowd-out fix as get_failing_relvals: sub-IB unit-test failures were
+        # entirely invisible to generate_shift_summary before include_sub_ibs
+        # existed at all (get_failing_unittests matched ib.tag = $t only, never
+        # parent_tag) -- found live, 2026-09-09: UBSAN alone had 35 failing unit
+        # tests never surfaced in any shift digest. The per-node LIMIT here exists
+        # for the same reason it does on get_failing_relvals.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = []
+
+        get_failing_unittests("CMSSW_20_1_X_2026-09-07-2300", arch="el9_amd64_gcc14", limit=100, include_sub_ibs=True)
+
+        cypher, params = session.run.call_args.args
+        self.assertIn("ib.parent_tag = $t", cypher)
         self.assertIn("CALL (ib) {", cypher)
         self.assertIn("LIMIT $lim", cypher)
         self.assertEqual(params["lim"], 100)

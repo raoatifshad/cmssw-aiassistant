@@ -3660,6 +3660,38 @@ def _ib_pair_architectures(previous_tag: str, latest_tag: str) -> list[str]:
     return [row["arch"] for row in rows]
 
 
+def _variant_previous_tag(current_tag: str, variant: str | None, arch: str) -> str | None:
+    """Find the build of this exact sub-IB variant+arch that immediately preceded
+    current_tag, scoped to the same release series (matching the recurrence-scoping
+    convention used elsewhere, e.g. _workflow_evidence_cells) -- crossing into a
+    different release series would compare against a different codebase entirely,
+    not a meaningful regression signal. Used as a fallback in generate_shift_summary
+    when a sub-IB has no build at the shift's exact previous_tag date (a real,
+    common case -- e.g. CPP23 only ever builds on -1100 tags and skips days), so a
+    persistently-failing sub-IB workflow isn't misreported as newly failing just
+    because its own build cadence doesn't line up with the primary's. Returns None
+    (not a graceful-message string) when no earlier build of this variant exists at
+    all in the series, so the caller can distinguish "no prior build to compare
+    against" from "compared and nothing changed"."""
+    series_match = re.match(r"^CMSSW_(\d+)_(\d+)_", current_tag)
+    if not series_match:
+        return None
+    series_prefix = f"CMSSW_{series_match.group(1)}_{series_match.group(2)}_"
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            row = session.run(
+                "MATCH (ib:IB {arch:$arch}) "
+                "WHERE coalesce(ib.variant, '') = coalesce($variant, '') "
+                "AND ib.tag STARTS WITH $series_prefix AND ib.tag < $current_tag "
+                "RETURN ib.tag AS tag ORDER BY ib.tag DESC LIMIT 1",
+                arch=arch, variant=variant, series_prefix=series_prefix, current_tag=current_tag,
+            ).single()
+    finally:
+        driver.close()
+    return row["tag"] if row else None
+
+
 def _group_relvals_by_variant(rows: list[dict]) -> dict[str, list[dict]]:
     """Group get_failing_relvals() rows by sub-IB variant ('' for a primary
     run) so a diff pairs the same track (e.g. NONLTO-vs-NONLTO) across two
@@ -3678,6 +3710,66 @@ def _group_ids_by_variant(rows: list[dict]) -> dict[str, set[str]]:
     for row in rows:
         by_variant.setdefault(row.get("variant") or "", set()).add(row["workflow_id"])
     return by_variant
+
+
+def _group_names_by_variant(rows: list[dict]) -> dict[str, set[str]]:
+    """Same idea as _group_ids_by_variant, but for get_unittest_names()'s "did this
+    test actually run" rows - {variant: {name, ...}}."""
+    by_variant: dict[str, set[str]] = {}
+    for row in rows:
+        by_variant.setdefault(row.get("variant") or "", set()).add(row["name"])
+    return by_variant
+
+
+def _variant_diff_baseline(
+    variant: str, arch: str, previous_tag: str,
+    before_by_variant: dict[str, list[dict]], after_by_variant: dict[str, list[dict]],
+    before_ran_variants: set[str], fetch_fn, label: str,
+) -> tuple[list[dict], str | None, bool]:
+    """Resolve the "before" rows to diff one sub-IB variant's current state against,
+    for one data type (RelVal/UnitTest) in one shift-summary architecture. Three
+    outcomes:
+    - An exact match at previous_tag exists: use it as-is -- no note, real baseline.
+      "Exists" is checked via before_ran_variants (positive proof this variant's IB
+      node was actually ingested at previous_tag, e.g. get_relval_workflow_ids/
+      get_unittest_names -- any status, not just FAILED), NOT via
+      `variant in before_by_variant`: a variant with a real exact-match build that
+      simply had zero failures is indistinguishable from "this variant doesn't exist
+      at previous_tag at all" if only the failing-rows grouping is consulted (both
+      produce an empty/missing entry), which would wrongly trigger the fallback
+      below and use an unnecessarily stale baseline for a variant that already had
+      a perfectly good one.
+    - No exact match, but this variant's own build history has an earlier build
+      (found via _variant_previous_tag, unbounded lookback -- a sub-IB's own last
+      known state is still the right comparison even if it's several days back, not
+      an artificially narrow window pinned to the primary's chosen dates): fall back
+      to that build, with a note naming the substituted tag so a shifter isn't
+      misled into thinking every variant covers the same window.
+    - No exact match AND no earlier build of this variant exists at all (first
+      import ever, or a genuinely new sub-IB): there is no real baseline, so the
+      caller must not diff at all -- an empty "before" would misreport every
+      current failure as newly failing. Signaled via has_baseline=False."""
+    if variant in before_ran_variants:
+        return before_by_variant.get(variant, []), None, True
+    after_rows = after_by_variant.get(variant, [])
+    if not after_rows:
+        return [], None, True
+    variant_name = variant or "primary"
+    own_current_tag = after_rows[0]["ib_tag"]
+    own_previous_tag = _variant_previous_tag(own_current_tag, variant or None, arch)
+    if not own_previous_tag:
+        return (
+            [],
+            f"`{variant_name}` has no previous {label} build imported, so its current "
+            f"failures aren't shown as newly failing.",
+            False,
+        )
+    return (
+        fetch_fn(own_previous_tag, arch),
+        f"`{variant_name}` has no {label} build at `{previous_tag}` -- compared against "
+        f"its own previous build `{own_previous_tag}` instead.",
+        True,
+    )
 
 
 def _relval_table(rows: list[dict], exit_code_names: dict[int, str]) -> list[str]:
@@ -3833,21 +3925,35 @@ def _plain_shift_table(headers: list[str], rows: list[list]) -> list[str]:
 
 
 def _unittest_shift_table(rows: list[dict]) -> list[str]:
-    return _plain_shift_table(["Name", "Errors"], [[row["name"], row.get("errors") or 0] for row in rows])
+    """Rows now include sub-IB unit-test failures (get_failing_unittests's
+    include_sub_ibs=True, wired up in generate_shift_summary) that were previously
+    invisible here entirely -- a "(variant)" suffix on the test name (same
+    non-column-changing approach as _status_row_label) says which build a failure
+    belongs to instead of silently mixing primary and every sub-IB together."""
+    def label(row: dict) -> str:
+        variant = row.get("variant")
+        return f"{row['name']} ({variant})" if variant else row["name"]
+    return _plain_shift_table(["Name", "Errors"], [[label(row), row.get("errors") or 0] for row in rows])
 
 
 def _build_and_addon_status(previous_tag: str, latest_tag: str) -> dict[tuple[str, str], dict]:
-    """Per (tag, arch) build_status/addon_status for a shift-summary pair --
-    one query instead of one per architecture. Both are whole-architecture
-    flags only (no per-package/per-test detail exists for either -- see
-    build_status_records in ingestion/build_graph.py and Release Explorer's
-    summarizeArchCell, which already renders both as a plain badge)."""
+    """Per (tag, arch) build_status/addon_status for a shift-summary pair -- one
+    query instead of one per architecture. Both are whole-architecture flags only
+    (no per-package/per-test detail exists for either -- see build_status_records in
+    ingestion/build_graph.py and Release Explorer's summarizeArchCell, which already
+    renders both as a plain badge). Includes sub-IBs (ib.tag IN $tags OR
+    ib.parent_tag IN $tags): each has its own build_status/addon_status property,
+    previously never queried, so a sub-IB's build breaking was invisible in every
+    shift digest. Still uniquely keyed by (row's own tag, arch) even with sub-IBs
+    included, since every sub-IB has its own distinct tag string -- callers bucket
+    by variant/parent_tag themselves."""
     driver = get_driver()
     try:
         with driver.session() as session:
             rows = [dict(record) for record in session.run(
-                "MATCH (ib:IB) WHERE ib.tag IN $tags "
-                "RETURN ib.tag AS tag, ib.arch AS arch, ib.build_status AS build_status, "
+                "MATCH (ib:IB) WHERE ib.tag IN $tags OR ib.parent_tag IN $tags "
+                "RETURN ib.tag AS tag, ib.arch AS arch, coalesce(ib.variant, '') AS variant, "
+                "ib.parent_tag AS parent_tag, ib.build_status AS build_status, "
                 "ib.addon_status AS addon_status",
                 tags=[previous_tag, latest_tag],
             )]
@@ -3856,34 +3962,100 @@ def _build_and_addon_status(previous_tag: str, latest_tag: str) -> dict[tuple[st
     return {(row["tag"], row["arch"]): row for row in rows}
 
 
+def _ib_status(tag: str, arch: str) -> dict | None:
+    """Single-IB build_status/addon_status lookup -- the fallback-path counterpart
+    to _build_and_addon_status, which only ever looks up the shift's own
+    previous_tag/latest_tag pair. Used when a sub-IB variant has no build at
+    previous_tag and _variant_previous_tag resolved a substituted tag to look up
+    instead."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            row = session.run(
+                "MATCH (ib:IB {tag:$tag, arch:$arch}) "
+                "RETURN ib.build_status AS build_status, ib.addon_status AS addon_status",
+                tag=tag, arch=arch,
+            ).single()
+    finally:
+        driver.close()
+    return dict(row) if row else None
+
+
+def _variant_status_entry(
+    variant: str, arch: str, previous_tag: str,
+    before_status_by_variant: dict[str, dict], after_status_by_variant: dict[str, dict],
+) -> tuple[dict | None, str | None, bool]:
+    """Same three-outcome fallback policy as _variant_diff_baseline, but resolving
+    a single status entry (dict with build_status/addon_status) per variant instead
+    of a list of failing rows. Unlike RelVal/UnitTest, "exact match at previous_tag"
+    is unambiguous here from variant presence alone -- build/addon status is a
+    direct IB node property, always populated if the node exists at all, so there's
+    no "real baseline that looks empty" case to guard against."""
+    if variant in before_status_by_variant:
+        return before_status_by_variant[variant], None, True
+    after_entry = after_status_by_variant.get(variant)
+    if not after_entry:
+        return None, None, True
+    variant_name = variant or "primary"
+    own_current_tag = after_entry["tag"]
+    own_previous_tag = _variant_previous_tag(own_current_tag, variant or None, arch)
+    if not own_previous_tag:
+        return (
+            None,
+            f"`{variant_name}` has no previous Build/AddOn build imported, so its "
+            f"current status isn't shown as newly changed.",
+            False,
+        )
+    return (
+        _ib_status(own_previous_tag, arch),
+        f"`{variant_name}` has no build at `{previous_tag}` -- compared its Build/AddOn "
+        f"status against its own previous build `{own_previous_tag}` instead.",
+        True,
+    )
+
+
 def _status_diff_rows(
-    before_status: str | None, after_status: str | None, arch: str,
+    before_status: str | None, after_status: str | None, arch: str, variant: str = "",
 ) -> tuple[dict | None, dict | None]:
     """(newly_failing_row, resolved_row) for one whole-architecture
     build_status/addon_status transition -- shared shape for Build and
-    AddOn since both are the same "single flag per architecture" data."""
+    AddOn since both are the same "single flag per architecture" data.
+    variant defaults to "" (primary) so existing 3-arg callers/tests are unaffected;
+    a non-empty variant is only ever added by generate_shift_summary's per-variant
+    loop and rendered as an extra "(variant)" suffix by _build_shift_table/
+    _addon_shift_table, not a new table column."""
+    row_extra = {"variant": variant} if variant else {}
     newly_failing = (
-        {"arch": arch, "status": after_status}
+        {"arch": arch, "status": after_status, **row_extra}
         if after_status == "error" and before_status != "error" else None
     )
     resolved = (
-        {"arch": arch, "status": after_status}
+        {"arch": arch, "status": after_status, **row_extra}
         if before_status == "error" and after_status != "error" else None
     )
     return newly_failing, resolved
 
 
+def _status_row_label(row: dict) -> str:
+    """Arch name, plus a "(variant)" suffix for a sub-IB row -- keeps
+    _build_shift_table/_addon_shift_table's existing ["Name", "Errors", ...] column
+    shape unchanged (the Shift Console frontend hard-codes this contract) while
+    still surfacing which sub-IB a status transition belongs to."""
+    variant = row.get("variant")
+    return f"{row['arch']} ({variant})" if variant else row["arch"]
+
+
 def _build_shift_table(rows: list[dict]) -> list[str]:
     return _plain_shift_table(
         ["Name", "Errors"],
-        [[row["arch"], f"build status: {row['status'] or 'unknown'}"] for row in rows],
+        [[_status_row_label(row), f"build status: {row['status'] or 'unknown'}"] for row in rows],
     )
 
 
 def _addon_shift_table(rows: list[dict]) -> list[str]:
     return _plain_shift_table(
         ["Name", "Errors", "Exit code"],
-        [[row["arch"], f"addon status: {row['status'] or 'unknown'}", "n/a"] for row in rows],
+        [[_status_row_label(row), f"addon status: {row['status'] or 'unknown'}", "n/a"] for row in rows],
     )
 
 
@@ -3891,11 +4063,19 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
     """Compose a virtual-shifter digest for latest_tag vs previous_tag: per-arch
     newly-failing/resolved RelVals and UnitTests (real per-item detail), new/
     resolved/changed Clang warnings, whole-architecture Build/AddOn status
-    transitions (a single badge per architecture only -- no per-package or
+    transitions (a single badge per architecture+variant -- no per-package or
     per-test detail exists for either, see _build_and_addon_status), and for
     each distinct newly-failing workflow, release-series-scoped recurrence
     plus best-effort PR/Issue/Concept evidence. Every evidence-bearing section
-    stays relevance-only -- never "caused"/"fixed"."""
+    stays relevance-only -- never "caused"/"fixed".
+
+    Every data type (RelVal, UnitTest, Build/AddOn) diffs each sub-IB variant
+    against its OWN true previous build when it has no build at the exact
+    previous_tag date, rather than either silently omitting it or (the bug this
+    replaced) treating an empty "before" as proof nothing was failing yet -- see
+    _variant_diff_baseline/_variant_status_entry. Substitutions and "no baseline
+    at all" cases are surfaced as an explicit per-architecture note so a shifter
+    never mistakes a several-day-old comparison for a same-window one."""
     architectures = [arch] if arch else _ib_pair_architectures(previous_tag, latest_tag)
     if not architectures:
         return f"Neither `{previous_tag}` nor `{latest_tag}` has any imported architecture in the graph."
@@ -3907,54 +4087,123 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
     per_arch: list[dict] = []
     newly_failing_by_workflow: dict[str, dict] = {}
     for one_arch in architectures:
+        sub_ib_notes: list[str] = []
+
         before_rows = get_failing_relvals(previous_tag, arch=one_arch, limit=200)
         after_rows = get_failing_relvals(latest_tag, arch=one_arch, limit=200)
         before_by_variant = _group_relvals_by_variant(before_rows)
         after_by_variant = _group_relvals_by_variant(after_rows)
-        # A workflow_id absent from after_rows could mean it passed, or it could mean this
-        # architecture hasn't ingested RelVal results for latest_tag yet (e.g. the build's
-        # still running) - those must not both read as "resolved". Only count a workflow
-        # as resolved once we have positive proof it actually ran at latest_tag.
+        # "Did this variant's IB node exist at all at previous_tag/latest_tag" (any
+        # status, not just FAILED) -- needed for two separate purposes: the existing
+        # resolved-workflow "positive proof it ran" guard (after side), and now also
+        # distinguishing "real baseline with zero failures" from "no baseline at all"
+        # (before side) -- before_by_variant alone can't tell those apart, since both
+        # produce an empty/missing entry.
+        before_ran_by_variant = _group_ids_by_variant(get_relval_workflow_ids(previous_tag, arch=one_arch))
         after_ran_by_variant = _group_ids_by_variant(get_relval_workflow_ids(latest_tag, arch=one_arch))
         newly_failing_arch: list[dict] = []
         resolved_arch: list[dict] = []
-        for variant in sorted(set(before_by_variant) | set(after_by_variant)):
-            diff = _diff_failing_relvals(before_by_variant.get(variant, []), after_by_variant.get(variant, []))
+        for variant in sorted(set(before_by_variant) | set(after_by_variant) | set(before_ran_by_variant)):
+            variant_before, note, has_baseline = _variant_diff_baseline(
+                variant, one_arch, previous_tag, before_by_variant, after_by_variant,
+                set(before_ran_by_variant),
+                lambda tag, arch: get_failing_relvals(tag, arch=arch, limit=200), "RelVal",
+            )
+            if note:
+                sub_ib_notes.append(note)
+            if not has_baseline:
+                continue
+            diff = _diff_failing_relvals(variant_before, after_by_variant.get(variant, []))
             newly, resolved = _split_relval_diff(diff)
             ran_ids = after_ran_by_variant.get(variant, set())
             newly_failing_arch.extend(newly)
             resolved_arch.extend(row for row in resolved if row["workflow_id"] in ran_ids)
+
         warnings_diff = diff_warnings(previous_tag, latest_tag, one_arch)
-        before_unittests = get_failing_unittests(previous_tag, arch=one_arch, limit=200)
-        after_unittests = get_failing_unittests(latest_tag, arch=one_arch, limit=200)
-        newly_failing_unittests, resolved_unittests_diff = _split_unittest_diff(
-            _diff_failing_unittests(before_unittests, after_unittests)
+
+        before_unittests = get_failing_unittests(previous_tag, arch=one_arch, limit=200, include_sub_ibs=True)
+        after_unittests = get_failing_unittests(latest_tag, arch=one_arch, limit=200, include_sub_ibs=True)
+        before_ut_by_variant = _group_relvals_by_variant(before_unittests)
+        after_ut_by_variant = _group_relvals_by_variant(after_unittests)
+        before_ran_ut_by_variant = _group_names_by_variant(
+            get_unittest_names(previous_tag, arch=one_arch, include_sub_ibs=True)
         )
-        # Same "positive proof it ran" guard as RelVal above, keyed by test name.
-        after_ran_unittests = {row["name"] for row in get_unittest_names(latest_tag, arch=one_arch)}
-        resolved_unittests = [row for row in resolved_unittests_diff if row["name"] in after_ran_unittests]
-        before_status = status_by_tag_arch.get((previous_tag, one_arch), {})
-        after_status_entry = status_by_tag_arch.get((latest_tag, one_arch))
-        if after_status_entry is None:
-            # No IB node ingested yet for latest_tag on this architecture at all - there's
-            # no live data to compare against, so don't claim anything newly failing or
-            # resolved (same principle as the RelVal/UnitTest guards above).
-            newly_failing_build = resolved_build = newly_failing_addon = resolved_addon = None
-        else:
-            newly_failing_build, resolved_build = _status_diff_rows(
-                before_status.get("build_status"), after_status_entry.get("build_status"), one_arch,
+        after_ran_ut_by_variant = _group_names_by_variant(
+            get_unittest_names(latest_tag, arch=one_arch, include_sub_ibs=True)
+        )
+        newly_failing_unittests: list[dict] = []
+        resolved_unittests: list[dict] = []
+        for variant in sorted(set(before_ut_by_variant) | set(after_ut_by_variant) | set(before_ran_ut_by_variant)):
+            variant_before, note, has_baseline = _variant_diff_baseline(
+                variant, one_arch, previous_tag, before_ut_by_variant, after_ut_by_variant,
+                set(before_ran_ut_by_variant),
+                lambda tag, arch: get_failing_unittests(tag, arch=arch, limit=200, include_sub_ibs=True),
+                "UnitTest",
             )
-            newly_failing_addon, resolved_addon = _status_diff_rows(
-                before_status.get("addon_status"), after_status_entry.get("addon_status"), one_arch,
+            if note:
+                sub_ib_notes.append(note)
+            if not has_baseline:
+                continue
+            diff = _diff_failing_unittests(variant_before, after_ut_by_variant.get(variant, []))
+            newly, resolved = _split_unittest_diff(diff)
+            ran_names = after_ran_ut_by_variant.get(variant, set())
+            newly_failing_unittests.extend(newly)
+            resolved_unittests.extend(row for row in resolved if row["name"] in ran_names)
+
+        # status_by_tag_arch has one entry per matched IB node (primary + every
+        # sub-IB pulled in via parent_tag) across the whole previous_tag/latest_tag
+        # pair; bucket this architecture's rows by variant and by which side
+        # (previous/latest) they belong to -- a sub-IB row belongs to a side via its
+        # parent_tag, since its own tag never equals previous_tag/latest_tag.
+        arch_status_rows = [row for row in status_by_tag_arch.values() if row["arch"] == one_arch]
+        before_status_by_variant = {
+            row["variant"]: row for row in arch_status_rows
+            if row["tag"] == previous_tag or row["parent_tag"] == previous_tag
+        }
+        after_status_by_variant = {
+            row["variant"]: row for row in arch_status_rows
+            if row["tag"] == latest_tag or row["parent_tag"] == latest_tag
+        }
+        newly_failing_build: list[dict] = []
+        resolved_build: list[dict] = []
+        newly_failing_addon: list[dict] = []
+        resolved_addon: list[dict] = []
+        for variant in sorted(set(before_status_by_variant) | set(after_status_by_variant)):
+            before_entry, note, has_baseline = _variant_status_entry(
+                variant, one_arch, previous_tag, before_status_by_variant, after_status_by_variant,
             )
+            if note:
+                sub_ib_notes.append(note)
+            after_entry = after_status_by_variant.get(variant)
+            if not has_baseline or after_entry is None:
+                # No IB node ingested yet for this side on this architecture+variant
+                # at all -- there's no live data to compare against, so don't claim
+                # anything newly failing or resolved (same principle as the
+                # RelVal/UnitTest guards above).
+                continue
+            nb, rb = _status_diff_rows(
+                before_entry.get("build_status") if before_entry else None,
+                after_entry.get("build_status"), one_arch, variant,
+            )
+            if nb:
+                newly_failing_build.append(nb)
+            if rb:
+                resolved_build.append(rb)
+            na, ra = _status_diff_rows(
+                before_entry.get("addon_status") if before_entry else None,
+                after_entry.get("addon_status"), one_arch, variant,
+            )
+            if na:
+                newly_failing_addon.append(na)
+            if ra:
+                resolved_addon.append(ra)
+
         per_arch.append({
             "arch": one_arch, "newly_failing_relvals": newly_failing_arch, "resolved_relvals": resolved_arch,
-            "warnings_diff": warnings_diff,
+            "warnings_diff": warnings_diff, "sub_ib_notes": sub_ib_notes,
             "newly_failing_unittests": newly_failing_unittests, "resolved_unittests": resolved_unittests,
-            "newly_failing_build": [row for row in [newly_failing_build] if row],
-            "resolved_build": [row for row in [resolved_build] if row],
-            "newly_failing_addon": [row for row in [newly_failing_addon] if row],
-            "resolved_addon": [row for row in [resolved_addon] if row],
+            "newly_failing_build": newly_failing_build, "resolved_build": resolved_build,
+            "newly_failing_addon": newly_failing_addon, "resolved_addon": resolved_addon,
         })
         for row in newly_failing_arch:
             newly_failing_by_workflow.setdefault(row["workflow_id"], row)
@@ -3971,7 +4220,11 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
     for arch_result in per_arch:
         one_arch = arch_result["arch"]
         warnings_diff = arch_result["warnings_diff"]
-        lines.extend(["", f"### `{one_arch}`", "", "#### Newly failing RelVal workflows"])
+        lines.extend(["", f"### `{one_arch}`"])
+        if arch_result["sub_ib_notes"]:
+            lines.extend(["", "**Sub-IB baselines:**"])
+            lines.extend(f"- {note}" for note in arch_result["sub_ib_notes"])
+        lines.extend(["", "#### Newly failing RelVal workflows"])
         lines.extend(_newly_failing_relval_table(arch_result["newly_failing_relvals"], exit_code_names, evidence))
         lines.extend(["", "#### Resolved RelVal workflows"])
         lines.extend(_relval_table(arch_result["resolved_relvals"], exit_code_names))

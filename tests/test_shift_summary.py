@@ -196,6 +196,10 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
             [] if tag == "CMSSW_20_1_X_2026-08-19-1100" else [new_row]
         )
+        # Positive proof the primary variant existed (ran, any status) at BOTH tags,
+        # so _variant_diff_baseline takes the real exact-match path -- a zero-failure
+        # baseline -- instead of falling back to a substituted earlier build.
+        get_relval_ids.return_value = [{"variant": None, "workflow_id": "0.0"}]
         recurrence.return_value = {
             "workflow_id": "140.51", "name": "RunMuonEG2022C",
             "total_appearances": 5, "failed_appearances": 3,
@@ -244,6 +248,7 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
             [] if tag == "CMSSW_20_1_X_2026-08-19-1100" else [new_row]
         )
+        get_relval_ids.return_value = [{"variant": None, "workflow_id": "0.0"}]
 
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
 
@@ -338,6 +343,7 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         get_failing.side_effect = lambda tag, arch=None, limit=None: (
             [] if tag == "CMSSW_20_1_X_2026-08-19-1100" else [new_row]
         )
+        get_relval_ids.return_value = [{"variant": None, "workflow_id": "0.0"}]
         find_prs.return_value = [
             {
                 "category": "LogicError",
@@ -371,7 +377,7 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
         recurrence, find_prs, search_c, get_relval_ids, get_ut_names
     ):
-        get_failing_unittests.side_effect = lambda tag, arch=None, limit=None: (
+        get_failing_unittests.side_effect = lambda tag, arch=None, limit=None, include_sub_ibs=False: (
             [{"name": "OldFlakyTest", "errors": 1}] if tag == "CMSSW_20_1_X_2026-08-19-1100"
             else [{"name": "test_something_LST", "errors": "Segmentation fault"}]
         )
@@ -418,8 +424,14 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server._build_and_addon_status")
     def test_build_and_addon_sections_show_status_transitions(self, build_and_addon_status, *_mocks):
         build_and_addon_status.return_value = {
-            ("CMSSW_20_1_X_2026-08-19-1100", "el9_amd64_gcc14"): {"build_status": "passed", "addon_status": "passed"},
-            ("CMSSW_20_1_X_2026-08-19-2300", "el9_amd64_gcc14"): {"build_status": "error", "addon_status": "error"},
+            ("CMSSW_20_1_X_2026-08-19-1100", "el9_amd64_gcc14"): {
+                "tag": "CMSSW_20_1_X_2026-08-19-1100", "arch": "el9_amd64_gcc14", "variant": "", "parent_tag": None,
+                "build_status": "passed", "addon_status": "passed",
+            },
+            ("CMSSW_20_1_X_2026-08-19-2300", "el9_amd64_gcc14"): {
+                "tag": "CMSSW_20_1_X_2026-08-19-2300", "arch": "el9_amd64_gcc14", "variant": "", "parent_tag": None,
+                "build_status": "error", "addon_status": "error",
+            },
         }
 
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
@@ -432,6 +444,91 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         resolved_build_idx = markdown.index("#### Resolved Build")
         newly_unit_idx = markdown.index("#### Newly failing Unit Tests")
         self.assertNotIn("el9_amd64_gcc14", markdown[resolved_build_idx:newly_unit_idx])
+
+    @patch("server.api_server.get_unittest_names", return_value=[])
+    @patch("server.api_server.get_relval_workflow_ids", return_value=[])
+    @patch("server.api_server.search_concepts", return_value=[])
+    @patch("server.api_server.get_relval_exception_evidence", return_value=[])
+    @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
+    @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
+    @patch("server.api_server._variant_previous_tag")
+    @patch("server.api_server.get_failing_relvals")
+    @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._build_and_addon_status", return_value={})
+    def test_sub_ib_missing_at_previous_tag_falls_back_to_its_own_previous_build(
+        self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing,
+        variant_previous_tag, diff_w, recurrence, find_prs, search_c, get_relval_ids, get_ut_names,
+    ):
+        # Real bug (2026-09-09): CPP23 only builds on a subset of primary dates and
+        # was compared against an empty "before" whenever previous_tag landed on a
+        # date CPP23 skipped, misreporting an already-failing CPP23 workflow as
+        # newly failing. CPP23 has no build at previous_tag here; its own true
+        # previous build (found via _variant_previous_tag) already had the same
+        # failure, so it must show as unchanged, not newly failing.
+        cpp23_row = _failing_row(workflow_id="140.051", name="RunMuonEG2022C", variant="CPP23", errors=5)
+        cpp23_row["ib_tag"] = "CMSSW_20_1_CPP23_X_2026-08-19-2300"
+        # get_failing_relvals(latest_tag, ...) pulls CPP23 in via parent_tag matching
+        # (so it's queried with the PRIMARY latest_tag, not CPP23's own tag) -- only
+        # the fallback path queries CPP23's own specific tag directly.
+        get_failing.side_effect = lambda tag, arch=None, limit=None: (
+            [cpp23_row] if tag in ("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_CPP23_X_2026-08-15-1100")
+            else []
+        )
+        variant_previous_tag.return_value = "CMSSW_20_1_CPP23_X_2026-08-15-1100"
+
+        markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
+
+        variant_previous_tag.assert_any_call("CMSSW_20_1_CPP23_X_2026-08-19-2300", "CPP23", "el9_amd64_gcc14")
+        self.assertIn(
+            "`CPP23` has no RelVal build at `CMSSW_20_1_X_2026-08-19-1100` -- compared against "
+            "its own previous build `CMSSW_20_1_CPP23_X_2026-08-15-1100` instead.",
+            markdown,
+        )
+        newly_idx = markdown.index("#### Newly failing RelVal workflows")
+        resolved_idx = markdown.index("#### Resolved RelVal workflows")
+        self.assertNotIn("140.051", markdown[newly_idx:resolved_idx])
+
+    @patch("server.api_server.get_unittest_names", return_value=[])
+    @patch("server.api_server.get_relval_workflow_ids", return_value=[])
+    @patch("server.api_server.search_concepts", return_value=[])
+    @patch("server.api_server.get_relval_exception_evidence", return_value=[])
+    @patch("server.api_server.get_relval_recurrence", return_value={"total_appearances": 0})
+    @patch("server.api_server.diff_warnings", return_value=EMPTY_WARNINGS_DIFF)
+    @patch("server.api_server._variant_previous_tag", return_value=None)
+    @patch("server.api_server.get_failing_relvals")
+    @patch("server.api_server._ib_pair_architectures", return_value=["el9_amd64_gcc14"])
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._build_and_addon_status", return_value={})
+    def test_sub_ib_with_no_prior_build_at_all_is_not_reported_as_newly_failing(
+        self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing,
+        variant_previous_tag, diff_w, recurrence, find_prs, search_c, get_relval_ids, get_ut_names,
+    ):
+        # A brand-new sub-IB (or its very first ever import) has no earlier build to
+        # compare against at all. An empty "before" must NOT be silently treated as
+        # "nothing was failing yet" (which would misreport every current failure as
+        # new) -- per explicit product decision, this case is simply excluded from
+        # newly-failing and named in the note instead.
+        new_variant_row = _failing_row(workflow_id="1.0", name="BrandNewSubIbWorkflow", variant="G4ADEPT")
+        new_variant_row["ib_tag"] = "CMSSW_20_1_G4ADEPT_X_2026-08-19-2300"
+        # G4ADEPT is pulled in via parent_tag matching, so it's returned for the
+        # PRIMARY latest_tag query, not its own tag.
+        get_failing.side_effect = lambda tag, arch=None, limit=None: (
+            [new_variant_row] if tag == "CMSSW_20_1_X_2026-08-19-2300" else []
+        )
+
+        markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
+
+        self.assertIn(
+            "`G4ADEPT` has no previous RelVal build imported, so its current failures "
+            "aren't shown as newly failing.",
+            markdown,
+        )
+        newly_idx = markdown.index("#### Newly failing RelVal workflows")
+        resolved_idx = markdown.index("#### Resolved RelVal workflows")
+        self.assertNotIn("BrandNewSubIbWorkflow", markdown[newly_idx:resolved_idx])
 
 
 if __name__ == "__main__":
