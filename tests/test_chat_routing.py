@@ -3126,6 +3126,115 @@ class IbComparisonAnswerTests(unittest.TestCase):
         self.assertNotIn("| Failed RelVals |", answer)
 
     @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.find_prs_merged_between", return_value=[])
+    @patch("server.api_server._single_ib_comparison_row")
+    @patch("server.api_server._variant_previous_tag")
+    @patch("server.api_server.get_driver")
+    def test_falls_back_to_own_previous_build_and_cross_references_it(
+        self, get_driver, variant_previous_tag, single_ib_row, find_prs_merged_between, get_exit_code_names,
+    ):
+        # Part 1: a variant with no exact match at before_tag (but one at after_tag)
+        # falls back to its own true previous build, same policy
+        # generate_shift_summary's _variant_diff_baseline already uses for the shift
+        # digest -- applied here to the chat comparison too. Part 2: cross-variant
+        # "Also failing in" references must reflect that SUBSTITUTED tag/row, not
+        # pretend the literal before_tag applies to a variant that never had a build
+        # there.
+        before_tag, after_tag = "CMSSW_20_1_X_2026-08-31-1100", "CMSSW_20_1_X_2026-09-01-1100"
+        substitute_tag = "CMSSW_20_1_ASAN_X_2026-08-27-1100"
+
+        def row(tag, primary_tag, variant, failed, failing_relvals):
+            return {
+                "tag": tag, "primary_tag": primary_tag, "variant": variant,
+                "relval_total": 10, "relval_failed": failed, "relval_errors": failed,
+                "relval_warnings": failed, "unit_test_total": 1, "unit_test_failed": 0,
+                "unit_test_errors": 0, "failing_relvals": failing_relvals,
+            }
+
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            row(before_tag, before_tag, "primary", 0, []),
+            row(after_tag, after_tag, "primary", 1, [
+                {"workflow_id": "700.0", "name": "PrimaryNew", "errors": 1, "warnings": 1, "exitcode": 1},
+            ]),
+            # No ASAN row at before_tag at all -- the "no exact match" case.
+            row("CMSSW_20_1_ASAN_X_2026-09-01-1100", after_tag, "ASAN", 1, [
+                {"workflow_id": "700.0", "name": "PrimaryNew", "errors": 2, "warnings": 2, "exitcode": 2},
+            ]),
+        ]
+        variant_previous_tag.return_value = substitute_tag
+        single_ib_row.return_value = row(substitute_tag, "CMSSW_20_1_X_2026-08-27-1100", "ASAN", 1, [
+            {"workflow_id": "700.0", "name": "PrimaryNew", "errors": 2, "warnings": 2, "exitcode": 2},
+        ])
+
+        answer, actions = _ib_comparison_answer(f"compare {before_tag} and {after_tag} el9_amd64_gcc14")
+
+        variant_previous_tag.assert_called_once_with(
+            "CMSSW_20_1_ASAN_X_2026-09-01-1100", "ASAN", "el9_amd64_gcc14"
+        )
+        single_ib_row.assert_called_once_with(substitute_tag, "el9_amd64_gcc14")
+        self.assertIn(
+            f"`ASAN` has no build at `{before_tag}` -- compared against its own "
+            f"previous build `{substitute_tag}` instead.",
+            answer,
+        )
+
+        primary_block = answer.split("### `ASAN`")[0]
+        asan_block = answer.split("### `ASAN`")[1]
+        # Primary's newly-failing 700.0 must cross-reference ASAN's SUBSTITUTED
+        # before-side tag, not a literal (nonexistent) before_tag-dated ASAN build.
+        self.assertIn(
+            f"| `700.0` | PrimaryNew | 1 | 1 | Newly failing | ASAN (`{substitute_tag}`) | "
+            f"ASAN (`CMSSW_20_1_ASAN_X_2026-09-01-1100`) |",
+            primary_block,
+        )
+        # ASAN's own row, diffed against its substituted baseline, correctly shows
+        # "still failing" (already failing in the substitute) and cross-references
+        # primary only on the after side (primary didn't have it failing before).
+        self.assertIn(
+            f"| `700.0` | PrimaryNew | 2 | 2 | Still failing (already failing in `{before_tag}`) | "
+            f"- | primary (`{after_tag}`) |",
+            asan_block,
+        )
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server._single_ib_comparison_row")
+    @patch("server.api_server._variant_previous_tag", return_value=None)
+    @patch("server.api_server.get_driver")
+    def test_no_earlier_build_at_all_keeps_existing_no_record_message(
+        self, get_driver, variant_previous_tag, single_ib_row, get_exit_code_names,
+    ):
+        # When _variant_previous_tag finds nothing (first-ever import of this
+        # sub-IB, or genuinely no earlier build), behavior must stay exactly what it
+        # was before Part 1 existed: the plain "no imported record" message, no
+        # substitution note, and no wasted row fetch.
+        before_tag, after_tag = "CMSSW_20_1_X_2026-08-31-1100", "CMSSW_20_1_X_2026-09-01-1100"
+
+        def row(tag, primary_tag, variant, failed, failing_relvals):
+            return {
+                "tag": tag, "primary_tag": primary_tag, "variant": variant,
+                "relval_total": 10, "relval_failed": failed, "relval_errors": failed,
+                "relval_warnings": failed, "unit_test_total": 1, "unit_test_failed": 0,
+                "unit_test_errors": 0, "failing_relvals": failing_relvals,
+            }
+
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            row(before_tag, before_tag, "primary", 0, []),
+            row(after_tag, after_tag, "primary", 0, []),
+            row("CMSSW_20_1_G4ADEPT_X_2026-09-01-1100", after_tag, "G4ADEPT", 0, []),
+        ]
+
+        answer, actions = _ib_comparison_answer(f"compare {before_tag} and {after_tag} el9_amd64_gcc14")
+
+        single_ib_row.assert_not_called()
+        self.assertIn(
+            f"`{before_tag}` has no imported record for this sub-IB on `el9_amd64_gcc14`.",
+            answer,
+        )
+        self.assertNotIn("has no build at", answer)
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.find_prs_merged_between")
     @patch("server.api_server.get_driver")
     def test_lists_merged_prs_when_relval_failures_increased(self, get_driver, find_prs_merged_between, get_exit_code_names):

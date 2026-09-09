@@ -3573,6 +3573,89 @@ def _render_failing_workflows(
     return lines
 
 
+def _single_ib_comparison_row(tag: str, arch: str) -> dict | None:
+    """Fetch one IB node's full comparison row (metrics + failing_relvals) by exact
+    tag+arch -- the same RETURN shape as _all_arch_ib_comparison_answer's bulk query
+    (a superset of _ib_comparison_answer's, which only reads the RelVal/UnitTest
+    subset of it; extra keys are harmless there). Used by
+    _resolve_comparison_before's fallback: when a variant has no exact match at
+    before_tag but does at after_tag, this fetches its own true previous build's
+    row directly (found via _variant_previous_tag) instead of giving up."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            row = session.run(
+                """
+                MATCH (ib:IB {tag: $tag, arch: $arch})
+                OPTIONAL MATCH (ib)-[:RAN_RELVAL]->(relval:RelVal)
+                WITH ib, collect(DISTINCT relval) AS relvals
+                OPTIONAL MATCH (ib)-[:RAN_UNITTEST]->(unit_test:UnitTest)
+                WITH ib, relvals, collect(DISTINCT unit_test) AS unit_tests
+                OPTIONAL MATCH (ib)-[:REPORTED]->(warning:Warning)
+                WITH ib, relvals, unit_tests, collect(DISTINCT warning) AS warnings
+                RETURN ib.tag AS tag, coalesce(ib.parent_tag, ib.tag) AS primary_tag, ib.arch AS arch,
+                       coalesce(ib.variant, 'primary') AS variant,
+                       coalesce(ib.comp_warnings, 0) AS build_warnings,
+                       coalesce(ib.ignored_warnings, 0) AS ignored_warnings,
+                       size(warnings) AS clang_locations,
+                       reduce(total = 0, item IN warnings | total + coalesce(item.count, 0)) AS clang_occurrences,
+                       size(relvals) AS relval_total,
+                       size([item IN relvals WHERE item.status = 'FAILED'
+                             AND coalesce(item.known_error, false) = false]) AS relval_failed,
+                       reduce(total = 0, item IN relvals | total + coalesce(item.errors, 0)) AS relval_errors,
+                       reduce(total = 0, item IN relvals | total + coalesce(item.warnings, 0)) AS relval_warnings,
+                       size(unit_tests) AS unit_test_total,
+                       size([item IN unit_tests WHERE item.status = 'FAILED']) AS unit_test_failed,
+                       reduce(total = 0, item IN unit_tests | total + coalesce(item.errors, 0)) AS unit_test_errors,
+                       [item IN relvals WHERE item.status = 'FAILED'
+                        AND coalesce(item.known_error, false) = false |
+                           {workflow_id: item.workflow_id, name: item.name, errors: item.errors,
+                            warnings: item.warnings, exitcode: item.exitcode}
+                       ] AS failing_relvals
+                """,
+                tag=tag, arch=arch,
+            ).single()
+    finally:
+        driver.close()
+    return dict(row) if row else None
+
+
+def _resolve_comparison_before(variant: str, arch: str, before_tag: str, after: dict | None) -> tuple[dict | None, str | None]:
+    """Chat-comparison counterpart to generate_shift_summary's _variant_diff_baseline
+    fallback policy, adapted to full metric+failing-workflow rows (not just a
+    failing-list) since _ib_comparison_answer/_all_arch_ib_comparison_answer report
+    full metric deltas, not only failing workflows. Applies ONLY to the before
+    (previous) side, NEVER after_tag/latest -- you can't substitute a "future" build
+    for the one the shifter explicitly asked about, so a variant missing at
+    after_tag keeps the existing exact-match-only "no imported record" behavior
+    unchanged; only call this once `after` is already known to exist.
+
+    When this variant has no exact match at before_tag, look up its own true
+    previous build (via _variant_previous_tag, same unbounded release-series-scoped
+    lookback the digest uses -- a sub-IB's own last known state is the right
+    comparison even several days back) and fetch that build's full row instead of
+    giving up. Returns (row_or_None, note_or_None); note is only set when a
+    substitution actually happened, worded the same way as generate_shift_summary's
+    "Sub-IB baselines:" notes so a shifter never mistakes a several-day-old
+    comparison for a same-window one. Returns (None, None) when no earlier build of
+    this variant exists at all -- callers keep today's "no imported record"
+    behavior for that case, unchanged."""
+    if after is None:
+        return None, None
+    variant_key = None if variant == "primary" else variant
+    substitute_tag = _variant_previous_tag(after["tag"], variant_key, arch)
+    if not substitute_tag:
+        return None, None
+    row = _single_ib_comparison_row(substitute_tag, arch)
+    if not row:
+        return None, None
+    note = (
+        f"`{variant}` has no build at `{before_tag}` -- compared against its own "
+        f"previous build `{substitute_tag}` instead."
+    )
+    return row, note
+
+
 def _all_arch_ib_comparison_answer(question: str) -> str | None:
     """Compare imported IB facts across every architecture (plus each architecture's
     sub-IBs, e.g. ASAN/CLANG/MULTIARCHS/NONLTO) without LLM tool calls."""
@@ -3648,23 +3731,47 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
     ]
     exit_code_names = get_exit_code_names()
 
-    def render_block(variant: str, records: dict[str, dict], all_variants: dict[str, dict[str, dict]]) -> list[str]:
+    def render_block(
+        variant: str, records: dict[str, dict], substitution_note: str | None, all_variants: dict[str, dict[str, dict]],
+    ) -> list[str]:
         before = records.get(before_tag)
         after = records.get(after_tag)
         if not before or not after:
             missing = before_tag if not before else after_tag
             return [f"`{missing}` has no imported record here."]
-        return _render_metric_deltas(before, after, metrics, before_tag, after_tag) + _render_failing_workflows(
+        block = [substitution_note] if substitution_note else []
+        block.extend(_render_metric_deltas(before, after, metrics, before_tag, after_tag))
+        block.extend(_render_failing_workflows(
             before, after, before_tag, after_tag, exit_code_names, variant, all_variants
-        )
+        ))
+        return block
 
     lines = ["## All-architecture IB comparison"]
     for arch, by_variant in sorted(by_arch_variant.items()):
+        # Resolve every variant's own-previous-build fallback for this architecture
+        # in one pass BEFORE rendering anything -- see the identical comment in
+        # _ib_comparison_answer for why lazily resolving inside render_block would
+        # leave "primary" (always rendered first) blind to a sub-IB's substitution.
+        substitution_notes: dict[str, str] = {}
+        for variant, records in by_variant.items():
+            if before_tag in records:
+                continue
+            after = records.get(after_tag)
+            if not after:
+                continue
+            before, note = _resolve_comparison_before(variant, arch, before_tag, after)
+            if before:
+                records[before_tag] = before
+            if note:
+                substitution_notes[variant] = note
+
         lines.extend(["", f"### `{arch}`"])
-        lines.extend(render_block("primary", by_variant.get("primary", {}), by_variant))
+        lines.extend(render_block(
+            "primary", by_variant.get("primary", {}), substitution_notes.get("primary"), by_variant
+        ))
         for variant in sorted(v for v in by_variant if v != "primary"):
             lines.extend(["", f"#### `{variant}`"])
-            lines.extend(render_block(variant, by_variant[variant], by_variant))
+            lines.extend(render_block(variant, by_variant[variant], substitution_notes.get(variant), by_variant))
     lines.append("")
     lines.append("Build warnings are CMS queue-summary counts; Clang values are parsed diagnostics. Missing values are shown as zero only when that IB architecture record is imported.")
     return "\n".join(lines)
@@ -4410,6 +4517,26 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
         ("Unit-test errors", "unit_test_errors"),
     ]
     exit_code_names = get_exit_code_names()
+    # Resolve every variant's own-previous-build fallback in one pass BEFORE
+    # rendering anything, so cross-variant "Also failing in" lookups (which scan
+    # the full by_variant map inside _render_failing_workflows) see every variant's
+    # resolved before-row regardless of render order -- "primary" always renders
+    # first (see the sort key below), so resolving lazily inside the render loop
+    # would leave primary's own cross-references blind to a sub-IB's substitution
+    # that hasn't happened yet.
+    substitution_notes: dict[str, str] = {}
+    for variant, records in by_variant.items():
+        if before_tag in records:
+            continue
+        after = records.get(after_tag)
+        if not after:
+            continue
+        before, note = _resolve_comparison_before(variant, arch, before_tag, after)
+        if before:
+            records[before_tag] = before
+        if note:
+            substitution_notes[variant] = note
+
     lines = [f"## IB comparison: {arch}"]
     for variant in sorted(by_variant, key=lambda v: (v != "primary", v)):
         records = by_variant[variant]
@@ -4420,6 +4547,8 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
             missing = before_tag if not before else after_tag
             lines.append(f"`{missing}` has no imported record for this sub-IB on `{arch}`.")
             continue
+        if variant in substitution_notes:
+            lines.append(substitution_notes[variant])
         lines.extend(_render_metric_deltas(before, after, metrics, before_tag, after_tag))
         lines.extend(
             _render_failing_workflows(before, after, before_tag, after_tag, exit_code_names, variant, by_variant)
