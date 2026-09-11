@@ -33,7 +33,7 @@ from tools import (  # noqa: E402
     get_relval_exception_evidence, get_relval_recurrence, get_relval_workflow_ids, get_shift_summary,
     get_unittest_names, relval_failure_architectures, search_concepts,
     search_workflow_ids, store_shift_summary, top_recurring_relval_failures,
-    latest_and_previous_primary_tags, variant_previous_tag,
+    latest_and_previous_primary_tags, variant_previous_tag, single_ib_status,
 )
 from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # noqa: E402
 from server.llm_client import DEFAULT_MODEL, get_client  # noqa: E402
@@ -4074,25 +4074,6 @@ def _build_and_addon_status(previous_tag: str, latest_tag: str) -> dict[tuple[st
     return {(row["tag"], row["arch"]): row for row in rows}
 
 
-def _ib_status(tag: str, arch: str) -> dict | None:
-    """Single-IB build_status/addon_status lookup -- the fallback-path counterpart
-    to _build_and_addon_status, which only ever looks up the shift's own
-    previous_tag/latest_tag pair. Used when a sub-IB variant has no build at
-    previous_tag and _variant_previous_tag resolved a substituted tag to look up
-    instead."""
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            row = session.run(
-                "MATCH (ib:IB {tag:$tag, arch:$arch}) "
-                "RETURN ib.build_status AS build_status, ib.addon_status AS addon_status",
-                tag=tag, arch=arch,
-            ).single()
-    finally:
-        driver.close()
-    return dict(row) if row else None
-
-
 def _variant_status_entry(
     variant: str, arch: str, previous_tag: str,
     before_status_by_variant: dict[str, dict], after_status_by_variant: dict[str, dict],
@@ -4119,7 +4100,7 @@ def _variant_status_entry(
             False,
         )
     return (
-        _ib_status(own_previous_tag, arch),
+        single_ib_status(own_previous_tag, arch),
         f"`{variant_name}` has no build at `{previous_tag}` -- compared its Build/AddOn "
         f"status against its own previous build `{own_previous_tag}` instead.",
         True,
