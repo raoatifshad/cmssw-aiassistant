@@ -22,13 +22,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from neo4j_conn import get_driver  # noqa: E402
 from tools import (  # noqa: E402
     get_build_failures, get_failing_relvals, get_failing_unittests, get_relval_recurrence, list_ib_tags,
-    find_relval_regressions,
+    find_relval_regressions, find_unittest_regressions, find_build_regressions,
 )
 
 
 RULE_TYPES = {
     "relval_failure_count", "relval_recurrence", "latest_ib_stalled",
-    "unittest_failure_count", "build_failure_count", "relval_regression",
+    "unittest_failure_count", "build_failure_count",
+    "relval_regression", "unittest_regression", "build_regression",
 }
 
 
@@ -198,6 +199,62 @@ def _check_relval_regression(params: dict, threshold: float) -> tuple[bool, str,
     }
 
 
+def _check_unittest_regression(params: dict, threshold: float) -> tuple[bool, str, dict]:
+    """Same shape as _check_relval_regression, for UnitTest failures: fires on any
+    unit test newly failing since the previous build, across DEFAULT and every
+    sub-IB (each against its own previous build) in one combined check."""
+    arch = params.get("arch")
+    result = find_unittest_regressions(arch)
+    if result["latest_tag"] is None:
+        return False, "Fewer than two primary builds are imported; nothing to compare yet.", {}
+    newly_failing = result["newly_failing"]
+    count = len(newly_failing)
+    triggered = count >= threshold
+    lines = [
+        f"{count} unit test(s) newly failing since the previous build "
+        f"(`{result['previous_tag']}` -> `{result['latest_tag']}`)"
+        f"{f' on `{arch}`' if arch else ''} (threshold {threshold:g}):"
+    ]
+    for item in newly_failing[:20]:
+        lines.append(f"- `{item['name']}` on `{item['arch']}` [{item['variant']}]")
+    if count > 20:
+        lines.append(f"... and {count - 20} more.")
+    message = "\n".join(lines)
+    return triggered, message, {
+        "count": count, "latest_tag": result["latest_tag"], "previous_tag": result["previous_tag"],
+        "newly_failing": newly_failing,
+    }
+
+
+def _check_build_regression(params: dict, threshold: float) -> tuple[bool, str, dict]:
+    """Same shape as _check_relval_regression, for the whole-architecture
+    build_status/addon_status badges: fires when any badge (Build or AddOn --
+    covered together, see find_build_regressions) flips to 'error' since the
+    previous build, across DEFAULT and every sub-IB (each against its own previous
+    build). threshold=1 means "fire on any badge flip at all"."""
+    arch = params.get("arch")
+    result = find_build_regressions(arch)
+    if result["latest_tag"] is None:
+        return False, "Fewer than two primary builds are imported; nothing to compare yet.", {}
+    newly_failing = result["newly_failing"]
+    count = len(newly_failing)
+    triggered = count >= threshold
+    lines = [
+        f"{count} Build/AddOn badge(s) newly in error since the previous build "
+        f"(`{result['previous_tag']}` -> `{result['latest_tag']}`)"
+        f"{f' on `{arch}`' if arch else ''} (threshold {threshold:g}):"
+    ]
+    for item in newly_failing[:20]:
+        lines.append(f"- {item['kind']} on `{item['arch']}` [{item['variant']}]")
+    if count > 20:
+        lines.append(f"... and {count - 20} more.")
+    message = "\n".join(lines)
+    return triggered, message, {
+        "count": count, "latest_tag": result["latest_tag"], "previous_tag": result["previous_tag"],
+        "newly_failing": newly_failing,
+    }
+
+
 _CHECKS = {
     "relval_failure_count": _check_relval_failure_count,
     "relval_recurrence": _check_relval_recurrence,
@@ -205,6 +262,8 @@ _CHECKS = {
     "unittest_failure_count": _check_unittest_failure_count,
     "build_failure_count": _check_build_failure_count,
     "relval_regression": _check_relval_regression,
+    "unittest_regression": _check_unittest_regression,
+    "build_regression": _check_build_regression,
 }
 
 

@@ -776,6 +776,147 @@ def find_relval_regressions(arch: str | None = None) -> dict:
     return {"latest_tag": latest_tag, "previous_tag": previous_tag, "newly_failing": newly_failing}
 
 
+def find_unittest_regressions(arch: str | None = None) -> dict:
+    """Same policy as find_relval_regressions, for UnitTest failures instead of
+    RelVal workflows: DEFAULT (primary) diffs against its fixed previous build,
+    each sub-IB present at the latest build diffs against ITS OWN previous build
+    when it has no exact match at previous_tag. "Does this variant exist at
+    previous_tag" is checked via get_unittest_names (any status), never via
+    get_failing_unittests's before-rows alone, for the identical reason
+    find_relval_regressions checks existence via get_relval_workflow_ids -- a
+    variant with a real zero-failure baseline is otherwise indistinguishable from
+    one that doesn't exist at previous_tag at all. Backs the unittest_regression
+    alert rule."""
+    tags = latest_and_previous_primary_tags(arch)
+    if not tags:
+        return {"latest_tag": None, "previous_tag": None, "newly_failing": []}
+    latest_tag, previous_tag = tags
+
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            architectures = [
+                row["arch"] for row in session.run(
+                    "MATCH (ib:IB {tag:$tag}) WHERE $arch IS NULL OR ib.arch = $arch "
+                    "RETURN DISTINCT ib.arch AS arch",
+                    tag=latest_tag, arch=arch,
+                )
+            ]
+    finally:
+        driver.close()
+
+    newly_failing = []
+    for one_arch in architectures:
+        after_rows = get_failing_unittests(latest_tag, arch=one_arch, limit=200, include_sub_ibs=True)
+        before_rows = get_failing_unittests(previous_tag, arch=one_arch, limit=200, include_sub_ibs=True)
+        before_ran_variants = {
+            row["variant"] for row in get_unittest_names(previous_tag, arch=one_arch, include_sub_ibs=True)
+        }
+        before_names_by_variant: dict[str | None, set[str]] = {}
+        for row in before_rows:
+            before_names_by_variant.setdefault(row["variant"], set()).add(row["name"])
+        after_by_variant: dict[str | None, list[dict]] = {}
+        for row in after_rows:
+            after_by_variant.setdefault(row["variant"], []).append(row)
+
+        for variant, rows in after_by_variant.items():
+            if variant in before_ran_variants:
+                before_names = before_names_by_variant.get(variant, set())
+            else:
+                own_current_tag = rows[0]["ib_tag"]
+                own_previous_tag = variant_previous_tag(own_current_tag, variant, one_arch)
+                if not own_previous_tag:
+                    continue  # no baseline at all -- can't claim anything is newly failing
+                before_names = {
+                    r["name"] for r in
+                    get_failing_unittests(own_previous_tag, arch=one_arch, limit=200, include_sub_ibs=True)
+                }
+            for row in rows:
+                if row["name"] not in before_names:
+                    newly_failing.append({"variant": variant or "primary", "arch": one_arch, "name": row["name"]})
+
+    return {"latest_tag": latest_tag, "previous_tag": previous_tag, "newly_failing": newly_failing}
+
+
+def single_ib_status(tag: str, arch: str) -> dict | None:
+    """Single-IB build_status/addon_status lookup by exact tag+arch -- the
+    fallback-path counterpart to a bulk (tag, arch) status query, used when a
+    variant has no build at a reference tag and variant_previous_tag resolved a
+    substituted tag to look up instead. Shared by server.api_server's chat
+    comparison (_variant_status_entry) and find_build_regressions."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            row = session.run(
+                "MATCH (ib:IB {tag:$tag, arch:$arch}) "
+                "RETURN ib.build_status AS build_status, ib.addon_status AS addon_status",
+                tag=tag, arch=arch,
+            ).single()
+    finally:
+        driver.close()
+    return dict(row) if row else None
+
+
+def find_build_regressions(arch: str | None = None) -> dict:
+    """Same policy as find_relval_regressions, for the whole-architecture
+    build_status/addon_status badges instead of a per-item failure list: DEFAULT
+    diffs against its fixed previous build, each sub-IB diffs against ITS OWN
+    previous build. A regression here means a badge flipped from anything other
+    than 'error' TO 'error' -- the same transition server.api_server's
+    _status_diff_rows already detects for the chat comparison and shift digest,
+    applied dynamically to "latest vs previous" instead of two explicitly-named
+    tags. Backs the build_regression alert rule, which covers BOTH Build and AddOn
+    in one check since both are the identical "single flag per architecture+variant"
+    shape -- there is no per-item AddOn test data anywhere in this graph to check
+    more granularly (see the codebase's explicit "no addon_* rule type" note)."""
+    tags = latest_and_previous_primary_tags(arch)
+    if not tags:
+        return {"latest_tag": None, "previous_tag": None, "newly_failing": []}
+    latest_tag, previous_tag = tags
+
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB) WHERE (ib.tag IN $tags OR ib.parent_tag IN $tags) "
+                "AND ($arch IS NULL OR ib.arch = $arch) "
+                "RETURN ib.tag AS tag, ib.arch AS arch, coalesce(ib.variant, '') AS variant, "
+                "ib.parent_tag AS parent_tag, ib.build_status AS build_status, "
+                "ib.addon_status AS addon_status",
+                tags=[latest_tag, previous_tag], arch=arch,
+            )]
+    finally:
+        driver.close()
+
+    by_arch_variant: dict[str, dict[str, list[dict]]] = {}
+    for row in rows:
+        by_arch_variant.setdefault(row["arch"], {}).setdefault(row["variant"], []).append(row)
+
+    newly_failing = []
+    for one_arch, by_variant in by_arch_variant.items():
+        for variant, variant_rows in by_variant.items():
+            after_entry = next(
+                (r for r in variant_rows if r["tag"] == latest_tag or r["parent_tag"] == latest_tag), None,
+            )
+            if not after_entry:
+                continue
+            before_entry = next(
+                (r for r in variant_rows if r["tag"] == previous_tag or r["parent_tag"] == previous_tag), None,
+            )
+            if not before_entry:
+                own_previous_tag = variant_previous_tag(after_entry["tag"], variant or None, one_arch)
+                before_entry = single_ib_status(own_previous_tag, one_arch) if own_previous_tag else None
+            before_build = before_entry.get("build_status") if before_entry else None
+            before_addon = before_entry.get("addon_status") if before_entry else None
+            variant_name = variant or "primary"
+            if after_entry.get("build_status") == "error" and before_build != "error":
+                newly_failing.append({"variant": variant_name, "arch": one_arch, "kind": "build"})
+            if after_entry.get("addon_status") == "error" and before_addon != "error":
+                newly_failing.append({"variant": variant_name, "arch": one_arch, "kind": "addon"})
+
+    return {"latest_tag": latest_tag, "previous_tag": previous_tag, "newly_failing": newly_failing}
+
+
 def get_build_failures(ib_tag: str, arch: str | None = None, limit: int = 50) -> list[dict]:
     """Architectures with a queue-summary compilation build_status of 'error'
     for an IB, including sub-IBs when given a primary tag. This is the

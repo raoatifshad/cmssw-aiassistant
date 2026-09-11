@@ -5,8 +5,10 @@ from graph.alerts import (
     RULE_TYPES,
     _CHECKS,
     _check_build_failure_count,
+    _check_build_regression,
     _check_relval_regression,
     _check_unittest_failure_count,
+    _check_unittest_regression,
     create_rule,
     evaluate_rules,
 )
@@ -22,6 +24,12 @@ class RuleTypeRegistrationTests(unittest.TestCase):
     def test_relval_regression_rule_type_is_registered(self):
         self.assertIn("relval_regression", RULE_TYPES)
         self.assertIn("relval_regression", _CHECKS)
+
+    def test_unittest_and_build_regression_rule_types_are_registered(self):
+        self.assertIn("unittest_regression", RULE_TYPES)
+        self.assertIn("unittest_regression", _CHECKS)
+        self.assertIn("build_regression", RULE_TYPES)
+        self.assertIn("build_regression", _CHECKS)
 
     @patch("graph.alerts.get_driver")
     def test_create_rule_accepts_relval_regression(self, get_driver):
@@ -178,6 +186,82 @@ class CheckRelvalRegressionTests(unittest.TestCase):
         _check_relval_regression({"arch": "el9_amd64_gcc14"}, threshold=1)
 
         find_regressions.assert_called_once_with("el9_amd64_gcc14")
+
+
+class CheckUnittestRegressionTests(unittest.TestCase):
+    @patch("graph.alerts.find_unittest_regressions")
+    def test_triggers_when_newly_failing_count_meets_threshold(self, find_regressions):
+        find_regressions.return_value = {
+            "latest_tag": "CMSSW_20_1_X_2026-09-08-2300", "previous_tag": "CMSSW_20_1_X_2026-09-07-2300",
+            "newly_failing": [{"variant": "UBSAN", "arch": "el9_amd64_gcc14", "name": "FlakyTest"}],
+        }
+
+        triggered, message, evidence = _check_unittest_regression({}, threshold=1)
+
+        self.assertTrue(triggered)
+        self.assertEqual(evidence["count"], 1)
+        self.assertIn("1 unit test(s) newly failing", message)
+        self.assertIn("`FlakyTest`", message)
+
+    @patch("graph.alerts.find_unittest_regressions")
+    def test_does_not_trigger_with_no_newly_failing_tests(self, find_regressions):
+        find_regressions.return_value = {
+            "latest_tag": "CMSSW_20_1_X_2026-09-08-2300", "previous_tag": "CMSSW_20_1_X_2026-09-07-2300",
+            "newly_failing": [],
+        }
+
+        triggered, _, evidence = _check_unittest_regression({}, threshold=1)
+
+        self.assertFalse(triggered)
+        self.assertEqual(evidence["count"], 0)
+
+    @patch("graph.alerts.find_unittest_regressions")
+    def test_reports_gracefully_when_fewer_than_two_builds_imported(self, find_regressions):
+        find_regressions.return_value = {"latest_tag": None, "previous_tag": None, "newly_failing": []}
+
+        triggered, message, evidence = _check_unittest_regression({}, threshold=1)
+
+        self.assertFalse(triggered)
+        self.assertEqual(evidence, {})
+        self.assertIn("Fewer than two primary builds", message)
+
+
+class CheckBuildRegressionTests(unittest.TestCase):
+    @patch("graph.alerts.find_build_regressions")
+    def test_triggers_on_a_build_badge_flip(self, find_regressions):
+        find_regressions.return_value = {
+            "latest_tag": "CMSSW_20_1_X_2026-09-08-2300", "previous_tag": "CMSSW_20_1_X_2026-09-07-2300",
+            "newly_failing": [{"variant": "primary", "arch": "el9_amd64_gcc14", "kind": "build"}],
+        }
+
+        triggered, message, evidence = _check_build_regression({}, threshold=1)
+
+        self.assertTrue(triggered)
+        self.assertEqual(evidence["count"], 1)
+        self.assertIn("1 Build/AddOn badge(s) newly in error", message)
+        self.assertIn("build on", message)
+
+    @patch("graph.alerts.find_build_regressions")
+    def test_does_not_trigger_with_no_badge_flips(self, find_regressions):
+        find_regressions.return_value = {
+            "latest_tag": "CMSSW_20_1_X_2026-09-08-2300", "previous_tag": "CMSSW_20_1_X_2026-09-07-2300",
+            "newly_failing": [],
+        }
+
+        triggered, _, evidence = _check_build_regression({}, threshold=1)
+
+        self.assertFalse(triggered)
+        self.assertEqual(evidence["count"], 0)
+
+    @patch("graph.alerts.find_build_regressions")
+    def test_reports_gracefully_when_fewer_than_two_builds_imported(self, find_regressions):
+        find_regressions.return_value = {"latest_tag": None, "previous_tag": None, "newly_failing": []}
+
+        triggered, message, evidence = _check_build_regression({}, threshold=1)
+
+        self.assertFalse(triggered)
+        self.assertEqual(evidence, {})
+        self.assertIn("Fewer than two primary builds", message)
 
 
 class EvaluateRulesDispatchTests(unittest.TestCase):

@@ -4,6 +4,7 @@ from unittest.mock import patch
 from graph.tools import (
     _ib_sort_key, diff_warnings, find_prs_before_ib, find_prs_merged_between, list_ib_tags,
     latest_and_previous_primary_tags, variant_previous_tag, find_relval_regressions,
+    find_unittest_regressions, find_build_regressions, single_ib_status,
 )
 
 
@@ -206,6 +207,212 @@ class FindRelvalRegressionsTests(unittest.TestCase):
         result = find_relval_regressions("el9_amd64_gcc14")
 
         self.assertEqual(result["newly_failing"], [])
+
+
+class FindUnittestRegressionsTests(unittest.TestCase):
+    """Same policy as FindRelvalRegressionsTests, for UnitTest failures."""
+
+    @patch("graph.tools.variant_previous_tag")
+    @patch("graph.tools.get_unittest_names")
+    @patch("graph.tools.get_failing_unittests")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_reports_no_baseline_when_fewer_than_two_builds_imported(
+        self, latest_and_previous, get_driver, get_failing, get_ut_names, variant_previous,
+    ):
+        latest_and_previous.return_value = None
+
+        result = find_unittest_regressions()
+
+        self.assertEqual(result, {"latest_tag": None, "previous_tag": None, "newly_failing": []})
+        get_failing.assert_not_called()
+
+    @patch("graph.tools.variant_previous_tag")
+    @patch("graph.tools.get_unittest_names")
+    @patch("graph.tools.get_failing_unittests")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_primary_zero_failure_baseline_is_not_a_fallback_case(
+        self, latest_and_previous, get_driver, get_failing, get_ut_names, variant_previous,
+    ):
+        # Same ambiguity find_relval_regressions guards against: primary existing
+        # at previous_tag with zero failures must not look like "doesn't exist".
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-09-08-2300", "CMSSW_20_1_X_2026-09-07-2300")
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"arch": "el9_amd64_gcc14"}]
+        get_ut_names.return_value = [{"variant": None, "name": "SomeTest"}]
+        get_failing.side_effect = lambda tag, arch=None, limit=None, include_sub_ibs=False: (
+            [{"ib_tag": tag, "variant": None, "name": "NewlyFailingTest"}]
+            if tag == "CMSSW_20_1_X_2026-09-08-2300" else []
+        )
+
+        result = find_unittest_regressions("el9_amd64_gcc14")
+
+        self.assertEqual(
+            result["newly_failing"],
+            [{"variant": "primary", "arch": "el9_amd64_gcc14", "name": "NewlyFailingTest"}],
+        )
+        variant_previous.assert_not_called()
+
+    @patch("graph.tools.variant_previous_tag")
+    @patch("graph.tools.get_unittest_names", return_value=[])
+    @patch("graph.tools.get_failing_unittests")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_sub_ib_missing_at_previous_tag_falls_back_to_its_own_previous_build(
+        self, latest_and_previous, get_driver, get_failing, get_ut_names, variant_previous,
+    ):
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-09-08-1100", "CMSSW_20_1_X_2026-09-07-2300")
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"arch": "el9_amd64_gcc14"}]
+        variant_previous.return_value = "CMSSW_20_1_UBSAN_X_2026-09-03-1100"
+
+        def get_failing_side_effect(tag, arch=None, limit=None, include_sub_ibs=False):
+            if tag == "CMSSW_20_1_X_2026-09-08-1100":
+                return [{"ib_tag": "CMSSW_20_1_UBSAN_X_2026-09-08-1100", "variant": "UBSAN", "name": "FlakyTest"}]
+            if tag == "CMSSW_20_1_UBSAN_X_2026-09-03-1100":
+                return [{"ib_tag": tag, "variant": "UBSAN", "name": "FlakyTest"}]
+            return []
+
+        get_failing.side_effect = get_failing_side_effect
+
+        result = find_unittest_regressions("el9_amd64_gcc14")
+
+        variant_previous.assert_called_once_with(
+            "CMSSW_20_1_UBSAN_X_2026-09-08-1100", "UBSAN", "el9_amd64_gcc14"
+        )
+        self.assertEqual(result["newly_failing"], [])
+
+
+class SingleIbStatusTests(unittest.TestCase):
+    @patch("graph.tools.get_driver")
+    def test_returns_build_and_addon_status_for_the_exact_tag(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {"build_status": "error", "addon_status": "passed"}
+
+        result = single_ib_status("CMSSW_20_1_CLANG_X_2026-09-06-2300", "el9_amd64_gcc14")
+
+        self.assertEqual(result, {"build_status": "error", "addon_status": "passed"})
+
+    @patch("graph.tools.get_driver")
+    def test_returns_none_when_no_such_ib_node(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = None
+
+        self.assertIsNone(single_ib_status("CMSSW_20_1_CLANG_X_2026-01-01-0000", "el9_amd64_gcc14"))
+
+
+class FindBuildRegressionsTests(unittest.TestCase):
+    """Covers BOTH Build and AddOn transitions in one check, since both are the
+    same "single flag per architecture+variant" shape."""
+
+    @patch("graph.tools.variant_previous_tag")
+    @patch("graph.tools.single_ib_status")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_reports_no_baseline_when_fewer_than_two_builds_imported(
+        self, latest_and_previous, get_driver, single_ib, variant_previous,
+    ):
+        latest_and_previous.return_value = None
+
+        result = find_build_regressions()
+
+        self.assertEqual(result, {"latest_tag": None, "previous_tag": None, "newly_failing": []})
+
+    @patch("graph.tools.variant_previous_tag")
+    @patch("graph.tools.single_ib_status")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_primary_build_flip_to_error_is_a_regression(
+        self, latest_and_previous, get_driver, single_ib, variant_previous,
+    ):
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-09-08-2300", "CMSSW_20_1_X_2026-09-07-2300")
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"tag": "CMSSW_20_1_X_2026-09-07-2300", "arch": "el9_amd64_gcc14", "variant": "",
+             "parent_tag": None, "build_status": "passed", "addon_status": "passed"},
+            {"tag": "CMSSW_20_1_X_2026-09-08-2300", "arch": "el9_amd64_gcc14", "variant": "",
+             "parent_tag": None, "build_status": "error", "addon_status": "passed"},
+        ]
+
+        result = find_build_regressions("el9_amd64_gcc14")
+
+        self.assertEqual(
+            result["newly_failing"],
+            [{"variant": "primary", "arch": "el9_amd64_gcc14", "kind": "build"}],
+        )
+        variant_previous.assert_not_called()
+
+    @patch("graph.tools.variant_previous_tag")
+    @patch("graph.tools.single_ib_status")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_staying_in_error_is_not_a_new_regression(
+        self, latest_and_previous, get_driver, single_ib, variant_previous,
+    ):
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-09-08-2300", "CMSSW_20_1_X_2026-09-07-2300")
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"tag": "CMSSW_20_1_X_2026-09-07-2300", "arch": "el9_amd64_gcc14", "variant": "",
+             "parent_tag": None, "build_status": "error", "addon_status": "passed"},
+            {"tag": "CMSSW_20_1_X_2026-09-08-2300", "arch": "el9_amd64_gcc14", "variant": "",
+             "parent_tag": None, "build_status": "error", "addon_status": "passed"},
+        ]
+
+        result = find_build_regressions("el9_amd64_gcc14")
+
+        self.assertEqual(result["newly_failing"], [])
+
+    @patch("graph.tools.variant_previous_tag")
+    @patch("graph.tools.single_ib_status")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_sub_ib_missing_at_previous_tag_falls_back_to_its_own_previous_build(
+        self, latest_and_previous, get_driver, single_ib, variant_previous,
+    ):
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-09-08-1100", "CMSSW_20_1_X_2026-09-07-2300")
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        # CLANG has no row at all for previous_tag (CMSSW_20_1_X_2026-09-07-2300).
+        session.run.return_value = [
+            {"tag": "CMSSW_20_1_CLANG_X_2026-09-08-1100", "arch": "el9_amd64_gcc14", "variant": "CLANG",
+             "parent_tag": "CMSSW_20_1_X_2026-09-08-1100", "build_status": "error", "addon_status": "passed"},
+        ]
+        variant_previous.return_value = "CMSSW_20_1_CLANG_X_2026-09-06-2300"
+        single_ib.return_value = {"build_status": "passed", "addon_status": "passed"}
+
+        result = find_build_regressions("el9_amd64_gcc14")
+
+        variant_previous.assert_called_once_with(
+            "CMSSW_20_1_CLANG_X_2026-09-08-1100", "CLANG", "el9_amd64_gcc14"
+        )
+        single_ib.assert_called_once_with("CMSSW_20_1_CLANG_X_2026-09-06-2300", "el9_amd64_gcc14")
+        self.assertEqual(
+            result["newly_failing"],
+            [{"variant": "CLANG", "arch": "el9_amd64_gcc14", "kind": "build"}],
+        )
+
+    @patch("graph.tools.variant_previous_tag", return_value=None)
+    @patch("graph.tools.single_ib_status")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_addon_flip_is_detected_independently_of_build(
+        self, latest_and_previous, get_driver, single_ib, variant_previous,
+    ):
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-09-08-2300", "CMSSW_20_1_X_2026-09-07-2300")
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"tag": "CMSSW_20_1_X_2026-09-07-2300", "arch": "el9_amd64_gcc14", "variant": "",
+             "parent_tag": None, "build_status": "passed", "addon_status": "passed"},
+            {"tag": "CMSSW_20_1_X_2026-09-08-2300", "arch": "el9_amd64_gcc14", "variant": "",
+             "parent_tag": None, "build_status": "passed", "addon_status": "error"},
+        ]
+
+        result = find_build_regressions("el9_amd64_gcc14")
+
+        self.assertEqual(
+            result["newly_failing"],
+            [{"variant": "primary", "arch": "el9_amd64_gcc14", "kind": "addon"}],
+        )
 
 
 class FindPrsMergedBetweenTests(unittest.TestCase):
