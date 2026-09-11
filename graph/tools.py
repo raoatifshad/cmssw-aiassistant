@@ -630,6 +630,152 @@ def get_unittest_names(ib_tag: str, arch: str | None = None, include_sub_ibs: bo
     return rows
 
 
+_PRIMARY_IB_TAG_RE = re.compile(r"^CMSSW_(\d+)_(\d+)_X_(\d{4}-\d{2}-\d{2}-\d{4})$")
+
+
+def latest_and_previous_primary_tags(arch: str | None = None) -> tuple[str, str] | None:
+    """Return (latest_tag, previous_tag): the two most recent primary builds within
+    the newest (highest major.minor) release series, or None if fewer than two
+    exist. Lives here (not server/api_server.py) so both the chat "compare two
+    latest" resolution and the standalone alerts module (graph/alerts.py -- no
+    FastAPI/server dependency by design) can resolve the same "what counts as the
+    current default comparison window" without either depending on the other.
+    server.api_server._latest_and_previous_ib_tags delegates here."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB) "
+                "WHERE ($arch IS NULL OR ib.arch = $arch) "
+                "AND ib.tag =~ '^CMSSW_[0-9]+_[0-9]+_X_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' "
+                "RETURN DISTINCT ib.tag AS tag",
+                arch=arch,
+            )]
+    finally:
+        driver.close()
+    if not rows:
+        return None
+
+    def version_key(tag: str) -> tuple[int, int, str]:
+        major, minor, timestamp = _PRIMARY_IB_TAG_RE.match(tag).groups()
+        return (int(major), int(minor), timestamp)
+
+    keyed = [(version_key(row["tag"]), row["tag"]) for row in rows]
+    newest_series = max(key[:2] for key, _ in keyed)
+    timestamps = sorted({key[2] for key, _ in keyed if key[:2] == newest_series}, reverse=True)
+    if len(timestamps) < 2:
+        return None
+    major, minor = newest_series
+    latest_tag = f"CMSSW_{major}_{minor}_X_{timestamps[0]}"
+    previous_tag = f"CMSSW_{major}_{minor}_X_{timestamps[1]}"
+    return latest_tag, previous_tag
+
+
+def variant_previous_tag(current_tag: str, variant: str | None, arch: str) -> str | None:
+    """Find the build of this exact sub-IB variant+arch that immediately preceded
+    current_tag, scoped to the same release series (matching the recurrence-scoping
+    convention used elsewhere, e.g. server.api_server._workflow_evidence_cells) --
+    crossing into a different release series would compare against a different
+    codebase entirely, not a meaningful regression signal. Used as a fallback
+    whenever a variant (primary or sub-IB) has no build at some reference tag (a
+    real, common case -- e.g. CPP23 only ever builds on -1100 tags and skips days),
+    so a persistently-failing workflow isn't misreported as newly failing just
+    because that variant's own build cadence doesn't line up with whatever window
+    the caller is anchored to. Returns None (not a graceful-message string) when no
+    earlier build of this variant exists at all in the series, so the caller can
+    distinguish "no prior build to compare against" from "compared and nothing
+    changed". server.api_server._variant_previous_tag delegates here."""
+    series_match = re.match(r"^CMSSW_(\d+)_(\d+)_", current_tag)
+    if not series_match:
+        return None
+    series_prefix = f"CMSSW_{series_match.group(1)}_{series_match.group(2)}_"
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            row = session.run(
+                "MATCH (ib:IB {arch:$arch}) "
+                "WHERE coalesce(ib.variant, '') = coalesce($variant, '') "
+                "AND ib.tag STARTS WITH $series_prefix AND ib.tag < $current_tag "
+                "RETURN ib.tag AS tag ORDER BY ib.tag DESC LIMIT 1",
+                arch=arch, variant=variant, series_prefix=series_prefix, current_tag=current_tag,
+            ).single()
+    finally:
+        driver.close()
+    return row["tag"] if row else None
+
+
+def find_relval_regressions(arch: str | None = None) -> dict:
+    """Compare the latest primary build against its previous build, and every
+    sub-IB present at the latest build against ITS OWN previous build (same policy
+    variant_previous_tag/server.api_server._resolve_comparison_before use for the
+    chat comparison, applied uniformly to primary too here -- primary is just
+    another variant, variant=None, with the same "does it have a build at the
+    reference tag, and if not, fall back" resolution). Returns every newly-failing
+    RelVal workflow found either way -- backs the relval_regression alert rule,
+    which notifies on any regression since the last build across the whole
+    DEFAULT+sub-IB landscape, unlike the other alert rule types which check a
+    currently-failing count against one fixed, pre-configured tag.
+
+    Scoped to arch when given; when arch is None, checks every architecture that
+    has an imported primary record at the latest tag -- DEFAULT itself is not a
+    fixed architecture list (it can be 2 architectures on one build and 5 on the
+    next), and each sub-IB can have its own architecture set too."""
+    tags = latest_and_previous_primary_tags(arch)
+    if not tags:
+        return {"latest_tag": None, "previous_tag": None, "newly_failing": []}
+    latest_tag, previous_tag = tags
+
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            architectures = [
+                row["arch"] for row in session.run(
+                    "MATCH (ib:IB {tag:$tag}) WHERE $arch IS NULL OR ib.arch = $arch "
+                    "RETURN DISTINCT ib.arch AS arch",
+                    tag=latest_tag, arch=arch,
+                )
+            ]
+    finally:
+        driver.close()
+
+    newly_failing = []
+    for one_arch in architectures:
+        after_rows = get_failing_relvals(latest_tag, arch=one_arch, limit=200)
+        before_rows = get_failing_relvals(previous_tag, arch=one_arch, limit=200)
+        # "Does this variant's IB node exist at all at previous_tag" must be checked
+        # via positive proof (any status, not just FAILED) -- get_relval_workflow_ids,
+        # never via "does it have a FAILING row" (get_failing_relvals's before_rows):
+        # a variant with a real zero-failure baseline is otherwise indistinguishable
+        # from one that doesn't exist at previous_tag at all, since both produce an
+        # empty/missing entry -- the identical ambiguity _variant_diff_baseline in
+        # server/api_server.py already had to guard against for the chat comparison.
+        before_ran_variants = {row["variant"] for row in get_relval_workflow_ids(previous_tag, arch=one_arch)}
+        before_ids_by_variant: dict[str | None, set[str]] = {}
+        for row in before_rows:
+            before_ids_by_variant.setdefault(row["variant"], set()).add(row["workflow_id"])
+        after_by_variant: dict[str | None, list[dict]] = {}
+        for row in after_rows:
+            after_by_variant.setdefault(row["variant"], []).append(row)
+
+        for variant, rows in after_by_variant.items():
+            if variant in before_ran_variants:
+                before_ids = before_ids_by_variant.get(variant, set())
+            else:
+                own_current_tag = rows[0]["ib_tag"]
+                own_previous_tag = variant_previous_tag(own_current_tag, variant, one_arch)
+                if not own_previous_tag:
+                    continue  # no baseline at all -- can't claim anything is newly failing
+                before_ids = {r["workflow_id"] for r in get_failing_relvals(own_previous_tag, arch=one_arch, limit=200)}
+            for row in rows:
+                if row["workflow_id"] not in before_ids:
+                    newly_failing.append({
+                        "variant": variant or "primary", "arch": one_arch,
+                        "workflow_id": row["workflow_id"], "name": row["name"],
+                    })
+
+    return {"latest_tag": latest_tag, "previous_tag": previous_tag, "newly_failing": newly_failing}
+
+
 def get_build_failures(ib_tag: str, arch: str | None = None, limit: int = 50) -> list[dict]:
     """Architectures with a queue-summary compilation build_status of 'error'
     for an IB, including sub-IBs when given a primary tag. This is the

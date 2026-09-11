@@ -33,6 +33,7 @@ from tools import (  # noqa: E402
     get_relval_exception_evidence, get_relval_recurrence, get_relval_workflow_ids, get_shift_summary,
     get_unittest_names, relval_failure_architectures, search_concepts,
     search_workflow_ids, store_shift_summary, top_recurring_relval_failures,
+    latest_and_previous_primary_tags, variant_previous_tag,
 )
 from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # noqa: E402
 from server.llm_client import DEFAULT_MODEL, get_client  # noqa: E402
@@ -1168,35 +1169,12 @@ def _latest_ib_records(arch: str | None = None) -> list[dict]:
 
 def _latest_and_previous_ib_tags(arch: str | None = None) -> tuple[str, str] | None:
     """Return (latest_tag, previous_tag): the two most recent builds within the
-    newest (highest major.minor) release series, or None if fewer than two exist."""
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            rows = [dict(record) for record in session.run(
-                "MATCH (ib:IB) "
-                "WHERE ($arch IS NULL OR ib.arch = $arch) "
-                "AND ib.tag =~ '^CMSSW_[0-9]+_[0-9]+_X_[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' "
-                "RETURN DISTINCT ib.tag AS tag",
-                arch=arch,
-            )]
-    finally:
-        driver.close()
-    if not rows:
-        return None
-
-    def version_key(tag: str) -> tuple[int, int, str]:
-        major, minor, timestamp = _PRIMARY_IB_TAG_RE.match(tag).groups()
-        return (int(major), int(minor), timestamp)
-
-    keyed = [(version_key(row["tag"]), row["tag"]) for row in rows]
-    newest_series = max(key[:2] for key, _ in keyed)
-    timestamps = sorted({key[2] for key, _ in keyed if key[:2] == newest_series}, reverse=True)
-    if len(timestamps) < 2:
-        return None
-    major, minor = newest_series
-    latest_tag = f"CMSSW_{major}_{minor}_X_{timestamps[0]}"
-    previous_tag = f"CMSSW_{major}_{minor}_X_{timestamps[1]}"
-    return latest_tag, previous_tag
+    newest (highest major.minor) release series, or None if fewer than two exist.
+    Delegates to graph.tools.latest_and_previous_primary_tags, which lives there
+    (not here) so the standalone alerts module can resolve the same window without
+    depending on server/api_server.py -- kept as a thin wrapper here rather than
+    replacing every call site, since existing tests patch this exact name."""
+    return latest_and_previous_primary_tags(arch)
 
 
 def _latest_and_days_ago_ib_tags(days: int, arch: str | None = None) -> tuple[str, str] | None:
@@ -3818,34 +3796,12 @@ def _ib_pair_architectures(previous_tag: str, latest_tag: str) -> list[str]:
 
 def _variant_previous_tag(current_tag: str, variant: str | None, arch: str) -> str | None:
     """Find the build of this exact sub-IB variant+arch that immediately preceded
-    current_tag, scoped to the same release series (matching the recurrence-scoping
-    convention used elsewhere, e.g. _workflow_evidence_cells) -- crossing into a
-    different release series would compare against a different codebase entirely,
-    not a meaningful regression signal. Used as a fallback in generate_shift_summary
-    when a sub-IB has no build at the shift's exact previous_tag date (a real,
-    common case -- e.g. CPP23 only ever builds on -1100 tags and skips days), so a
-    persistently-failing sub-IB workflow isn't misreported as newly failing just
-    because its own build cadence doesn't line up with the primary's. Returns None
-    (not a graceful-message string) when no earlier build of this variant exists at
-    all in the series, so the caller can distinguish "no prior build to compare
-    against" from "compared and nothing changed"."""
-    series_match = re.match(r"^CMSSW_(\d+)_(\d+)_", current_tag)
-    if not series_match:
-        return None
-    series_prefix = f"CMSSW_{series_match.group(1)}_{series_match.group(2)}_"
-    driver = get_driver()
-    try:
-        with driver.session() as session:
-            row = session.run(
-                "MATCH (ib:IB {arch:$arch}) "
-                "WHERE coalesce(ib.variant, '') = coalesce($variant, '') "
-                "AND ib.tag STARTS WITH $series_prefix AND ib.tag < $current_tag "
-                "RETURN ib.tag AS tag ORDER BY ib.tag DESC LIMIT 1",
-                arch=arch, variant=variant, series_prefix=series_prefix, current_tag=current_tag,
-            ).single()
-    finally:
-        driver.close()
-    return row["tag"] if row else None
+    current_tag. Delegates to graph.tools.variant_previous_tag, which lives there
+    (not here) so the standalone alerts module's relval_regression rule can reuse
+    the identical fallback policy without depending on server/api_server.py --
+    kept as a thin wrapper here rather than replacing every call site, since
+    existing tests patch this exact name."""
+    return variant_previous_tag(current_tag, variant, arch)
 
 
 def _group_relvals_by_variant(rows: list[dict]) -> dict[str, list[dict]]:

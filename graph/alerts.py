@@ -22,12 +22,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 from neo4j_conn import get_driver  # noqa: E402
 from tools import (  # noqa: E402
     get_build_failures, get_failing_relvals, get_failing_unittests, get_relval_recurrence, list_ib_tags,
+    find_relval_regressions,
 )
 
 
 RULE_TYPES = {
     "relval_failure_count", "relval_recurrence", "latest_ib_stalled",
-    "unittest_failure_count", "build_failure_count",
+    "unittest_failure_count", "build_failure_count", "relval_regression",
 }
 
 
@@ -159,12 +160,51 @@ def _check_latest_ib_stalled(params: dict, threshold: float) -> tuple[bool, str,
     return triggered, message, {"hours_stale": hours_stale, "tag": tag}
 
 
+def _check_relval_regression(params: dict, threshold: float) -> tuple[bool, str, dict]:
+    """Unlike every other rule type here, this doesn't check a currently-failing
+    count against one fixed, pre-configured tag -- it dynamically resolves
+    "latest vs previous build" each time it runs (find_relval_regressions) and
+    fires on any workflow that's genuinely NEW since then. DEFAULT and every
+    sub-IB present at the latest build are covered in one combined check: DEFAULT
+    diffs against the fixed previous_tag, each sub-IB diffs against its own true
+    previous build (same fallback policy the chat comparison and shift digest use)
+    since sub-IB build cadence rarely lines up with DEFAULT's. threshold=1 means
+    "fire on any newly-failing workflow at all" -- set higher only to tolerate a
+    small amount of regression noise before alerting.
+
+    params: {"arch": "<arch>"} optional -- omit to check every architecture that
+    has an imported primary record at the latest build (DEFAULT is not a fixed
+    architecture list; it can be 2 architectures on one build and 5 on the next)."""
+    arch = params.get("arch")
+    result = find_relval_regressions(arch)
+    if result["latest_tag"] is None:
+        return False, "Fewer than two primary builds are imported; nothing to compare yet.", {}
+    newly_failing = result["newly_failing"]
+    count = len(newly_failing)
+    triggered = count >= threshold
+    lines = [
+        f"{count} RelVal workflow(s) newly failing since the previous build "
+        f"(`{result['previous_tag']}` -> `{result['latest_tag']}`)"
+        f"{f' on `{arch}`' if arch else ''} (threshold {threshold:g}):"
+    ]
+    for item in newly_failing[:20]:
+        lines.append(f"- `{item['workflow_id']}` ({item['name']}) on `{item['arch']}` [{item['variant']}]")
+    if count > 20:
+        lines.append(f"... and {count - 20} more.")
+    message = "\n".join(lines)
+    return triggered, message, {
+        "count": count, "latest_tag": result["latest_tag"], "previous_tag": result["previous_tag"],
+        "newly_failing": newly_failing,
+    }
+
+
 _CHECKS = {
     "relval_failure_count": _check_relval_failure_count,
     "relval_recurrence": _check_relval_recurrence,
     "latest_ib_stalled": _check_latest_ib_stalled,
     "unittest_failure_count": _check_unittest_failure_count,
     "build_failure_count": _check_build_failure_count,
+    "relval_regression": _check_relval_regression,
 }
 
 

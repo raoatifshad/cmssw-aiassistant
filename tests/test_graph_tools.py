@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from graph.tools import (
     _ib_sort_key, diff_warnings, find_prs_before_ib, find_prs_merged_between, list_ib_tags,
+    latest_and_previous_primary_tags, variant_previous_tag, find_relval_regressions,
 )
 
 
@@ -39,6 +40,172 @@ class FindPrsBeforeIbTests(unittest.TestCase):
 
         query = session.run.call_args.args[0]
         self.assertIn("ORDER BY p.merged_at IS NULL, p.merged_at DESC", query)
+
+
+class LatestAndPreviousPrimaryTagsTests(unittest.TestCase):
+    """Moved here from server/api_server.py (server.api_server._latest_and_previous_ib_tags
+    now delegates to this) so the standalone alerts module can resolve the same
+    "current default comparison window" without depending on the server module."""
+
+    @patch("graph.tools.get_driver")
+    def test_picks_the_newest_release_series_two_most_recent_timestamps(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"tag": "CMSSW_20_1_X_2026-09-06-2300"},
+            {"tag": "CMSSW_20_1_X_2026-09-07-2300"},
+            {"tag": "CMSSW_20_1_X_2026-09-08-2300"},
+            {"tag": "CMSSW_20_0_X_2026-09-08-2300"},  # older series, must not win
+        ]
+
+        result = latest_and_previous_primary_tags("el9_amd64_gcc14")
+
+        self.assertEqual(result, ("CMSSW_20_1_X_2026-09-08-2300", "CMSSW_20_1_X_2026-09-07-2300"))
+
+    @patch("graph.tools.get_driver")
+    def test_returns_none_when_fewer_than_two_builds_in_the_newest_series(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"tag": "CMSSW_20_1_X_2026-09-08-2300"}]
+
+        self.assertIsNone(latest_and_previous_primary_tags("el9_amd64_gcc14"))
+
+    @patch("graph.tools.get_driver")
+    def test_returns_none_when_nothing_imported(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = []
+
+        self.assertIsNone(latest_and_previous_primary_tags())
+
+
+class VariantPreviousTagTests(unittest.TestCase):
+    """Moved here from server/api_server.py (server.api_server._variant_previous_tag
+    now delegates to this)."""
+
+    @patch("graph.tools.get_driver")
+    def test_scopes_to_same_release_series_and_same_variant(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {"tag": "CMSSW_20_1_CPP23_X_2026-08-27-1100"}
+
+        result = variant_previous_tag("CMSSW_20_1_CPP23_X_2026-09-01-1100", "CPP23", "el9_amd64_gcc14")
+
+        self.assertEqual(result, "CMSSW_20_1_CPP23_X_2026-08-27-1100")
+        query, params = session.run.call_args.args[0], session.run.call_args.kwargs
+        self.assertIn("ib.tag STARTS WITH $series_prefix", query)
+        self.assertIn("ib.tag < $current_tag", query)
+        self.assertEqual(params["series_prefix"], "CMSSW_20_1_")
+        self.assertEqual(params["variant"], "CPP23")
+
+    @patch("graph.tools.get_driver")
+    def test_returns_none_when_no_earlier_build_exists(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = None
+
+        self.assertIsNone(variant_previous_tag("CMSSW_20_1_CPP23_X_2026-07-28-1100", "CPP23", "el9_amd64_gcc14"))
+
+
+class FindRelvalRegressionsTests(unittest.TestCase):
+    """find_relval_regressions backs the relval_regression alert rule type -- the
+    first alert that fires on an actual regression since the last build, rather
+    than a currently-failing count against one fixed, pre-configured tag."""
+
+    @patch("graph.tools.variant_previous_tag")
+    @patch("graph.tools.get_failing_relvals")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_reports_no_baseline_when_fewer_than_two_builds_imported(
+        self, latest_and_previous, get_driver, get_failing, variant_previous,
+    ):
+        latest_and_previous.return_value = None
+
+        result = find_relval_regressions()
+
+        self.assertEqual(result, {"latest_tag": None, "previous_tag": None, "newly_failing": []})
+        get_failing.assert_not_called()
+
+    @patch("graph.tools.get_relval_workflow_ids")
+    @patch("graph.tools.variant_previous_tag")
+    @patch("graph.tools.get_failing_relvals")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_primary_uses_the_fixed_previous_tag_no_fallback_needed(
+        self, latest_and_previous, get_driver, get_failing, variant_previous, get_relval_ids,
+    ):
+        # Primary exists at previous_tag with real proof (get_relval_workflow_ids,
+        # any status) even though it happened to have zero failures there --
+        # variant_previous_tag must never be consulted for it. Checking existence
+        # via get_failing_relvals's failing-only rows instead would wrongly treat
+        # this zero-failure baseline as "no exact match" and trigger a needless
+        # fallback (the exact bug this test caught during development).
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-09-08-2300", "CMSSW_20_1_X_2026-09-07-2300")
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"arch": "el9_amd64_gcc14"}]
+        get_relval_ids.return_value = [{"variant": None, "workflow_id": "0.0"}]
+        get_failing.side_effect = lambda tag, arch=None, limit=None: (
+            [{"ib_tag": tag, "variant": None, "workflow_id": "999.0", "name": "NewOne"}]
+            if tag == "CMSSW_20_1_X_2026-09-08-2300" else []
+        )
+
+        result = find_relval_regressions("el9_amd64_gcc14")
+
+        self.assertEqual(result["latest_tag"], "CMSSW_20_1_X_2026-09-08-2300")
+        self.assertEqual(
+            result["newly_failing"],
+            [{"variant": "primary", "arch": "el9_amd64_gcc14", "workflow_id": "999.0", "name": "NewOne"}],
+        )
+        variant_previous.assert_not_called()
+
+    @patch("graph.tools.get_relval_workflow_ids", return_value=[])
+    @patch("graph.tools.variant_previous_tag")
+    @patch("graph.tools.get_failing_relvals")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_sub_ib_missing_at_previous_tag_falls_back_to_its_own_previous_build(
+        self, latest_and_previous, get_driver, get_failing, variant_previous, get_relval_ids,
+    ):
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-09-08-1100", "CMSSW_20_1_X_2026-09-07-2300")
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"arch": "el9_amd64_gcc14"}]
+        variant_previous.return_value = "CMSSW_20_1_CPP23_X_2026-09-03-1100"
+
+        def get_failing_side_effect(tag, arch=None, limit=None):
+            if tag == "CMSSW_20_1_X_2026-09-08-1100":
+                return [{
+                    "ib_tag": "CMSSW_20_1_CPP23_X_2026-09-08-1100", "variant": "CPP23",
+                    "workflow_id": "140.051", "name": "RunMuonEG2022C",
+                }]
+            if tag == "CMSSW_20_1_CPP23_X_2026-09-03-1100":
+                return [{"ib_tag": tag, "variant": "CPP23", "workflow_id": "140.051", "name": "RunMuonEG2022C"}]
+            return []  # previous_tag itself has no CPP23 row at all
+
+        get_failing.side_effect = get_failing_side_effect
+
+        result = find_relval_regressions("el9_amd64_gcc14")
+
+        variant_previous.assert_called_once_with(
+            "CMSSW_20_1_CPP23_X_2026-09-08-1100", "CPP23", "el9_amd64_gcc14"
+        )
+        # Already failing in CPP23's own previous build -- not newly failing.
+        self.assertEqual(result["newly_failing"], [])
+
+    @patch("graph.tools.get_relval_workflow_ids", return_value=[])
+    @patch("graph.tools.variant_previous_tag", return_value=None)
+    @patch("graph.tools.get_failing_relvals")
+    @patch("graph.tools.get_driver")
+    @patch("graph.tools.latest_and_previous_primary_tags")
+    def test_sub_ib_with_no_earlier_build_at_all_is_not_reported(
+        self, latest_and_previous, get_driver, get_failing, variant_previous, get_relval_ids,
+    ):
+        latest_and_previous.return_value = ("CMSSW_20_1_X_2026-09-08-1100", "CMSSW_20_1_X_2026-09-07-2300")
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"arch": "el9_amd64_gcc14"}]
+        get_failing.side_effect = lambda tag, arch=None, limit=None: (
+            [{"ib_tag": "CMSSW_20_1_G4ADEPT_X_2026-09-08-1100", "variant": "G4ADEPT",
+              "workflow_id": "1.0", "name": "BrandNew"}]
+            if tag == "CMSSW_20_1_X_2026-09-08-1100" else []
+        )
+
+        result = find_relval_regressions("el9_amd64_gcc14")
+
+        self.assertEqual(result["newly_failing"], [])
 
 
 class FindPrsMergedBetweenTests(unittest.TestCase):
