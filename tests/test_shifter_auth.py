@@ -1,7 +1,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -209,6 +209,75 @@ class ProtectedEndpointTests(unittest.TestCase):
         response = self.client.get("/api/shift-summary", params={"from": "CMSSW_20_1_X_2026-08-20-2300"})
 
         self.assertEqual(response.status_code, 422)
+
+    @patch("server.shifter_auth.DEV_SHIFTER_LOGIN", True)
+    def test_release_explorer_failing_api_without_a_session_is_refused(self):
+        response = self.client.get(
+            "/api/release-explorer/failing", params={"tag": "CMSSW_20_1_X_2026-09-08-2300"}, follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 401)
+
+    @patch("server.api_server.get_exit_code_names", return_value={16640: "OtherCMS"})
+    @patch("server.api_server.get_failing_unittests")
+    @patch("server.api_server.get_failing_relvals")
+    def test_release_explorer_failing_api_queries_each_requested_arch_and_tags_variant(
+        self, get_relvals, get_unittests, get_exit_codes,
+    ):
+        # One architecture has a primary-build failure (variant=None -> "primary")
+        # plus a sub-IB failure (variant="CLANG"); the other has nothing -- both
+        # get_failing_relvals/get_failing_unittests calls happen (one per requested
+        # arch, since neither RETURNs its own arch column when arch is omitted), and
+        # every row in the response is tagged with the arch it was actually asked for.
+        def relvals_side_effect(tag, arch=None, limit=200):
+            if arch == "el9_amd64_gcc14":
+                return [
+                    {"ib_tag": tag, "variant": None, "workflow_id": 140.051, "name": "wf_a", "errors": 2, "exitcode": 16640},
+                    {"ib_tag": tag, "variant": "CLANG", "workflow_id": 25.0, "name": "wf_b", "errors": 1, "exitcode": 0},
+                ]
+            return []
+
+        def unittests_side_effect(tag, arch=None, limit=200, include_sub_ibs=False):
+            self.assertTrue(include_sub_ibs)
+            if arch == "el9_amd64_gcc14":
+                return [{"ib_tag": tag, "variant": None, "name": "FastSimulation/Utilities", "errors": 3}]
+            return []
+
+        get_relvals.side_effect = relvals_side_effect
+        get_unittests.side_effect = unittests_side_effect
+        app.dependency_overrides[require_shifter] = lambda: "alice"
+
+        response = self.client.get(
+            "/api/release-explorer/failing",
+            params={"tag": "CMSSW_20_1_X_2026-09-08-2300", "archs": "el9_amd64_gcc14,el9_aarch64_gcc14"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["tag"], "CMSSW_20_1_X_2026-09-08-2300")
+        self.assertEqual(
+            body["relvals"],
+            [
+                {
+                    "arch": "el9_amd64_gcc14", "variant": "primary", "workflow_id": 140.051,
+                    "name": "wf_a", "errors": 2, "exit_code": "16640 (OtherCMS)",
+                },
+                {
+                    "arch": "el9_amd64_gcc14", "variant": "CLANG", "workflow_id": 25.0,
+                    "name": "wf_b", "errors": 1, "exit_code": "0",
+                },
+            ],
+        )
+        self.assertEqual(
+            body["unittests"],
+            [{"arch": "el9_amd64_gcc14", "variant": "primary", "name": "FastSimulation/Utilities", "errors": 3}],
+        )
+        self.assertEqual(
+            get_relvals.call_args_list,
+            [
+                call("CMSSW_20_1_X_2026-09-08-2300", arch="el9_amd64_gcc14", limit=200),
+                call("CMSSW_20_1_X_2026-09-08-2300", arch="el9_aarch64_gcc14", limit=200),
+            ],
+        )
 
 
 if __name__ == "__main__":

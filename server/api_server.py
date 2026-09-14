@@ -5515,6 +5515,53 @@ def alerts_status(username: str = Depends(require_shifter)):
     return {"fired": len(notifier.fired), "alerts": notifier.fired}
 
 
+@app.get("/api/release-explorer/failing")
+def release_explorer_failing(tag: str, archs: str | None = None, username: str = Depends(require_shifter)):
+    """Structured (JSON, not markdown) failing-RelVal and failing-UnitTest lists for
+    one exact tag -- feeds the Shift Console's Release Explorer panel (separate repo,
+    cmssdt-18V), which lets a shifter pick any historical cycle/flavor/dated build via
+    its own pickers, independent of /api/shift-summary's own default live window. `tag`
+    is that build's release_name as the flavor's own static JSON already names it, which
+    is exactly this graph's IB tag -- no translation needed, including for a sub-IB
+    flavor (its release_name already *is* the sub-IB's own tag).
+
+    `archs` is a comma-separated architecture list -- the panel already knows exactly
+    which architectures that release covers (comparison.tests_archs), so it should
+    always be passed explicitly. get_failing_relvals/get_failing_unittests don't
+    RETURN an arch column (two IB nodes sharing the same tag but different
+    architectures are still separate matches when arch is omitted), so each
+    architecture is queried separately here and tagged with the arch that was asked
+    for -- omitting `archs` still works but every row comes back with arch=None.
+
+    Both queries pull in sub-IBs of a primary tag (get_failing_relvals always does;
+    get_failing_unittests is asked to via include_sub_ibs=True for symmetry) -- each
+    row's own `variant` says whether it's the primary build or a named sub-IB, so a
+    shifter isn't left guessing why this list can outnumber the flavor JSON's own
+    DEFAULT-only failing count."""
+    arch_list = [a.strip() for a in archs.split(",") if a.strip()] if archs else [None]
+    exit_code_names = get_exit_code_names()
+    relvals: list[dict] = []
+    unittests: list[dict] = []
+    for one_arch in arch_list:
+        for row in get_failing_relvals(tag, arch=one_arch, limit=200):
+            relvals.append({
+                "arch": one_arch,
+                "variant": row["variant"] or "primary",
+                "workflow_id": row["workflow_id"],
+                "name": row["name"],
+                "errors": row["errors"],
+                "exit_code": _format_exit_code(row["exitcode"], exit_code_names) if row.get("exitcode") else "0",
+            })
+        for row in get_failing_unittests(tag, arch=one_arch, limit=200, include_sub_ibs=True):
+            unittests.append({
+                "arch": one_arch,
+                "variant": row.get("variant") or "primary",
+                "name": row["name"],
+                "errors": row["errors"],
+            })
+    return {"tag": tag, "relvals": relvals, "unittests": unittests}
+
+
 @app.delete("/api/chat/{session_id}")
 def reset(session_id: str):
     _sessions.pop(session_id, None)
