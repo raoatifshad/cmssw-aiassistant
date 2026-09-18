@@ -551,6 +551,29 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("136.899", answer)
         get_failing_relvals.assert_called_once_with(tag, arch=None, limit=100)
 
+    @patch("server.api_server.get_relval_recurrence")
+    def test_relval_capability_answers_where_is_workflow_failing_with_no_tag(self, get_relval_recurrence):
+        # Regression: found live 2026-09-18 -- "537.0 where this workflow failing" (no
+        # IB tag at all, first turn of a fresh session) fell all the way through the
+        # "relval" capability's chain to the flat "No imported local evidence" message.
+        # _recurring_failure_answer is exactly the right handler for a bare workflow ID
+        # with no tag -- it was already in the chain -- but its trigger regex,
+        # _RECURRING_FAILURE_INTENT_RE, recognized "when ... fail" and never "where ...
+        # fail", so it never matched this phrasing and the question never reached it.
+        get_relval_recurrence.return_value = {
+            "workflow_id": "537.0", "name": "DYToLL012Jets_5FS_TuneCH3_13TeV_amcatnloFxFx_herwig7",
+            "total_appearances": 237, "failed_appearances": 36,
+            "failed_tags": ["CMSSW_20_1_X_2026-09-17-2300", "CMSSW_20_1_X_2026-09-16-2300"],
+        }
+        session_id = "relval-where-is-it-failing"
+        result = _execute_planned_capability("relval", "537.0 where this workflow failing", session_id)
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("failed in **36 of 237**", answer)
+        self.assertIn("CMSSW_20_1_X_2026-09-17-2300", answer)
+        get_relval_recurrence.assert_called_once_with("537.0")
+
     @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_failing_relvals")
     def test_relval_capability_lists_failing_workflows_for_what_are_failing_phrasing(
