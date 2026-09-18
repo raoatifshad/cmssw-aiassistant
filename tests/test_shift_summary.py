@@ -228,6 +228,12 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         self.assertIn("relevance only, do not prove a PR or Issue caused or fixed a failure", markdown)
         # the out-of-series tag must not be counted as an in-series recurrence
         self.assertIn("Failed in 2 prior build(s) this series", markdown)
+        # Regression (found live 2026-09-18, workflow 537.0 vs closed Issue #49849):
+        # the evidence lookup must be scoped to THIS row's own ib_tag -- the build
+        # that's actually newly failing -- not left unscoped to search the workflow's
+        # entire cross-release-series exception history and surface a stale,
+        # unrelated signature as if it were evidence for the current failure.
+        self.assertEqual(find_prs.call_args.kwargs.get("ib_tag"), new_row["ib_tag"])
 
     @patch("server.api_server.get_unittest_names", return_value=[])
     @patch("server.api_server.get_relval_workflow_ids", return_value=[])
@@ -253,7 +259,13 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
 
         self.assertIn("No prior appearance of this workflow ID in the imported graph", markdown)
-        self.assertIn("No PR/Issue in the imported graph matches this workflow's exception signature", markdown)
+        # No PR/Issue match -> the evidence cell is empty, not a placeholder sentence --
+        # a shifter should see nothing rather than text implying a search came up empty
+        # (see _workflow_evidence_cells; this used to render the placeholder text below).
+        self.assertNotIn("No PR/Issue in the imported graph matches this workflow's exception signature", markdown)
+        self.assertIn("| `999.0` | BrandNewWorkflow", markdown)
+        row_line = next(line for line in markdown.splitlines() if line.startswith("| `999.0`"))
+        self.assertTrue(row_line.rstrip().endswith("|  |"), row_line)
 
     @patch("server.api_server.get_unittest_names", return_value=[])
     @patch("server.api_server.get_relval_workflow_ids")
