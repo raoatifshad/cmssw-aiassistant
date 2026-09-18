@@ -2800,7 +2800,20 @@ def _workflow_recurrence_answer(workflow_id: str, recurrence: dict, session_id: 
         f"Workflow `{workflow_id}` (`{recurrence['name']}`) has failed in **{failed} of {total}** "
         f"imported record(s) ({rate:.0%}) across every architecture and IB seen so far."
     ]
-    if recurrence["failed_tags"]:
+    failed_records = recurrence.get("failed_records")
+    if failed_records:
+        # Each entry names its own sub-IB variant ("primary" for a non-sub-IB build)
+        # and architecture -- IB (tag, architecture) pairs are never merged (see
+        # module docstring's invariants), and a bare tag string alone is ambiguous
+        # both across sub-IBs and across the several architectures the same tag can
+        # fail on simultaneously (found live: workflow 537.0's list used to show the
+        # same primary tag twice with no way to tell the two architectures apart,
+        # while its real UBSAN/ROOT6 sub-IB failures never appeared at all).
+        entries = ", ".join(
+            f"`{record['tag']}` ({record['variant']}, `{record['arch']}`)" for record in failed_records
+        )
+        lines.append("Most recent failing builds: " + entries)
+    elif recurrence.get("failed_tags"):
         lines.append("Most recent failing builds: " + ", ".join(f"`{tag}`" for tag in recurrence["failed_tags"]))
     lines.append(
         "This counts every imported IB/architecture combination, not just the one currently discussed — "

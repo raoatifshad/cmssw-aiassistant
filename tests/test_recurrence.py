@@ -8,21 +8,84 @@ from server.api_server import (
 )
 
 
+def _relval_row(tag, name="RunMuonEG2022C", status="FAILED", arch="el9_amd64_gcc14", variant="primary"):
+    return {"name": name, "status": status, "tag": tag, "arch": arch, "variant": variant}
+
+
 class RecurringFailureTests(unittest.TestCase):
     @patch("graph.tools.get_driver")
     def test_get_relval_recurrence_computes_failure_rate(self, get_driver):
         session = get_driver.return_value.session.return_value.__enter__.return_value
-        session.run.return_value = [{
-            "name": "RunMuonEG2022C",
-            "total_appearances": 441,
-            "failed_appearances": 258,
-            "failed_tags": ["CMSSW_20_1_X_2026-08-17-2300", "CMSSW_20_1_X_2026-08-17-1100"],
-        }]
+        session.run.return_value = (
+            [_relval_row("CMSSW_20_1_X_2026-08-17-2300"), _relval_row("CMSSW_20_1_X_2026-08-17-1100")]
+            + [_relval_row(f"CMSSW_20_1_X_2026-08-{n:02d}-2300", status="PASSED") for n in range(1, 17)]
+        )
 
         result = get_relval_recurrence("140.051")
 
-        self.assertEqual(result["total_appearances"], 441)
-        self.assertEqual(result["failed_appearances"], 258)
+        self.assertEqual(result["total_appearances"], 18)
+        self.assertEqual(result["failed_appearances"], 2)
+        self.assertEqual(
+            [record["tag"] for record in result["failed_records"]],
+            ["CMSSW_20_1_X_2026-08-17-2300", "CMSSW_20_1_X_2026-08-17-1100"],
+        )
+
+    @patch("graph.tools.get_driver")
+    def test_get_relval_recurrence_does_not_crowd_out_sub_ib_failures(self, get_driver):
+        # Regression: found live 2026-09-18, workflow 537.0. A sub-IB's tag (e.g.
+        # CMSSW_20_1_UBSAN_X_...) always sorts alphabetically BEFORE its primary's
+        # tag (CMSSW_20_1_X_...) purely because every variant name starts with a
+        # letter earlier than "X" -- the old Cypher-side `ORDER BY ib.tag DESC`
+        # therefore always ranked every primary-build failure ahead of every sub-IB
+        # failure regardless of actual date, so a genuinely more recent sub-IB
+        # failure (ROOT6, 09-16) got silently dropped from a count-capped list full
+        # of older primary-build entries (several architectures, 09-11 through
+        # 09-15). Re-sorting by _ib_sort_key in Python must recover it and rank it
+        # ahead of the older primary entries.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        primary_tags = [
+            f"CMSSW_20_1_X_2026-09-{day}-2300" for day in ("11", "12", "13", "14", "15")
+        ]
+        session.run.return_value = (
+            [_relval_row(tag, name="SomeWorkflow") for tag in primary_tags]
+            + [_relval_row(
+                "CMSSW_20_1_ROOT6_X_2026-09-16-2300", name="SomeWorkflow",
+                arch="el9_aarch64_gcc14", variant="ROOT6",
+            )]
+        )
+
+        result = get_relval_recurrence("537.0")
+
+        tags_in_order = [record["tag"] for record in result["failed_records"]]
+        self.assertEqual(tags_in_order[0], "CMSSW_20_1_ROOT6_X_2026-09-16-2300")
+        self.assertIn("CMSSW_20_1_ROOT6_X_2026-09-16-2300", tags_in_order)
+
+    @patch("graph.tools.get_driver")
+    def test_get_relval_recurrence_scopes_to_the_current_era_when_a_number_is_reused(self, get_driver):
+        # Regression: found live 2026-09-18. workflow_id "537.0" has 237 occurrences
+        # named "DYToLL012Jets_5FS_..." (the current, actual workflow) and a separate
+        # 5 occurrences named "DYToLL012Jets_5FS_...+...+HARVESTGEN" from an unrelated,
+        # much older era -- the same number reassigned to a physically different
+        # workflow. The old implementation aggregated with no explicit GROUP BY,
+        # which implicitly grouped by `name` and picked between the two arbitrarily
+        # (observed flipping across a plain database restart, no code change at
+        # all). Must always resolve to the name/count of the MOST RECENT occurrence.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = (
+            [_relval_row(f"CMSSW_20_1_X_2026-09-{n:02d}-2300", name="CurrentWorkflow",
+                         status="FAILED" if n in (11, 17) else "PASSED") for n in range(10, 18)]
+            + [_relval_row(f"CMSSW_10_6_ASAN_X_2020-01-{n:02d}-2300", name="OldEraWorkflow+HARVESTGEN",
+                           arch="slc7_amd64_gcc700", variant="ASAN") for n in range(1, 6)]
+        )
+
+        result = get_relval_recurrence("537.0")
+
+        self.assertEqual(result["name"], "CurrentWorkflow")
+        self.assertEqual(result["total_appearances"], 8)
+        self.assertEqual(result["failed_appearances"], 2)
+        self.assertTrue(all(
+            record["tag"].startswith("CMSSW_20_1_X_") for record in result["failed_records"]
+        ))
 
     @patch("graph.tools.get_driver")
     def test_get_relval_recurrence_reports_zero_for_an_unknown_workflow(self, get_driver):

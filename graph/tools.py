@@ -227,25 +227,74 @@ def search_concepts(question: str, limit: int = 5) -> list[dict]:
 def get_relval_recurrence(workflow_id: str) -> dict:
     """How often has this workflow failed across every imported IB, not just
     the one currently being discussed? Computed at query time from data
-    already ingested -- no scheduled job needed, always current."""
-    rows = _run_query(
-        "MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal {workflow_id:$workflow_id}) "
-        "WITH relval.name AS name, ib, relval "
-        "ORDER BY ib.tag DESC "
-        "RETURN name, count(relval) AS total_appearances, "
-        "sum(CASE WHEN relval.status = 'FAILED' THEN 1 ELSE 0 END) AS failed_appearances, "
-        "collect(CASE WHEN relval.status = 'FAILED' THEN ib.tag ELSE null END)[0..10] AS failed_tags",
-        {"workflow_id": workflow_id},
-    )
-    if not rows or not rows[0]["total_appearances"]:
+    already ingested -- no scheduled job needed, always current.
+
+    A workflow_id is not a stable identity across CMSSW eras -- the same
+    number can be reassigned to a physically different workflow (a different
+    step composition, hence a different relval.name) when a later release
+    series' matrix changes what runs in that slot. Found live: workflow_id
+    "537.0" has 237 occurrences named "DYToLL012Jets_5FS_..." and a separate
+    5 occurrences named "DYToLL012Jets_5FS_...+...+HARVESTGEN" from an
+    unrelated, much older era. A naive `RETURN relval.name, count(relval),
+    ...` with no explicit GROUP BY implicitly groups by every non-aggregated
+    column including `name`, so it silently produces one row per distinct
+    name and reading the first row (the old behavior here) picked between
+    two unrelated workflows arbitrarily -- observed switching which one won
+    across a plain database restart, with no code change at all. Scoped
+    instead to the single most recent occurrence's name, so the answer is
+    always about the workflow slot as it exists in current data, never an
+    unpredictable blend of two workflows that happen to share a number.
+
+    failed_records (each {"tag", "arch", "variant"}, "primary" for a non-sub-IB
+    build) is sorted by _ib_sort_key (release series, then build timestamp)
+    rather than a flat ib.tag string sort -- a sub-IB's tag (e.g.
+    CMSSW_20_1_UBSAN_X_...) always sorts alphabetically BEFORE its primary's
+    tag (CMSSW_20_1_X_...) purely because every variant name starts with a
+    letter earlier than "X", regardless of actual date. A flat tag-string
+    sort therefore systematically crowds every sub-IB failure out of a
+    count-capped "most recent" list whenever the primary alone has enough
+    failing architectures to fill the cap. Found live, workflow 537.0: real
+    UBSAN/ROOT6 sub-IB failures existed in the graph but never appeared in
+    the old flat top-10, which showed only primary-build duplicates (the
+    same tag repeated once per failing architecture) with no way to tell
+    them apart either -- variant/arch are now explicit per record instead of
+    a bare, ambiguous tag string. failed_tags (bare tag strings, same
+    corrected order) is kept for existing callers that only need the tag.
+
+    Fetches every raw (name, status, tag, arch, variant) row directly (not
+    via _run_query, whose MAX_ROWS row-count cap would otherwise truncate a
+    heavily-recurring workflow's row set before this function can even
+    determine which name is current) -- same bypass pattern
+    get_failing_relvals/list_ib_tags already use, for the same reason."""
+    driver = get_driver()
+    try:
+        with driver.session() as s:
+            rows = [dict(r) for r in s.run(
+                "MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal {workflow_id:$workflow_id}) "
+                "RETURN relval.name AS name, relval.status AS status, "
+                "ib.tag AS tag, ib.arch AS arch, coalesce(ib.variant, 'primary') AS variant",
+                {"workflow_id": workflow_id},
+            )]
+    finally:
+        driver.close()
+    if not rows:
         return {"workflow_id": workflow_id, "total_appearances": 0}
-    row = rows[0]
+    current_name = max(rows, key=lambda r: _ib_sort_key(r["tag"]))["name"]
+    current = [r for r in rows if r["name"] == current_name]
+    failed_records = sorted(
+        (r for r in current if r["status"] == "FAILED"),
+        key=lambda r: _ib_sort_key(r["tag"]),
+        reverse=True,
+    )[:10]
     return {
         "workflow_id": workflow_id,
-        "name": row["name"],
-        "total_appearances": row["total_appearances"],
-        "failed_appearances": row["failed_appearances"],
-        "failed_tags": [tag for tag in row["failed_tags"] if tag],
+        "name": current_name,
+        "total_appearances": len(current),
+        "failed_appearances": sum(1 for r in current if r["status"] == "FAILED"),
+        "failed_records": [
+            {"tag": r["tag"], "arch": r["arch"], "variant": r["variant"]} for r in failed_records
+        ],
+        "failed_tags": [r["tag"] for r in failed_records],
     }
 
 
