@@ -2636,11 +2636,18 @@ def _failed_relval_list_answer(question: str, context: dict[str, str] | None) ->
     if not re.search(r"\b(?:errors?|fail(?:ing|ures?)?|relvals?)\b", question, re.IGNORECASE):
         return None
     rows = get_failing_relvals(context["tag"], arch=context["arch"], limit=100)
+    # context["arch"] is None when the caller never named one (a bare-tag mention
+    # still returns a context scoped to every imported architecture -- see
+    # _failing_relval_context) -- f-string-interpolating None literally renders the
+    # word "None" instead of omitting the clause (found live: "...and its sub-IBs on
+    # `None` are:"). Every other architecture-scoped message in this codebase already
+    # guards this (e.g. _latest_ib_answer's `f" for \`{arch}\`" if arch else ""`).
+    arch_clause = f" on `{context['arch']}`" if context.get("arch") else ""
     if not rows:
-        return f"No failing RelVals were found for `{context['tag']}` on `{context['arch']}`."
+        return f"No failing RelVals were found for `{context['tag']}`{arch_clause}."
     exit_code_names = get_exit_code_names()
     lines = [
-        f"The {len(rows)} failing RelVals for `{context['tag']}` and its sub-IBs on `{context['arch']}` are:",
+        f"The {len(rows)} failing RelVals for `{context['tag']}` and its sub-IBs{arch_clause} are:",
         "",
         "| Source IB | RelVal | Workflow ID | Errors | Exit code |",
         "| --- | --- | ---: | ---: | ---: |",
@@ -3058,9 +3065,13 @@ def _failed_relval_pr_answer(question: str, context: dict[str, str] | None) -> t
         rows = find_prs_for_error(failure["name"], ib_tag=context["tag"])
         matches.extend((failure["name"], row) for row in rows)
     if not matches:
+        # context["arch"] can be None (a bare-tag mention scopes to every imported
+        # architecture -- see _failing_relval_context) -- guard the same way
+        # _failed_relval_list_answer does, or this renders the literal word "None".
+        arch_clause = f" on `{context['arch']}`" if context.get("arch") else ""
         return (
             f"No direct PR evidence matching any of the {len(failures)} failed RelVal workflow names "
-            f"was found for `{context['tag']}` on `{context['arch']}`. "
+            f"was found for `{context['tag']}`{arch_clause}. "
             "The imported RelVal data has aggregate error counts, not detailed failure messages, so it cannot support stronger attribution.",
             [],
         )
