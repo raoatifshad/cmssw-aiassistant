@@ -4009,7 +4009,20 @@ def _workflow_evidence_cells(workflow_id: str, row: dict, latest_tag: str) -> tu
     # it failed in - not the bare workflow_id, which a PR/Issue essentially never quotes
     # (cms-bot posts every tested workflow ID in routine PR CI comments, so id-only
     # matching is noise, not evidence - see get_relval_exception_evidence's docstring).
-    exception_evidence = get_relval_exception_evidence(workflow_id, limit=5)
+    # Scoped to THIS row's own ib_tag (the build that's actually newly failing) -- an
+    # earlier version omitted ib_tag entirely, which let get_relval_exception_evidence
+    # search the workflow's ENTIRE cross-release-series exception history and surface a
+    # stale, unrelated signature as if it were evidence for the current failure. Found
+    # live, 2026-09-18: workflow 537.0 newly failed with exit code 62720 (SIGSEGV) on
+    # CMSSW_20_1_X_2026-09-17-2300 with zero RelValException rows recorded for that
+    # exact build, yet this cell was showing closed Issue #49849 -- which is entirely
+    # about a different exception ("ExternalLHEProducer: Child failed with exit code
+    # 1.") last recorded for 537.0 a build earlier (-09-16-2300) and, separately, about
+    # workflow 183.1 on CMSSW_16_1_X in its own title/body. Scoping by ib_tag means a
+    # workflow whose current failure has no recorded exception text (ES-export coverage
+    # is partial, see get_failing_relvals) now correctly shows no evidence instead of a
+    # misleadingly specific but wrong one.
+    exception_evidence = get_relval_exception_evidence(workflow_id, ib_tag=row.get("ib_tag"), limit=5)
     mentions = []
     for entry in exception_evidence:
         category = f"[{entry['category']}] " if entry.get("category") else ""
@@ -4020,10 +4033,14 @@ def _workflow_evidence_cells(workflow_id: str, row: dict, latest_tag: str) -> tu
             path = "issues" if match["kind"] == "Issue" else "pull"
             url = f"https://github.com/cms-sw/cmssw/{path}/{match['number']}"
             mentions.append(f"{category}[cmssw {match['kind']} #{match['number']}]({url}) ({state})")
-    if not mentions:
-        pr_cell = "No PR/Issue in the imported graph matches this workflow's exception signature."
-    else:
-        pr_cell = f"{', '.join(mentions[:5])} -- relevance only, {_RECURRENCE_EVIDENCE_CAVEAT.split(' and ')[-1]}"
+    # Empty (not a "no evidence" placeholder sentence) when nothing matched -- an empty
+    # pipe-table cell is a deliberate signal the frontend should render as "nothing here"
+    # (hide the evidence badge/row entirely), not text implying a search happened and
+    # came up empty. See the frontend coordination note for this change.
+    pr_cell = (
+        f"{', '.join(mentions[:5])} -- relevance only, {_RECURRENCE_EVIDENCE_CAVEAT.split(' and ')[-1]}"
+        if mentions else ""
+    )
 
     return _table_cell(recurrence_cell), _table_cell(pr_cell)
 
