@@ -576,6 +576,32 @@ class ChatRoutingTests(unittest.TestCase):
 
     @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_failing_relvals")
+    @patch("server.api_server._latest_and_previous_ib_tags")
+    def test_relval_capability_resolves_latest_release_phrasing_with_no_tag(
+        self, latest_tags, get_failing_relvals, get_exit_code_names
+    ):
+        # Regression: found live 2026-09-18 -- "what relvals are failing in latest
+        # release" (fresh session, no tag established yet) fell through to the flat
+        # "No imported local evidence" message. _is_latest_ib_question didn't
+        # recognize "release" as a synonym for "IB", so the "relval" capability's
+        # latest-resolution fallback never resolved "latest" into an actual tag.
+        tag = "CMSSW_20_1_ASAN_X_2026-08-24-2300"
+        latest_tags.return_value = (tag, "CMSSW_20_1_ASAN_X_2026-08-24-1100")
+        get_failing_relvals.return_value = [
+            {"ib_tag": tag, "name": "136.899", "workflow_id": "136.899", "errors": 3, "exitcode": 1},
+        ]
+        session_id = "relval-latest-release-no-tag"
+        result = _execute_planned_capability(
+            "relval", "what relvals are failing in latest release", session_id
+        )
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertIn("136.899", answer)
+        get_failing_relvals.assert_called_once_with(tag, arch=None, limit=100)
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_relvals")
     def test_relval_capability_lists_failing_workflows_for_what_are_failing_phrasing(
         self, get_failing_relvals, get_exit_code_names
     ):
@@ -2666,6 +2692,16 @@ class LatestTypoToleranceTests(unittest.TestCase):
 
     def test_is_latest_ib_question_tolerates_the_typo(self):
         self.assertTrue(_is_latest_ib_question("what workflows are failing in the lastest IB"))
+
+    def test_is_latest_ib_question_recognizes_release_as_a_synonym(self):
+        # Regression: found live 2026-09-18 -- "what relvals are failing in latest
+        # release" never matched at all, because this function required the literal
+        # word "ib"/"integration build" alongside "latest" and didn't know "release"
+        # is the same thing in CMSSW terminology (the tags themselves are named after
+        # a release series, e.g. CMSSW_20_1_X). A fresh session with no tag yet had
+        # no way to resolve "latest" into an actual tag and fell through to the flat
+        # "No imported local evidence" message even though real data was imported.
+        self.assertTrue(_is_latest_ib_question("what relvals are failing in latest release"))
 
     def test_is_latest_comparison_question_tolerates_the_typo(self):
         self.assertTrue(_is_latest_comparison_question("compare the lastest IB with the previous one"))

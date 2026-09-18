@@ -589,9 +589,14 @@ _LATEST_WORD_RE = r"latest|lastest|newest|most\s+recent|current"
 
 
 def _is_latest_ib_question(question: str) -> bool:
+    # "release" is a real, common CMSSW synonym for "IB" (the tags themselves are
+    # named after a release series, e.g. CMSSW_20_1_X) -- found live: "what relvals
+    # are failing in latest release" never matched this at all, so a fresh session
+    # with no prior tag had no way to resolve "latest" into an actual tag and fell
+    # through to the flat "No imported local evidence" message.
     return bool(
         re.search(rf"\b(?:{_LATEST_WORD_RE}|last)\b", question, re.IGNORECASE)
-        and re.search(r"\b(?:ib|integration\s+build)\b", question, re.IGNORECASE)
+        and re.search(r"\b(?:ib|integration\s+build|release)\b", question, re.IGNORECASE)
         and not re.search(r"\b(?:clang|warning)\b", question, re.IGNORECASE)
     )
 
@@ -4748,6 +4753,18 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
                 scoped_question = f"{question} {context_tag}"
                 if context_arch:
                     scoped_question = f"{scoped_question} {context_arch}"
+            elif _is_latest_ib_question(question):
+                # "what relvals are failing in the latest release/IB" with no
+                # prior session tag either -- resolve "latest" to the actual
+                # current tag the same way _latest_ib_answer does, instead of
+                # requiring the caller already know and type the literal tag
+                # string. Found live: "what relvals are failing in latest
+                # release" fell through to the flat "No imported local
+                # evidence" message even on a fresh session with real data
+                # imported.
+                latest_tags = _latest_and_previous_ib_tags()
+                if latest_tags:
+                    scoped_question = f"{question} {latest_tags[0]}"
         # Mirror the legacy waterfall's context bookkeeping (below, in chat()):
         # a natural non-keyword follow-up like "why are they failing" has no
         # "relval" category of its own, so RequestPlanner can't route it here
