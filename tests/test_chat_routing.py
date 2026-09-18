@@ -651,6 +651,47 @@ class ChatRoutingTests(unittest.TestCase):
 
     @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_failing_relvals")
+    def test_relval_list_answer_omits_arch_clause_when_arch_is_none(self, get_failing_relvals, get_exit_code_names):
+        # Regression: found live 2026-09-18 -- "what relvals are failing in
+        # CMSSW_20_1_X_2026-09-16-1100" (no architecture named) rendered the literal
+        # word "None" ("...and its sub-IBs on `None` are:") because context["arch"]
+        # was f-string-interpolated directly instead of being guarded the way every
+        # other architecture-scoped message in this codebase already is (see
+        # _relval_error_count_answer's `f" on \`{arch}\`" if arch else " across all
+        # imported architectures"` pattern).
+        context = {"tag": "CMSSW_20_1_X_2026-09-16-1100", "arch": None}
+        get_failing_relvals.return_value = [
+            {"ib_tag": "CMSSW_20_1_PY314_X_2026-09-16-1100", "name": "RelValQCD", "workflow_id": "511.0",
+             "errors": 0, "exitcode": 62720},
+        ]
+
+        answer = _failed_relval_list_answer("what relvals are failing in CMSSW_20_1_X_2026-09-16-1100", context)
+
+        self.assertNotIn("None", answer)
+        self.assertIn("and its sub-IBs are:", answer)
+
+    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.get_failing_relvals")
+    def test_relval_pr_answer_omits_arch_clause_when_arch_is_none(self, get_failing_relvals, find_prs_for_error):
+        # Same bug class as test_relval_list_answer_omits_arch_clause_when_arch_is_none,
+        # found in the sibling PR-evidence helper -- it had the exact same unguarded
+        # f-string interpolation of context["arch"].
+        from server.api_server import _failed_relval_pr_answer
+
+        context = {"tag": "CMSSW_20_1_X_2026-09-16-1100", "arch": None}
+        get_failing_relvals.return_value = [
+            {"ib_tag": "CMSSW_20_1_PY314_X_2026-09-16-1100", "name": "RelValQCD", "workflow_id": "511.0",
+             "errors": 0, "exitcode": 62720},
+        ]
+
+        result = _failed_relval_pr_answer("any pr related to these failures", context)
+
+        self.assertIsNotNone(result)
+        answer, _ = result
+        self.assertNotIn("None", answer)
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_relvals")
     def test_relval_capability_lists_failing_workflows_with_explicit_tag(
         self, get_failing_relvals, get_exit_code_names
     ):
