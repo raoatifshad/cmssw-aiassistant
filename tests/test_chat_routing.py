@@ -3521,6 +3521,72 @@ class IbComparisonAnswerTests(unittest.TestCase):
             answer,
         )
         self.assertIn("| `200.0` | NewWorkflow | 2 | 1 | Newly failing | - | - |", answer)
+        # The consolidated cross-architecture summary (added so a shifter sees what
+        # actually changed before scrolling past per-arch metric-delta detail) must
+        # also list this newly-failing workflow, and must appear before the detail.
+        self.assertIn("**Newly failing:**", answer)
+        self.assertIn("`200.0` (`NewWorkflow`) on `el9_amd64_gcc14` (CLANG)", answer)
+        self.assertLess(answer.index("**Newly failing:**"), answer.index("### `el9_amd64_gcc14`"))
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_driver")
+    def test_all_arch_comparison_leads_with_cross_architecture_change_summary(self, get_driver, get_exit_code_names):
+        # Regression: found live 2026-09-18 -- a real "all architectures" comparison
+        # buried the one thing that mattered (one newly-failing workflow) under six
+        # architectures of RelVal-warning-count churn and repeated sub-IB
+        # substitution notes. User's own words: "the shifter not only needs the
+        # interesting facts not noise" -- confirmed recommendation: lead with a
+        # consolidated Newly failing/Resolved section across ALL architectures
+        # before the per-architecture detail.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        base = {
+            "primary_tag": "CMSSW_20_1_X_2026-09-04-2300", "variant": "primary", "build_warnings": 0,
+            "ignored_warnings": 0, "clang_locations": 0, "clang_occurrences": 0, "relval_total": 10,
+            "relval_failed": 0, "relval_errors": 0, "relval_warnings": 0, "unit_test_total": 3,
+            "unit_test_failed": 0, "unit_test_errors": 0,
+        }
+        session.run.return_value = [
+            {**base, "tag": "CMSSW_20_1_X_2026-09-04-2300", "arch": "arch_a", "relval_failed": 0,
+             "failing_relvals": []},
+            {**base, "tag": "CMSSW_20_1_X_2026-09-06-2300", "arch": "arch_a", "relval_failed": 1,
+             "failing_relvals": [{"workflow_id": "537.0", "name": "SomeWorkflow", "errors": 1, "warnings": 0, "exitcode": 62720}]},
+            {**base, "tag": "CMSSW_20_1_X_2026-09-04-2300", "arch": "arch_b", "relval_failed": 1,
+             "failing_relvals": [{"workflow_id": "10805.31", "name": "OtherWorkflow", "errors": 7, "warnings": 0, "exitcode": 25600}]},
+            {**base, "tag": "CMSSW_20_1_X_2026-09-06-2300", "arch": "arch_b", "relval_failed": 0,
+             "failing_relvals": []},
+        ]
+
+        answer = _all_arch_ib_comparison_answer(
+            "compare CMSSW_20_1_X_2026-09-04-2300 and CMSSW_20_1_X_2026-09-06-2300 all architectures"
+        )
+
+        summary = answer.split("---")[0]
+        self.assertIn("`537.0` (`SomeWorkflow`) on `arch_a` (primary) -- 62720", summary)
+        self.assertIn("`10805.31` (`OtherWorkflow`) on `arch_b` (primary) -- was 25600", summary)
+        self.assertLess(summary.index("**Newly failing:**"), summary.index("**Resolved:**"))
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_driver")
+    def test_all_arch_comparison_summary_says_so_when_nothing_changed(self, get_driver, get_exit_code_names):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        base = {
+            "primary_tag": "CMSSW_20_1_X_2026-09-04-2300", "variant": "primary", "build_warnings": 0,
+            "ignored_warnings": 0, "clang_locations": 0, "clang_occurrences": 0, "relval_total": 10,
+            "relval_failed": 0, "relval_errors": 0, "relval_warnings": 0, "unit_test_total": 3,
+            "unit_test_failed": 0, "unit_test_errors": 0, "failing_relvals": [],
+        }
+        session.run.return_value = [
+            {**base, "tag": "CMSSW_20_1_X_2026-09-04-2300", "arch": "arch_a"},
+            {**base, "tag": "CMSSW_20_1_X_2026-09-06-2300", "arch": "arch_a"},
+        ]
+
+        answer = _all_arch_ib_comparison_answer(
+            "compare CMSSW_20_1_X_2026-09-04-2300 and CMSSW_20_1_X_2026-09-06-2300 all architectures"
+        )
+
+        self.assertIn(
+            "No RelVal workflow is newly failing or resolved across any compared architecture.", answer
+        )
 
 
 if __name__ == "__main__":

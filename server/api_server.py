@@ -3767,12 +3767,15 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
         ))
         return block
 
-    lines = ["## All-architecture IB comparison"]
-    for arch, by_variant in sorted(by_arch_variant.items()):
-        # Resolve every variant's own-previous-build fallback for this architecture
-        # in one pass BEFORE rendering anything -- see the identical comment in
-        # _ib_comparison_answer for why lazily resolving inside render_block would
-        # leave "primary" (always rendered first) blind to a sub-IB's substitution.
+    # Resolve every (arch, variant)'s own-previous-build fallback for EVERY
+    # architecture in one upfront pass, before either the cross-architecture
+    # summary or the per-architecture detail below reads any before/after record
+    # -- see the identical comment that used to sit inside the per-arch loop for
+    # why lazily resolving inside render_block would leave "primary" (always
+    # rendered first) blind to a sub-IB's substitution. Both the summary and the
+    # detail need to see the SAME substituted records, computed once.
+    substitution_notes_by_arch: dict[str, dict[str, str]] = {}
+    for arch, by_variant in by_arch_variant.items():
         substitution_notes: dict[str, str] = {}
         for variant, records in by_variant.items():
             if before_tag in records:
@@ -3785,7 +3788,24 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
                 records[before_tag] = before
             if note:
                 substitution_notes[variant] = note
+        substitution_notes_by_arch[arch] = substitution_notes
 
+    # Shifter-facing signal first: which RelVal workflows actually CHANGED state
+    # across every compared architecture/variant, before any per-architecture
+    # metric-delta detail -- found live (2026-09-18): a real "all architectures"
+    # comparison buried the one thing that mattered (one newly-failing workflow)
+    # under six architectures of RelVal-warning-count churn and repeated
+    # sub-IB-substitution notes. See _relval_change_summary_across_architectures.
+    lines = ["## All-architecture IB comparison", ""]
+    lines.extend(_render_relval_change_summary(
+        *_relval_change_summary_across_architectures(by_arch_variant, before_tag, after_tag),
+        exit_code_names,
+    ))
+
+    lines.append("")
+    lines.append("---")
+    for arch, by_variant in sorted(by_arch_variant.items()):
+        substitution_notes = substitution_notes_by_arch[arch]
         lines.extend(["", f"### `{arch}`"])
         lines.extend(render_block(
             "primary", by_variant.get("primary", {}), substitution_notes.get("primary"), by_variant
@@ -3796,6 +3816,57 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
     lines.append("")
     lines.append("Build warnings are CMS queue-summary counts; Clang values are parsed diagnostics. Missing values are shown as zero only when that IB architecture record is imported.")
     return "\n".join(lines)
+
+
+def _relval_change_summary_across_architectures(
+    by_arch_variant: dict[str, dict[str, dict[str, dict]]], before_tag: str, after_tag: str,
+) -> tuple[list[dict], list[dict]]:
+    """Collect every RelVal identity that's newly failing or resolved across EVERY
+    compared architecture/variant (substitution already resolved by the caller),
+    each tagged with its own arch/variant. Uses _diff_failing_relvals/
+    _split_relval_diff -- which drop anything unchanged -- rather than
+    _render_failing_workflows's per-arch table (which deliberately keeps "still
+    failing" rows too, since a shifter reading one architecture's own detail also
+    needs to know what was already broken there). A cross-architecture summary
+    should only ever surface a CHANGE; a persistently-failing workflow the
+    shifter already knows about from every previous shift is noise here, not
+    signal, and still fully visible in the per-architecture detail below."""
+    newly_failing: list[dict] = []
+    resolved: list[dict] = []
+    for arch, by_variant in by_arch_variant.items():
+        for variant, records in by_variant.items():
+            before = records.get(before_tag)
+            after = records.get(after_tag)
+            if not before or not after:
+                continue
+            diff = _diff_failing_relvals(before["failing_relvals"], after["failing_relvals"])
+            arch_newly, arch_resolved = _split_relval_diff(diff)
+            newly_failing.extend({**row, "arch": arch, "variant": variant} for row in arch_newly)
+            resolved.extend({**row, "arch": arch, "variant": variant} for row in arch_resolved)
+    return newly_failing, resolved
+
+
+def _render_relval_change_summary(
+    newly_failing: list[dict], resolved: list[dict], exit_code_names: dict[int, str],
+) -> list[str]:
+    """Render _relval_change_summary_across_architectures' result as the
+    shifter-facing lead section: what changed, nothing else."""
+    if not newly_failing and not resolved:
+        return ["No RelVal workflow is newly failing or resolved across any compared architecture."]
+    lines = []
+    if newly_failing:
+        lines.append("**Newly failing:**")
+        for row in sorted(newly_failing, key=lambda r: (r["arch"], r["variant"], r["workflow_id"])):
+            exit_code_cell = _format_exit_code(row["exitcode"], exit_code_names)
+            lines.append(f"- `{row['workflow_id']}` (`{row['name']}`) on `{row['arch']}` ({row['variant']}) -- {exit_code_cell}")
+    if resolved:
+        if lines:
+            lines.append("")
+        lines.append("**Resolved:**")
+        for row in sorted(resolved, key=lambda r: (r["arch"], r["variant"], r["workflow_id"])):
+            exit_code_cell = _format_exit_code(row["exitcode"], exit_code_names)
+            lines.append(f"- `{row['workflow_id']}` (`{row['name']}`) on `{row['arch']}` ({row['variant']}) -- was {exit_code_cell}")
+    return lines
 
 
 def _relval_identity(item: dict) -> tuple[str, str | None, int | None]:
