@@ -261,17 +261,36 @@ def get_relval_recurrence(workflow_id: str) -> dict:
     a bare, ambiguous tag string. failed_tags (bare tag strings, same
     corrected order) is kept for existing callers that only need the tag.
 
-    Fetches every raw (name, status, tag, arch, variant) row directly (not
-    via _run_query, whose MAX_ROWS row-count cap would otherwise truncate a
-    heavily-recurring workflow's row set before this function can even
-    determine which name is current) -- same bypass pattern
-    get_failing_relvals/list_ib_tags already use, for the same reason."""
+    Fetches every raw (name, status, known_error, tag, arch, variant) row
+    directly (not via _run_query, whose MAX_ROWS row-count cap would
+    otherwise truncate a heavily-recurring workflow's row set before this
+    function can even determine which name is current) -- same bypass
+    pattern get_failing_relvals/list_ib_tags already use, for the same
+    reason.
+
+    known_error=true rows (e.g. "Architecture incompatibility, GridPacks
+    were built for x86_64" on an aarch64 architecture) are excluded from
+    failed_appearances/failed_records, same as get_failing_relvals and every
+    other failing-RelVal count in this codebase -- they represent a known,
+    benign environmental limitation, not a real regression, matching the
+    real CMSDT dashboard's own exclusion (see the "known_error RelVal
+    exclusion" note elsewhere in this file). Found live: workflow 537.0's
+    entire ROOT6 sub-IB failure history on el9_aarch64_gcc14 was
+    known_error=true (GridPacks only built for x86_64) -- before this
+    exclusion, a "recurring failure" answer misrepresented a well-understood
+    architecture limitation as an unresolved regression, and it crowded a
+    genuine ASAN/UBSAN sub-IB failure out of the capped list. total_appearances
+    still counts every run regardless of known_error (failed + passed +
+    known_error == total, same invariant used everywhere else);
+    known_error_appearances is reported separately within the current name's
+    scope so nothing is silently dropped without acknowledgment."""
     driver = get_driver()
     try:
         with driver.session() as s:
             rows = [dict(r) for r in s.run(
                 "MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal {workflow_id:$workflow_id}) "
                 "RETURN relval.name AS name, relval.status AS status, "
+                "coalesce(relval.known_error, false) AS known_error, "
                 "ib.tag AS tag, ib.arch AS arch, coalesce(ib.variant, 'primary') AS variant",
                 {"workflow_id": workflow_id},
             )]
@@ -281,16 +300,15 @@ def get_relval_recurrence(workflow_id: str) -> dict:
         return {"workflow_id": workflow_id, "total_appearances": 0}
     current_name = max(rows, key=lambda r: _ib_sort_key(r["tag"]))["name"]
     current = [r for r in rows if r["name"] == current_name]
-    failed_records = sorted(
-        (r for r in current if r["status"] == "FAILED"),
-        key=lambda r: _ib_sort_key(r["tag"]),
-        reverse=True,
-    )[:10]
+    genuine_failures = [r for r in current if r["status"] == "FAILED" and not r["known_error"]]
+    known_error_failures = [r for r in current if r["status"] == "FAILED" and r["known_error"]]
+    failed_records = sorted(genuine_failures, key=lambda r: _ib_sort_key(r["tag"]), reverse=True)[:10]
     return {
         "workflow_id": workflow_id,
         "name": current_name,
         "total_appearances": len(current),
-        "failed_appearances": sum(1 for r in current if r["status"] == "FAILED"),
+        "failed_appearances": len(genuine_failures),
+        "known_error_appearances": len(known_error_failures),
         "failed_records": [
             {"tag": r["tag"], "arch": r["arch"], "variant": r["variant"]} for r in failed_records
         ],

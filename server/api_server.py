@@ -2796,9 +2796,17 @@ def _workflow_recurrence_answer(workflow_id: str, recurrence: dict, session_id: 
     total = recurrence["total_appearances"]
     failed = recurrence["failed_appearances"]
     rate = failed / total if total else 0
+    known_error = recurrence.get("known_error_appearances") or 0
+    # known_error failures (e.g. GridPacks only built for x86_64, hit on an aarch64
+    # architecture) are excluded from `failed`/rate -- same known_error exclusion
+    # used everywhere else in this codebase -- but surfaced by count so a shifter
+    # isn't left wondering why a build they know failed doesn't appear in the list
+    # below; same terse comma-addendum style as _ib_results_summary_answer's own
+    # known-error note.
+    known_error_note = f", {known_error:,} known error (excluded above)" if known_error else ""
     lines = [
         f"Workflow `{workflow_id}` (`{recurrence['name']}`) has failed in **{failed} of {total}** "
-        f"imported record(s) ({rate:.0%}) across every architecture and IB seen so far."
+        f"imported record(s) ({rate:.0%}{known_error_note}) across every architecture and IB seen so far."
     ]
     failed_records = recurrence.get("failed_records")
     if failed_records:

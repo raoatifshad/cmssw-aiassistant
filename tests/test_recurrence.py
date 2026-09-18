@@ -8,8 +8,10 @@ from server.api_server import (
 )
 
 
-def _relval_row(tag, name="RunMuonEG2022C", status="FAILED", arch="el9_amd64_gcc14", variant="primary"):
-    return {"name": name, "status": status, "tag": tag, "arch": arch, "variant": variant}
+def _relval_row(
+    tag, name="RunMuonEG2022C", status="FAILED", arch="el9_amd64_gcc14", variant="primary", known_error=False,
+):
+    return {"name": name, "status": status, "known_error": known_error, "tag": tag, "arch": arch, "variant": variant}
 
 
 class RecurringFailureTests(unittest.TestCase):
@@ -59,6 +61,35 @@ class RecurringFailureTests(unittest.TestCase):
         tags_in_order = [record["tag"] for record in result["failed_records"]]
         self.assertEqual(tags_in_order[0], "CMSSW_20_1_ROOT6_X_2026-09-16-2300")
         self.assertIn("CMSSW_20_1_ROOT6_X_2026-09-16-2300", tags_in_order)
+
+    @patch("graph.tools.get_driver")
+    def test_get_relval_recurrence_excludes_known_error_failures(self, get_driver):
+        # Regression: found live 2026-09-18, workflow 537.0 -- user asked to verify a
+        # ROOT6/el9_aarch64_gcc14 entry, which turned out to have known_error=true
+        # ("Architecture incompatibility, GridPacks were built for x86_64"), a known
+        # benign environmental limitation, not a real regression. Every other
+        # failing-RelVal count in this codebase (get_failing_relvals, IB comparisons,
+        # etc.) already excludes known_error -- this function hadn't, so it
+        # misrepresented a well-understood limitation as an unresolved failure.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            _relval_row("CMSSW_20_1_X_2026-09-17-2300", name="SomeWorkflow"),
+            _relval_row(
+                "CMSSW_20_1_ROOT6_X_2026-09-16-2300", name="SomeWorkflow",
+                arch="el9_aarch64_gcc14", variant="ROOT6", known_error=True,
+            ),
+            _relval_row(
+                "CMSSW_20_1_ROOT6_X_2026-09-15-2300", name="SomeWorkflow",
+                arch="el9_aarch64_gcc14", variant="ROOT6", known_error=True,
+            ),
+        ]
+
+        result = get_relval_recurrence("537.0")
+
+        self.assertEqual(result["failed_appearances"], 1)
+        self.assertEqual(result["known_error_appearances"], 2)
+        tags_in_order = [record["tag"] for record in result["failed_records"]]
+        self.assertEqual(tags_in_order, ["CMSSW_20_1_X_2026-09-17-2300"])
 
     @patch("graph.tools.get_driver")
     def test_get_relval_recurrence_scopes_to_the_current_era_when_a_number_is_reused(self, get_driver):
@@ -142,6 +173,19 @@ class RecurringFailureTests(unittest.TestCase):
 
         self.assertIn("258 of 441", answer)
         self.assertIn("59%", answer)
+
+    @patch("server.api_server.get_relval_recurrence")
+    def test_recurring_failure_answer_notes_excluded_known_error_count(self, recurrence):
+        recurrence.return_value = {
+            "workflow_id": "537.0", "name": "SomeWorkflow",
+            "total_appearances": 10, "failed_appearances": 1, "known_error_appearances": 4,
+            "failed_tags": ["CMSSW_20_1_X_2026-09-17-2300"],
+        }
+
+        answer = _recurring_failure_answer("has workflow 537.0 recurred before?", "s1")
+
+        self.assertIn("1 of 10", answer)
+        self.assertIn("4 known error", answer)
 
     @patch("server.api_server.get_relval_recurrence")
     def test_recurring_failure_answer_remembers_the_workflow_for_pr_evidence_followups(self, recurrence):
