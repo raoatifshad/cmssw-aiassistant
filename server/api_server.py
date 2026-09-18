@@ -2659,7 +2659,7 @@ _RECURRING_FAILURE_INTENT_RE = re.compile(
     r"\b(?:recurring|recur(?:s|red)?|happened\s+before|seen\s+(?:this\s+)?before|"
     r"known\s+issue|keeps?\s+failing|how\s+often|history|frequent(?:ly)?|"
     r"common(?:est)?|most\s+(?:often|common|frequent))\b|\btop\b[^?!]{0,20}\bfail|"
-    r"\bwhen\b[^?!]{0,30}\bfail",
+    r"\bwhen\b[^?!]{0,30}\bfail|\bwhere\b[^?!]{0,30}\bfail",
     re.IGNORECASE,
 )
 # A wildcard-style workflow reference (e.g. "140.xx", "140.??") -- the exact-ID
