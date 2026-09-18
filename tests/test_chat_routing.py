@@ -3082,6 +3082,44 @@ class IbComparisonAnswerTests(unittest.TestCase):
         self.assertIn("| `300.0` | WillResolve | 3 | 3 | Resolved | - | - |", answer)
         self.assertIn("| `400.0` | NewlyFailing | 4 | 4 | Newly failing | - | - |", answer)
 
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_driver")
+    def test_same_workflow_id_different_exit_code_is_resolved_plus_newly_failing(
+        self, get_driver, get_exit_code_names
+    ):
+        # _render_failing_workflows now keys rows by the same (workflow_id, step,
+        # exitcode) identity as _diff_failing_relvals/generate_shift_summary (see
+        # _relval_identity) instead of workflow_id alone -- a workflow failing with a
+        # different exit code between builds must show as its old identity resolved
+        # and a new identity newly failing, not as one "still failing" row that
+        # silently absorbs the exit-code change.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {
+                "tag": "CMSSW_20_1_CLANG_X_2026-09-04-2300", "primary_tag": "CMSSW_20_1_X_2026-09-04-2300",
+                "variant": "CLANG", "relval_total": 10, "relval_failed": 1, "relval_errors": 1,
+                "relval_warnings": 0, "unit_test_total": 0, "unit_test_failed": 0, "unit_test_errors": 0,
+                "failing_relvals": [
+                    {"workflow_id": "100.0", "name": "FlipsExitCode", "errors": 1, "warnings": 0, "exitcode": 1},
+                ],
+            },
+            {
+                "tag": "CMSSW_20_1_CLANG_X_2026-09-06-2300", "primary_tag": "CMSSW_20_1_X_2026-09-06-2300",
+                "variant": "CLANG", "relval_total": 10, "relval_failed": 1, "relval_errors": 1,
+                "relval_warnings": 0, "unit_test_total": 0, "unit_test_failed": 0, "unit_test_errors": 0,
+                "failing_relvals": [
+                    {"workflow_id": "100.0", "name": "FlipsExitCode", "errors": 1, "warnings": 0, "exitcode": 2},
+                ],
+            },
+        ]
+
+        answer, actions = _ib_comparison_answer(
+            "compare CMSSW_20_1_CLANG_X_2026-09-04-2300 and CMSSW_20_1_CLANG_X_2026-09-06-2300 el9_amd64_gcc14"
+        )
+
+        self.assertIn("| `100.0` | FlipsExitCode | 1 | 1 | Resolved | - | - |", answer)
+        self.assertIn("| `100.0` | FlipsExitCode | 1 | 2 | Newly failing | - | - |", answer)
+
     @staticmethod
     def _sub_ib_rows(before_failed: int, after_failed: int, before_ut_failed: int = 0, after_ut_failed: int = 0):
         return [
