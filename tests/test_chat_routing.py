@@ -563,7 +563,11 @@ class ChatRoutingTests(unittest.TestCase):
         get_relval_recurrence.return_value = {
             "workflow_id": "537.0", "name": "DYToLL012Jets_5FS_TuneCH3_13TeV_amcatnloFxFx_herwig7",
             "total_appearances": 237, "failed_appearances": 36,
-            "failed_tags": ["CMSSW_20_1_X_2026-09-17-2300", "CMSSW_20_1_X_2026-09-16-2300"],
+            "failed_records": [
+                {"tag": "CMSSW_20_1_X_2026-09-17-2300", "arch": "el9_amd64_gcc16", "variant": "primary"},
+                {"tag": "CMSSW_20_1_UBSAN_X_2026-09-14-2300", "arch": "el9_amd64_gcc14", "variant": "UBSAN"},
+            ],
+            "failed_tags": ["CMSSW_20_1_X_2026-09-17-2300", "CMSSW_20_1_UBSAN_X_2026-09-14-2300"],
         }
         session_id = "relval-where-is-it-failing"
         result = _execute_planned_capability("relval", "537.0 where this workflow failing", session_id)
@@ -571,7 +575,10 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNotNone(result)
         answer, _ = result
         self.assertIn("failed in **36 of 237**", answer)
-        self.assertIn("CMSSW_20_1_X_2026-09-17-2300", answer)
+        # Each entry names its own variant and architecture -- not just a bare,
+        # ambiguous tag string (see get_relval_recurrence's crowd-out fix).
+        self.assertIn("`CMSSW_20_1_X_2026-09-17-2300` (primary, `el9_amd64_gcc16`)", answer)
+        self.assertIn("`CMSSW_20_1_UBSAN_X_2026-09-14-2300` (UBSAN, `el9_amd64_gcc14`)", answer)
         get_relval_recurrence.assert_called_once_with("537.0")
 
     @patch("server.api_server.get_exit_code_names", return_value={})
