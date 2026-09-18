@@ -3464,17 +3464,21 @@ def _render_failing_workflows(
     before: dict, after: dict, before_tag: str, after_tag: str, exit_code_names: dict[int, str],
     current_variant: str, by_variant: dict[str, dict[str, dict]],
 ) -> list[str]:
-    """Render every RelVal workflow failing in either build as a table, one row per
-    workflow_id, classified Newly failing / Still failing (carried over from
-    before_tag, whether or not its detail changed) / Resolved. Deliberately NOT
-    _diff_failing_relvals (that helper drops any workflow whose before/after records
-    are byte-identical, which is right for a shift digest that only cares about
-    *changes* -- see generate_shift_summary) -- a shifter comparing two builds also
-    needs to know which workflows were *already* failing before this window, not
-    just the ones whose stats happened to move, or a persistently-failing workflow
-    silently vanishes from the answer (found live, 2026-09-09: 9 of 12 failing
-    EVTGEN3 workflows had identical stats across both builds and used to disappear
-    entirely).
+    """Render every RelVal failure identity failing in either build as a table, one
+    row per (workflow_id, step, exitcode) -- see _relval_identity -- classified Newly
+    failing / Still failing (carried over from before_tag, whether or not its other
+    detail changed) / Resolved. Deliberately NOT _diff_failing_relvals (that helper
+    drops any identity whose before/after records are byte-identical, which is right
+    for a shift digest that only cares about *changes* -- see generate_shift_summary)
+    -- a shifter comparing two builds also needs to know which workflows were
+    *already* failing before this window, not just the ones whose stats happened to
+    move, or a persistently-failing workflow silently vanishes from the answer (found
+    live, 2026-09-09: 9 of 12 failing EVTGEN3 workflows had identical stats across
+    both builds and used to disappear entirely). Keyed by the same identity as
+    _diff_failing_relvals/generate_shift_summary (rather than workflow_id alone) so a
+    workflow that changes step or exit code between builds shows up here the same way
+    it does in the shift digest: its old identity resolving and a new one appearing,
+    not one "still failing" row silently absorbing the change.
 
     Two more columns are purely additive cross-variant *visibility*, never
     reclassification: "Also failing in ({before_tag})"/"Also failing in
@@ -3484,14 +3488,16 @@ def _render_failing_workflows(
     "ASAN" doesn't tell a shifter which ASAN build). This needs the full by_variant
     map for the architecture (every variant's before_tag/after_tag rows), not just
     this one variant's before/after -- see _ib_comparison_answer's per-variant loop
-    and _all_arch_ib_comparison_answer's render_block for how it's threaded in.
-    What counts as Newly failing/Still failing/Resolved for THIS variant is decided
-    purely from this variant's own before/after, exactly as before; the cross-variant
-    columns never change that classification."""
-    before_failing = {item["workflow_id"]: item for item in before["failing_relvals"]}
-    after_failing = {item["workflow_id"]: item for item in after["failing_relvals"]}
-    all_failing_ids = sorted(set(before_failing) | set(after_failing))
-    if not all_failing_ids:
+    and _all_arch_ib_comparison_answer's render_block for how it's threaded in. This
+    column stays keyed by workflow_id alone, not the full identity -- it answers "is
+    this workflow also broken elsewhere," not whether it broke at the exact same step/
+    exit code there. What counts as Newly failing/Still failing/Resolved for THIS
+    variant is decided purely from this variant's own before/after, exactly as
+    before; the cross-variant columns never change that classification."""
+    before_failing = {_relval_identity(item): item for item in before["failing_relvals"]}
+    after_failing = {_relval_identity(item): item for item in after["failing_relvals"]}
+    all_identities = sorted(set(before_failing) | set(after_failing), key=_relval_identity_sort_key)
+    if not all_identities:
         return ["", "No RelVal workflow is failing in either build."]
 
     # Precompute once per side (not once per workflow_id below): which OTHER
@@ -3530,9 +3536,10 @@ def _render_failing_workflows(
         f"Also failing in ({after_tag}) |",
         "| --- | --- | ---: | ---: | --- | --- | --- |",
     ]
-    for workflow_id in all_failing_ids:
-        previous = before_failing.get(workflow_id)
-        later = after_failing.get(workflow_id)
+    for identity in all_identities:
+        workflow_id = identity[0]
+        previous = before_failing.get(identity)
+        later = after_failing.get(identity)
         current = later or previous
         name = current["name"]
         if previous and later:
@@ -3588,14 +3595,20 @@ def _single_ib_comparison_row(tag: str, arch: str) -> dict | None:
                        [item IN relvals WHERE item.status = 'FAILED'
                         AND coalesce(item.known_error, false) = false |
                            {workflow_id: item.workflow_id, name: item.name, errors: item.errors,
-                            warnings: item.warnings, exitcode: item.exitcode}
+                            warnings: item.warnings, exitcode: item.exitcode,
+                            steps: [s IN [(item)-[:HAS_EXCEPTION]->(exc:RelValException) | exc.step]
+                                    WHERE s IS NOT NULL]}
                        ] AS failing_relvals
                 """,
                 tag=tag, arch=arch,
             ).single()
     finally:
         driver.close()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    result = dict(row)
+    _attach_relval_step_field(result["failing_relvals"])
+    return result
 
 
 def _resolve_comparison_before(variant: str, arch: str, before_tag: str, after: dict | None) -> tuple[dict | None, str | None]:
@@ -3671,7 +3684,9 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
                [item IN relvals WHERE item.status = 'FAILED'
                 AND coalesce(item.known_error, false) = false |
                    {workflow_id: item.workflow_id, name: item.name, errors: item.errors,
-                    warnings: item.warnings, exitcode: item.exitcode}
+                    warnings: item.warnings, exitcode: item.exitcode,
+                    steps: [s IN [(item)-[:HAS_EXCEPTION]->(exc:RelValException) | exc.step]
+                            WHERE s IS NOT NULL]}
                ] AS failing_relvals
         ORDER BY arch, variant, primary_tag
     """
@@ -3683,6 +3698,8 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
         driver.close()
     if not rows:
         return "Neither requested Integration Build is present in the imported graph."
+    for row in rows:
+        _attach_relval_step_field(row["failing_relvals"])
 
     # Same "which of the two requested tags does this row belong to" logic as
     # _ib_comparison_answer: key by the row's own tag when the caller named a sub-IB
@@ -3755,24 +3772,58 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _relval_identity(item: dict) -> tuple[str, str | None, int | None]:
+    """A RelVal's failure identity for diffing: (workflow_id, step, exitcode). A change
+    in ANY of the three counts as a different failure, not a continuation of the same
+    one - e.g. the same workflow_id failing with a different exit code, or at a
+    different cmsRun step, is treated as its old identity resolving and a new one
+    appearing, rather than being silently dropped as "already failing, nothing to see"
+    (see _diff_failing_relvals). `step` comes from get_failing_relvals' aggregated,
+    possibly-None RelValException step field - its ES-export coverage is partial, so a
+    workflow whose exception coverage differs between the two builds (same real
+    failure, same exit code) can spuriously flip identity too. That's accepted: a
+    change in step counts as a new failure even when it's only the export's coverage
+    that changed, not the failure itself."""
+    return (item["workflow_id"], item.get("step"), item.get("exitcode"))
+
+
+def _relval_identity_sort_key(identity: tuple[str, str | None, int | None]) -> tuple:
+    """None-safe sort key for a _relval_identity tuple. step/exitcode can be None on
+    one identity and a real value on another for the same workflow_id (that's the
+    whole point of the identity - see _relval_identity), and a plain tuple sort would
+    crash comparing None to a str/int once workflow_ids tie."""
+    workflow_id, step, exitcode = identity
+    return (workflow_id, step or "", exitcode if exitcode is not None else -1)
+
+
+def _attach_relval_step_field(failing_relvals: list[dict]) -> None:
+    """Reduce each failing-RelVal dict's raw `steps` list (collected via a
+    HAS_EXCEPTION pattern comprehension in the Cypher query that produced it) to the
+    single stable `step` value _relval_identity expects - same rule as
+    graph.tools.get_failing_relvals: sorted/joined, or None when no exception data
+    exists for this workflow at all. Mutates each dict in place."""
+    for item in failing_relvals:
+        steps = sorted(set(item.pop("steps", []) or []))
+        item["step"] = ",".join(steps) if steps else None
+
+
 def _diff_failing_relvals(
     before_failures: list[dict], after_failures: list[dict]
-) -> list[tuple[str, dict | None, dict | None]]:
-    """Diff two failing-RelVal snapshots by workflow_id. Returns
-    (workflow_id, before_row_or_None, after_row_or_None) tuples for every
-    workflow whose failure record changed (newly failing, resolved, or
-    same-workflow detail changed), sorted by workflow_id."""
-    previous = {item["workflow_id"]: item for item in before_failures}
-    later = {item["workflow_id"]: item for item in after_failures}
+) -> list[tuple[tuple, dict | None, dict | None]]:
+    """Diff two failing-RelVal snapshots by (workflow_id, step, exitcode) - see
+    _relval_identity. Returns (identity, before_row_or_None, after_row_or_None) tuples
+    for every identity present on only one side, sorted by identity."""
+    previous = {_relval_identity(item): item for item in before_failures}
+    later = {_relval_identity(item): item for item in after_failures}
     return [
-        (workflow_id, previous.get(workflow_id), later.get(workflow_id))
-        for workflow_id in sorted(set(previous) | set(later))
-        if previous.get(workflow_id) != later.get(workflow_id)
+        (identity, previous.get(identity), later.get(identity))
+        for identity in sorted(set(previous) | set(later), key=_relval_identity_sort_key)
+        if previous.get(identity) != later.get(identity)
     ]
 
 
 def _split_relval_diff(
-    diff: list[tuple[str, dict | None, dict | None]]
+    diff: list[tuple[tuple, dict | None, dict | None]]
 ) -> tuple[list[dict], list[dict]]:
     """Split a _diff_failing_relvals result into (newly_failing, resolved) row lists."""
     newly_failing = [after for _, before, after in diff if after and not before]
@@ -4414,7 +4465,9 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
                [relval IN relvals WHERE relval.status = 'FAILED'
                 AND coalesce(relval.known_error, false) = false |
                    {workflow_id: relval.workflow_id, name: relval.name, errors: relval.errors,
-                    warnings: relval.warnings, exitcode: relval.exitcode}
+                    warnings: relval.warnings, exitcode: relval.exitcode,
+                    steps: [s IN [(relval)-[:HAS_EXCEPTION]->(exc:RelValException) | exc.step]
+                            WHERE s IS NOT NULL]}
                ] AS failing_relvals
         ORDER BY variant, primary_tag
     """
@@ -4424,6 +4477,8 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
             rows = [dict(record) for record in session.run(query, tags=tags, arch=arch)]
     finally:
         driver.close()
+    for row in rows:
+        _attach_relval_step_field(row["failing_relvals"])
     if not rows:
         return f"I found neither requested IB for **{arch}** (including any sub-IBs).", []
 

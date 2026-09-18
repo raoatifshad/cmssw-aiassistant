@@ -24,7 +24,7 @@ class DiffFailingRelvalsTests(unittest.TestCase):
             {"workflow_id": "2.0", "name": "B", "errors": 2, "exitcode": 2},
         ]
         diff = _diff_failing_relvals(before, after)
-        self.assertEqual([workflow_id for workflow_id, _, _ in diff], ["2.0"])
+        self.assertEqual([identity[0] for identity, _, _ in diff], ["2.0"])
 
     def test_unchanged_workflow_is_excluded(self):
         row = {"workflow_id": "1.0", "name": "A", "errors": 1, "exitcode": 1}
@@ -36,8 +36,8 @@ class DiffFailingRelvalsTests(unittest.TestCase):
         after = [{"workflow_id": "1.0", "name": "A", "errors": 5, "exitcode": 1}]
         diff = _diff_failing_relvals(before, after)
         self.assertEqual(len(diff), 1)
-        workflow_id, before_row, after_row = diff[0]
-        self.assertEqual(workflow_id, "1.0")
+        identity, before_row, after_row = diff[0]
+        self.assertEqual(identity[0], "1.0")
         self.assertIsNotNone(before_row)
         self.assertIsNotNone(after_row)
 

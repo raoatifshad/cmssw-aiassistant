@@ -516,13 +516,26 @@ def get_failing_relvals(ib_tag: str, arch: str | None = None, limit: int = 50) -
                 "  ORDER BY rv.workflow_id "
                 "  LIMIT $lim "
                 "} "
+                "OPTIONAL MATCH (rv)-[:HAS_EXCEPTION]->(exc:RelValException) "
+                "WITH ib, rv, collect(DISTINCT exc.step) AS raw_steps "
                 "RETURN ib.tag AS ib_tag, ib.variant AS variant, rv.name AS name, "
-                "rv.workflow_id AS workflow_id, rv.errors AS errors, rv.exitcode AS exitcode "
+                "rv.workflow_id AS workflow_id, rv.errors AS errors, rv.exitcode AS exitcode, "
+                "[s IN raw_steps WHERE s IS NOT NULL] AS steps "
                 "ORDER BY ib.tag, rv.workflow_id",
                 {"t": ib_tag, "arch": arch, "lim": limit},
             )]
     finally:
         driver.close()
+    # A RelVal can have zero, one, or several linked RelValException rows (a workflow
+    # can fail across more than one cmsRun step, or the exception export can simply
+    # miss it entirely - see ingest_es_exceptions/_ingest_relval_exception_file). Reduce
+    # to one stable, order-independent value per workflow so it's usable as part of a
+    # dict/set key (see _diff_failing_relvals's (workflow_id, step, exitcode) match key)
+    # - None when no exception data exists for this workflow at all, distinct from any
+    # real step name.
+    for row in rows:
+        steps = sorted(set(row.pop("steps", []) or []))
+        row["step"] = ",".join(steps) if steps else None
     return rows
 
 
