@@ -1627,13 +1627,32 @@ def _render_pr_evidence_rows(term: str, rows: list[dict], via_llm: bool = False)
     return "\n".join(lines)
 
 
+_PR_SEARCH_ROW_LIMIT = 20  # matches find_prs_for_error's own default -- kept as an
+# explicit constant here (rather than relying on that default) so the "did the regex
+# term come back suspiciously broad" check below stays correct even if that default
+# ever changes.
+
+# A regex term can't preserve C++/Python qualified-name syntax at all -- "::", "()",
+# and "->" get thrown away by word-splitting, and the real, specific part of a
+# question like "edm::FileInPath::initialize_()" (the method name) is frequently
+# lowercase (private-method/snake_case convention) and so also fails
+# _looks_like_pr_search_identifier's capitalization check on its own. Presence of
+# this syntax is a strong signal real specificity was lost, independent of whether
+# the regex path happened to find *something* -- found live, 2026-09-21: "any PR /
+# issue having edm::FileInPath::initialize_()" searched only the bare class name
+# "FileInPath" and returned 20 (the row limit) loosely-related PRs spanning 2020-2026.
+_QUALIFIED_CODE_REFERENCE_RE = re.compile(r"::|\(\)|->")
+
+
 def _llm_extract_pr_error_signature(question: str) -> str | None:
     """Fallback for _pr_evidence_answer when regex-based _pr_search_terms finds no
-    usable identifier -- reads the whole question via one constrained LLM call
-    instead of scoring isolated words in it. See propose_pr_search_signature's
-    docstring for the motivating example. Never trusted as fact on its own: the
-    caller still runs the real, deterministic find_prs_for_error search on
-    whatever this returns and only answers from its actual results."""
+    usable identifier, or when it did find one but the result looks too broad or the
+    question's syntax suggests real specificity was thrown away -- reads the whole
+    question via one constrained LLM call instead of scoring isolated words in it.
+    See propose_pr_search_signature's docstring for the motivating example. Never
+    trusted as fact on its own: the caller still runs the real, deterministic
+    find_prs_for_error search on whatever this returns and only answers from its
+    actual results."""
     if _llm_client is None:
         return None
     return propose_pr_search_signature(_llm_client, DEFAULT_MODEL, question)
@@ -1648,33 +1667,66 @@ def _pr_evidence_answer(question: str, fallback_term: str | None = None) -> tupl
     to whatever was just discussed without a stale context ever overriding
     something the user actually typed.
 
-    When every regex-extracted term (or the absence of any) fails to find a match,
-    falls back once to _llm_extract_pr_error_signature -- a single constrained LLM
-    call that reads the whole question instead of scoring isolated capitalized
-    words, the pilot for the class of bug documented in
-    project_pr_search_precision_fix (found live 2026-09-21: a pasted MIOpen error
-    message got reduced to searching the isolated word "Permission"). The LLM only
-    proposes what to search for; find_prs_for_error still does the real,
-    deterministic matching and this function still composes the answer only from
-    its actual results."""
+    Falls back to _llm_extract_pr_error_signature -- a single constrained LLM call
+    that reads the whole question instead of scoring isolated words -- not only when
+    every regex-extracted term fails to find anything, but ALSO when a regex term did
+    find something that looks suspiciously broad (hit _PR_SEARCH_ROW_LIMIT) or when
+    the question contains qualified-code syntax (_QUALIFIED_CODE_REFERENCE_RE) that
+    word-splitting can't preserve. "Found nothing" and "found something too generic
+    because real specificity got thrown away" are both signals the regex path lost
+    the actual ask -- found live, 2026-09-21: "Permission" from a pasted MIOpen error
+    (the first case) and "FileInPath" alone from "edm::FileInPath::initialize_()"
+    (the second -- the regex path DID return 20 rows, so the old zero-results-only
+    trigger never even tried the LLM). When both an LLM-derived hit and a regex hit
+    exist, the narrower (fewer rows) one is preferred -- a match from a fuller,
+    more specific phrase is more likely the real answer than a broad bare-word match.
+    The LLM only proposes what to search for; find_prs_for_error still does the real,
+    deterministic matching and this function still composes the answer only from its
+    actual results."""
     if not re.search(r"\b(?:pr|mr|pull request|merge request|fix|fixes|fixed)\b", question, re.IGNORECASE):
         return None
     terms = _pr_search_terms(question) or ([fallback_term] if fallback_term else [])
+    regex_hit: tuple[str, list[dict]] | None = None
     for term in terms:
-        rows = find_prs_for_error(term)
+        rows = find_prs_for_error(term, limit=_PR_SEARCH_ROW_LIMIT)
         if rows:
-            return _render_pr_evidence_rows(term, rows), rows
-    llm_signature = _llm_extract_pr_error_signature(question)
-    llm_tried = bool(llm_signature and llm_signature not in terms)
-    if llm_tried:
-        rows = find_prs_for_error(llm_signature)
-        if rows:
-            return _render_pr_evidence_rows(llm_signature, rows, via_llm=True), rows
+            regex_hit = (term, rows)
+            break
+
+    needs_llm_check = (
+        regex_hit is None
+        or len(regex_hit[1]) >= _PR_SEARCH_ROW_LIMIT
+        or _QUALIFIED_CODE_REFERENCE_RE.search(question)
+    )
+    llm_signature = _llm_extract_pr_error_signature(question) if needs_llm_check else None
+    llm_hit: tuple[str, list[dict]] | None = None
+    if llm_signature and llm_signature not in terms:
+        llm_rows = find_prs_for_error(llm_signature, limit=_PR_SEARCH_ROW_LIMIT)
+        if llm_rows:
+            llm_hit = (llm_signature, llm_rows)
+
+    if llm_hit and (regex_hit is None or len(llm_hit[1]) <= len(regex_hit[1])):
+        term, rows = llm_hit
+        return _render_pr_evidence_rows(term, rows, via_llm=True), rows
+    if regex_hit:
+        term, rows = regex_hit
+        answer = _render_pr_evidence_rows(term, rows)
+        # A narrower/qualified search was attempted (that's why needs_llm_check fired)
+        # and came up empty -- say so explicitly, so a shifter reading a broad,
+        # generic-looking list (e.g. every PR mentioning a bare class name) knows
+        # these are loose, topic-level matches, not a hit on the exact thing asked
+        # about, rather than silently presenting them the same way as a precise match.
+        if needs_llm_check and llm_signature and not llm_hit:
+            answer += (
+                f"\n\n(A more specific search for `{llm_signature}` found nothing -- "
+                "the results above are broader, topic-level matches only.)"
+            )
+        return answer, rows
     # Cite the LLM-derived signature in the miss, not just the first regex term, when
     # it was actually tried too -- it's the more specific, more informative attempt
     # (e.g. the full error message, not one isolated word from it), so a shifter
     # reading the miss sees what was really searched, not just the weaker fallback.
-    miss_term = llm_signature if llm_tried else (terms[0] if terms else llm_signature)
+    miss_term = llm_signature or (terms[0] if terms else None)
     if miss_term:
         return f"No PR evidence matching `{miss_term}` exists in the imported graph.", []
     return None
