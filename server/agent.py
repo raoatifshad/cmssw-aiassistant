@@ -84,8 +84,10 @@ def propose_pr_search_signature(client, model: str, question: str) -> str | None
         "distinctive, searchable phrase from the question (an exact error message, "
         "exception text, module/class name, or file path) that a human GitHub PR or "
         "Issue comment would plausibly quote verbatim -- or null if no such phrase is "
-        "present. Never return a generic English word or a sentence fragment made of "
-        "ordinary words. Do not answer the question."
+        "present. Strip any surrounding quote marks ('\"`) from the phrase -- return "
+        "the bare text a human would actually type, not the raw punctuation from a "
+        "pasted log. Never return a generic English word or a sentence fragment made "
+        "of ordinary words. Do not answer the question."
     )
     try:
         response = client.chat.completions.create(
@@ -100,7 +102,16 @@ def propose_pr_search_signature(client, model: str, question: str) -> str | None
         match = re.search(r"\{.*\}", content, re.DOTALL)
         decision = json.loads(match.group(0) if match else content)
         signature = decision.get("error_signature")
-        return signature.strip() if isinstance(signature, str) and signature.strip() else None
+        if not isinstance(signature, str):
+            return None
+        # Defensive cleanup, not just a prompt instruction -- temperature=0 doesn't
+        # guarantee perfectly consistent formatting call to call, and a leading/
+        # trailing quote mark that survives is a real search-miss risk (found live,
+        # 2026-09-21: the same underlying phrase matched with or without its
+        # decorative quotes, but a hosted LLM's exact formatting isn't reliable
+        # enough to depend on the prompt instruction alone).
+        signature = signature.strip().strip("'\"` ").strip()
+        return signature or None
     except (AttributeError, json.JSONDecodeError, TypeError, ValueError):
         return None
 

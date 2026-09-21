@@ -1,6 +1,6 @@
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from server.api_server import (
     ChatRequest,
@@ -34,6 +34,7 @@ from server.api_server import (
     _normalize_deterministic_question,
     _pr_evidence_answer,
     _pr_search_terms,
+    _looks_like_noise_artifact,
     _pending_relval_scopes,
     _pending_unittest_scopes,
     _failed_relval_list_answer,
@@ -66,7 +67,7 @@ from server.api_server import (
     record_feedback,
 )
 from server.request_planner import Plan, PlanKind, RequestContext
-from server.agent import KGChatSession
+from server.agent import KGChatSession, propose_pr_search_signature
 from graph.tools import TOOLS, get_failing_relvals, get_failing_unittests, search_issues_by_text
 from ingestion.build_graph import ib_parent_tag
 
@@ -337,6 +338,61 @@ class ChatRoutingTests(unittest.TestCase):
             _pr_search_terms("is there any PR/issue open for testAlpakaModelCudaAsync"),
             ["testAlpakaModelCudaAsync"],
         )
+
+    def test_noise_artifact_rejects_hex_hash_and_punctuation_run(self):
+        # Regression: found live 2026-09-21 -- a pasted CUDA/Alpaka exception block
+        # extracted a package-version hex hash and a decorative divider-line
+        # fragment as if they were real search identifiers, and the hash (longer)
+        # won the search over the workflow's actual error code, since
+        # _pr_evidence_answer tries the longest term first.
+        self.assertTrue(_looks_like_noise_artifact("caaac8d71f39d400ab2511b2403675a"))
+        self.assertTrue(_looks_like_noise_artifact("CEST-----------------------"))
+        # Real identifiers of similar shape/length must not be caught by the
+        # same rules.
+        self.assertFalse(_looks_like_noise_artifact("cudaErrorLaunchOutOfResources"))
+        self.assertFalse(_looks_like_noise_artifact("CMSSW_20_1_X_2026-08-04-2300"))
+
+    def test_search_terms_drop_hex_hash_and_punctuation_run_from_pasted_exception(self):
+        # End-to-end version of the above: the noise tokens must never reach the
+        # candidate set _pr_evidence_answer searches with, while the genuine error
+        # code from the same pasted block survives.
+        question = (
+            "any PR or issue for this: ----- Begin Fatal Exception 19-Sep-2026 "
+            "15:11:10 CEST-----------------------\n"
+            "/data/cmsbld/.../external/alpaka/2.1.1-3caaac8d71f39d400ab2511b2403675a/"
+            "include/alpaka/kernel/TaskKernelGpuUniformCudaHipRt.hpp(275) "
+            "'cudaErrorLaunchOutOfResources': 'too many resources requested for launch'!"
+        )
+
+        terms = _pr_search_terms(question)
+
+        self.assertIn("cudaErrorLaunchOutOfResources", terms)
+        self.assertFalse(any("caaac8d71f39d400ab2511b2403675a" in term for term in terms))
+        self.assertFalse(any(term.count("-") >= 3 for term in terms))
+
+    def test_propose_pr_search_signature_strips_surrounding_quotes(self):
+        # Regression: found live 2026-09-21 -- the same underlying phrase matched
+        # find_prs_for_error with or without its decorative quotes, but a hosted
+        # LLM's exact formatting isn't reliable enough call-to-call to depend on
+        # the prompt instruction alone; defensive Python-side stripping is required.
+        client = MagicMock()
+        client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(
+                content='{"error_signature": "\'cudaErrorLaunchOutOfResources\'"}'
+            ))]
+        )
+
+        signature = propose_pr_search_signature(client, "some-model", "any PR for this error?")
+
+        self.assertEqual(signature, "cudaErrorLaunchOutOfResources")
+
+    def test_propose_pr_search_signature_returns_none_for_null_signature(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"error_signature": null}'))]
+        )
+
+        self.assertIsNone(propose_pr_search_signature(client, "some-model", "how many relvals failing?"))
 
     @patch("server.api_server.find_prs_for_error")
     def test_pr_evidence_falls_back_to_last_discussed_workflow(self, find_prs):

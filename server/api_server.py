@@ -1390,6 +1390,28 @@ def _looks_like_pr_search_identifier(word: str) -> bool:
     return any(char.isdigit() for char in word) or any(char.isupper() for char in word[1:])
 
 
+_HEX_HASH_RE = re.compile(r"^[0-9a-f]{12,}$", re.IGNORECASE)
+_PUNCTUATION_RUN_RE = re.compile(r"[-_.]{3,}")
+
+
+def _looks_like_noise_artifact(word: str) -> bool:
+    """A token that's structurally noise, not a real identifier, regardless of
+    whether it happens to pass _looks_like_pr_search_identifier's digit/
+    capitalization check -- a hex-hash-shaped string (a package version checksum,
+    e.g. "caaac8d71f39d400ab2511b2403675a" from an external-tool path) or a run of
+    3+ repeated punctuation characters (a decorative divider line glued onto a word
+    by the tokenizer, e.g. "CEST-----------------------" from a pasted exception
+    header's "----- Begin Fatal Exception ... -----" banner) are both structural
+    artifacts of a raw log/dump, never something a human would deliberately search
+    for. Unlike PR_QUERY_STOP_WORDS (specific words, grows one exception at a time),
+    these are shape-based rules that generalize to any future hash or divider-line
+    artifact without needing a new entry -- found live, 2026-09-21: a pasted CUDA
+    exception block extracted both as if they were real identifiers, one of them
+    (the hash) winning the search over the workflow's actual error code because
+    _pr_evidence_answer tries the longest term first."""
+    return bool(_HEX_HASH_RE.match(word)) or bool(_PUNCTUATION_RUN_RE.search(word))
+
+
 def _pr_search_terms(question: str) -> list[str]:
     """Return explicit domain identifiers, never filler words or sentence fragments."""
     quoted = [
@@ -1417,7 +1439,10 @@ def _pr_search_terms(question: str) -> list[str]:
         *re.findall(r"\bCMSSW_\d+_\d+(?:_[A-Za-z0-9]+)+\b", question),
         *re.findall(r"\b\d{4,6}\.\d+\b", question),
         *package_paths,
-        *(word for word in standalone if _looks_like_pr_search_identifier(word)),
+        *(
+            word for word in standalone
+            if _looks_like_pr_search_identifier(word) and not _looks_like_noise_artifact(word)
+        ),
     }
     identifiers = sorted(
         (candidate for candidate in candidates if not any(
