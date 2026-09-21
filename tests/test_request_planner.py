@@ -107,6 +107,45 @@ class RequestPlannerTests(unittest.TestCase):
         self.assertEqual(plan.capability, "unittest_summary")
         self.assertNotIn("session-1", self.planner.pending)
 
+    def test_clarification_choices_carry_the_original_architecture(self):
+        # Regression: found live 2026-09-21 -- "how many ibs are failing for
+        # el9_amd64_gcc14 for release <tag>" triggered this clarification,
+        # but every canned choice (e.g. "Combined summary") only ever
+        # reconstructed "summary for <tag>", silently dropping the
+        # architecture the user had already named. Clicking that button
+        # then widened the answer to every imported architecture instead of
+        # just the one originally asked about.
+        tag = "CMSSW_20_1_X_2026-09-13-2300"
+        context = RequestContext.extract(
+            f"how many ibs are failing for el9_amd64_gcc14 for release {tag}"
+        )
+
+        plan = self.planner.plan(context, "session-arch")
+
+        choices = dict(plan.clarification.choices)
+        self.assertEqual(choices["Combined summary"], f"summary for {tag} el9_amd64_gcc14")
+        self.assertEqual(choices["Build warnings"], f"build warnings for {tag} el9_amd64_gcc14")
+        self.assertEqual(choices["RelVal failures"], f"failed RelVals for {tag} el9_amd64_gcc14")
+        self.assertEqual(choices["Unit-test results"], f"unit tests for {tag} el9_amd64_gcc14")
+
+    def test_bare_category_reply_resolves_with_original_architecture_preserved(self):
+        # _resolve_pending's own path: a bare category reply that repeats
+        # neither the tag nor the architecture ("unit tests" alone) must
+        # still resolve scoped to the architecture named in the ORIGINAL
+        # ambiguous question, not silently widen to every architecture --
+        # same bug as test_clarification_choices_carry_the_original_architecture,
+        # different call path (free-text bare reply vs. a canned choice).
+        tag = "CMSSW_20_1_X_2026-09-13-2300"
+        self.planner.plan(
+            RequestContext.extract(f"failures for el9_amd64_gcc14 {tag}"), "session-arch-2",
+        )
+
+        plan = self.planner.plan(RequestContext.extract("unit tests"), "session-arch-2")
+
+        self.assertEqual(plan.kind, PlanKind.DETERMINISTIC)
+        self.assertEqual(plan.capability, "unittest_summary")
+        self.assertEqual(plan.context.architecture, "el9_amd64_gcc14")
+
     def test_multiple_tags_without_comparison_asks_for_intent(self):
         context = RequestContext.extract(
             "CMSSW_20_1_X_2026-08-10-1100 CMSSW_20_1_X_2026-08-11-2300"
