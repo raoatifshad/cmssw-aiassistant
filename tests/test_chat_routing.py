@@ -1590,9 +1590,10 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("126", answer)
         scope_records.assert_called_once_with("CMSSW_20_1_EVTGEN3_X_2026-08-09-2300", include_sub_ibs=True)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_primary_relval_failure_count_lists_every_architecture_up_front(self, scope_records, _sub_ib_variant_tags):
+    def test_primary_relval_failure_count_lists_every_architecture_up_front(self, scope_records, _sub_ib_variant_tags, _get_failing_relvals):
         # A plain question with no architecture marked is_relval_default at
         # all is no longer ambiguous enough to justify a round-trip -- with
         # nothing to guess as "the" architecture, show every one directly
@@ -1626,8 +1627,9 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("8 failing RelVal(s)", answer)
         self.assertNotIn(session_id, _pending_relval_scopes)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_relval_failure_count_all_returns_aggregate(self, scope_records):
+    def test_relval_failure_count_all_returns_aggregate(self, scope_records, _get_failing_relvals):
         session_id = "relval-all-scope"
         scope_records.return_value = [
             {
@@ -1684,9 +1686,10 @@ class ChatRoutingTests(unittest.TestCase):
         finally:
             _pending_relval_scopes.pop("scope-choice-tie", None)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._relval_scope_records")
     @patch("server.api_server.get_driver")
-    def test_relval_failure_count_mentions_sub_ib_variants(self, get_driver, scope_records):
+    def test_relval_failure_count_mentions_sub_ib_variants(self, get_driver, scope_records, _get_failing_relvals):
         # Sub-IB variants (ASAN, UBSAN, ROOT6, ...) are never merged into a
         # primary tag's RelVal numbers (different (tag, architecture)
         # identities, per CLAUDE.md), but their existence should be
@@ -1706,9 +1709,10 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("ASAN", answer)
         self.assertIn("UBSAN", answer)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_sub_ib_relval_failure_count_lists_every_architecture_up_front(self, scope_records, _sub_ib_variant_tags):
+    def test_sub_ib_relval_failure_count_lists_every_architecture_up_front(self, scope_records, _sub_ib_variant_tags, _get_failing_relvals):
         session_id = "relval-sub-ib-scope"
         sub_ib = "CMSSW_20_1_CLANG_X_2026-08-13-2300"
         scope_records.return_value = [
@@ -1771,9 +1775,10 @@ class ChatRoutingTests(unittest.TestCase):
         finally:
             _pending_relval_scopes.pop(session_id, None)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_any_failing_relvals_with_one_architecture_returns_exact_ib(self, scope_records, _sub_ib_variant_tags):
+    def test_any_failing_relvals_with_one_architecture_returns_exact_ib(self, scope_records, _sub_ib_variant_tags, _get_failing_relvals):
         session_id = "relval-any-scope"
         scope_records.return_value = [{
             "tag": "CMSSW_20_1_X_2026-08-10-1100",
@@ -1794,9 +1799,10 @@ class ChatRoutingTests(unittest.TestCase):
         finally:
             _pending_relval_scopes.pop(session_id, None)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_relval_failure_count_never_hides_non_default_architectures(self, scope_records, _sub_ib_variant_tags):
+    def test_relval_failure_count_never_hides_non_default_architectures(self, scope_records, _sub_ib_variant_tags, _get_failing_relvals):
         # Regression: found live -- a primary tag's only is_relval_default
         # architecture had 51/951 RelVal failures while two other, non-default
         # architectures had 1/951 each. The old logic narrowed to just the
@@ -2142,9 +2148,10 @@ class ChatRoutingTests(unittest.TestCase):
         finally:
             _pending_relval_scopes.pop(session_id, None)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_relval_data_availability_is_graph_backed(self, scope_records, _sub_ib_variant_tags):
+    def test_relval_data_availability_is_graph_backed(self, scope_records, _sub_ib_variant_tags, _get_failing_relvals):
         scope_records.return_value = [{
             "tag": "CMSSW_20_1_X_2026-08-10-1100",
             "arch": "el9_amd64_gcc14",
@@ -2192,9 +2199,10 @@ class ChatRoutingTests(unittest.TestCase):
         scope_records.assert_called_once_with(tag, include_sub_ibs=True)
         _pending_relval_scopes.pop("s-errcount-multi", None)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_ambiguous_named_relval_question_defaults_to_graph_summary(self, scope_records, _sub_ib_variant_tags):
+    def test_ambiguous_named_relval_question_defaults_to_graph_summary(self, scope_records, _sub_ib_variant_tags, _get_failing_relvals):
         scope_records.return_value = [{
             "tag": "CMSSW_20_1_X_2026-08-10-1100",
             "arch": "el9_amd64_gcc14",
@@ -2209,6 +2217,96 @@ class ChatRoutingTests(unittest.TestCase):
 
         self.assertIn("Imported RelVal results", answer)
         self.assertIn("3 failing RelVal(s)", answer)
+
+    @patch("server.api_server.get_failing_relvals", return_value=[])
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
+    @patch("server.api_server._relval_scope_records")
+    def test_relval_ib_summary_answer_honors_an_explicit_architecture(
+        self, scope_records, _sub_ib_variant_tags, _get_failing_relvals
+    ):
+        # Regression: found live 2026-09-21 -- "failed RelVals for <tag>
+        # el9_amd64_gcc14" (the exact canned reply from this project's own
+        # scope clarification) still answered with every imported
+        # architecture, because this handler (unlike its sibling
+        # _relval_failure_count_answer) never checked for an architecture
+        # named explicitly in the question at all.
+        tag = "CMSSW_20_1_X_2026-09-13-2300"
+        scope_records.return_value = [
+            {"tag": tag, "arch": "el8_amd64_gcc14", "relval_total": 954, "failed_relvals": 1, "passed_relvals": 953, "is_relval_default": False},
+            {"tag": tag, "arch": "el9_aarch64_gcc14", "relval_total": 954, "failed_relvals": 0, "passed_relvals": 904, "known_error_relvals": 50, "is_relval_default": False},
+            {"tag": tag, "arch": "el9_amd64_gcc14", "relval_total": 954, "failed_relvals": 0, "passed_relvals": 954, "is_relval_default": False},
+        ]
+
+        answer = _relval_ib_summary_answer(f"failed RelVals for {tag} el9_amd64_gcc14", "s-relval-arch")
+
+        self.assertIn("el9_amd64_gcc14", answer)
+        self.assertNotIn("el8_amd64_gcc14", answer)
+        self.assertNotIn("el9_aarch64_gcc14", answer)
+
+    @patch("server.api_server.get_exit_code_names", return_value={8021: "MethodFailure"})
+    @patch("server.api_server.get_failing_relvals")
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
+    @patch("server.api_server._relval_scope_records")
+    def test_relval_scope_summary_names_the_failing_workflow_inline(
+        self, scope_records, _sub_ib_variant_tags, get_failing_relvals, _get_exit_code_names
+    ):
+        # Same "the summary itself should carry enough information" fix as
+        # test_unittest_summary_names_the_failing_package_inline -- a
+        # shifter asking for RelVal results on a build with only 1 failure
+        # should see the actual failing workflow and its exit code, not
+        # just "1 failing RelVal(s)" with no indication of which one.
+        tag = "CMSSW_20_1_X_2026-09-13-2300"
+        scope_records.return_value = [
+            {"tag": tag, "arch": "el9_amd64_gcc14", "relval_total": 954, "failed_relvals": 1, "passed_relvals": 953, "is_relval_default": False},
+        ]
+        get_failing_relvals.return_value = [
+            {"ib_tag": tag, "name": "TTbar_14TeV", "workflow_id": "140.0", "errors": 1, "exitcode": 8021},
+        ]
+
+        answer = _relval_ib_summary_answer(f"failed RelVals for {tag} el9_amd64_gcc14", "s-relval-name")
+
+        self.assertIn("TTbar_14TeV", answer)
+        self.assertIn("140.0", answer)
+        self.assertIn("8021", answer)
+        get_failing_relvals.assert_called_once_with(tag, arch="el9_amd64_gcc14", limit=10)
+
+    @patch("server.api_server.get_exit_code_names", return_value={})
+    @patch("server.api_server.get_failing_relvals")
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
+    @patch("server.api_server._relval_scope_records")
+    def test_relval_scope_summary_excludes_sub_ib_workflows_from_inline_list(
+        self, scope_records, _sub_ib_variant_tags, get_failing_relvals, _get_exit_code_names
+    ):
+        # get_failing_relvals also matches any sub-IB whose parent_tag is
+        # this tag -- the inline "Failing workflows:" list must filter those
+        # out client-side, the same way the table above it never includes
+        # sub-IB rows either (see the "not included above" note).
+        tag = "CMSSW_20_1_X_2026-09-13-2300"
+        scope_records.return_value = [
+            {"tag": tag, "arch": "el9_amd64_gcc14", "relval_total": 954, "failed_relvals": 1, "passed_relvals": 953, "is_relval_default": False},
+        ]
+        get_failing_relvals.return_value = [
+            {"ib_tag": tag, "name": "TTbar_14TeV", "workflow_id": "140.0", "errors": 1, "exitcode": 8021},
+            {"ib_tag": "CMSSW_20_1_DEVEL_X_2026-09-13-2300", "name": "OtherWF", "workflow_id": "141.0", "errors": 1, "exitcode": 1},
+        ]
+
+        answer = _relval_ib_summary_answer(f"failed RelVals for {tag} el9_amd64_gcc14", "s-relval-filter")
+
+        self.assertIn("TTbar_14TeV", answer)
+        self.assertNotIn("OtherWF", answer)
+
+    @patch("server.api_server.get_failing_relvals", return_value=[])
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
+    @patch("server.api_server._relval_scope_records")
+    def test_relval_scope_summary_uses_status_emoji(self, scope_records, _sub_ib_variant_tags, _get_failing_relvals):
+        tag = "CMSSW_20_1_X_2026-09-13-2300"
+        scope_records.return_value = [
+            {"tag": tag, "arch": "el8_amd64_gcc14", "relval_total": 954, "failed_relvals": 1, "passed_relvals": 953, "is_relval_default": False},
+        ]
+
+        answer = _relval_ib_summary_answer(f"failed RelVals for {tag}", "s-relval-emoji")
+
+        self.assertIn("🔴", answer)
 
     @patch("server.api_server._relval_scope_records")
     def test_generic_relval_summary_asks_when_multiple_default_architectures_exist(self, scope_records):

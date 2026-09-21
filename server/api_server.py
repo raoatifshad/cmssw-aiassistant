@@ -742,6 +742,9 @@ def _sub_ib_variant_note(tag: str, sub_ib_variants: list[str] | None) -> str | N
     )
 
 
+_RELVAL_SCOPE_SUMMARY_WORKFLOW_CAP = 10
+
+
 def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: list[str] | None = None) -> str:
     """Format a complete RelVal count without merging architecture-specific facts."""
     total = sum(record["relval_total"] or 0 for record in records)
@@ -752,18 +755,63 @@ def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: li
     # numbers from silently not adding up to `total` on the reader's own arithmetic.
     known_error = sum(record.get("known_error_relvals") or 0 for record in records)
     known_error_note = f", {known_error:,} known error" if known_error else ""
+    # Status emoji mirror the real CMSDT dashboard's own red/orange/green
+    # convention (confirmed against a real dashboard screenshot, 2026-09-21)
+    # so a shifter can tell build health apart at a glance in a plain-text
+    # chat reply, not just from the numbers -- red for a genuine failure,
+    # orange for known_error-only (excluded from the failing count but still
+    # worth a shifter's attention), green for clean.
+    headline_marker = "🔴" if failed else ("🟠" if known_error else "🟢")
     lines = [
-        f"{heading}: **{failed:,} failing RelVal(s)** across **{total:,}** RelVal record(s) "
+        f"{headline_marker} {heading}: **{failed:,} failing RelVal(s)** across **{total:,}** RelVal record(s) "
         f"({passed:,} passed{known_error_note}).",
         "",
         "| IB | Architecture | Failing | Passed | Total |",
         "| --- | --- | ---: | ---: | ---: |",
     ]
     lines.extend(
-        f"| `{record['tag']}` | `{record['arch']}` | {record['failed_relvals'] or 0:,} | "
+        f"| `{record['tag']}` | `{record['arch']}` | "
+        f"{'🔴' if record['failed_relvals'] else ('🟠' if record.get('known_error_relvals') else '🟢')} "
+        f"{record['failed_relvals'] or 0:,} | "
         f"{record['passed_relvals'] or 0:,} | {record['relval_total'] or 0:,} |"
         for record in records
     )
+    # Name the actual failing workflow(s) -- with their exit code, the exact
+    # information a shifter needs to triage -- instead of leaving a shifter
+    # to ask a completely separate "what/which workflows are failing"
+    # question for a count that's already small enough to just show. Same
+    # "the summary itself should carry enough information" fix as
+    # _unittest_summary_from_records's "Failed packages:" section. Filtered
+    # to `ib_tag == record["tag"]` because get_failing_relvals also matches
+    # any sub-IB whose parent_tag is this tag -- this table explicitly never
+    # includes sub-IB rows (see the "not included above" note below), so
+    # their workflows must not leak in here either.
+    failing_lines = []
+    exit_code_names: dict[int, str] | None = None
+    for record in records:
+        failed_count = record["failed_relvals"] or 0
+        if not failed_count:
+            continue
+        candidate_rows = get_failing_relvals(
+            record["tag"], arch=record["arch"], limit=_RELVAL_SCOPE_SUMMARY_WORKFLOW_CAP,
+        )
+        rows = [row for row in candidate_rows if row["ib_tag"] == record["tag"]]
+        if not rows:
+            continue
+        if exit_code_names is None:
+            exit_code_names = get_exit_code_names()
+        entries = ", ".join(
+            f"`{row['name']}` (wf {row['workflow_id']}, exit "
+            f"{_format_exit_code(row['exitcode'], exit_code_names) if row['exitcode'] else 0})"
+            for row in rows
+        )
+        more = failed_count - len(rows)
+        suffix = f" (+{more} more)" if more > 0 else ""
+        failing_lines.append(f"- 🔴 **{record['arch']}**: {entries}{suffix}")
+    if failing_lines:
+        lines.append("")
+        lines.append("Failing workflows:")
+        lines.extend(failing_lines)
     note = _sub_ib_variant_note(records[0]["tag"], sub_ib_variants)
     if note:
         lines.append("")
@@ -799,7 +847,9 @@ def _relval_arch_choice_answer(tag: str, records: list[dict]) -> str:
     )
 
 
-def _relval_scope_or_choice(session_id: str, tag: str, records: list[dict], all_requested: bool) -> list[dict] | str:
+def _relval_scope_or_choice(
+    session_id: str, tag: str, records: list[dict], all_requested: bool, selected_arch: str | None = None,
+) -> list[dict] | str:
     """Ask only when it's genuinely ambiguous which architecture represents
     "the" build -- more than one architecture flagged is_relval_default at
     once (a real incident: a production IB had 4 simultaneously, which used
@@ -811,7 +861,20 @@ def _relval_scope_or_choice(session_id: str, tag: str, records: list[dict], all_
     had 51/951 RelVal failures while two other, non-default architectures
     had 1/951 each and were never shown or mentioned at all. Shared by every
     relval summary-style answer so architecture ambiguity is never silently
-    resolved differently in different places."""
+    resolved differently in different places.
+
+    selected_arch, when given, takes priority over everything else below --
+    an architecture the user already stated explicitly is never second-
+    guessed by the is_relval_default ambiguity check. Found live,
+    2026-09-21: "failed RelVals for <tag> el9_amd64_gcc14" -- the exact
+    canned reply from this project's own scope clarification -- still
+    answered with all three imported architectures, because
+    _relval_ib_summary_answer (the handler this phrasing actually reaches)
+    called this function without ever passing the architecture the question
+    named, unlike its sibling _relval_failure_count_answer."""
+    if selected_arch:
+        selected_records = [record for record in records if record["arch"] == selected_arch]
+        return selected_records if selected_records else _relval_arch_choice_answer(tag, records)
     if all_requested:
         return records
     default_records = [record for record in records if record.get("is_relval_default")]
@@ -888,10 +951,12 @@ def _relval_data_availability_answer(question: str, session_id: str) -> str | No
     if not records:
         return f"No imported RelVal data is available for `{tag}`."
     all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
-    resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
+    selected_arch = _requested_ib_arch(question)
+    resolved = _relval_scope_or_choice(session_id, tag, records, all_requested, selected_arch)
     if isinstance(resolved, str):
         return resolved
-    return _relval_scope_summary(resolved, f"Imported RelVal data for `{tag}`", _sub_ib_variant_names(tag))
+    heading = f"Imported RelVal data for `{tag}`" + (f" on `{selected_arch}`" if selected_arch else "")
+    return _relval_scope_summary(resolved, heading, _sub_ib_variant_names(tag))
 
 
 def _relval_ib_summary_answer(question: str, session_id: str) -> str | None:
@@ -909,10 +974,12 @@ def _relval_ib_summary_answer(question: str, session_id: str) -> str | None:
     if not records:
         return f"No imported RelVal data is available for `{tag}`."
     all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
-    resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
+    selected_arch = _requested_ib_arch(question)
+    resolved = _relval_scope_or_choice(session_id, tag, records, all_requested, selected_arch)
     if isinstance(resolved, str):
         return resolved
-    return _relval_scope_summary(resolved, f"Imported RelVal results for `{tag}`", _sub_ib_variant_names(tag))
+    heading = f"Imported RelVal results for `{tag}`" + (f" on `{selected_arch}`" if selected_arch else "")
+    return _relval_scope_summary(resolved, heading, _sub_ib_variant_names(tag))
 
 
 def _unittest_scope_records(tag: str) -> list[dict]:
