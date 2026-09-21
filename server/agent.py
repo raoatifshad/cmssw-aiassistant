@@ -64,6 +64,47 @@ def propose_capability_classification(client, model: str, question: str, capabil
         return None
 
 
+def propose_pr_search_signature(client, model: str, question: str) -> str | None:
+    """Ask the LLM to read the WHOLE question -- not score isolated words the way
+    server.api_server._pr_search_terms's regex does -- and propose the single best
+    search phrase for a PR/Issue evidence search. Pilot fallback for
+    _pr_evidence_answer, used only when that regex-based extraction finds nothing
+    usable: found live, 2026-09-21, that a pasted error message ("MIOpen Error:
+    filesystem error: cannot create directories: Permission denied
+    [/tmp/miopen-cache/3.5.2.]") got reduced to scoring "Permission" as an isolated
+    capitalized word, when the actual searchable unit is the error message as a
+    whole. This never answers the question itself and is never trusted as fact on
+    its own -- the caller still runs the real, deterministic find_prs_for_error
+    search on whatever this returns and composes the final answer only from its
+    real graph results, same non-agentic constrained-JSON pattern as
+    propose_capability_classification."""
+    prompt = (
+        "The user's question may include a pasted error message or log excerpt. "
+        "Return exactly one JSON object with field error_signature: the single most "
+        "distinctive, searchable phrase from the question (an exact error message, "
+        "exception text, module/class name, or file path) that a human GitHub PR or "
+        "Issue comment would plausibly quote verbatim -- or null if no such phrase is "
+        "present. Never return a generic English word or a sentence fragment made of "
+        "ordinary words. Do not answer the question."
+    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": question},
+            ],
+            temperature=0,
+        )
+        content = response.choices[0].message.content or ""
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        decision = json.loads(match.group(0) if match else content)
+        signature = decision.get("error_signature")
+        return signature.strip() if isinstance(signature, str) and signature.strip() else None
+    except (AttributeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
 def execute_read_only_plan(tool_calls: tuple[tuple[str, dict], ...], tools_registry: dict) -> list[dict]:
     """Execute already-validated tools and retain each structured result as evidence."""
     evidence = []

@@ -370,6 +370,76 @@ class ChatRoutingTests(unittest.TestCase):
     def test_pr_evidence_without_a_fallback_or_identifier_returns_none(self):
         self.assertIsNone(_pr_evidence_answer("is there any issue /pr open for it recently?"))
 
+    @patch("server.api_server.find_prs_for_error")
+    @patch("server.api_server.propose_pr_search_signature")
+    @patch("server.api_server._llm_client", new="not-none-sentinel")
+    def test_pr_evidence_falls_back_to_llm_signature_when_regex_terms_miss(
+        self, propose_signature, find_prs
+    ):
+        # Pilot for the class of bug in project_pr_search_precision_fix: found live
+        # 2026-09-21, a pasted MIOpen error ("...Permission denied...") got reduced to
+        # searching the isolated word "Permission" -- the regex approach can only ever
+        # score words in isolation, never read the message as a whole. When every
+        # regex-extracted term fails to find a match, _pr_evidence_answer now falls
+        # back once to propose_pr_search_signature (one constrained LLM call reading
+        # the whole question) and searches with whatever it proposes.
+        question = (
+            "MIOpen Error: filesystem error: cannot create directories: "
+            "Permission denied [/tmp/miopen-cache/3.5.2.]"
+        )
+        propose_signature.return_value = (
+            "MIOpen Error: filesystem error: cannot create directories: "
+            "Permission denied [/tmp/miopen-cache/3.5.2.]"
+        )
+        # First two calls are the regex-extracted terms ("tmp/miopen", "MIOpen"),
+        # both miss; the third call is the LLM-derived full-message signature, hit.
+        find_prs.side_effect = [
+            [],
+            [],
+            [{
+                "repo": "cmssw", "pr_number": 51900, "title": "Fix MIOpen cache permissions",
+                "merged_at": None, "evidence": ["pr_comment"], "matched_files": [],
+                "matched_unit_tests": False, "matched_unit_test_packages": [],
+                "matched_unit_test_ibs": [], "matched_warnings": None,
+            }],
+        ]
+
+        result = _pr_evidence_answer(f"any pr for this: {question}")
+
+        self.assertIsNotNone(result)
+        answer, rows = result
+        self.assertIn("51900", answer)
+        self.assertIn("LLM-assisted search", answer)
+        self.assertEqual(len(rows), 1)
+        propose_signature.assert_called_once()
+
+    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.propose_pr_search_signature", return_value=None)
+    @patch("server.api_server._llm_client", new="not-none-sentinel")
+    def test_pr_evidence_reports_no_evidence_when_llm_fallback_also_misses(
+        self, propose_signature, find_prs
+    ):
+        # The LLM fallback is a best-effort second attempt, not a guarantee -- when
+        # neither the regex terms nor the LLM-proposed signature find anything, this
+        # must still report a plain no-evidence miss, never fabricate a match.
+        result = _pr_evidence_answer("any pr for CMSSW_20_1_X_2026-08-04-2300?")
+
+        self.assertIsNotNone(result)
+        answer, rows = result
+        self.assertIn("No PR evidence matching", answer)
+        self.assertEqual(rows, [])
+
+    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.propose_pr_search_signature")
+    def test_pr_evidence_skips_llm_fallback_when_client_unconfigured(self, propose_signature, find_prs):
+        # _llm_client defaults to None until the app's startup event configures it
+        # (never fires in this test process) -- the fallback must no-op cleanly
+        # rather than erroring, and never call the LLM proposal function at all.
+        result = _pr_evidence_answer("any PR fixing CMSSW_20_1_X_2026-08-04-2300?")
+
+        self.assertIsNotNone(result)
+        propose_signature.assert_not_called()
+
     @patch("server.api_server.get_driver")
     def test_ib_results_summary_uses_explicit_architecture(self, get_driver):
         tag = "CMSSW_20_1_X_2026-08-10-1100"
