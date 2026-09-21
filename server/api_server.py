@@ -944,6 +944,9 @@ def _unittest_arch_choice_answer(tag: str, records: list[dict]) -> str:
     )
 
 
+_UNITTEST_SUMMARY_FAILED_PACKAGE_CAP = 10
+
+
 def _unittest_summary_from_records(tag: str, records: list[dict], include_sub_ibs: bool = True) -> str:
     total = sum(record["total"] or 0 for record in records)
     failed = sum(record["failed"] or 0 for record in records)
@@ -961,6 +964,30 @@ def _unittest_summary_from_records(tag: str, records: list[dict], include_sub_ib
         f"{record['total'] or 0:,} | {record['errors'] or 0:,} |"
         for record in records
     )
+    # Name the actual failing package(s) inline instead of making a user ask a
+    # separate follow-up for what the summary's own "Failed" count refers to
+    # -- found live, 2026-09-21: a 1-failure summary gave no hint it was
+    # HLTrigger/Tools without a second "which package failed" question.
+    # Capped per architecture (not per build) since each architecture is
+    # its own real failure set; a genuinely broad failure list still gets a
+    # "+N more" pointer to _failed_unittest_list_answer instead of dumping
+    # everything into what's meant to be a short summary.
+    failing_package_lines = []
+    for record in records:
+        failed_count = record["failed"] or 0
+        if not failed_count:
+            continue
+        failing_rows = get_failing_unittests(tag, arch=record["arch"], limit=_UNITTEST_SUMMARY_FAILED_PACKAGE_CAP)
+        if not failing_rows:
+            continue
+        names = ", ".join(f"`{row['name']}`" for row in failing_rows)
+        more = failed_count - len(failing_rows)
+        suffix = f" (+{more} more)" if more > 0 else ""
+        failing_package_lines.append(f"- **{record['arch']}**: {names}{suffix}")
+    if failing_package_lines:
+        lines.append("")
+        lines.append("Failed packages:")
+        lines.extend(failing_package_lines)
     # Inline each sub-IB variant's own unit-test results too, never merged
     # into the numbers above -- each is a genuinely separate build per
     # CLAUDE.md's IB-identity invariant. Approved 2026-08-26: a plain

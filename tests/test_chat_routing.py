@@ -1152,8 +1152,9 @@ class ChatRoutingTests(unittest.TestCase):
         answer, _ = result
         self.assertIn("51640", answer)
 
+    @patch("server.api_server.get_failing_unittests", return_value=[])
     @patch("server.api_server.get_driver")
-    def test_unittest_capability_uses_session_ib_context_when_tag_omitted(self, get_driver):
+    def test_unittest_capability_uses_session_ib_context_when_tag_omitted(self, get_driver, _get_failing_unittests):
         # Regression guard: unlike "relval" (fixed above), the "unittest"
         # capability already threads _latest_ib_contexts.get(session_id) as a
         # fallback tag (_unittest_summary_answer's `context_tag` parameter).
@@ -1838,9 +1839,60 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("s-multi-unittest", _pending_unittest_scopes)
         _pending_unittest_scopes.pop("s-multi-unittest", None)
 
+    @patch("server.api_server.get_failing_unittests")
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_never_hides_non_default_architectures(self, scope_records, _sub_ib_variant_tags):
+    def test_unittest_summary_names_the_failing_package_inline(self, scope_records, _sub_ib_variant_tags, get_failing_unittests):
+        # Regression: found live 2026-09-21 -- a real user asked "unit tests
+        # for <tag>", got "1 failed across 375 package result(s)" with no
+        # indication of WHICH package, and had to ask a completely separate
+        # follow-up ("which unit test package failed") to learn it was
+        # HLTrigger/Tools. The summary itself must name the failing
+        # package(s), not just the count -- a separate detailed-list handler
+        # already existed (_failed_unittest_list_answer) but requiring a
+        # second question for a single-failure build is a worse default.
+        scope_records.return_value = [
+            {"arch": "el9_amd64_gcc14", "is_default": True, "total": 375, "failed": 1, "passed": 374, "errors": 1},
+        ]
+        get_failing_unittests.return_value = [{"name": "HLTrigger/Tools", "errors": 1}]
+
+        answer = _unittest_summary_answer(
+            "unit tests for CMSSW_20_1_MULTIARCHSV4_X_2026-09-14-2300", None, "s-name-inline-unittest",
+        )
+
+        self.assertIn("HLTrigger/Tools", answer)
+        get_failing_unittests.assert_called_once_with(
+            "CMSSW_20_1_MULTIARCHSV4_X_2026-09-14-2300", arch="el9_amd64_gcc14", limit=10
+        )
+
+    @patch("server.api_server.get_failing_unittests")
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
+    @patch("server.api_server._unittest_scope_records")
+    def test_unittest_summary_caps_and_labels_more_when_many_packages_fail(self, scope_records, _sub_ib_variant_tags, get_failing_unittests):
+        # A genuinely broad failure set must stay a short pointer, not turn
+        # the summary into the full detailed list -- that's what
+        # _failed_unittest_list_answer is for.
+        scope_records.return_value = [
+            {"arch": "el9_amd64_gcc14", "is_default": True, "total": 375, "failed": 15, "passed": 360, "errors": 15},
+        ]
+        get_failing_unittests.return_value = [
+            {"name": f"Package/Number{i}", "errors": 1} for i in range(10)
+        ]
+
+        answer = _unittest_summary_answer(
+            "unit tests for CMSSW_20_1_MULTIARCHSV4_X_2026-09-14-2300", None, "s-capped-unittest",
+        )
+
+        self.assertIn("Package/Number0", answer)
+        self.assertIn("(+5 more)", answer)
+        get_failing_unittests.assert_called_once_with(
+            "CMSSW_20_1_MULTIARCHSV4_X_2026-09-14-2300", arch="el9_amd64_gcc14", limit=10
+        )
+
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
+    @patch("server.api_server._unittest_scope_records")
+    def test_unittest_summary_never_hides_non_default_architectures(self, scope_records, _sub_ib_variant_tags, _get_failing_unittests):
         # Regression: a build with only ONE architecture flagged is_default
         # among several imported used to silently narrow to just that one,
         # dropping the rest with no indication they existed -- the same bug
@@ -1862,9 +1914,10 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("el9_aarch64_gcc14", answer)
         self.assertIn("7 failed", answer)  # 2+2+3
 
+    @patch("server.api_server.get_failing_unittests", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_all_recovers_full_architecture_set(self, scope_records, _sub_ib_variant_tags):
+    def test_unittest_summary_all_recovers_full_architecture_set(self, scope_records, _sub_ib_variant_tags, _get_failing_unittests):
         # Regression: found live -- replying "all" to the multi-default
         # choice prompt only returned the pre-filtered tied-default subset
         # (2 of 4 architectures), because the pending state itself was
@@ -1890,9 +1943,10 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("el10_amd64_gcc15", answer)
         self.assertIn("11 failed", answer)
 
+    @patch("server.api_server.get_failing_unittests", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_remembers_session_architecture_for_tagless_followup(self, scope_records, _sub_ib_variant_tags):
+    def test_unittest_summary_remembers_session_architecture_for_tagless_followup(self, scope_records, _sub_ib_variant_tags, _get_failing_unittests):
         # Regression: found live -- "how many unit tests failing in <tag>
         # <arch>" (explicit tag+arch) resolved fine, but a tag-less,
         # arch-less follow-up in the same session ("what 3 failed unit
@@ -1912,9 +1966,10 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("3 failed", answer)
         self.assertNotIn("Choose one", answer)
 
+    @patch("server.api_server.get_failing_unittests", return_value=[])
     @patch("server.api_server.get_driver")
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_mentions_sub_ib_variants(self, scope_records, get_driver):
+    def test_unittest_summary_mentions_sub_ib_variants(self, scope_records, get_driver, _get_failing_unittests):
         # Regression: found live -- a primary tag's unit-test summary gave no
         # hint that CLANG/DEVEL/MULTIARCHS/NONLTO/ROOT6 sub-IB variants exist
         # for the same build, each running its own separate unit-test suite
@@ -2001,9 +2056,10 @@ class ChatRoutingTests(unittest.TestCase):
 
         self.assertIn("DQM/Physics", answer)
 
+    @patch("server.api_server.get_failing_unittests", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_resolves_after_choosing_an_architecture(self, scope_records, _sub_ib_variant_tags):
+    def test_unittest_summary_resolves_after_choosing_an_architecture(self, scope_records, _sub_ib_variant_tags, _get_failing_unittests):
         scope_records.return_value = [
             {"arch": "el9_amd64_gcc15", "is_default": True, "total": 950, "failed": 3, "passed": 947, "errors": 3},
             {"arch": "el9_amd64_gcc16", "is_default": True, "total": 950, "failed": 4, "passed": 946, "errors": 4},
@@ -2015,9 +2071,10 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("4 failed", answer)
         self.assertNotIn("s-resume-unittest", _pending_unittest_scopes)
 
+    @patch("server.api_server.get_failing_unittests", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_honors_an_explicit_architecture_up_front(self, scope_records, _sub_ib_variant_tags):
+    def test_unittest_summary_honors_an_explicit_architecture_up_front(self, scope_records, _sub_ib_variant_tags, _get_failing_unittests):
         # An architecture named directly in the first question must resolve
         # immediately -- no reason to ask when the user already said which one.
         scope_records.return_value = [
@@ -2032,9 +2089,10 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("4 failed", answer)
         self.assertNotIn("s-explicit-unittest", _pending_unittest_scopes)
 
+    @patch("server.api_server.get_failing_unittests", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_recognizes_unit_without_the_word_test(self, scope_records, _sub_ib_variant_tags):
+    def test_unittest_summary_recognizes_unit_without_the_word_test(self, scope_records, _sub_ib_variant_tags, _get_failing_unittests):
         # Regression: a real user asked "unit failures in <tag>" -- no "test"
         # word at all -- and the old \bunit\s*tests?\b regex required "test"
         # to be present, so this fell through to the ambiguous-category
