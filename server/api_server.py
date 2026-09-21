@@ -1909,6 +1909,23 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
         # coverage" section.
         return None
 
+    # Same widened-trigger fallback as _pr_evidence_answer (see
+    # project_llm_fallback_trigger_widened), extended here after finding it actually
+    # loses real evidence, not just hypothetically: for "edm::FileInPath::initialize_()"
+    # the bare regex term "FileInPath" matched Issue #51757 ("Infinite loop in
+    # edm::FileInPath") only generically -- but that Issue's body literally contains
+    # the exact qualified string "edm::FileInPath::initialize_()" verbatim. Unlike
+    # find_prs_for_error's per-term sequential loop, this query already matches every
+    # term in one pass and reports which one(s) hit per row (matched_terms) -- so the
+    # natural extension is simpler here: when the question has qualified-code syntax
+    # word-splitting can't preserve, just add the LLM-derived signature as one more
+    # search term. A row matching it shows that in its own matched_terms, making the
+    # precise match visible without needing separate "prefer narrower" branching.
+    if _QUALIFIED_CODE_REFERENCE_RE.search(question):
+        llm_signature = _llm_extract_pr_error_signature(question)
+        if llm_signature and llm_signature not in terms:
+            terms = terms + [llm_signature]
+
     query = """
         MATCH (issue:Issue {repo:'cmssw'})
         WHERE toLower(coalesce(issue.state, '')) = 'open'
@@ -1922,7 +1939,7 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
         WHERE size(matched_terms) > 0
         RETURN issue.number AS number, issue.title AS title, issue.state AS state,
                matched_terms[0..5] AS matched_terms
-        ORDER BY issue.number DESC
+        ORDER BY size(matched_terms) DESC, issue.number DESC
         LIMIT 20
     """
     driver = get_driver()
