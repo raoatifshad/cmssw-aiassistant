@@ -216,7 +216,18 @@ class KGChatSession:
                 }
                 if self.uses_structured_tools:
                     request["tools"] = self.openai_tools
-                    request["reasoning_effort"] = "none"
+                    # "none" was the original value here but the hosted gpt-oss-20b
+                    # backend's Harmony response format rejects it outright
+                    # ("ValueError : Harmony does not support reasoning_effort='none'",
+                    # a real 500 from the litellm/vLLM gateway, not a graph-evidence
+                    # decision) -- found live, 2026-09-21: every LLM tool-calling call
+                    # this model made (feedback verification, the LLM-fallback chat
+                    # path) silently failed and surfaced as "could not reach an
+                    # evidence-based decision" / a generic API-error string, never as
+                    # an obvious crash. Harmony's valid values are low/medium/high;
+                    # "low" keeps closest to the original fast/deterministic intent
+                    # (paired with temperature=0 below).
+                    request["reasoning_effort"] = "low"
                     request["temperature"] = 0
                 response = self.client.chat.completions.create(**request)
             except Exception as e:
