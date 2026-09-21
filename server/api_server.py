@@ -42,6 +42,7 @@ from server.agent import (  # noqa: E402
     execute_read_only_plan,
     propose_capability_classification,
     propose_investigation_plan,
+    propose_pr_search_signature,
     synthesize_evidence_answer,
 )
 from server.knowledge_contract import LLM_KNOWLEDGE_CONTRACT  # noqa: E402
@@ -1593,6 +1594,51 @@ def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
     return "\n".join(lines), [pr]
 
 
+def _render_pr_evidence_rows(term: str, rows: list[dict], via_llm: bool = False) -> str:
+    """Render find_prs_for_error's rows for one matched search term -- shared by both
+    the regex-extracted-term path and the LLM-assisted fallback in
+    _pr_evidence_answer, so the two paths produce identically-shaped answers."""
+    suffix = " (LLM-assisted search)" if via_llm else ""
+    lines = [f"PR evidence matching `{term}`{suffix}:"]
+    for row in rows:
+        lines.append(
+            f"- **{row['repo']} #{row['pr_number']}** - {row['title']} "
+            f"(merged {row['merged_at'] or 'unknown'})"
+        )
+        evidence = ", ".join(row["evidence"])
+        details = [f"evidence: {evidence}"]
+        if row["matched_files"]:
+            details.append(f"changed files: {', '.join(row['matched_files'])}")
+        if row["matched_unit_tests"]:
+            details.append(
+                "failed aggregate unit-test packages: "
+                f"{', '.join(row['matched_unit_test_packages'])} "
+                f"in {', '.join(row['matched_unit_test_ibs'])}"
+            )
+        if row["matched_warnings"]:
+            details.append(
+                f"matching warnings: {row['matched_warnings']} "
+                f"({row['matched_occurrences']} occurrences)"
+            )
+        lines.append(f"  - {'; '.join(details)}")
+    lines.append(
+        "These links establish relevance only. Package-level unit-test results do not identify a specific failing test or prove a PR caused or fixed it."
+    )
+    return "\n".join(lines)
+
+
+def _llm_extract_pr_error_signature(question: str) -> str | None:
+    """Fallback for _pr_evidence_answer when regex-based _pr_search_terms finds no
+    usable identifier -- reads the whole question via one constrained LLM call
+    instead of scoring isolated words in it. See propose_pr_search_signature's
+    docstring for the motivating example. Never trusted as fact on its own: the
+    caller still runs the real, deterministic find_prs_for_error search on
+    whatever this returns and only answers from its actual results."""
+    if _llm_client is None:
+        return None
+    return propose_pr_search_signature(_llm_client, DEFAULT_MODEL, question)
+
+
 def _pr_evidence_answer(question: str, fallback_term: str | None = None) -> tuple[str, list[dict]] | None:
     """Return direct graph evidence for PR-focused questions when available.
     fallback_term (e.g. a workflow ID from _last_workflow_contexts) is only
@@ -1600,42 +1646,37 @@ def _pr_evidence_answer(question: str, fallback_term: str | None = None) -> tupl
     explicit identifier in the question always wins over remembered
     context, so a natural follow-up like "any PRs for it?" can still resolve
     to whatever was just discussed without a stale context ever overriding
-    something the user actually typed."""
+    something the user actually typed.
+
+    When every regex-extracted term (or the absence of any) fails to find a match,
+    falls back once to _llm_extract_pr_error_signature -- a single constrained LLM
+    call that reads the whole question instead of scoring isolated capitalized
+    words, the pilot for the class of bug documented in
+    project_pr_search_precision_fix (found live 2026-09-21: a pasted MIOpen error
+    message got reduced to searching the isolated word "Permission"). The LLM only
+    proposes what to search for; find_prs_for_error still does the real,
+    deterministic matching and this function still composes the answer only from
+    its actual results."""
     if not re.search(r"\b(?:pr|mr|pull request|merge request|fix|fixes|fixed)\b", question, re.IGNORECASE):
         return None
     terms = _pr_search_terms(question) or ([fallback_term] if fallback_term else [])
     for term in terms:
         rows = find_prs_for_error(term)
-        if not rows:
-            continue
-        lines = [f"PR evidence matching `{term}`:"]
-        for row in rows:
-            lines.append(
-                f"- **{row['repo']} #{row['pr_number']}** - {row['title']} "
-                f"(merged {row['merged_at'] or 'unknown'})"
-            )
-            evidence = ", ".join(row["evidence"])
-            details = [f"evidence: {evidence}"]
-            if row["matched_files"]:
-                details.append(f"changed files: {', '.join(row['matched_files'])}")
-            if row["matched_unit_tests"]:
-                details.append(
-                    "failed aggregate unit-test packages: "
-                    f"{', '.join(row['matched_unit_test_packages'])} "
-                    f"in {', '.join(row['matched_unit_test_ibs'])}"
-                )
-            if row["matched_warnings"]:
-                details.append(
-                    f"matching warnings: {row['matched_warnings']} "
-                    f"({row['matched_occurrences']} occurrences)"
-                )
-            lines.append(f"  - {'; '.join(details)}")
-        lines.append(
-            "These links establish relevance only. Package-level unit-test results do not identify a specific failing test or prove a PR caused or fixed it."
-        )
-        return "\n".join(lines), rows
-    if terms:
-        return f"No PR evidence matching `{terms[0]}` exists in the imported graph.", []
+        if rows:
+            return _render_pr_evidence_rows(term, rows), rows
+    llm_signature = _llm_extract_pr_error_signature(question)
+    llm_tried = bool(llm_signature and llm_signature not in terms)
+    if llm_tried:
+        rows = find_prs_for_error(llm_signature)
+        if rows:
+            return _render_pr_evidence_rows(llm_signature, rows, via_llm=True), rows
+    # Cite the LLM-derived signature in the miss, not just the first regex term, when
+    # it was actually tried too -- it's the more specific, more informative attempt
+    # (e.g. the full error message, not one isolated word from it), so a shifter
+    # reading the miss sees what was really searched, not just the weaker fallback.
+    miss_term = llm_signature if llm_tried else (terms[0] if terms else llm_signature)
+    if miss_term:
+        return f"No PR evidence matching `{miss_term}` exists in the imported graph.", []
     return None
 
 
