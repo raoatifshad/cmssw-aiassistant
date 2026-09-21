@@ -1089,7 +1089,7 @@ def search_issues_by_text(term: str, include_comments: bool = False, limit: int 
 
 
 def find_prs_for_error(error: str, ib_tag: str | None = None, limit: int = 20) -> list[dict]:
-    """Find PRs from warnings, test packages, files, titles, and descriptions.
+    """Find PRs from warnings, test packages, files, titles, descriptions, and comments.
     The evidence field distinguishes source-warning matches from weaker discovery
     signals. None of the results prove that a PR caused an error."""
     limit = min(limit, MAX_ROWS)
@@ -1166,9 +1166,28 @@ def find_prs_for_error(error: str, ib_tag: str | None = None, limit: int = 20) -
         "'failed_unit_test_package' AS evidence LIMIT $limit",
         {"error": error, "ib_tag": ib_tag, "limit": limit},
     )
+    # cmsbuild is cms-bot: it posts a "Failed Tests" comment on every PR dumping the
+    # full exception traceback of *any currently-broken baseline test* as routine CI
+    # status, regardless of whether that PR relates to the search term at all (same
+    # noise source documented on get_relval_exception_evidence's identical exclusion,
+    # found live via PR #51375 matching an unrelated workflow's LogicError purely
+    # because cms-bot's boilerplate comment happened to quote it). Excluding bot
+    # comments here keeps this a genuine-discussion signal, not CI noise.
+    comment_rows = _run_query(
+        "MATCH (p:PR)-[:HAS_COMMENT]->(c:GitHubComment) "
+        "WHERE c.author <> 'cmsbuild' AND toLower(coalesce(c.body, '')) CONTAINS toLower($error) "
+        "WITH DISTINCT p "
+        "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
+        "RETURN p.repo AS repo, p.number AS pr_number, p.title AS title, "
+        "a.name AS author, p.merged_at AS merged_at, 0 AS matched_warnings, "
+        "0 AS matched_occurrences, [] AS matched_files, 0 AS matched_unit_tests, "
+        "0 AS matched_unit_test_errors, [] AS matched_unit_test_packages, [] AS matched_unit_test_ibs, "
+        "'pr_comment' AS evidence LIMIT $limit",
+        {"error": error, "limit": limit},
+    )
 
     merged = {}
-    for row in warning_rows + test_rows + file_rows + title_rows + description_rows:
+    for row in warning_rows + test_rows + file_rows + title_rows + description_rows + comment_rows:
         key = (row["repo"], row["pr_number"])
         existing = merged.get(key)
         if not existing:

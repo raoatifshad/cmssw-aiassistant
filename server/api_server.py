@@ -86,7 +86,8 @@ source file, including questions about a unit-test failure, use \
 find_prs_for_error. Explain the returned evidence: warning_changed_file is
 strongest; failed_unit_test_package means the changed test file belongs to a
 package with a failed aggregate test result, and report its matched_unit_test_ibs;
-changed_file_path, pr_title, and pr_description are discovery signals. No match
+changed_file_path, pr_title, pr_description, and pr_comment (a human PR comment,
+never cms-bot's own routine CI comments) are discovery signals. No match
 proves that a PR caused a warning or test failure.
 
 If a tool returns an error or nothing, say so plainly. Never fabricate excuses."""

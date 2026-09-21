@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from graph.tools import (
-    _ib_sort_key, diff_warnings, find_prs_before_ib, find_prs_merged_between, list_ib_tags,
+    _ib_sort_key, diff_warnings, find_prs_before_ib, find_prs_for_error, find_prs_merged_between, list_ib_tags,
     latest_and_previous_primary_tags, variant_previous_tag, find_relval_regressions,
     find_unittest_regressions, find_build_regressions, single_ib_status,
 )
@@ -526,6 +526,55 @@ class DiffWarningsTests(unittest.TestCase):
 
         self.assertEqual(result, {"new": new_rows, "resolved": resolved_rows, "changed": changed_rows})
         self.assertEqual(session.run.call_count, 3)
+
+
+def _empty_pr_match_row(evidence: str, **overrides) -> dict:
+    row = {
+        "repo": "cmssw", "pr_number": 1, "title": "t", "author": "a", "merged_at": None,
+        "matched_warnings": 0, "matched_occurrences": 0, "matched_files": [],
+        "matched_unit_tests": 0, "matched_unit_test_errors": 0,
+        "matched_unit_test_packages": [], "matched_unit_test_ibs": [], "evidence": evidence,
+    }
+    row.update(overrides)
+    return row
+
+
+class FindPrsForErrorTests(unittest.TestCase):
+    @patch("graph.tools.get_driver")
+    def test_matches_a_human_pr_comment(self, get_driver):
+        # Regression: find_prs_for_error searched PR title/body/changed-files/
+        # warnings/unit-test packages but never comments at all -- a term only
+        # ever mentioned in a PR *comment* (not the title/body) silently reported
+        # no PR evidence even though it was genuinely there. Confirmed live: "is
+        # there any PR/issue open for testAlpakaModelCudaAsync" found nothing
+        # because get_relval_exception_evidence/_open_issue_answer already search
+        # comments, but the general find_prs_for_error path never did.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        comment_match = _empty_pr_match_row("pr_comment", pr_number=51900, title="Fix SoA round-trip")
+        session.run.side_effect = [[], [], [], [], [], [comment_match]]
+
+        results = find_prs_for_error("testSoADataTypesCudaAsync")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["pr_number"], 51900)
+        self.assertIn("pr_comment", results[0]["evidence"])
+        self.assertEqual(session.run.call_count, 6)
+
+    @patch("graph.tools.get_driver")
+    def test_comment_query_excludes_cmsbuild_bot_comments(self, get_driver):
+        # cms-bot (author "cmsbuild") posts a routine "Failed Tests" comment
+        # dumping the full exception traceback of every currently-broken baseline
+        # test on every PR, unrelated to whether that PR actually relates to the
+        # search term -- same noise source get_relval_exception_evidence already
+        # excludes. The comment-matching query itself must filter it out, not
+        # rely on the caller to notice.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.side_effect = [[], [], [], [], [], []]
+
+        find_prs_for_error("some error text")
+
+        comment_query = session.run.call_args_list[5].args[0]
+        self.assertIn("c.author <> 'cmsbuild'", comment_query)
 
 
 if __name__ == "__main__":
