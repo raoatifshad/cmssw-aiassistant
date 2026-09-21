@@ -556,6 +556,31 @@ class ChatRoutingTests(unittest.TestCase):
             ["HydjetQMinBias_5519GeV+Run4D121_hi", "34551.85"],
         )
 
+    @patch("server.api_server.get_driver")
+    def test_open_issue_search_does_not_require_the_word_open(self, get_driver):
+        # Regression: found live 2026-09-21 -- "...where this comment lies in the
+        # issue/pr" mentions "issue" but never "open"/"unresolved"/"active", so
+        # _open_issue_answer returned None immediately and Issues were never even
+        # searched, even though the sibling PR search ran fine for the same
+        # question. The Cypher query itself already scopes to state='open' Issues
+        # unconditionally, so requiring that word in the phrasing was a redundant,
+        # over-narrow entry gate, not real filtering.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{
+            "number": 51900, "title": "MIOpen cache permission failure",
+            "state": "open", "matched_terms": ["MIOpen"],
+        }]
+
+        answer = _open_issue_answer(
+            "MIOpen Error: filesystem error: cannot create directories: "
+            "Permission denied [/tmp/miopen-cache/3.5.2.] where this comment "
+            "lies in the issue/pr",
+            None,
+        )
+
+        self.assertIsNotNone(answer)
+        self.assertIn("Issue #51900", answer)
+
     def test_normalizes_common_deterministic_paraphrases(self):
         self.assertEqual(
             _normalize_deterministic_question("How much Rel-Val failures are in this integration-build?"),

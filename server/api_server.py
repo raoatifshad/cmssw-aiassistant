@@ -1808,10 +1808,17 @@ def _release_artifact_answer(question: str) -> str | None:
 
 
 def _open_issue_answer(question: str, relval_context: dict[str, str | None] | None) -> str | None:
-    """Find open Issues using concrete query terms or the active failed-RelVal context."""
+    """Find open Issues using concrete query terms or the active failed-RelVal context.
+    Always scoped to state='open' Issues by the query below (that's fixed, not a
+    function of phrasing) -- previously also required the literal word "open"/
+    "unresolved"/"active" to appear in the question before even trying, which was a
+    redundant, over-narrow entry gate: the search was always open-issues-only anyway,
+    so that word was never adding real filtering, only blocking phrasings that never
+    said it. Found live, 2026-09-21: "...where this comment lies in the issue/pr"
+    mentions "issue" but never "open" -- this returned None immediately, so Issues
+    were never even searched (not "found nothing" -- never attempted), even though
+    the sibling PR search ran fine for the same question."""
     if not re.search(r"\bissues?\b", question, re.IGNORECASE):
-        return None
-    if not re.search(r"\b(?:open|unresolved|active)\b", question, re.IGNORECASE):
         return None
 
     if relval_context is None and _RELVAL_KEYWORD_RE.search(question) and re.search(
@@ -1837,10 +1844,18 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
             ] + failure_terms
         ))
     if not terms:
-        return (
-            "Please provide a concrete CMSSW release, workflow ID, workflow name, or package path "
-            "to search open Issues."
-        )
+        # Defer (None), don't dead-end with a prompt -- matches _pr_evidence_answer's
+        # sibling behavior when it has nothing to search either. Found live,
+        # 2026-09-21: "is workflow 140.051 a known issue?" mentions "issue" but has no
+        # term _pr_search_terms recognizes (a 3-digit-prefix workflow ID like
+        # "140.051" doesn't match its 4-6-digit pattern), so before this it hit the
+        # prompt below and stopped there -- even though _recurring_failure_answer,
+        # later in the same capability's chain, could answer with real recurrence
+        # data immediately, no extra input needed. Returning None lets that happen,
+        # same "capability matched, one handler in its chain must not swallow a
+        # better answer downstream" principle as CLAUDE.md's "Capability-handler
+        # coverage" section.
+        return None
 
     query = """
         MATCH (issue:Issue {repo:'cmssw'})
