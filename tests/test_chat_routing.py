@@ -357,7 +357,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNotNone(result)
         answer, _ = result
         self.assertIn("140.0", answer)
-        find_prs.assert_called_once_with("140.0")
+        find_prs.assert_called_once_with("140.0", limit=20)
 
     @patch("server.api_server.find_prs_for_error", return_value=[])
     def test_pr_evidence_prefers_an_explicit_identifier_over_the_fallback(self, find_prs):
@@ -365,7 +365,7 @@ class ChatRoutingTests(unittest.TestCase):
         # overridden by stale remembered context from an earlier turn.
         _pr_evidence_answer("any PR fixing CMSSW_20_1_X_2026-08-04-2300?", fallback_term="140.0")
 
-        find_prs.assert_called_once_with("CMSSW_20_1_X_2026-08-04-2300")
+        find_prs.assert_called_once_with("CMSSW_20_1_X_2026-08-04-2300", limit=20)
 
     def test_pr_evidence_without_a_fallback_or_identifier_returns_none(self):
         self.assertIsNone(_pr_evidence_answer("is there any issue /pr open for it recently?"))
@@ -439,6 +439,79 @@ class ChatRoutingTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         propose_signature.assert_not_called()
+
+    @patch("server.api_server.find_prs_for_error")
+    @patch("server.api_server.propose_pr_search_signature")
+    @patch("server.api_server._llm_client", new="not-none-sentinel")
+    def test_pr_evidence_prefers_narrower_llm_match_for_qualified_code_reference(
+        self, propose_signature, find_prs
+    ):
+        # Found live 2026-09-21: "any PR / issue having edm::FileInPath::initialize_()"
+        # extracted only the bare class name "FileInPath" (word-splitting can't
+        # preserve "::"/"()" , and the real specific part -- "initialize_", lowercase
+        # per C++ private-method convention -- fails the capitalization check on its
+        # own). The regex search still found 20 (the row limit) loosely-related PRs,
+        # so the OLD zero-results-only trigger never even tried the LLM. Presence of
+        # "::"/"()" must trigger the LLM check even though the regex path already
+        # "succeeded", and a narrower LLM-derived match must be preferred over the
+        # broad one.
+        question = "any PR / issue having edm::FileInPath::initialize_()"
+        propose_signature.return_value = "edm::FileInPath::initialize_()"
+        broad_rows = [
+            {"repo": "cmssw", "pr_number": 40000 + n, "title": f"Unrelated FileInPath change {n}",
+             "merged_at": None, "evidence": ["pr_title"], "matched_files": [],
+             "matched_unit_tests": False, "matched_unit_test_packages": [],
+             "matched_unit_test_ibs": [], "matched_warnings": None}
+            for n in range(20)
+        ]
+        narrow_rows = [{
+            "repo": "cmssw", "pr_number": 46200, "title": "edm::FileInPath: return reference to paths; cleanup code",
+            "merged_at": None, "evidence": ["pr_title"], "matched_files": [],
+            "matched_unit_tests": False, "matched_unit_test_packages": [],
+            "matched_unit_test_ibs": [], "matched_warnings": None,
+        }]
+        find_prs.side_effect = [broad_rows, narrow_rows]
+
+        result = _pr_evidence_answer(question)
+
+        self.assertIsNotNone(result)
+        answer, rows = result
+        self.assertIn("46200", answer)
+        self.assertIn("LLM-assisted search", answer)
+        self.assertEqual(len(rows), 1)
+        propose_signature.assert_called_once()
+
+    @patch("server.api_server.find_prs_for_error")
+    @patch("server.api_server.propose_pr_search_signature")
+    @patch("server.api_server._llm_client", new="not-none-sentinel")
+    def test_pr_evidence_falls_back_to_broad_regex_match_when_llm_finds_nothing_narrower(
+        self, propose_signature, find_prs
+    ):
+        # The LLM double-check must never make a broad-but-real regex match
+        # disappear -- when it can't find anything narrower, the original (broad)
+        # result is still better than reporting no evidence at all.
+        question = "any PR / issue having edm::FileInPath::initialize_()"
+        propose_signature.return_value = "edm::FileInPath::initialize_()"
+        broad_rows = [
+            {"repo": "cmssw", "pr_number": 40000 + n, "title": f"Unrelated FileInPath change {n}",
+             "merged_at": None, "evidence": ["pr_title"], "matched_files": [],
+             "matched_unit_tests": False, "matched_unit_test_packages": [],
+             "matched_unit_test_ibs": [], "matched_warnings": None}
+            for n in range(20)
+        ]
+        find_prs.side_effect = [broad_rows, []]
+
+        result = _pr_evidence_answer(question)
+
+        self.assertIsNotNone(result)
+        answer, rows = result
+        self.assertNotIn("LLM-assisted search", answer)
+        self.assertEqual(len(rows), 20)
+        # Transparent about the broad fallback: a narrower search was tried and came
+        # up empty, so a shifter isn't misled into treating a generic class-name match
+        # as if it were a precise hit on the exact method asked about.
+        self.assertIn("more specific search", answer)
+        self.assertIn("edm::FileInPath::initialize_()", answer)
 
     @patch("server.api_server.get_driver")
     def test_ib_results_summary_uses_explicit_architecture(self, get_driver):
