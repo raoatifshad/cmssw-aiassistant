@@ -1373,6 +1373,22 @@ def _latest_clang_warning_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _looks_like_pr_search_identifier(word: str) -> bool:
+    """A real CMSSW-domain identifier (a package/class/workflow symbol) either carries
+    a digit or has internal capitalization -- a CamelCase/PascalCase compound (e.g.
+    "MIOpen", "AlpakaModelCudaAsync") or an all-caps acronym/exit-code name (e.g.
+    "SIGSEGV", "CUDA"). An ordinary English word that merely starts a sentence or
+    clause, like "Permission" in a pasted "...Permission denied..." error message,
+    has its only uppercase letter at position 0 and would pass the old bare
+    `any(char.isupper()...)` check just the same. That was tolerable while comment
+    text wasn't searched, but find_prs_for_error's PR-comment search scans ~690k
+    comments -- found live: "Permission" alone (extracted from a pasted MIOpen
+    error) returned 20 completely unrelated PRs, almost all matched only via
+    pr_comment, because "permission" is common enough to appear in some unrelated
+    human comment on nearly any large, active PR set."""
+    return any(char.isdigit() for char in word) or any(char.isupper() for char in word[1:])
+
+
 def _pr_search_terms(question: str) -> list[str]:
     """Return explicit domain identifiers, never filler words or sentence fragments."""
     quoted = [
@@ -1400,7 +1416,7 @@ def _pr_search_terms(question: str) -> list[str]:
         *re.findall(r"\bCMSSW_\d+_\d+(?:_[A-Za-z0-9]+)+\b", question),
         *re.findall(r"\b\d{4,6}\.\d+\b", question),
         *package_paths,
-        *(word for word in standalone if any(char.isupper() or char.isdigit() for char in word)),
+        *(word for word in standalone if _looks_like_pr_search_identifier(word)),
     }
     identifiers = sorted(
         (candidate for candidate in candidates if not any(
