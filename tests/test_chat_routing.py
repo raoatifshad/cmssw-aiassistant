@@ -309,6 +309,35 @@ class ChatRoutingTests(unittest.TestCase):
             ["RecoTracker/TrackProducer"],
         )
 
+    def test_search_terms_reject_ordinary_capitalized_words(self):
+        # Regression: found live -- pasting a raw error message ("MIOpen Error:
+        # filesystem error: cannot create directories: Permission denied
+        # [/tmp/miopen-cache/3.5.2.]") extracted "Permission" as a search term,
+        # since it has an uppercase letter and isn't a stop word. Against
+        # find_prs_for_error's PR-comment search (~690k comments), a single
+        # ordinary English word that merely starts a clause returned 20
+        # completely unrelated PRs. "Permission" has its only uppercase letter
+        # at position 0 (not a real CamelCase/acronym identifier); "MIOpen"
+        # (internal capital) and the package-path-shaped "tmp/miopen" must
+        # still survive.
+        question = (
+            "MIOpen Error: filesystem error: cannot create directories: "
+            "Permission denied [/tmp/miopen-cache/3.5.2.]"
+        )
+
+        self.assertEqual(_pr_search_terms(question), ["tmp/miopen", "MIOpen"])
+
+    def test_search_terms_keep_all_caps_acronyms_and_internal_caps(self):
+        # Same fix as above, checked from the other direction: an all-caps
+        # acronym/exit-code name (SIGSEGV) and a genuine CamelCase compound
+        # identifier must still pass, since both carry uppercase beyond
+        # position 0.
+        self.assertEqual(_pr_search_terms("any PR for SIGSEGV crash"), ["SIGSEGV"])
+        self.assertEqual(
+            _pr_search_terms("is there any PR/issue open for testAlpakaModelCudaAsync"),
+            ["testAlpakaModelCudaAsync"],
+        )
+
     @patch("server.api_server.find_prs_for_error")
     def test_pr_evidence_falls_back_to_last_discussed_workflow(self, find_prs):
         # Regression: a real user asked about workflow 140.0's recurrence,
