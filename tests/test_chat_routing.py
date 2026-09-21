@@ -2243,6 +2243,46 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertNotIn("el8_amd64_gcc14", answer)
         self.assertNotIn("el9_aarch64_gcc14", answer)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
+    @patch("server.api_server._sub_ib_variant_tags")
+    @patch("server.api_server._relval_scope_records")
+    def test_relval_ib_summary_answer_breaks_down_every_sub_ib_for_one_architecture(
+        self, scope_records, sub_ib_variant_tags, _get_failing_relvals
+    ):
+        # Regression: found live 2026-09-21 -- "how many ibs are failing for
+        # el9_amd64_gcc14 for release <tag>" genuinely means "across every
+        # IB in this release" (the DEFAULT/primary tag is only 1 of 11), but
+        # the answer only ever showed the primary tag's own number plus a
+        # flat "10 sub-IB variant(s) not included above -- ask individually"
+        # footnote, requiring 10 separate follow-up questions to see them.
+        tag = "CMSSW_20_1_X_2026-09-13-2300"
+        devel_tag = "CMSSW_20_1_DEVEL_X_2026-09-13-2300"
+        evtgen3_tag = "CMSSW_20_1_EVTGEN3_X_2026-09-13-2300"
+        sub_ib_variant_tags.return_value = [
+            {"variant": "DEVEL", "tag": devel_tag},
+            {"variant": "EVTGEN3", "tag": evtgen3_tag},
+        ]
+
+        def scope_records_for(queried_tag, include_sub_ibs=False):
+            data = {
+                tag: [{"tag": tag, "arch": "el9_amd64_gcc14", "relval_total": 954, "failed_relvals": 0, "passed_relvals": 954}],
+                devel_tag: [{"tag": devel_tag, "arch": "el9_amd64_gcc14", "relval_total": 954, "failed_relvals": 2, "passed_relvals": 952}],
+                evtgen3_tag: [{"tag": evtgen3_tag, "arch": "el9_amd64_gcc14", "relval_total": 954, "failed_relvals": 11, "passed_relvals": 941, "known_error_relvals": 2}],
+            }
+            return data[queried_tag]
+        scope_records.side_effect = scope_records_for
+
+        answer = _relval_ib_summary_answer(
+            f"how many relvals are failing for el9_amd64_gcc14 for release {tag}", "s-relval-breakdown"
+        )
+
+        self.assertIn(tag, answer)
+        self.assertIn(devel_tag, answer)
+        self.assertIn(evtgen3_tag, answer)
+        self.assertIn("DEVEL", answer)
+        self.assertIn("EVTGEN3", answer)
+        self.assertIn("2 of 3 IB(s)", answer)
+
     @patch("server.api_server.get_exit_code_names", return_value={8021: "MethodFailure"})
     @patch("server.api_server.get_failing_relvals")
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
