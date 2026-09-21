@@ -654,6 +654,35 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNotNone(answer)
         self.assertIn("Issue #51900", answer)
 
+    @patch("server.api_server.get_driver")
+    @patch("server.api_server.propose_pr_search_signature")
+    @patch("server.api_server._llm_client", new="not-none-sentinel")
+    def test_open_issue_search_adds_llm_signature_for_qualified_code_reference(
+        self, propose_signature, get_driver
+    ):
+        # Found live 2026-09-21: "any PR / issue having edm::FileInPath::initialize_()"
+        # matched Issue #51757 only via the bare term "FileInPath" -- but that Issue's
+        # body literally contains the exact qualified string
+        # "edm::FileInPath::initialize_()" verbatim, a precise hit the bare-word
+        # search couldn't distinguish from four other issues that only coincidentally
+        # mention "FileInPath". When the question has qualified-code syntax, the
+        # LLM-derived signature is now added as an extra search term so an exact
+        # match is visible in the row's own matched_terms, not indistinguishable from
+        # a generic one.
+        propose_signature.return_value = "edm::FileInPath::initialize_()"
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{
+            "number": 51757, "title": "Infinite loop in edm::FileInPath", "state": "open",
+            "matched_terms": ["FileInPath", "edm::FileInPath::initialize_()"],
+        }]
+
+        answer = _open_issue_answer("any PR / issue having edm::FileInPath::initialize_()", None)
+
+        self.assertIsNotNone(answer)
+        self.assertIn("Issue #51757", answer)
+        self.assertIn("edm::FileInPath::initialize_()", answer)
+        self.assertEqual(session.run.call_args.kwargs["terms"], ["FileInPath", "edm::FileInPath::initialize_()"])
+
     def test_normalizes_common_deterministic_paraphrases(self):
         self.assertEqual(
             _normalize_deterministic_question("How much Rel-Val failures are in this integration-build?"),
