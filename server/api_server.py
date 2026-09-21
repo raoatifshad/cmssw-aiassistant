@@ -1594,12 +1594,19 @@ def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
     return "\n".join(lines), [pr]
 
 
-def _render_pr_evidence_rows(term: str, rows: list[dict], via_llm: bool = False) -> str:
+def _render_pr_evidence_rows(term: str, rows: list[dict], via_llm: bool = False, header: str | None = None) -> str:
     """Render find_prs_for_error's rows for one matched search term -- shared by both
     the regex-extracted-term path and the LLM-assisted fallback in
-    _pr_evidence_answer, so the two paths produce identically-shaped answers."""
-    suffix = " (LLM-assisted search)" if via_llm else ""
-    lines = [f"PR evidence matching `{term}`{suffix}:"]
+    _pr_evidence_answer, so the two paths produce identically-shaped answers.
+    `header` overrides the default line -- used for the capped "closest related, not
+    an exact match" fallback, which needs its own explanatory wording instead of the
+    default "PR evidence matching `X`:" (which would otherwise imply `X` itself was a
+    precise hit when it's actually the broad term a more specific search fell back
+    from)."""
+    if header is None:
+        suffix = " (LLM-assisted search)" if via_llm else ""
+        header = f"PR evidence matching `{term}`{suffix}:"
+    lines = [header]
     for row in rows:
         lines.append(
             f"- **{row['repo']} #{row['pr_number']}** - {row['title']} "
@@ -1631,6 +1638,12 @@ _PR_SEARCH_ROW_LIMIT = 20  # matches find_prs_for_error's own default -- kept as
 # explicit constant here (rather than relying on that default) so the "did the regex
 # term come back suspiciously broad" check below stays correct even if that default
 # ever changes.
+
+_PR_BROAD_FALLBACK_PREVIEW = 3  # how many rows to show, clearly labeled as "closest
+# related, not an exact match", when a more specific search was warranted and found
+# nothing -- deliberately small: this is context of last resort, not a real answer,
+# and dumping the full _PR_SEARCH_ROW_LIMIT verbatim (the old behavior) was itself
+# the noise complaint that prompted this cap.
 
 # A regex term can't preserve C++/Python qualified-name syntax at all -- "::", "()",
 # and "->" get thrown away by word-splitting, and the real, specific part of a
@@ -1677,12 +1690,20 @@ def _pr_evidence_answer(question: str, fallback_term: str | None = None) -> tupl
     the actual ask -- found live, 2026-09-21: "Permission" from a pasted MIOpen error
     (the first case) and "FileInPath" alone from "edm::FileInPath::initialize_()"
     (the second -- the regex path DID return 20 rows, so the old zero-results-only
-    trigger never even tried the LLM). When both an LLM-derived hit and a regex hit
-    exist, the narrower (fewer rows) one is preferred -- a match from a fuller,
-    more specific phrase is more likely the real answer than a broad bare-word match.
-    The LLM only proposes what to search for; find_prs_for_error still does the real,
-    deterministic matching and this function still composes the answer only from its
-    actual results."""
+    trigger never even tried the LLM).
+
+    Precise-first, never diluted: a real LLM-derived-signature hit is returned alone,
+    regardless of how many rows the broad regex term also found -- modern
+    retrieval/search precedent (and this project's own "relevance only, no noise"
+    culture) is to never blend a precise match with broader ones as if equally
+    trustworthy. When a more specific check was warranted and genuinely found
+    nothing, the broad regex hit is still shown (never silently replaced with
+    nothing) but CAPPED to _PR_BROAD_FALLBACK_PREVIEW rows and explicitly labeled as
+    "closest related, not an exact match" -- found live: dumping all 20 loosely-
+    related PRs verbatim, even with a trailing caveat, was still noise a shifter had
+    to read past. The LLM only proposes what to search for; find_prs_for_error still
+    does the real, deterministic matching and this function still composes the
+    answer only from its actual results."""
     if not re.search(r"\b(?:pr|mr|pull request|merge request|fix|fixes|fixed)\b", question, re.IGNORECASE):
         return None
     terms = _pr_search_terms(question) or ([fallback_term] if fallback_term else [])
@@ -1705,23 +1726,26 @@ def _pr_evidence_answer(question: str, fallback_term: str | None = None) -> tupl
         if llm_rows:
             llm_hit = (llm_signature, llm_rows)
 
-    if llm_hit and (regex_hit is None or len(llm_hit[1]) <= len(regex_hit[1])):
+    if llm_hit:
         term, rows = llm_hit
         return _render_pr_evidence_rows(term, rows, via_llm=True), rows
     if regex_hit:
         term, rows = regex_hit
-        answer = _render_pr_evidence_rows(term, rows)
-        # A narrower/qualified search was attempted (that's why needs_llm_check fired)
-        # and came up empty -- say so explicitly, so a shifter reading a broad,
-        # generic-looking list (e.g. every PR mentioning a bare class name) knows
-        # these are loose, topic-level matches, not a hit on the exact thing asked
-        # about, rather than silently presenting them the same way as a precise match.
-        if needs_llm_check and llm_signature and not llm_hit:
-            answer += (
-                f"\n\n(A more specific search for `{llm_signature}` found nothing -- "
-                "the results above are broader, topic-level matches only.)"
+        # A more specific check was warranted (that's why needs_llm_check fired) and
+        # genuinely came up empty -- show a small, clearly-labeled preview instead of
+        # the full broad list, so a shifter isn't left reading 20 loosely-related PRs
+        # to discover none of them are a real answer.
+        if needs_llm_check and llm_signature:
+            preview = rows[:_PR_BROAD_FALLBACK_PREVIEW]
+            answer = _render_pr_evidence_rows(
+                term, preview,
+                header=(
+                    f"No PR specifically discusses `{llm_signature}`. "
+                    f"Closest related PRs mentioning `{term}` only (not an exact match):"
+                ),
             )
-        return answer, rows
+            return answer, preview
+        return _render_pr_evidence_rows(term, rows), rows
     # Cite the LLM-derived signature in the miss, not just the first regex term, when
     # it was actually tried too -- it's the more specific, more informative attempt
     # (e.g. the full error message, not one isolated word from it), so a shifter
@@ -1921,6 +1945,7 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
     # word-splitting can't preserve, just add the LLM-derived signature as one more
     # search term. A row matching it shows that in its own matched_terms, making the
     # precise match visible without needing separate "prefer narrower" branching.
+    llm_signature: str | None = None
     if _QUALIFIED_CODE_REFERENCE_RE.search(question):
         llm_signature = _llm_extract_pr_error_signature(question)
         if llm_signature and llm_signature not in terms:
@@ -1937,8 +1962,7 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
             OR any(comment_body IN comment_bodies WHERE toLower(comment_body) CONTAINS toLower(term))
         ] AS matched_terms
         WHERE size(matched_terms) > 0
-        RETURN issue.number AS number, issue.title AS title, issue.state AS state,
-               matched_terms[0..5] AS matched_terms
+        RETURN issue.number AS number, issue.title AS title, issue.state AS state, matched_terms
         ORDER BY size(matched_terms) DESC, issue.number DESC
         LIMIT 20
     """
@@ -1951,11 +1975,34 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
 
     if not rows:
         return "No open CMSSW Issues matched the supplied concrete identifiers in the imported graph."
-    lines = ["Open CMSSW Issues matching the supplied identifiers:"]
-    for row in rows:
+
+    # Precise-first, never diluted -- same principle as _pr_evidence_answer: when the
+    # LLM-derived signature genuinely matched something, show only those rows rather
+    # than blending them into the full broad list. When a more specific check was
+    # warranted and found nothing, cap the shown set to a small, clearly-labeled
+    # "closest related" preview instead of dumping every loosely-related Issue --
+    # matched_terms is read unsliced (not the Cypher-side [0..5] this used to use) so
+    # this precise-match check is never wrong just because a row happened to match
+    # more than 5 terms.
+    precise_rows = [row for row in rows if llm_signature and llm_signature in row["matched_terms"]]
+    if precise_rows:
+        rows_to_show = precise_rows
+        header = "Open CMSSW Issues matching the supplied identifiers:"
+    elif llm_signature:
+        rows_to_show = rows[:_PR_BROAD_FALLBACK_PREVIEW]
+        header = (
+            f"No open Issue specifically discusses `{llm_signature}`. "
+            "Closest related open Issues (not an exact match):"
+        )
+    else:
+        rows_to_show = rows
+        header = "Open CMSSW Issues matching the supplied identifiers:"
+
+    lines = [header]
+    for row in rows_to_show:
         lines.append(
             f"- **Issue #{row['number']}** - {row['title']} "
-            f"(matched: {', '.join(f'`{term}`' for term in row['matched_terms'])})"
+            f"(matched: {', '.join(f'`{term}`' for term in row['matched_terms'][:5])})"
         )
     lines.append("These are textual matches in imported Issue titles, bodies, or comments; they do not prove a fix or causal relationship.")
     return "\n".join(lines)
