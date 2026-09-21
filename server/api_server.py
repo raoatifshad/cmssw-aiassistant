@@ -745,6 +745,45 @@ def _sub_ib_variant_note(tag: str, sub_ib_variants: list[str] | None) -> str | N
 _RELVAL_SCOPE_SUMMARY_WORKFLOW_CAP = 10
 
 
+def _relval_failing_workflow_line(
+    record: dict, exit_code_names: dict[int, str] | None, label: str | None = None,
+) -> tuple[str | None, dict[int, str] | None]:
+    """One '- 🔴 **label**: `name` (wf id, exit CODE (NAME)), ...' line naming
+    the actual failing workflow(s) for a single RelVal scope record, or
+    (None, exit_code_names) when there's nothing to show. `label` defaults
+    to the record's own architecture (the right label when every row in the
+    caller's table is a different architecture of the SAME IB); a caller
+    showing multiple IBs on the SAME architecture instead (see
+    _relval_arch_scoped_ib_breakdown) passes its own IB-identifying label so
+    entries stay distinguishable. Shared by _relval_scope_summary and
+    _relval_arch_scoped_ib_breakdown so both render this the same way.
+    exit_code_names is threaded through (fetched at most once per caller,
+    not once per record) since it's a small, static, whole-graph lookup,
+    not something that varies per IB."""
+    failed_count = record["failed_relvals"] or 0
+    if not failed_count:
+        return None, exit_code_names
+    candidate_rows = get_failing_relvals(
+        record["tag"], arch=record["arch"], limit=_RELVAL_SCOPE_SUMMARY_WORKFLOW_CAP,
+    )
+    # get_failing_relvals also matches any sub-IB whose parent_tag is this
+    # tag -- filter to exactly this IB's own rows so a sub-IB's workflows
+    # never leak into a different IB's line.
+    rows = [row for row in candidate_rows if row["ib_tag"] == record["tag"]]
+    if not rows:
+        return None, exit_code_names
+    if exit_code_names is None:
+        exit_code_names = get_exit_code_names()
+    entries = ", ".join(
+        f"`{row['name']}` (wf {row['workflow_id']}, exit "
+        f"{_format_exit_code(row['exitcode'], exit_code_names) if row['exitcode'] else 0})"
+        for row in rows
+    )
+    more = failed_count - len(rows)
+    suffix = f" (+{more} more)" if more > 0 else ""
+    return f"- 🔴 **{label or record['arch']}**: {entries}{suffix}", exit_code_names
+
+
 def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: list[str] | None = None) -> str:
     """Format a complete RelVal count without merging architecture-specific facts."""
     total = sum(record["relval_total"] or 0 for record in records)
@@ -781,33 +820,13 @@ def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: li
     # to ask a completely separate "what/which workflows are failing"
     # question for a count that's already small enough to just show. Same
     # "the summary itself should carry enough information" fix as
-    # _unittest_summary_from_records's "Failed packages:" section. Filtered
-    # to `ib_tag == record["tag"]` because get_failing_relvals also matches
-    # any sub-IB whose parent_tag is this tag -- this table explicitly never
-    # includes sub-IB rows (see the "not included above" note below), so
-    # their workflows must not leak in here either.
+    # _unittest_summary_from_records's "Failed packages:" section.
     failing_lines = []
     exit_code_names: dict[int, str] | None = None
     for record in records:
-        failed_count = record["failed_relvals"] or 0
-        if not failed_count:
-            continue
-        candidate_rows = get_failing_relvals(
-            record["tag"], arch=record["arch"], limit=_RELVAL_SCOPE_SUMMARY_WORKFLOW_CAP,
-        )
-        rows = [row for row in candidate_rows if row["ib_tag"] == record["tag"]]
-        if not rows:
-            continue
-        if exit_code_names is None:
-            exit_code_names = get_exit_code_names()
-        entries = ", ".join(
-            f"`{row['name']}` (wf {row['workflow_id']}, exit "
-            f"{_format_exit_code(row['exitcode'], exit_code_names) if row['exitcode'] else 0})"
-            for row in rows
-        )
-        more = failed_count - len(rows)
-        suffix = f" (+{more} more)" if more > 0 else ""
-        failing_lines.append(f"- 🔴 **{record['arch']}**: {entries}{suffix}")
+        line, exit_code_names = _relval_failing_workflow_line(record, exit_code_names)
+        if line:
+            failing_lines.append(line)
     if failing_lines:
         lines.append("")
         lines.append("Failing workflows:")
@@ -816,6 +835,57 @@ def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: li
     if note:
         lines.append("")
         lines.append(note)
+    return "\n".join(lines)
+
+
+def _relval_arch_scoped_ib_breakdown(tag: str, selected_arch: str, primary_records: list[dict]) -> str:
+    """When a question names one specific architecture, show every IB for
+    that architecture across the whole release -- the primary/DEFAULT tag
+    AND each sub-IB variant -- as its own row, instead of just the primary
+    tag's own number plus a footnote naming the variants and requiring a
+    separate follow-up per variant. Found live, 2026-09-21: "how many ibs
+    are failing for el9_amd64_gcc14 for release <tag>" genuinely means
+    "across every IB in this release, on this one architecture" -- the
+    DEFAULT tag is only 1 of 11 IBs (1 primary + 10 sub-IB variants:
+    CLANG/CUDART/DEVEL/EVTGEN3/G4ADEPT/G4VECGEOM/GEANT4/MULTIARCHS/NONLTO/
+    ROOT6) that can each independently be failing or clean on the same
+    architecture, and the user has to be able to see all of them in one
+    answer, not ask about each variant by name individually."""
+    primary_scoped = [record for record in primary_records if record["arch"] == selected_arch]
+    if not primary_scoped:
+        return _relval_arch_choice_answer(tag, primary_records)
+    rows: list[tuple[str, dict]] = [(tag, primary_scoped[0])]
+    for entry in _sub_ib_variant_tags(tag):
+        sub_tag, variant = entry["tag"], entry["variant"]
+        sub_scoped = [
+            record for record in _relval_scope_records(sub_tag, include_sub_ibs=False)
+            if record["arch"] == selected_arch
+        ]
+        if sub_scoped:
+            rows.append((f"{sub_tag} (`{variant}`)", sub_scoped[0]))
+    failing_ib_count = sum(1 for _, record in rows if record["failed_relvals"] or 0)
+    lines = [
+        f"RelVal results on `{selected_arch}` across `{tag}` and its sub-IB variants: "
+        f"**{failing_ib_count} of {len(rows)} IB(s)** have at least one failing RelVal.",
+        "",
+        "| IB | Failing | Passed | Total |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    exit_code_names: dict[int, str] | None = None
+    failing_lines: list[str] = []
+    for label, record in rows:
+        marker = "🔴" if record["failed_relvals"] else ("🟠" if record.get("known_error_relvals") else "🟢")
+        lines.append(
+            f"| {label} | {marker} {record['failed_relvals'] or 0:,} | "
+            f"{record['passed_relvals'] or 0:,} | {record['relval_total'] or 0:,} |"
+        )
+        line, exit_code_names = _relval_failing_workflow_line(record, exit_code_names, label=label)
+        if line:
+            failing_lines.append(line)
+    if failing_lines:
+        lines.append("")
+        lines.append("Failing workflows:")
+        lines.extend(failing_lines)
     return "\n".join(lines)
 
 
@@ -975,11 +1045,20 @@ def _relval_ib_summary_answer(question: str, session_id: str) -> str | None:
         return f"No imported RelVal data is available for `{tag}`."
     all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
     selected_arch = _requested_ib_arch(question)
-    resolved = _relval_scope_or_choice(session_id, tag, records, all_requested, selected_arch)
+    # A specific architecture named explicitly means "every IB in this
+    # release on that one architecture," not just the primary/DEFAULT tag's
+    # own number -- see _relval_arch_scoped_ib_breakdown's docstring. This
+    # only applies when exactly one architecture was named (not "all"); the
+    # "all architectures" / no-architecture-named paths keep the existing
+    # single-IB, multi-architecture table (with a flat sub-IB mention),
+    # since a full IB x architecture matrix in one text answer would be
+    # unwieldy for the common case.
+    if selected_arch and not all_requested:
+        return _relval_arch_scoped_ib_breakdown(tag, selected_arch, records)
+    resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
     if isinstance(resolved, str):
         return resolved
-    heading = f"Imported RelVal results for `{tag}`" + (f" on `{selected_arch}`" if selected_arch else "")
-    return _relval_scope_summary(resolved, heading, _sub_ib_variant_names(tag))
+    return _relval_scope_summary(resolved, f"Imported RelVal results for `{tag}`", _sub_ib_variant_names(tag))
 
 
 def _unittest_scope_records(tag: str) -> list[dict]:
