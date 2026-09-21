@@ -1731,11 +1731,16 @@ def _pr_evidence_answer(question: str, fallback_term: str | None = None) -> tupl
         return _render_pr_evidence_rows(term, rows, via_llm=True), rows
     if regex_hit:
         term, rows = regex_hit
-        # A more specific check was warranted (that's why needs_llm_check fired) and
-        # genuinely came up empty -- show a small, clearly-labeled preview instead of
-        # the full broad list, so a shifter isn't left reading 20 loosely-related PRs
-        # to discover none of them are a real answer.
-        if needs_llm_check and llm_signature:
+        # Cap+relabel only when the underlying match set is itself broad/generic
+        # (hit _PR_SEARCH_ROW_LIMIT) -- found live, 2026-09-21: "any information about
+        # ticl::AssociationMap any PR/issue open?" has qualified-code syntax
+        # (triggering needs_llm_check) but its regex hit was already a small,
+        # reasonably-focused set (well under the limit); relabeling that as "not an
+        # exact match" and cutting it to 3 was WRONG -- it implied hidden noise that
+        # didn't exist and dropped genuinely relevant results for no reason. A small
+        # match set stands on its own regardless of whether the LLM's stricter
+        # qualified-string check happened to also confirm it.
+        if llm_signature and len(rows) >= _PR_SEARCH_ROW_LIMIT:
             preview = rows[:_PR_BROAD_FALLBACK_PREVIEW]
             answer = _render_pr_evidence_rows(
                 term, preview,
@@ -1964,12 +1969,12 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
         WHERE size(matched_terms) > 0
         RETURN issue.number AS number, issue.title AS title, issue.state AS state, matched_terms
         ORDER BY size(matched_terms) DESC, issue.number DESC
-        LIMIT 20
+        LIMIT $limit
     """
     driver = get_driver()
     try:
         with driver.session() as session:
-            rows = [dict(record) for record in session.run(query, terms=terms)]
+            rows = [dict(record) for record in session.run(query, terms=terms, limit=_PR_SEARCH_ROW_LIMIT)]
     finally:
         driver.close()
 
@@ -1979,16 +1984,23 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
     # Precise-first, never diluted -- same principle as _pr_evidence_answer: when the
     # LLM-derived signature genuinely matched something, show only those rows rather
     # than blending them into the full broad list. When a more specific check was
-    # warranted and found nothing, cap the shown set to a small, clearly-labeled
-    # "closest related" preview instead of dumping every loosely-related Issue --
-    # matched_terms is read unsliced (not the Cypher-side [0..5] this used to use) so
-    # this precise-match check is never wrong just because a row happened to match
-    # more than 5 terms.
+    # warranted and found nothing, cap+relabel ONLY if the underlying match set is
+    # itself broad/generic (hit _PR_SEARCH_ROW_LIMIT) -- found live, 2026-09-21:
+    # "any information about ticl::AssociationMap any PR/issue open?" has qualified-
+    # code syntax but its bare-term match was already a small, reasonably-focused set
+    # (well under the limit); relabeling that as "not an exact match" implied hidden
+    # noise that didn't exist and dropped genuinely relevant results for no reason. A
+    # small match set stands on its own even if the LLM's stricter qualified-string
+    # check didn't also confirm it (people often drop a C++ namespace prefix in
+    # casual discussion, e.g. writing "AssociationMap" instead of
+    # "ticl::AssociationMap"). matched_terms is read unsliced (not the Cypher-side
+    # [0..5] this used to use) so the precise-match check is never wrong just because
+    # a row happened to match more than 5 terms.
     precise_rows = [row for row in rows if llm_signature and llm_signature in row["matched_terms"]]
     if precise_rows:
         rows_to_show = precise_rows
         header = "Open CMSSW Issues matching the supplied identifiers:"
-    elif llm_signature:
+    elif llm_signature and len(rows) >= _PR_SEARCH_ROW_LIMIT:
         rows_to_show = rows[:_PR_BROAD_FALLBACK_PREVIEW]
         header = (
             f"No open Issue specifically discusses `{llm_signature}`. "
