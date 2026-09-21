@@ -258,7 +258,17 @@ class RequestPlanner:
         if pending.missing_field != "category" or not context.categories:
             return None
         self.pending.pop(session_id, None)
-        return RequestContext.extract(f"{context.question} {pending.context['tag']}")
+        # An architecture named in the ORIGINAL ambiguous question (the one
+        # that triggered this clarification) must survive into the resolved
+        # follow-up -- found live, 2026-09-21: "how many ibs are failing for
+        # el9_amd64_gcc14 for release <tag>" triggered this clarification,
+        # but replying "summary for <tag>" (the exact canned "Combined
+        # summary" choice text, which never carried the architecture either
+        # -- see _clarification below) silently widened the answer to every
+        # imported architecture instead of just the one originally asked
+        # about, with no indication anything had been dropped.
+        arch_suffix = f" {pending.context['arch']}" if pending.context.get("arch") else ""
+        return RequestContext.extract(f"{context.question} {pending.context['tag']}{arch_suffix}")
 
     @staticmethod
     def _clarification(context: RequestContext) -> Clarification | None:
@@ -266,15 +276,19 @@ class RequestPlanner:
             context.tag and context.has_failure_request
             and not context.categories and not context.has_shift_summary_request
         ):
+            arch_suffix = f" {context.architecture}" if context.architecture else ""
+            clarification_context = {"tag": context.tag}
+            if context.architecture:
+                clarification_context["arch"] = context.architecture
             return Clarification(
                 missing_field="category",
                 question="Do you want build warnings, failed RelVals, unit-test results, or a combined IB summary?",
-                context={"tag": context.tag},
+                context=clarification_context,
                 choices=(
-                    ("Build warnings", f"build warnings for {context.tag}"),
-                    ("RelVal failures", f"failed RelVals for {context.tag}"),
-                    ("Unit-test results", f"unit tests for {context.tag}"),
-                    ("Combined summary", f"summary for {context.tag}"),
+                    ("Build warnings", f"build warnings for {context.tag}{arch_suffix}"),
+                    ("RelVal failures", f"failed RelVals for {context.tag}{arch_suffix}"),
+                    ("Unit-test results", f"unit tests for {context.tag}{arch_suffix}"),
+                    ("Combined summary", f"summary for {context.tag}{arch_suffix}"),
                 ),
             )
         if (
