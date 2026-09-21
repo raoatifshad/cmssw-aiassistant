@@ -484,12 +484,15 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server.find_prs_for_error")
     @patch("server.api_server.propose_pr_search_signature")
     @patch("server.api_server._llm_client", new="not-none-sentinel")
-    def test_pr_evidence_falls_back_to_broad_regex_match_when_llm_finds_nothing_narrower(
+    def test_pr_evidence_caps_broad_fallback_when_llm_finds_nothing_narrower(
         self, propose_signature, find_prs
     ):
-        # The LLM double-check must never make a broad-but-real regex match
-        # disappear -- when it can't find anything narrower, the original (broad)
-        # result is still better than reporting no evidence at all.
+        # Precise-first, capped fallback (per user-approved design 2026-09-21): the
+        # LLM double-check must never make a broad-but-real regex match disappear
+        # entirely -- but dumping the full _PR_SEARCH_ROW_LIMIT rows verbatim, even
+        # with a trailing caveat, was itself the noise complaint that prompted this.
+        # When a more specific search was warranted and comes up empty, show only a
+        # small, clearly-labeled "closest related, not an exact match" preview.
         question = "any PR / issue having edm::FileInPath::initialize_()"
         propose_signature.return_value = "edm::FileInPath::initialize_()"
         broad_rows = [
@@ -506,11 +509,9 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNotNone(result)
         answer, rows = result
         self.assertNotIn("LLM-assisted search", answer)
-        self.assertEqual(len(rows), 20)
-        # Transparent about the broad fallback: a narrower search was tried and came
-        # up empty, so a shifter isn't misled into treating a generic class-name match
-        # as if it were a precise hit on the exact method asked about.
-        self.assertIn("more specific search", answer)
+        self.assertEqual(len(rows), 3)
+        self.assertIn("closest related", answer.lower())
+        self.assertIn("not an exact match", answer)
         self.assertIn("edm::FileInPath::initialize_()", answer)
 
     @patch("server.api_server.get_driver")
@@ -682,6 +683,33 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("Issue #51757", answer)
         self.assertIn("edm::FileInPath::initialize_()", answer)
         self.assertEqual(session.run.call_args.kwargs["terms"], ["FileInPath", "edm::FileInPath::initialize_()"])
+
+    @patch("server.api_server.get_driver")
+    @patch("server.api_server.propose_pr_search_signature")
+    @patch("server.api_server._llm_client", new="not-none-sentinel")
+    def test_open_issue_search_caps_broad_fallback_when_no_row_matches_precisely(
+        self, propose_signature, get_driver
+    ):
+        # Precise-first, capped fallback (per user-approved design 2026-09-21), Issue
+        # side: when NO row's matched_terms includes the LLM-derived signature (only
+        # the bare, generic term matched anything), show a small, clearly-labeled
+        # "closest related, not an exact match" preview instead of the full set.
+        propose_signature.return_value = "edm::FileInPath::initialize_()"
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"number": 40000 + n, "title": f"Unrelated FileInPath issue {n}", "state": "open",
+             "matched_terms": ["FileInPath"]}
+            for n in range(5)
+        ]
+
+        answer = _open_issue_answer("any PR / issue having edm::FileInPath::initialize_()", None)
+
+        self.assertIsNotNone(answer)
+        self.assertIn("closest related", answer.lower())
+        self.assertIn("not an exact match", answer)
+        self.assertIn("edm::FileInPath::initialize_()", answer)
+        shown_issue_count = answer.count("**Issue #")
+        self.assertEqual(shown_issue_count, 3)
 
     def test_normalizes_common_deterministic_paraphrases(self):
         self.assertEqual(
