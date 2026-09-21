@@ -514,6 +514,39 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("not an exact match", answer)
         self.assertIn("edm::FileInPath::initialize_()", answer)
 
+    @patch("server.api_server.find_prs_for_error")
+    @patch("server.api_server.propose_pr_search_signature")
+    @patch("server.api_server._llm_client", new="not-none-sentinel")
+    def test_pr_evidence_does_not_relabel_a_small_match_set(self, propose_signature, find_prs):
+        # Regression: found live 2026-09-21 -- "any information about
+        # ticl::AssociationMap any PR/issue open?" has qualified-code syntax
+        # (triggering the LLM check) but its bare-term match was already a small,
+        # reasonably-focused set (well under the row limit) of a genuinely relevant
+        # real PR (see CLAUDE.md's "Capability-handler coverage" section -- this exact
+        # question is the documented regression case for combining PR+Issue evidence
+        # without short-circuiting). Relabeling a small set as "not an exact match"
+        # just because the LLM's stricter qualified-string check didn't also confirm
+        # it is wrong -- it implies hidden noise that doesn't exist. A small match set
+        # must be shown normally, not capped/relabeled.
+        question = "any information about ticl::AssociationMap any PR/issue open?"
+        propose_signature.return_value = "ticl::AssociationMap"
+        small_rows = [{
+            "repo": "cmssw", "pr_number": 51649, "title": "Rename SimDataformats TICL associator as TICLAssociationMap",
+            "merged_at": "2026-08-21T09:33:48Z", "evidence": ["pr_title"], "matched_files": [],
+            "matched_unit_tests": False, "matched_unit_test_packages": [],
+            "matched_unit_test_ibs": [], "matched_warnings": None,
+        }]
+        find_prs.side_effect = [small_rows, []]
+
+        result = _pr_evidence_answer(question)
+
+        self.assertIsNotNone(result)
+        answer, rows = result
+        self.assertIn("PR evidence matching `AssociationMap`:", answer)
+        self.assertIn("51649", answer)
+        self.assertNotIn("closest related", answer.lower())
+        self.assertEqual(len(rows), 1)
+
     @patch("server.api_server.get_driver")
     def test_ib_results_summary_uses_explicit_architecture(self, get_driver):
         tag = "CMSSW_20_1_X_2026-08-10-1100"
@@ -692,14 +725,17 @@ class ChatRoutingTests(unittest.TestCase):
     ):
         # Precise-first, capped fallback (per user-approved design 2026-09-21), Issue
         # side: when NO row's matched_terms includes the LLM-derived signature (only
-        # the bare, generic term matched anything), show a small, clearly-labeled
-        # "closest related, not an exact match" preview instead of the full set.
+        # the bare, generic term matched anything) AND the match set is itself broad
+        # (hit the row limit -- a small match set is shown as-is, see
+        # test_open_issue_search_does_not_relabel_a_small_match_set below), show a
+        # small, clearly-labeled "closest related, not an exact match" preview instead
+        # of the full set.
         propose_signature.return_value = "edm::FileInPath::initialize_()"
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value = [
             {"number": 40000 + n, "title": f"Unrelated FileInPath issue {n}", "state": "open",
              "matched_terms": ["FileInPath"]}
-            for n in range(5)
+            for n in range(20)
         ]
 
         answer = _open_issue_answer("any PR / issue having edm::FileInPath::initialize_()", None)
@@ -708,8 +744,35 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("closest related", answer.lower())
         self.assertIn("not an exact match", answer)
         self.assertIn("edm::FileInPath::initialize_()", answer)
-        shown_issue_count = answer.count("**Issue #")
-        self.assertEqual(shown_issue_count, 3)
+        self.assertEqual(answer.count("**Issue #"), 3)
+
+    @patch("server.api_server.get_driver")
+    @patch("server.api_server.propose_pr_search_signature")
+    @patch("server.api_server._llm_client", new="not-none-sentinel")
+    def test_open_issue_search_does_not_relabel_a_small_match_set(self, propose_signature, get_driver):
+        # Regression: found live 2026-09-21 -- "any information about
+        # ticl::AssociationMap any PR/issue open?" has qualified-code syntax
+        # (triggering the LLM check) but its bare-term match was already a small,
+        # reasonably-focused set (well under the row limit) that genuinely relevant
+        # real Issues were part of (#42737 et al., confirmed live in
+        # project_cross_variant... -- see CLAUDE.md's capability-handler-coverage
+        # history). Relabeling a small set as "not an exact match" just because the
+        # LLM's stricter qualified-string check didn't also confirm it (people often
+        # drop a C++ namespace prefix in casual discussion) is wrong -- it implies
+        # hidden noise that doesn't exist. A small match set must be shown as-is.
+        propose_signature.return_value = "ticl::AssociationMap"
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"number": 42737, "title": "edm::RefToBase is deprecated", "state": "open",
+             "matched_terms": ["AssociationMap"]},
+        ]
+
+        answer = _open_issue_answer("any information about ticl::AssociationMap any PR/issue open?", None)
+
+        self.assertIsNotNone(answer)
+        self.assertIn("Open CMSSW Issues matching the supplied identifiers:", answer)
+        self.assertIn("Issue #42737", answer)
+        self.assertNotIn("closest related", answer.lower())
 
     def test_normalizes_common_deterministic_paraphrases(self):
         self.assertEqual(
