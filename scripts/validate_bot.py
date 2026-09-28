@@ -10,6 +10,8 @@ Usage:
     venv/bin/python scripts/validate_bot.py [--base-url http://localhost:8001]
     venv/bin/python scripts/validate_bot.py --with-capability-fallback  # server must have
                                                                           # ENABLE_CAPABILITY_FALLBACK_TO_LLM=true
+    venv/bin/python scripts/validate_bot.py --with-answer-verification  # server must have
+                                                                          # ENABLE_DETERMINISTIC_ANSWER_VERIFICATION=true
 
 Requires the API server to be running (see README.md) against real imported
 data. Never invents data; every scenario below is templated against the
@@ -60,6 +62,14 @@ class Turn:
     # flagged as missing session-tag fallback (clang/build), so the report
     # distinguishes "known, already-flagged" from "new" breakage.
     known_gap: str | None = None
+    # Substrings that must NOT appear in the answer. Unlike FAILURE_MARKERS
+    # (global, catches a routing dead end / crash), this is scenario-specific:
+    # it catches a *wrong-but-plausible* answer that never trips a global
+    # marker at all -- e.g. a negated question ("workflows that are NOT
+    # failing") getting the same answer as its un-negated opposite. That kind
+    # of bug doesn't look broken to a marker scan; it looks like a normal
+    # answer, just the wrong one.
+    must_not_contain: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -145,6 +155,15 @@ def build_scenarios(tag: str, arch: str) -> list[Scenario]:
             Turn(f"failed relvals for {tag}", expect_contains=[]),
             Turn("any PRs related to these failures", expect_contains=[]),
         ]),
+        Scenario("general-knowledge question is refused, never answered from the LLM's own knowledge", [
+            # Key invariant check: the LLM must never answer from its own
+            # knowledge, only from tool evidence. Confirmed live 2026-09-22 --
+            # the system correctly refuses rather than naming an actual
+            # person, since "president of Pakistan" has no local graph
+            # evidence to answer from. Flag-independent (never reaches either
+            # DETERMINISTIC branch gate), so this belongs in the base set.
+            Turn("who is president of pakistan", expect_contains=["couldn't match"]),
+        ]),
         Scenario("PR + open-issue evidence combined, not short-circuited", [
             # Regression for the "pr_evidence" or-chain bug: a question asking
             # for both PRs and open Issues used to only ever get PR evidence
@@ -189,7 +208,31 @@ def build_capability_fallback_scenarios(tag: str) -> list[Scenario]:
     ]
 
 
-def run(base_url: str, with_capability_fallback: bool = False) -> int:
+def build_answer_verification_scenarios(tag: str) -> list[Scenario]:
+    """Only meaningful -- and only expected to pass -- against a server
+    running with ENABLE_DETERMINISTIC_ANSWER_VERIFICATION=true. Confirmed
+    live 2026-09-22: deterministic routing only tests keyword/substring
+    presence, so "workflows that are NOT failing" and "workflows that are
+    failing" both trigger the same "failing" keyword in the relval handler
+    and get the IDENTICAL answer -- wrong for the negated question, since it
+    actually wants the passing workflows. With the flag off this doesn't
+    trip any FAILURE_MARKERS at all (it looks like a normal, non-crashing
+    answer, just the wrong one) -- that's why must_not_contain exists and
+    why this scenario is opt-in via --with-answer-verification rather than
+    part of the default scenario list.
+    """
+    return [
+        Scenario("answer verification catches negation mismatch", [
+            Turn(
+                f"give me the workflows that are NOT failing in relvals {tag}",
+                expect_contains=[],
+                must_not_contain=["No failing RelVals were found"],
+            ),
+        ]),
+    ]
+
+
+def run(base_url: str, with_capability_fallback: bool = False, with_answer_verification: bool = False) -> int:
     client = httpx.Client(base_url=base_url, timeout=30.0)
 
     health = client.get("/api/health")
@@ -213,6 +256,10 @@ def run(base_url: str, with_capability_fallback: bool = False) -> int:
         print("Including capability-dead-end-fallback scenarios -- server must be "
               "running with ENABLE_CAPABILITY_FALLBACK_TO_LLM=true or these will fail.\n")
         scenarios += build_capability_fallback_scenarios(tag)
+    if with_answer_verification:
+        print("Including deterministic-answer-verification scenarios -- server must be "
+              "running with ENABLE_DETERMINISTIC_ANSWER_VERIFICATION=true or these will fail.\n")
+        scenarios += build_answer_verification_scenarios(tag)
     failures: list[str] = []
     known_gaps: list[str] = []
     passed = 0
@@ -231,15 +278,21 @@ def run(base_url: str, with_capability_fallback: bool = False) -> int:
             answer = resp.json().get("answer", "")
             answer_lower = answer.lower()
             hit_marker = next((m for m in FAILURE_MARKERS if m.lower() in answer_lower), None)
+            forbidden_hit = next((n for n in turn.must_not_contain if n.lower() in answer_lower), None)
             missing = [needle for needle in turn.expect_contains if needle.lower() not in answer_lower]
             alt_hit = any(needle.lower() in answer_lower for needle in turn.alt_ok_contains)
-            ok = hit_marker is None and (not missing or alt_hit)
+            ok = hit_marker is None and forbidden_hit is None and (not missing or alt_hit)
             if ok:
                 passed += 1
                 label = "ok (no data yet)" if missing and alt_hit else "ok  "
                 print(f"  {label} {turn.question!r}")
             else:
-                reason = f"marker={hit_marker!r}" if hit_marker else f"missing={missing!r}"
+                if forbidden_hit:
+                    reason = f"forbidden={forbidden_hit!r}"
+                elif hit_marker:
+                    reason = f"marker={hit_marker!r}"
+                else:
+                    reason = f"missing={missing!r}"
                 detail = f"[{scenario.name}] {turn.question!r} -> {reason}\n    answer: {answer[:200]!r}"
                 if turn.known_gap:
                     known_gaps.append(f"{detail}\n    known gap: {turn.known_gap}")
@@ -273,5 +326,15 @@ if __name__ == "__main__":
              "when the server is running with ENABLE_CAPABILITY_FALLBACK_TO_LLM=true "
              "-- against a plain server these are expected to fail.",
     )
+    parser.add_argument(
+        "--with-answer-verification", action="store_true",
+        help="Also run deterministic-answer-verification scenarios. Only pass this "
+             "when the server is running with ENABLE_DETERMINISTIC_ANSWER_VERIFICATION=true "
+             "-- against a plain server these are expected to fail.",
+    )
     args = parser.parse_args()
-    sys.exit(run(args.base_url, with_capability_fallback=args.with_capability_fallback))
+    sys.exit(run(
+        args.base_url,
+        with_capability_fallback=args.with_capability_fallback,
+        with_answer_verification=args.with_answer_verification,
+    ))

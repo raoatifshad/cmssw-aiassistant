@@ -255,6 +255,33 @@ against the flat-message baseline before leaving it on. Unlike
 on the minority of messages that would otherwise dead-end, not on every
 message, so it's a safer default-on candidate once validated.
 
+### Deterministic answer verification
+
+Deterministic routing only ever tests keyword/substring presence, never
+phrase-level meaning — so "workflows that are NOT failing" and "workflows
+that are failing" both trigger the same "failing" keyword in the relval
+handler and can return the identical, wrong-for-one-of-them answer. Found
+live 2026-09-22: both phrasings returned "No failing RelVals were found",
+even though the negated question actually wanted the passing workflows.
+
+`ENABLE_DETERMINISTIC_ANSWER_VERIFICATION=true` closes this gap: every
+deterministic capability answer is checked against the full question with a
+small, constrained LLM call (`verify_answer_matches_question`,
+`server/agent.py`) — the same non-agentic pattern as
+`propose_capability_classification`, judging yes/no only, never writing the
+answer itself. A mismatch reroutes through the same evidence-gated LLM
+investigation path used elsewhere (`_run_llm_investigation`) instead of
+showing the wrong answer. The verifier fails open at the call site — any
+error (network, timeout, malformed response) defaults to trusting the
+deterministic answer, so a verifier-layer failure can never be worse than
+not having verification at all.
+
+Unlike `ENABLE_CAPABILITY_FALLBACK_TO_LLM`, this one *does* cost an LLM call
+on every deterministic answer, not just misses. Off by default — not for
+LLM-call cost, but because the verifier itself isn't infallible and needs
+validating against real traffic before it's trusted to override a
+deterministic answer by default.
+
 ## Log RAG platform
 
 The API also provides a durable Log RAG pipeline. It normalizes JSON/JSONL and
