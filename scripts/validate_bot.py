@@ -8,6 +8,8 @@ fix in server/api_server.py's "relval" branch of _execute_planned_capability).
 
 Usage:
     venv/bin/python scripts/validate_bot.py [--base-url http://localhost:8001]
+    venv/bin/python scripts/validate_bot.py --with-capability-fallback  # server must have
+                                                                          # ENABLE_CAPABILITY_FALLBACK_TO_LLM=true
 
 Requires the API server to be running (see README.md) against real imported
 data. Never invents data; every scenario below is templated against the
@@ -159,7 +161,35 @@ def build_scenarios(tag: str, arch: str) -> list[Scenario]:
     ]
 
 
-def run(base_url: str) -> int:
+def build_capability_fallback_scenarios(tag: str) -> list[Scenario]:
+    """Only meaningful -- and only expected to pass -- against a server
+    running with ENABLE_CAPABILITY_FALLBACK_TO_LLM=true. Both phrasings below
+    were confirmed live (2026-09-22) to be real capability-matched-but-no-
+    handler dead ends: RequestPlanner correctly picks "relval"/"unittest",
+    but no helper in that capability's chain recognizes the exact phrasing,
+    so _execute_planned_capability returns None. With the flag off this hits
+    the flat "No imported local evidence" message (a FAILURE_MARKERS hit) by
+    design -- that's why these are opt-in via --with-capability-fallback
+    rather than part of the default scenario list every plain server run is
+    expected to pass.
+
+    expect_contains is deliberately empty for both turns: the point isn't
+    that a specific answer shape comes back (a real evidence-grounded answer
+    and a fallback_clarification action menu are both legitimate non-dead-end
+    outcomes -- see server/api_server.py's _run_llm_investigation), only that
+    the flat dead-end message and other FAILURE_MARKERS never do.
+    """
+    return [
+        Scenario("capability dead end rescued: relval recurrence, odd phrasing", [
+            Turn("tell me the recurrence pattern for workflow 136.899", expect_contains=[]),
+        ]),
+        Scenario("capability dead end rescued: unittest package-fix phrasing", [
+            Turn(f"what packages need fixing in {tag}", expect_contains=[]),
+        ]),
+    ]
+
+
+def run(base_url: str, with_capability_fallback: bool = False) -> int:
     client = httpx.Client(base_url=base_url, timeout=30.0)
 
     health = client.get("/api/health")
@@ -179,6 +209,10 @@ def run(base_url: str) -> int:
     print(f"Using live tag={tag} arch={arch}\n")
 
     scenarios = build_scenarios(tag, arch)
+    if with_capability_fallback:
+        print("Including capability-dead-end-fallback scenarios -- server must be "
+              "running with ENABLE_CAPABILITY_FALLBACK_TO_LLM=true or these will fail.\n")
+        scenarios += build_capability_fallback_scenarios(tag)
     failures: list[str] = []
     known_gaps: list[str] = []
     passed = 0
@@ -233,5 +267,11 @@ def run(base_url: str) -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://localhost:8001")
+    parser.add_argument(
+        "--with-capability-fallback", action="store_true",
+        help="Also run capability-dead-end-fallback scenarios. Only pass this "
+             "when the server is running with ENABLE_CAPABILITY_FALLBACK_TO_LLM=true "
+             "-- against a plain server these are expected to fail.",
+    )
     args = parser.parse_args()
-    sys.exit(run(args.base_url))
+    sys.exit(run(args.base_url, with_capability_fallback=args.with_capability_fallback))

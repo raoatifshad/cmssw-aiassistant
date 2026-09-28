@@ -3141,6 +3141,75 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(result.route, "llm_validated")
         self.assertEqual(result.answer, synthesize.return_value)
 
+    @patch("server.api_server._retriever", None)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.synthesize_evidence_answer")
+    @patch("server.api_server.execute_read_only_plan")
+    @patch("server.request_planner.validate_llm_plan")
+    @patch("server.api_server.propose_investigation_plan", return_value={"capability": "investigation"})
+    @patch("server.api_server._execute_planned_capability", return_value=None)
+    @patch("server.api_server._latest_ib_records")
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.CAPABILITY_FALLBACK_TO_LLM_ENABLED", True)
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_capability_dead_end_falls_through_to_llm_investigation_when_flag_enabled(
+        self, concepts, latest_ib_records, execute_capability, propose_plan, validate_plan,
+        execute_plan, synthesize, store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # RequestPlanner correctly identifies "relval" here (mirrors
+        # test_latest_ib_phrase_resolves_to_a_tag_before_routing), but this time
+        # none of the "relval" capability's own helpers recognize the phrasing
+        # (_execute_planned_capability -> None), simulating a real handler-chain
+        # miss. With the fallback flag on, this must not dead-end -- it should
+        # reach the same evidence-gated LLM investigation path used elsewhere,
+        # never fabricate the answer itself.
+        latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
+        validate_plan.return_value.capability = "investigation"
+        validate_plan.return_value.tool_calls = []
+        evidence = [{"tool": "get_failing_relvals", "arguments": {},
+                     "result": {"tag": "CMSSW_20_1_X_2026-08-17-2300", "failing_count": 7}}]
+        execute_plan.return_value = evidence
+        synthesize.return_value = "There are 7 failing workflows on CMSSW_20_1_X_2026-08-17-2300."
+
+        result = chat(ChatRequest(
+            question="how many relvals failing in the latest IB", session_id="capability-dead-end-rescue",
+        ))
+
+        self.assertEqual(result.answer, synthesize.return_value)
+        self.assertEqual(result.route, "capability_dead_end_rescue:relval:llm_validated")
+        execute_capability.assert_called_once()
+        propose_plan.assert_called_once()
+
+    @patch("server.api_server.CAPABILITY_FALLBACK_TO_LLM_ENABLED", False)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server._execute_planned_capability", return_value=None)
+    @patch("server.api_server._latest_ib_records")
+    @patch("server.api_server.propose_investigation_plan")
+    def test_capability_dead_end_keeps_flat_message_when_flag_disabled(
+        self, propose_plan, latest_ib_records, execute_capability,
+        store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # Rollback-path guard: with the flag at its default (off), the same
+        # handler-chain miss as above must still return today's flat message
+        # and must never invoke the LLM investigation path at all.
+        latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
+
+        result = chat(ChatRequest(
+            question="how many relvals failing in the latest IB", session_id="capability-dead-end-no-flag",
+        ))
+
+        self.assertIn(
+            "No imported local evidence is available for the selected `relval` request", result.answer
+        )
+        self.assertEqual(result.route, "capability:relval:no_evidence")
+        propose_plan.assert_not_called()
+
     def test_evidence_grounded_accepts_numbers_present_in_evidence(self):
         evidence = [{"tool": "t", "arguments": {}, "result": {"failing_count": 5, "tag": "CMSSW_20_1_X"}}]
         self.assertTrue(_evidence_grounded("There are 5 failures in CMSSW_20_1_X.", evidence))

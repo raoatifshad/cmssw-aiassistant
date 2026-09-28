@@ -138,6 +138,15 @@ _retriever: HybridRetriever | None = None
 #   to the original deterministic text otherwise.
 ROUTER_SHADOW_ENABLED = os.environ.get("ENABLE_ROUTER_SHADOW", "false").strip().lower() == "true"
 ANSWER_SYNTHESIS_ENABLED = os.environ.get("ENABLE_ANSWER_SYNTHESIS", "false").strip().lower() == "true"
+# Unlike the two flags above, this one does not add an LLM call to every
+# message -- it only fires on the minority of messages that would otherwise
+# dead-end (RequestPlanner picked a capability, but none of that capability's
+# _*_answer() helpers recognized the phrasing), so it's a much safer
+# default-on candidate once validated against real traffic. Off by default
+# for a safe rollout: it changes a real response, not just an additive log.
+CAPABILITY_FALLBACK_TO_LLM_ENABLED = os.environ.get(
+    "ENABLE_CAPABILITY_FALLBACK_TO_LLM", "false"
+).strip().lower() == "true"
 # A Concept accepted from user feedback is re-verified against current graph
 # facts on this cadence (ingestion/revalidate_feedback.py), never trusted
 # indefinitely from a single automated verification. CONCEPT_TTL_DAYS: how
@@ -5481,6 +5490,54 @@ def health():
     }
 
 
+def _run_llm_investigation(
+    sid: str, original_question: str, question: str, planned: Plan, route_prefix: str = ""
+):
+    """LLM picks among already-vetted, read-only graph tools/capabilities to
+    answer a question nothing deterministic matched -- never from the LLM's
+    own knowledge, only from tool evidence validated by validate_llm_plan and
+    _evidence_grounded. This is the system's one paraphrase-robust layer:
+    unlike the regex-driven planner/capability helpers, it generalizes across
+    rephrasings without a new handler being hand-written for each one.
+
+    Shared by chat()'s normal end-of-waterfall fallback and, when
+    CAPABILITY_FALLBACK_TO_LLM_ENABLED, by the RequestPlanner-driven
+    deterministic branch when its chosen capability's own handler chain
+    couldn't answer -- so a capability the planner routed correctly doesn't
+    dead-end just because no helper recognized this exact phrasing.
+    """
+    if _llm_client is None:
+        raise HTTPException(503, "CERN API not configured — see .env")
+    raw_plan = propose_investigation_plan(
+        _llm_client,
+        DEFAULT_MODEL,
+        question,
+        [capability.name for capability in _request_planner.capabilities],
+        sorted(_LLM_PLAN_TOOL_NAMES),
+    )
+    from server.request_planner import validate_llm_plan
+
+    llm_plan = validate_llm_plan(raw_plan, _request_planner.capabilities, set(_LLM_PLAN_TOOL_NAMES))
+    if llm_plan is None or llm_plan.capability != "investigation":
+        fallback_answer, fallback_actions = _fallback_clarification(planned.context)
+        return _chat_response(sid, original_question, fallback_answer, f"{route_prefix}fallback_clarification", actions=fallback_actions)
+    tool_evidence = execute_read_only_plan(llm_plan.tool_calls, TOOLS)
+    if not tool_evidence:
+        fallback_answer, fallback_actions = _fallback_clarification(planned.context)
+        return _chat_response(sid, original_question, fallback_answer, f"{route_prefix}fallback_clarification", actions=fallback_actions)
+    citations = _retriever.retrieve(question) if _retriever else []
+    if citations:
+        tool_evidence.append({"tool": "local_log_retrieval", "arguments": {}, "result": citations})
+    answer = synthesize_evidence_answer(_llm_client, DEFAULT_MODEL, SYSTEM_PROMPT, question, tool_evidence)
+    if not answer:
+        answer = "The approved local evidence could not be synthesized into an answer."
+        return _chat_response(sid, original_question, answer, f"{route_prefix}llm_validated", citations)
+    if not _evidence_grounded(answer, tool_evidence):
+        answer = _format_raw_evidence(tool_evidence)
+        return _chat_response(sid, original_question, answer, f"{route_prefix}llm_ungrounded_fallback", citations)
+    return _chat_response(sid, original_question, answer, f"{route_prefix}llm_validated", citations)
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     sid = req.session_id or str(uuid.uuid4())
@@ -5570,6 +5627,11 @@ def chat(req: ChatRequest):
         if planned_answer:
             answer, actions = planned_answer
             return _chat_response(sid, original_question, answer, f"capability:{planned.capability}", actions=actions)
+        if CAPABILITY_FALLBACK_TO_LLM_ENABLED and _llm_client is not None:
+            return _run_llm_investigation(
+                sid, original_question, question, planned,
+                route_prefix=f"capability_dead_end_rescue:{planned.capability}:",
+            )
         return _chat_response(
             sid,
             original_question,
@@ -5784,36 +5846,7 @@ def chat(req: ChatRequest):
     concept_answer = _concept_answer(question)
     if concept_answer:
         return _chat_response(sid, original_question, concept_answer, "deterministic")
-    if _llm_client is None:
-        raise HTTPException(503, "CERN API not configured — see .env")
-    raw_plan = propose_investigation_plan(
-        _llm_client,
-        DEFAULT_MODEL,
-        question,
-        [capability.name for capability in _request_planner.capabilities],
-        sorted(_LLM_PLAN_TOOL_NAMES),
-    )
-    from server.request_planner import validate_llm_plan
-
-    llm_plan = validate_llm_plan(raw_plan, _request_planner.capabilities, set(_LLM_PLAN_TOOL_NAMES))
-    if llm_plan is None or llm_plan.capability != "investigation":
-        fallback_answer, fallback_actions = _fallback_clarification(planned.context)
-        return _chat_response(sid, original_question, fallback_answer, "fallback_clarification", actions=fallback_actions)
-    tool_evidence = execute_read_only_plan(llm_plan.tool_calls, TOOLS)
-    if not tool_evidence:
-        fallback_answer, fallback_actions = _fallback_clarification(planned.context)
-        return _chat_response(sid, original_question, fallback_answer, "fallback_clarification", actions=fallback_actions)
-    citations = _retriever.retrieve(question) if _retriever else []
-    if citations:
-        tool_evidence.append({"tool": "local_log_retrieval", "arguments": {}, "result": citations})
-    answer = synthesize_evidence_answer(_llm_client, DEFAULT_MODEL, SYSTEM_PROMPT, question, tool_evidence)
-    if not answer:
-        answer = "The approved local evidence could not be synthesized into an answer."
-        return _chat_response(sid, original_question, answer, "llm_validated", citations)
-    if not _evidence_grounded(answer, tool_evidence):
-        answer = _format_raw_evidence(tool_evidence)
-        return _chat_response(sid, original_question, answer, "llm_ungrounded_fallback", citations)
-    return _chat_response(sid, original_question, answer, "llm_validated", citations)
+    return _run_llm_investigation(sid, original_question, question, planned)
 
 
 @app.get("/api/chat/{session_id}/history")

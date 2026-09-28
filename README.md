@@ -237,6 +237,24 @@ verified to preserve every number in it before being shown, falling back to
 the original deterministic text otherwise. Both flags are off by default in
 `.env.example` since each costs a real per-message LLM call.
 
+### Capability dead-end fallback
+
+The router correctly picking a capability doesn't guarantee that
+capability's own regex-driven `_*_answer()` helpers recognize the exact
+phrasing — when they don't, `chat()` used to give up immediately with a flat
+"No imported local evidence is available for the selected `X` request"
+message, even though the same evidence-gated LLM investigation path
+described above was one step away and already reachable from every other
+routing gap in the same function. `ENABLE_CAPABILITY_FALLBACK_TO_LLM=true`
+closes that one remaining dead end: instead of the flat message, it falls
+through to that same investigation path (still Cypher-tool-only, still
+verified against evidence before being shown). Off by default for a safe
+rollout — flip it, re-ask a phrasing that used to dead-end, and compare
+against the flat-message baseline before leaving it on. Unlike
+`ENABLE_ROUTER_SHADOW`/`ENABLE_ANSWER_SYNTHESIS`, this only adds an LLM call
+on the minority of messages that would otherwise dead-end, not on every
+message, so it's a safer default-on candidate once validated.
+
 ## Log RAG platform
 
 The API also provides a durable Log RAG pipeline. It normalizes JSON/JSONL and
