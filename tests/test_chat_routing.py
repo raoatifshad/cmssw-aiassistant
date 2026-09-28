@@ -54,6 +54,7 @@ from server.api_server import (
     _fallback_clarification,
     _latest_ib_arch_contexts,
     _latest_ib_contexts,
+    _verification_session_context,
     _parse_recency_window_days,
     _latest_and_days_ago_ib_tags,
     _shift_summary_answer,
@@ -67,7 +68,7 @@ from server.api_server import (
     record_feedback,
 )
 from server.request_planner import Plan, PlanKind, RequestContext
-from server.agent import KGChatSession, propose_pr_search_signature
+from server.agent import KGChatSession, propose_pr_search_signature, verify_answer_matches_question
 from graph.tools import TOOLS, get_failing_relvals, get_failing_unittests, search_issues_by_text
 from ingestion.build_graph import ib_parent_tag
 
@@ -393,6 +394,51 @@ class ChatRoutingTests(unittest.TestCase):
         )
 
         self.assertIsNone(propose_pr_search_signature(client, "some-model", "how many relvals failing?"))
+
+    def test_verify_answer_matches_question_returns_true_when_llm_confirms(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"matches": true}'))]
+        )
+
+        result = verify_answer_matches_question(
+            client, "some-model",
+            "how many relvals are failing in CMSSW_20_1_X_2026-09-21-1100",
+            "0 failing RelVal(s) across 592 RelVal record(s).",
+        )
+
+        self.assertTrue(result)
+
+    def test_verify_answer_matches_question_returns_false_on_negation_mismatch(self):
+        # Real bug found live 2026-09-22: "workflows that are NOT failing" and
+        # "workflows that are failing" both trigger the same "failing" keyword
+        # match in the deterministic relval handler and get the identical
+        # answer -- this is the verifier catching exactly that class of miss.
+        client = MagicMock()
+        client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(
+                content='{"matches": false, "reason": "question asks for workflows that are NOT '
+                        'failing (i.e. passing), answer only addresses failing RelVals"}'
+            ))]
+        )
+
+        result = verify_answer_matches_question(
+            client, "some-model",
+            "give me the workflows that are NOT failing in relvals CMSSW_20_1_X_2026-09-21-1100",
+            "No failing RelVals were found for CMSSW_20_1_X_2026-09-21-1100.",
+        )
+
+        self.assertFalse(result)
+
+    def test_verify_answer_matches_question_fails_open_on_malformed_json(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="not json at all"))]
+        )
+
+        result = verify_answer_matches_question(client, "some-model", "some question", "some answer")
+
+        self.assertTrue(result)
 
     @patch("server.api_server.find_prs_for_error")
     def test_pr_evidence_falls_back_to_last_discussed_workflow(self, find_prs):
@@ -3209,6 +3255,166 @@ class ChatRoutingTests(unittest.TestCase):
         )
         self.assertEqual(result.route, "capability:relval:no_evidence")
         propose_plan.assert_not_called()
+
+    @patch("server.api_server._retriever", None)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.synthesize_evidence_answer")
+    @patch("server.api_server.execute_read_only_plan")
+    @patch("server.request_planner.validate_llm_plan")
+    @patch("server.api_server.propose_investigation_plan", return_value={"capability": "investigation"})
+    @patch("server.api_server.verify_answer_matches_question", return_value=False)
+    @patch("server.api_server._execute_planned_capability", return_value=("No failing RelVals were found.", []))
+    @patch("server.api_server._latest_ib_records")
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", True)
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_deterministic_answer_semantic_mismatch_falls_through_to_llm_investigation_when_flag_enabled(
+        self, concepts, latest_ib_records, execute_capability, verify_answer, propose_plan, validate_plan,
+        execute_plan, synthesize, store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # Real bug found live 2026-09-22: "workflows that are NOT failing" and
+        # "workflows that are failing" both trigger the same "failing" keyword
+        # in the deterministic relval handler and get the identical answer,
+        # which is wrong for the negated question. _execute_planned_capability
+        # here simulates that exact mismatch (a truthy, but wrong, answer) --
+        # with the verification flag on, this must not be trusted as-is; it
+        # must reroute through the same evidence-gated LLM investigation path
+        # used for genuine dead ends, never fabricate a "corrected" answer itself.
+        latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
+        validate_plan.return_value.capability = "investigation"
+        validate_plan.return_value.tool_calls = []
+        evidence = [{"tool": "get_relval_results", "arguments": {},
+                     "result": {"tag": "CMSSW_20_1_X_2026-08-17-2300", "passing_count": 592}}]
+        execute_plan.return_value = evidence
+        synthesize.return_value = "592 workflows are not failing on CMSSW_20_1_X_2026-08-17-2300."
+
+        result = chat(ChatRequest(
+            question="how many relvals failing in the latest IB", session_id="semantic-mismatch-rescue",
+        ))
+
+        self.assertEqual(result.answer, synthesize.return_value)
+        self.assertEqual(result.route, "capability_semantic_mismatch_rescue:relval:llm_validated")
+        execute_capability.assert_called_once()
+        verify_answer.assert_called_once()
+        propose_plan.assert_called_once()
+
+    def test_verification_session_context_is_none_without_an_established_tag(self):
+        self.assertIsNone(_verification_session_context("what about unit tests", "no-context-session"))
+
+    def test_verification_session_context_is_none_when_tag_already_in_question(self):
+        tag = "CMSSW_20_1_X_2026-08-17-2300"
+        session_id = "tag-repeated-session"
+        _latest_ib_contexts[session_id] = tag
+        try:
+            self.assertIsNone(_verification_session_context(f"unit tests for {tag}", session_id))
+        finally:
+            _latest_ib_contexts.pop(session_id, None)
+
+    def test_verification_session_context_describes_carried_tag_and_arch(self):
+        # Real false positive found live 2026-09-22: without this note, the
+        # verifier has no memory of the conversation and flags a legitimate
+        # tag-carried-from-earlier-turn answer ("what about unit tests" ->
+        # an answer naming the tag) as a mismatch.
+        tag = "CMSSW_20_1_X_2026-08-17-2300"
+        arch = "el9_amd64_gcc14"
+        session_id = "tag-carried-session"
+        _latest_ib_contexts[session_id] = tag
+        _latest_ib_arch_contexts[session_id] = arch
+        try:
+            note = _verification_session_context("what about unit tests", session_id)
+        finally:
+            _latest_ib_contexts.pop(session_id, None)
+            _latest_ib_arch_contexts.pop(session_id, None)
+
+        self.assertIn(tag, note)
+        self.assertIn(arch, note)
+
+    @patch("server.api_server._retriever", None)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.verify_answer_matches_question", return_value=True)
+    @patch(
+        "server.api_server._execute_planned_capability",
+        return_value=("Unit-test results for CMSSW_20_1_X_2026-08-17-2300 are architecture-specific.", []),
+    )
+    @patch("server.api_server._latest_ib_records")
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", True)
+    def test_deterministic_verification_passes_session_tag_context_for_tagless_followup(
+        self, latest_ib_records, execute_capability, verify_answer, store_chat_turns, restore, store_decision,
+        clear_pending
+    ):
+        # Confirms the fix for the false positive above end to end: a real
+        # tag-carried-from-earlier-turn follow-up must not be rerouted just
+        # because the verifier lacks conversation memory -- the session tag
+        # is threaded into the verifier call so it can judge fairly.
+        tag = "CMSSW_20_1_X_2026-08-17-2300"
+        session_id = "verification-context-followup"
+        _latest_ib_contexts[session_id] = tag
+        try:
+            result = chat(ChatRequest(question="what about unit tests", session_id=session_id))
+        finally:
+            _latest_ib_contexts.pop(session_id, None)
+
+        self.assertEqual(result.route, "capability:unittest")
+        verify_answer.assert_called_once()
+        self.assertIn(tag, verify_answer.call_args.kwargs["session_context"])
+
+    @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", False)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.verify_answer_matches_question")
+    @patch("server.api_server._execute_planned_capability", return_value=("No failing RelVals were found.", []))
+    @patch("server.api_server._latest_ib_records")
+    def test_deterministic_answer_skips_verification_when_flag_disabled(
+        self, latest_ib_records, execute_capability, verify_answer,
+        store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # Rollback-path guard: with the flag at its default (off), the
+        # verifier must never even be called -- the deterministic answer is
+        # returned exactly as today, unchanged.
+        latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
+
+        result = chat(ChatRequest(
+            question="how many relvals failing in the latest IB", session_id="semantic-mismatch-flag-off",
+        ))
+
+        self.assertEqual(result.answer, "No failing RelVals were found.")
+        self.assertEqual(result.route, "capability:relval")
+        verify_answer.assert_not_called()
+
+    @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", True)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.verify_answer_matches_question", side_effect=RuntimeError("boom"))
+    @patch("server.api_server._execute_planned_capability", return_value=("No failing RelVals were found.", []))
+    @patch("server.api_server._latest_ib_records")
+    @patch("server.api_server._llm_client", object())
+    def test_deterministic_answer_verification_fails_open_on_verifier_error(
+        self, latest_ib_records, execute_capability, verify_answer,
+        store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # A verifier-layer failure (network, timeout, malformed client
+        # response, ...) must never be worse than not having verification at
+        # all -- the call site must catch it and trust the deterministic
+        # answer, not let it propagate into a 500.
+        latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
+
+        result = chat(ChatRequest(
+            question="how many relvals failing in the latest IB", session_id="semantic-mismatch-verifier-error",
+        ))
+
+        self.assertEqual(result.answer, "No failing RelVals were found.")
+        self.assertEqual(result.route, "capability:relval")
 
     def test_evidence_grounded_accepts_numbers_present_in_evidence(self):
         evidence = [{"tool": "t", "arguments": {}, "result": {"failing_count": 5, "tag": "CMSSW_20_1_X"}}]

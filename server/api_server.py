@@ -44,6 +44,7 @@ from server.agent import (  # noqa: E402
     propose_investigation_plan,
     propose_pr_search_signature,
     synthesize_evidence_answer,
+    verify_answer_matches_question,
 )
 from server.knowledge_contract import LLM_KNOWLEDGE_CONTRACT  # noqa: E402
 from server.shifter_auth import require_shifter, router as shifter_auth_router  # noqa: E402
@@ -146,6 +147,17 @@ ANSWER_SYNTHESIS_ENABLED = os.environ.get("ENABLE_ANSWER_SYNTHESIS", "false").st
 # for a safe rollout: it changes a real response, not just an additive log.
 CAPABILITY_FALLBACK_TO_LLM_ENABLED = os.environ.get(
     "ENABLE_CAPABILITY_FALLBACK_TO_LLM", "false"
+).strip().lower() == "true"
+# Unlike CAPABILITY_FALLBACK_TO_LLM_ENABLED, this one *does* add an LLM call
+# to every deterministic answer, not just misses -- deterministic routing
+# only ever tests keyword presence, so it has no concept of negation/
+# exclusion/scope ("NOT failing" vs "failing" hit the same trigger word and
+# can return the identical, wrong-for-one-of-them answer). Off by default:
+# the verifier itself isn't infallible, so this needs validating against
+# real traffic before it's trusted to override a deterministic answer by
+# default, even though the LLM-call cost itself isn't a concern here.
+DETERMINISTIC_ANSWER_VERIFICATION_ENABLED = os.environ.get(
+    "ENABLE_DETERMINISTIC_ANSWER_VERIFICATION", "false"
 ).strip().lower() == "true"
 # A Concept accepted from user feedback is re-verified against current graph
 # facts on this cadence (ingestion/revalidate_feedback.py), never trusted
@@ -5490,6 +5502,26 @@ def health():
     }
 
 
+def _verification_session_context(question: str, session_id: str) -> str | None:
+    """Describe conversation state a deterministic handler may have resolved
+    this question against but that isn't repeated in the question's own text
+    -- e.g. an IB tag carried from an earlier turn ("what about unit tests"
+    with no tag). Without this, verify_answer_matches_question has no memory
+    of the conversation and flags a legitimate tag-carried-from-earlier-turn
+    answer as a mismatch (confirmed live, 2026-09-22). Deliberately narrow:
+    only the same tag/architecture session state the handlers themselves
+    already use (_latest_ib_contexts/_latest_ib_arch_contexts), not full
+    conversation history."""
+    tag = _latest_ib_contexts.get(session_id)
+    if not tag or tag in question:
+        return None
+    note = f"This conversation previously established IB tag {tag}"
+    arch = _latest_ib_arch_contexts.get(session_id)
+    if arch and arch not in question:
+        note += f" and architecture {arch}"
+    return note + "; the answer may reference it even though this question's text doesn't repeat it."
+
+
 def _run_llm_investigation(
     sid: str, original_question: str, question: str, planned: Plan, route_prefix: str = ""
 ):
@@ -5626,6 +5658,23 @@ def chat(req: ChatRequest):
         planned_answer = _execute_planned_capability(planned.capability, question, sid)
         if planned_answer:
             answer, actions = planned_answer
+            if DETERMINISTIC_ANSWER_VERIFICATION_ENABLED and _llm_client is not None:
+                try:
+                    answer_matches = verify_answer_matches_question(
+                        _llm_client, DEFAULT_MODEL, question, answer,
+                        session_context=_verification_session_context(question, sid),
+                    )
+                except Exception as exc:
+                    # Fail open: a verifier-layer failure (network, timeout, ...)
+                    # must never be worse than not having verification at all --
+                    # trust the deterministic answer rather than 500ing the request.
+                    print(f"WARNING: could not verify deterministic answer: {exc}")
+                    answer_matches = True
+                if not answer_matches:
+                    return _run_llm_investigation(
+                        sid, original_question, question, planned,
+                        route_prefix=f"capability_semantic_mismatch_rescue:{planned.capability}:",
+                    )
             return _chat_response(sid, original_question, answer, f"capability:{planned.capability}", actions=actions)
         if CAPABILITY_FALLBACK_TO_LLM_ENABLED and _llm_client is not None:
             return _run_llm_investigation(
