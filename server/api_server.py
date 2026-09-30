@@ -1186,16 +1186,37 @@ def _unittest_summary_from_records(tag: str, records: list[dict], include_sub_ib
     # way the CMSSDT dashboard already shows a distinct Unit count per
     # variant column. include_sub_ibs=False stops this recursing into a
     # variant's own (nonexistent) sub-variants.
+    #
+    # Refined 2026-09-30: always-expand-every-variant buried real failures
+    # under a wall of identical "0 failed" sections for a real 11-variant
+    # tag with only 2 variants actually failing. Failures still get their
+    # full block, in full detail, right after the primary summary -- clean
+    # and never-imported variants are named but collapsed to one line each
+    # instead of repeating the same boilerplate per variant. Nothing is
+    # omitted, only summarized when there's nothing to report.
     if include_sub_ibs:
+        failure_blocks: list[str] = []
+        clean_variants: list[str] = []
+        missing_variants: list[str] = []
         for entry in _sub_ib_variant_tags(tag):
             sub_tag, variant = entry["tag"], entry["variant"]
             sub_records = _unittest_scope_records(sub_tag)
-            lines.append("")
-            lines.append(f"### Sub-IB variant `{variant}` (`{sub_tag}`)")
             if not sub_records:
-                lines.append(f"No imported unit-test records were found for `{sub_tag}`.")
+                missing_variants.append(variant)
+                continue
+            sub_failed = sum(record["failed"] or 0 for record in sub_records)
+            if sub_failed:
+                failure_blocks.append(f"\n### Sub-IB variant `{variant}` (`{sub_tag}`)")
+                failure_blocks.append(_unittest_summary_from_records(sub_tag, sub_records, include_sub_ibs=False))
             else:
-                lines.append(_unittest_summary_from_records(sub_tag, sub_records, include_sub_ibs=False))
+                clean_variants.append(variant)
+        lines.extend(failure_blocks)
+        if clean_variants:
+            lines.append("")
+            lines.append(f"✅ Clean, no failures: {', '.join(f'`{v}`' for v in clean_variants)}")
+        if missing_variants:
+            lines.append("")
+            lines.append(f"No imported unit-test records: {', '.join(f'`{v}`' for v in missing_variants)}")
     return "\n".join(lines)
 
 
@@ -1275,15 +1296,18 @@ def _unittest_summary_answer(
     return _unittest_summary_from_records(tag, records)
 
 
-def _failed_unittest_package_listing(tag: str, requested_arch: str | None) -> str:
+def _failed_unittest_package_listing(tag: str, requested_arch: str | None) -> tuple[str, bool]:
     """Build the failed-package listing for exactly one IB tag/architecture
     scope -- shared by the primary-tag answer and each inlined sub-IB
-    variant section in _failed_unittest_list_answer."""
+    variant section in _failed_unittest_list_answer. Returns (text,
+    has_failures) so the caller can bucket clean/never-imported variants
+    into a compact summary instead of repeating full "no failures"
+    boilerplate for each one (see _failed_unittest_list_answer)."""
     archs = [requested_arch] if requested_arch else [
         record["arch"] for record in _unittest_scope_records(tag)
     ]
     if not archs:
-        return f"No imported unit-test records were found for `{tag}`."
+        return f"No imported unit-test records were found for `{tag}`.", False
     lines = []
     found_any = False
     for arch in archs:
@@ -1294,8 +1318,8 @@ def _failed_unittest_package_listing(tag: str, requested_arch: str | None) -> st
         lines.append(f"\n**{arch}** ({len(rows)} failed):")
         lines.extend(f"- {row['name']} (errors: {row['errors'] or 0})" for row in rows)
     if not found_any:
-        return f"No failed unit-test packages were found for `{tag}`."
-    return "\n".join(lines)
+        return f"No failed unit-test packages were found for `{tag}`.", False
+    return "\n".join(lines), True
 
 
 def _failed_unittest_list_answer(
@@ -1319,18 +1343,38 @@ def _failed_unittest_list_answer(
         return None
     requested_arch = _requested_ib_arch(question) or (context_arch if not tag_match else None)
 
+    primary_listing, _ = _failed_unittest_package_listing(tag, requested_arch)
     lines = [
         f"Failed unit-test packages for `{tag}`:",
         "",
-        _failed_unittest_package_listing(tag, requested_arch),
+        primary_listing,
     ]
     # Inline each sub-IB variant's own failed-package list too, never merged
     # into the primary tag's listing -- see _unittest_summary_from_records
-    # for the same treatment and its rationale (approved 2026-08-26).
+    # for the same treatment and its rationale (approved 2026-08-26, refined
+    # 2026-09-30: failing variants still get their full listing, right after
+    # the primary one; clean/never-imported variants are named but collapsed
+    # to one line each instead of repeating the same boilerplate per
+    # variant, since always-expanding every variant buried the real
+    # failures under a wall of identical "no failures" sections).
+    clean_variants: list[str] = []
+    missing_variants: list[str] = []
     for entry in _sub_ib_variant_tags(tag):
         sub_tag, variant = entry["tag"], entry["variant"]
-        lines.append(f"\n### Sub-IB variant `{variant}` (`{sub_tag}`)")
-        lines.append(_failed_unittest_package_listing(sub_tag, requested_arch))
+        listing, has_failures = _failed_unittest_package_listing(sub_tag, requested_arch)
+        if has_failures:
+            lines.append(f"\n### Sub-IB variant `{variant}` (`{sub_tag}`)")
+            lines.append(listing)
+        elif listing.startswith("No imported"):
+            missing_variants.append(variant)
+        else:
+            clean_variants.append(variant)
+    if clean_variants:
+        lines.append("")
+        lines.append(f"✅ Clean, no failed packages: {', '.join(f'`{v}`' for v in clean_variants)}")
+    if missing_variants:
+        lines.append("")
+        lines.append(f"No imported unit-test records: {', '.join(f'`{v}`' for v in missing_variants)}")
     return "\n".join(lines)
 
 

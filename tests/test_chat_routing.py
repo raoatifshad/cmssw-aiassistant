@@ -2063,10 +2063,63 @@ class ChatRoutingTests(unittest.TestCase):
 
         answer = _unittest_summary_answer("unit tests", tag, "unittest-sub-ib-mention")
 
-        self.assertIn("CMSSW_20_1_CLANG_X_2026-08-25-2300", answer)
-        self.assertIn("CMSSW_20_1_DEVEL_X_2026-08-25-2300", answer)
-        self.assertIn("CMSSW_20_1_MULTIARCHS_X_2026-08-25-2300", answer)
-        self.assertIn("No imported unit-test records were found for `CMSSW_20_1_CLANG_X_2026-08-25-2300`", answer)
+        # Never-imported variants are still named (never silently merged or
+        # omitted), just collapsed to one compact line each instead of a
+        # full "no records" sentence per variant (refined 2026-09-30).
+        self.assertIn("No imported unit-test records: `CLANG`, `DEVEL`, `MULTIARCHS`", answer)
+
+    @patch("server.api_server.get_driver")
+    @patch("server.api_server.get_failing_unittests")
+    @patch("server.api_server._unittest_scope_records")
+    def test_unittest_summary_puts_failing_variants_first_and_collapses_clean_ones(
+        self, scope_records, get_failing_unittests, get_driver
+    ):
+        # Real bug found live 2026-09-30 (comparing against the CMSSDT
+        # dashboard): an 11-variant tag with only 2 real failures buried
+        # them under 7 identical "0 failed" sub-IB sections. Failing
+        # variants must appear in full, immediately after the primary
+        # summary; clean ones collapse to one line; never-imported ones to
+        # a separate line -- nothing omitted, just not spelled out at full
+        # length when there's nothing to report.
+        tag = "CMSSW_20_1_X_2026-09-20-2300"
+        primary_records = [
+            {"arch": "el9_amd64_gcc14", "is_default": True, "total": 376, "failed": 0, "passed": 376, "errors": 0},
+        ]
+        clang_records = [
+            {"arch": "el9_amd64_gcc14", "is_default": True, "total": 376, "failed": 2, "passed": 374, "errors": 2},
+        ]
+        devel_records = [
+            {"arch": "el9_amd64_gcc14", "is_default": True, "total": 376, "failed": 0, "passed": 376, "errors": 0},
+        ]
+
+        def scope_side_effect(queried_tag):
+            if queried_tag == tag:
+                return primary_records
+            if "CLANG" in queried_tag:
+                return clang_records
+            if "DEVEL" in queried_tag:
+                return devel_records
+            return []
+
+        scope_records.side_effect = scope_side_effect
+        get_failing_unittests.return_value = [{"name": "SimG4Core/Geometry", "errors": 2}]
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"variant": "CLANG", "tag": "CMSSW_20_1_CLANG_X_2026-09-20-2300"},
+            {"variant": "DEVEL", "tag": "CMSSW_20_1_DEVEL_X_2026-09-20-2300"},
+            {"variant": "MULTIARCHS", "tag": "CMSSW_20_1_MULTIARCHS_X_2026-09-20-2300"},
+        ]
+
+        answer = _unittest_summary_answer("unit tests", tag, "unittest-mixed-variants")
+
+        self.assertIn("Sub-IB variant `CLANG`", answer)
+        self.assertIn("SimG4Core/Geometry", answer)
+        self.assertIn("✅ Clean, no failures: `DEVEL`", answer)
+        self.assertIn("No imported unit-test records: `MULTIARCHS`", answer)
+        # Ordering: the failing variant's block must come before the clean
+        # summary line, which must come before the missing-records line.
+        self.assertLess(answer.index("Sub-IB variant `CLANG`"), answer.index("✅ Clean"))
+        self.assertLess(answer.index("✅ Clean"), answer.index("No imported unit-test records"))
 
     @patch("server.api_server.get_driver")
     @patch("server.api_server.get_failing_unittests")
