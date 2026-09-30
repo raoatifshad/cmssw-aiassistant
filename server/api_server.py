@@ -5700,6 +5700,31 @@ def chat(req: ChatRequest):
                 _latest_ib_arch_contexts[sid] = arch_hint
             else:
                 _latest_ib_arch_contexts.pop(sid, None)
+    else:
+        # A completely bare failure request -- "what are failing", "what's
+        # failing" -- names no tag, no category (relval/build/unittest/
+        # clang), and doesn't even say "latest"/"IB", so neither branch
+        # above fires. RequestPlanner._clarification only ever looks at the
+        # question's own text, never at session memory, so even a tag
+        # established earlier in this same session doesn't help here on its
+        # own (found while testing this fix) -- resolve to a concrete tag
+        # and inject it into the text: the session's own last tag if this is
+        # a follow-up, otherwise the latest IB (the obvious, unambiguous
+        # default absent any other signal). Either way this reaches the
+        # tag-present "which category?" clarification below -- now enriched
+        # with real per-category counts via _category_failure_snapshot --
+        # instead of the generic, uninformative "I couldn't match that"
+        # fallback.
+        bare_context = RequestContext.extract(question)
+        if bare_context.has_failure_request and not bare_context.categories:
+            resolved_tag = _latest_ib_contexts.get(sid)
+            if not resolved_tag:
+                latest_records = _latest_ib_records(None)
+                if latest_records:
+                    resolved_tag = latest_records[0]["tag"]
+            if resolved_tag:
+                question = f"{question} {resolved_tag}"
+                _latest_ib_contexts[sid] = resolved_tag
     _ACK_PREFIX = r"\s*(?:yes|yeah|yep|sure|ok(?:ay)?|please)?[,:\s]*"
     architecture_only = re.fullmatch(
         _ACK_PREFIX + r"(el\d+_(?:amd64|aarch64|riscv64)_gcc\d+)\s*[.?!]?\s*", question, re.IGNORECASE
