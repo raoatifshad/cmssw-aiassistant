@@ -6,6 +6,7 @@ from server.api_server import (
     ChatRequest,
     FeedbackRequest,
     SYSTEM_PROMPT,
+    _log_router_shadow_decision,
     _pending_ib_comparisons,
     _is_latest_ib_question,
     _is_latest_comparison_question,
@@ -524,6 +525,22 @@ class ChatRoutingTests(unittest.TestCase):
         # The LLM fallback is a best-effort second attempt, not a guarantee -- when
         # neither the regex terms nor the LLM-proposed signature find anything, this
         # must still report a plain no-evidence miss, never fabricate a match.
+        result = _pr_evidence_answer("any pr for CMSSW_20_1_X_2026-08-04-2300?")
+
+        self.assertIsNotNone(result)
+        answer, rows = result
+        self.assertIn("No PR evidence matching", answer)
+        self.assertEqual(rows, [])
+
+    @patch("server.api_server.find_prs_for_error", return_value=[])
+    @patch("server.api_server.propose_pr_search_signature", side_effect=TimeoutError("gateway too slow"))
+    @patch("server.api_server._llm_client", new="not-none-sentinel")
+    def test_pr_evidence_degrades_gracefully_when_llm_fallback_times_out(
+        self, propose_signature, find_prs
+    ):
+        # Same fail-safe contract as a null/unparseable LLM reply -- a
+        # slow/unreachable gateway here must fall back to the plain
+        # no-evidence miss, never propagate as an unhandled error.
         result = _pr_evidence_answer("any pr for CMSSW_20_1_X_2026-08-04-2300?")
 
         self.assertIsNotNone(result)
@@ -3187,6 +3204,25 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(result.route, "llm_validated")
         self.assertEqual(result.answer, synthesize.return_value)
 
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.propose_investigation_plan", side_effect=TimeoutError("gateway too slow"))
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_llm_investigation_degrades_to_friendly_message_on_timeout(
+        self, concepts, propose_plan, store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # Found live via scripts/stress_test_bot.py, 2026-09-22: concurrent
+        # LLM-heavy traffic pushed the gateway past 30-60s. A hung/failed
+        # call here must never surface as an unhandled 500 -- it degrades to
+        # a friendly, retryable message instead.
+        result = chat(ChatRequest(question="Explain the graph topology", session_id="llm-investigation-timeout"))
+
+        self.assertEqual(result.route, "llm_timeout")
+        self.assertIn("try again", result.answer.lower())
+
     @patch("server.api_server._retriever", None)
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")
@@ -3364,6 +3400,30 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(result.route, "capability:unittest")
         verify_answer.assert_called_once()
         self.assertIn(tag, verify_answer.call_args.kwargs["session_context"])
+
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server._execute_planned_capability", return_value=("relval evidence", []))
+    @patch("server.api_server._ROUTER_SHADOW_EXECUTOR")
+    def test_router_shadow_logging_is_dispatched_off_the_response_path(
+        self, executor, execute_capability, store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # Found live via scripts/stress_test_bot.py, 2026-09-22: this call
+        # used to run inline and block chat() before the real answer logic
+        # even started, stacking with the answer-verification/investigation
+        # calls to inflate total response time under gateway contention. It
+        # never affects what's shown to the user, so it must be submitted to
+        # the background executor, never called (and waited on) inline.
+        result = chat(ChatRequest(
+            question="how many relvals are failing in CMSSW_20_1_X_2026-08-17-2300",
+            session_id="shadow-non-blocking",
+        ))
+
+        self.assertEqual(result.answer, "relval evidence")
+        executor.submit.assert_called_once()
+        self.assertIs(executor.submit.call_args.args[0], _log_router_shadow_decision)
 
     @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", False)
     @patch("server.api_server._clear_pending_clarification")

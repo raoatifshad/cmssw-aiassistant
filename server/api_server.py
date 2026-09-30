@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -128,6 +129,12 @@ _last_issue_contexts: dict[str, int] = {}
 _llm_client = None
 _pipeline: LogRAGPipeline | None = None
 _retriever: HybridRetriever | None = None
+# Router-shadow logging is purely a background comparison (never used to
+# answer, never shown to the user -- see _log_router_shadow_decision), so it
+# has no reason to block the response it's logging about. Submitted here
+# instead of called inline, off a small bounded pool rather than an
+# unbounded thread-per-request.
+_ROUTER_SHADOW_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="router-shadow")
 
 # Phase 2/4: both off by default -- each adds a real per-message LLM call
 # (latency + cost) with no user-visible benefit until explicitly enabled.
@@ -366,7 +373,14 @@ def _log_router_shadow_decision(
     deterministic planner, and log both decisions for later comparison.
     Logging only -- never used to answer, never allowed to affect the real
     response. No-op unless ENABLE_ROUTER_SHADOW=true, since this costs a real
-    LLM call on every message with no user-visible benefit yet."""
+    LLM call on every message with no user-visible benefit yet.
+
+    Called via _ROUTER_SHADOW_EXECUTOR.submit(...), off the response path --
+    found live via scripts/stress_test_bot.py, 2026-09-22, that this call was
+    blocking chat() before the real answer logic even started, stacking with
+    the answer-verification/investigation calls to inflate total response
+    time under gateway contention. Nothing here is shown to the user, so
+    nothing here needs to finish before the response does."""
     if not ROUTER_SHADOW_ENABLED or _llm_client is None:
         return
     try:
@@ -560,7 +574,16 @@ def _llm_feedback_verification(req: "FeedbackRequest") -> tuple[str, str] | None
         tools_registry=TOOLS,
         system_prompt=FEEDBACK_VERIFIER_PROMPT,
     )
-    result = verifier.ask(f"Verify this feedback submission:\n<submission>{submission}</submission>")
+    try:
+        result = verifier.ask(f"Verify this feedback submission:\n<submission>{submission}</submission>")
+    except Exception as exc:
+        # A slow/unreachable gateway here must leave feedback "pending" (the
+        # same outcome as an unparseable LLM reply, handled by the caller)
+        # rather than 500ing /api/feedback -- ingestion/revalidate_feedback.py
+        # re-checks pending feedback later anyway once the graph or the
+        # gateway's health has moved on.
+        print(f"WARNING: LLM feedback verification failed or timed out: {exc}")
+        return None
     match = re.search(r"\{.*\}", result, re.DOTALL)
     if not match:
         return None
@@ -1887,7 +1910,14 @@ def _llm_extract_pr_error_signature(question: str) -> str | None:
     actual results."""
     if _llm_client is None:
         return None
-    return propose_pr_search_signature(_llm_client, DEFAULT_MODEL, question)
+    try:
+        return propose_pr_search_signature(_llm_client, DEFAULT_MODEL, question)
+    except Exception as exc:
+        # Same fail-safe contract as a null/unparseable LLM reply -- the
+        # caller already falls back to the regex-only search on None, so a
+        # slow/unreachable gateway here degrades the same way, never a 500.
+        print(f"WARNING: LLM PR search signature failed or timed out: {exc}")
+        return None
 
 
 def _pr_evidence_answer(question: str, fallback_term: str | None = None) -> tuple[str, list[dict]] | None:
@@ -5540,34 +5570,47 @@ def _run_llm_investigation(
     """
     if _llm_client is None:
         raise HTTPException(503, "CERN API not configured — see .env")
-    raw_plan = propose_investigation_plan(
-        _llm_client,
-        DEFAULT_MODEL,
-        question,
-        [capability.name for capability in _request_planner.capabilities],
-        sorted(_LLM_PLAN_TOOL_NAMES),
-    )
-    from server.request_planner import validate_llm_plan
+    try:
+        raw_plan = propose_investigation_plan(
+            _llm_client,
+            DEFAULT_MODEL,
+            question,
+            [capability.name for capability in _request_planner.capabilities],
+            sorted(_LLM_PLAN_TOOL_NAMES),
+        )
+        from server.request_planner import validate_llm_plan
 
-    llm_plan = validate_llm_plan(raw_plan, _request_planner.capabilities, set(_LLM_PLAN_TOOL_NAMES))
-    if llm_plan is None or llm_plan.capability != "investigation":
-        fallback_answer, fallback_actions = _fallback_clarification(planned.context)
-        return _chat_response(sid, original_question, fallback_answer, f"{route_prefix}fallback_clarification", actions=fallback_actions)
-    tool_evidence = execute_read_only_plan(llm_plan.tool_calls, TOOLS)
-    if not tool_evidence:
-        fallback_answer, fallback_actions = _fallback_clarification(planned.context)
-        return _chat_response(sid, original_question, fallback_answer, f"{route_prefix}fallback_clarification", actions=fallback_actions)
-    citations = _retriever.retrieve(question) if _retriever else []
-    if citations:
-        tool_evidence.append({"tool": "local_log_retrieval", "arguments": {}, "result": citations})
-    answer = synthesize_evidence_answer(_llm_client, DEFAULT_MODEL, SYSTEM_PROMPT, question, tool_evidence)
-    if not answer:
-        answer = "The approved local evidence could not be synthesized into an answer."
+        llm_plan = validate_llm_plan(raw_plan, _request_planner.capabilities, set(_LLM_PLAN_TOOL_NAMES))
+        if llm_plan is None or llm_plan.capability != "investigation":
+            fallback_answer, fallback_actions = _fallback_clarification(planned.context)
+            return _chat_response(sid, original_question, fallback_answer, f"{route_prefix}fallback_clarification", actions=fallback_actions)
+        tool_evidence = execute_read_only_plan(llm_plan.tool_calls, TOOLS)
+        if not tool_evidence:
+            fallback_answer, fallback_actions = _fallback_clarification(planned.context)
+            return _chat_response(sid, original_question, fallback_answer, f"{route_prefix}fallback_clarification", actions=fallback_actions)
+        citations = _retriever.retrieve(question) if _retriever else []
+        if citations:
+            tool_evidence.append({"tool": "local_log_retrieval", "arguments": {}, "result": citations})
+        answer = synthesize_evidence_answer(_llm_client, DEFAULT_MODEL, SYSTEM_PROMPT, question, tool_evidence)
+        if not answer:
+            answer = "The approved local evidence could not be synthesized into an answer."
+            return _chat_response(sid, original_question, answer, f"{route_prefix}llm_validated", citations)
+        if not _evidence_grounded(answer, tool_evidence):
+            answer = _format_raw_evidence(tool_evidence)
+            return _chat_response(sid, original_question, answer, f"{route_prefix}llm_ungrounded_fallback", citations)
         return _chat_response(sid, original_question, answer, f"{route_prefix}llm_validated", citations)
-    if not _evidence_grounded(answer, tool_evidence):
-        answer = _format_raw_evidence(tool_evidence)
-        return _chat_response(sid, original_question, answer, f"{route_prefix}llm_ungrounded_fallback", citations)
-    return _chat_response(sid, original_question, answer, f"{route_prefix}llm_validated", citations)
+    except Exception as exc:
+        # The LLM gateway can be slow or briefly unreachable under load (found
+        # live via scripts/stress_test_bot.py, 2026-09-22: concurrent
+        # LLM-heavy traffic pushed some calls past 30-60s) -- a hung or failed
+        # call here must degrade to a friendly, retryable message, never an
+        # unhandled 500.
+        print(f"WARNING: LLM investigation failed or timed out: {exc}")
+        return _chat_response(
+            sid, original_question,
+            "This is taking longer than usual to look up right now. Please try again in a moment.",
+            f"{route_prefix}llm_timeout",
+        )
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -5635,7 +5678,7 @@ def chat(req: ChatRequest):
     _restore_pending_clarification(sid)
     planned = _request_planner.plan(RequestContext.extract(question), sid)
     _store_planning_decision(sid, original_question, planned)
-    _log_router_shadow_decision(question, planned.kind.value, planned.capability, sid)
+    _ROUTER_SHADOW_EXECUTOR.submit(_log_router_shadow_decision, question, planned.kind.value, planned.capability, sid)
     if planned.kind == PlanKind.CLARIFICATION and planned.clarification:
         _store_pending_clarification(sid, planned.clarification)
     elif sid not in _request_planner.pending:
