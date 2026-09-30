@@ -3574,22 +3574,39 @@ def _build_summary_answer(question: str) -> str | None:
 
 def _category_failure_snapshot(tag: str) -> str | None:
     """Real per-category failure counts for a tag, summed across every
-    imported architecture -- built to make the "which category?" ambiguous-
-    request clarification (RequestPlanner._clarification, missing_field=
-    "category") informative instead of a blind menu, so the user can see
-    what's actually failing before picking one. Entirely graph facts, same
-    query shape as _ib_results_summary_answer's per-architecture table, just
-    summed rather than broken out -- never LLM-guessed. Returns None (never
-    raises) on any backend issue or an unknown tag, so a clarification this
-    enriches always still falls back to its plain question."""
+    imported architecture AND sub-IB variant -- built to make the "which
+    category?" ambiguous-request clarification (RequestPlanner._clarification,
+    missing_field="category") informative instead of a blind menu, so the
+    user can see what's actually failing before picking one. Entirely graph
+    facts, never LLM-guessed. Returns None (never raises) on any backend
+    issue or an unknown tag, so a clarification this enriches always still
+    falls back to its plain question.
+
+    `ib.tag = $tag OR ib.parent_tag = $tag` (same pattern as
+    _ib_results_summary_answer) is required, not optional -- an earlier
+    version of this query matched only `ib.tag = $tag`, silently excluding
+    every sub-IB variant (CLANG/CUDART/DEVEL/EVTGEN3/...). Found live,
+    2026-09-30: for CMSSW_20_1_X_2026-09-20-2300 that undercounted real
+    failures to zero for RelVals even though CUDART/DEVEL/EVTGEN3/G4ADEPT
+    all had real ones -- the same sub-IB-crowd-out bug class this codebase
+    has hit and fixed multiple times before (see CLAUDE.md).
+
+    build_status (a string: 'passed'/'error'/...) and comp_warnings (an int
+    count of compiler warnings on an otherwise-passing build) are two
+    different signals -- a build can fail outright with zero warnings
+    recorded (EVTGEN3 in that same real example: build_status='error',
+    comp_warnings=0). Reporting only comp_warnings made a broken build look
+    clean. Both are now reported."""
     query = """
-        MATCH (ib:IB {tag: $tag})
+        MATCH (ib:IB) WHERE ib.tag = $tag OR ib.parent_tag = $tag
         OPTIONAL MATCH (ib)-[:RAN_RELVAL]->(relval:RelVal)
         WITH ib, collect(DISTINCT relval) AS relvals
         OPTIONAL MATCH (ib)-[:RAN_UNITTEST]->(unit_test:UnitTest)
         WITH ib, relvals, collect(DISTINCT unit_test) AS unit_tests
         RETURN
-            count(DISTINCT ib) AS arch_count,
+            count(DISTINCT ib) AS record_count,
+            sum(CASE WHEN ib.build_status IS NOT NULL AND ib.build_status <> 'passed'
+                     THEN 1 ELSE 0 END) AS build_failing,
             sum(coalesce(ib.comp_warnings, 0)) AS build_warnings,
             sum(size([item IN relvals WHERE item.status = 'FAILED'
                       AND coalesce(item.known_error, false) = false])) AS relval_failed,
@@ -3605,16 +3622,17 @@ def _category_failure_snapshot(tag: str) -> str | None:
     except Exception as exc:
         print(f"WARNING: could not build category failure snapshot: {exc}")
         return None
-    if not row or not row["arch_count"]:
+    if not row or not row["record_count"]:
         return None
 
     def marker(count: int) -> str:
         return "🟢" if count == 0 else "🔴"
 
+    warnings_suffix = f" ({row['build_warnings']} warning(s))" if row["build_warnings"] else ""
     return (
-        f"For `{tag}` across {row['arch_count']} imported architecture(s): "
+        f"For `{tag}` across {row['record_count']} imported architecture/variant record(s): "
         f"{marker(row['relval_failed'])} {row['relval_failed']} RelVal(s) failing, "
-        f"{marker(row['build_warnings'])} {row['build_warnings']} build warning(s), "
+        f"{marker(row['build_failing'])} {row['build_failing']} build(s) not passing{warnings_suffix}, "
         f"{marker(row['unit_test_failed'])} {row['unit_test_failed']} unit test(s) failing."
     )
 
