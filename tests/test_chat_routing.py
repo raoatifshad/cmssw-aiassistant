@@ -23,6 +23,7 @@ from server.api_server import (
     _artifact_search_answer,
     _build_warning_answer,
     _ib_action_menu,
+    _category_failure_snapshot,
     _ib_relationship_answer,
     _ib_results_summary_answer,
     _pasted_exception_signature,
@@ -3103,6 +3104,63 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("Do you want build warnings", result)
         execute.assert_not_called()
         store_pending.assert_called_once()
+
+    @patch("server.api_server.get_driver")
+    def test_category_failure_snapshot_reports_real_counts_with_markers(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "arch_count": 2, "build_warnings": 0, "relval_failed": 3, "unit_test_failed": 0,
+        }
+
+        snapshot = _category_failure_snapshot("CMSSW_20_1_X_2026-08-10-1100")
+
+        self.assertIn("2 imported architecture(s)", snapshot)
+        self.assertIn("🔴 3 RelVal(s) failing", snapshot)
+        self.assertIn("🟢 0 build warning(s)", snapshot)
+        self.assertIn("🟢 0 unit test(s) failing", snapshot)
+
+    @patch("server.api_server.get_driver")
+    def test_category_failure_snapshot_returns_none_for_unknown_tag(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "arch_count": 0, "build_warnings": None, "relval_failed": None, "unit_test_failed": None,
+        }
+
+        self.assertIsNone(_category_failure_snapshot("CMSSW_UNKNOWN_TAG"))
+
+    @patch("server.api_server.get_driver", side_effect=RuntimeError("boom"))
+    def test_category_failure_snapshot_fails_open_on_backend_error(self, get_driver):
+        # An enrichment failure must never take down the base clarification
+        # -- the caller falls back to the plain question when this is None.
+        self.assertIsNone(_category_failure_snapshot("CMSSW_20_1_X_2026-08-10-1100"))
+
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._category_failure_snapshot")
+    def test_ambiguous_failure_request_is_enriched_with_real_counts(
+        self, snapshot, restore, store_decision, store_pending, clear_pending
+    ):
+        # The blind "Do you want build warnings, failed RelVals, unit-test
+        # results, or a combined IB summary?" menu is now informed by real
+        # graph facts (never LLM-guessed) so the user can see what's
+        # actually failing before picking a category.
+        snapshot.return_value = (
+            "For `CMSSW_20_1_X_2026-08-10-1100` across 2 imported architecture(s): "
+            "🔴 3 RelVal(s) failing, 🟢 0 build warning(s), 🟢 0 unit test(s) failing."
+        )
+        session_id = "planner-clarification-snapshot"
+        tag = "CMSSW_20_1_X_2026-08-10-1100"
+        try:
+            result = chat(ChatRequest(question=f"failures for {tag}", session_id=session_id))
+        finally:
+            from server.api_server import _request_planner
+            _request_planner.pending.pop(session_id, None)
+
+        snapshot.assert_called_once_with(tag)
+        self.assertIn("🔴 3 RelVal(s) failing", result.answer)
+        self.assertIn("Do you want build warnings", result.answer)
 
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_pending_clarification")
