@@ -3109,21 +3109,44 @@ class ChatRoutingTests(unittest.TestCase):
     def test_category_failure_snapshot_reports_real_counts_with_markers(self, get_driver):
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value.single.return_value = {
-            "arch_count": 2, "build_warnings": 0, "relval_failed": 3, "unit_test_failed": 0,
+            "record_count": 2, "build_failing": 0, "build_warnings": 0, "relval_failed": 3, "unit_test_failed": 0,
         }
 
         snapshot = _category_failure_snapshot("CMSSW_20_1_X_2026-08-10-1100")
 
-        self.assertIn("2 imported architecture(s)", snapshot)
+        self.assertIn("2 imported architecture/variant record(s)", snapshot)
         self.assertIn("🔴 3 RelVal(s) failing", snapshot)
-        self.assertIn("🟢 0 build warning(s)", snapshot)
+        self.assertIn("🟢 0 build(s) not passing", snapshot)
         self.assertIn("🟢 0 unit test(s) failing", snapshot)
+
+    @patch("server.api_server.get_driver")
+    def test_category_failure_snapshot_includes_sub_ib_variants(self, get_driver):
+        # Regression: found live 2026-09-30 -- an earlier version matched
+        # only ib.tag = $tag, silently excluding every sub-IB variant
+        # (CLANG/CUDART/DEVEL/EVTGEN3/...), undercounting real failures.
+        # Also confirms build_status ('error', a real build failure) is
+        # reported even when comp_warnings (a different signal) is 0.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "record_count": 14, "build_failing": 1, "build_warnings": 0, "relval_failed": 15, "unit_test_failed": 4,
+        }
+
+        snapshot = _category_failure_snapshot("CMSSW_20_1_X_2026-09-20-2300")
+
+        session.run.assert_called_once()
+        query = session.run.call_args.args[0]
+        self.assertIn("ib.tag = $tag OR ib.parent_tag = $tag", query)
+        self.assertIn("14 imported architecture/variant record(s)", snapshot)
+        self.assertIn("🔴 15 RelVal(s) failing", snapshot)
+        self.assertIn("🔴 1 build(s) not passing", snapshot)
+        self.assertIn("🔴 4 unit test(s) failing", snapshot)
 
     @patch("server.api_server.get_driver")
     def test_category_failure_snapshot_returns_none_for_unknown_tag(self, get_driver):
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value.single.return_value = {
-            "arch_count": 0, "build_warnings": None, "relval_failed": None, "unit_test_failed": None,
+            "record_count": 0, "build_failing": None, "build_warnings": None,
+            "relval_failed": None, "unit_test_failed": None,
         }
 
         self.assertIsNone(_category_failure_snapshot("CMSSW_UNKNOWN_TAG"))
