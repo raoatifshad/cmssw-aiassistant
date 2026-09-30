@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from server.api_server import _maybe_create_concept, _verify_feedback
+from server.api_server import FeedbackRequest, _llm_feedback_verification, _maybe_create_concept, _verify_feedback
 from ingestion.revalidate_feedback import revalidate_expiring_concepts, revalidate_pending_feedback
 
 
@@ -42,6 +42,22 @@ class VerifyFeedbackTests(unittest.TestCase):
         self.assertEqual(status, "accepted")
         self.assertEqual(method, "deterministic")
         llm_verification.assert_not_called()
+
+    @patch("server.api_server.KGChatSession")
+    @patch("server.api_server._llm_client", new="not-none-sentinel")
+    def test_llm_feedback_verification_returns_none_when_gateway_times_out(self, session_cls):
+        # Found live via scripts/stress_test_bot.py, 2026-09-22: the LLM
+        # gateway can be slow/unreachable under load. A hung/failed verifier
+        # call here must never propagate and 500 /api/feedback -- it degrades
+        # to the same "pending" outcome as an unparseable LLM reply, and
+        # ingestion/revalidate_feedback.py re-checks pending feedback later.
+        session_cls.return_value.ask.side_effect = TimeoutError("gateway too slow")
+
+        result = _llm_feedback_verification(FeedbackRequest(
+            question="Is Issue #51449 open?", answer="It is open.", verdict="correct",
+        ))
+
+        self.assertIsNone(result)
 
 
 class MaybeCreateConceptTests(unittest.TestCase):
