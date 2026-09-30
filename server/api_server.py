@@ -3572,6 +3572,53 @@ def _build_summary_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _category_failure_snapshot(tag: str) -> str | None:
+    """Real per-category failure counts for a tag, summed across every
+    imported architecture -- built to make the "which category?" ambiguous-
+    request clarification (RequestPlanner._clarification, missing_field=
+    "category") informative instead of a blind menu, so the user can see
+    what's actually failing before picking one. Entirely graph facts, same
+    query shape as _ib_results_summary_answer's per-architecture table, just
+    summed rather than broken out -- never LLM-guessed. Returns None (never
+    raises) on any backend issue or an unknown tag, so a clarification this
+    enriches always still falls back to its plain question."""
+    query = """
+        MATCH (ib:IB {tag: $tag})
+        OPTIONAL MATCH (ib)-[:RAN_RELVAL]->(relval:RelVal)
+        WITH ib, collect(DISTINCT relval) AS relvals
+        OPTIONAL MATCH (ib)-[:RAN_UNITTEST]->(unit_test:UnitTest)
+        WITH ib, relvals, collect(DISTINCT unit_test) AS unit_tests
+        RETURN
+            count(DISTINCT ib) AS arch_count,
+            sum(coalesce(ib.comp_warnings, 0)) AS build_warnings,
+            sum(size([item IN relvals WHERE item.status = 'FAILED'
+                      AND coalesce(item.known_error, false) = false])) AS relval_failed,
+            sum(size([item IN unit_tests WHERE item.status = 'FAILED'])) AS unit_test_failed
+    """
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                row = session.run(query, tag=tag).single()
+        finally:
+            driver.close()
+    except Exception as exc:
+        print(f"WARNING: could not build category failure snapshot: {exc}")
+        return None
+    if not row or not row["arch_count"]:
+        return None
+
+    def marker(count: int) -> str:
+        return "🟢" if count == 0 else "🔴"
+
+    return (
+        f"For `{tag}` across {row['arch_count']} imported architecture(s): "
+        f"{marker(row['relval_failed'])} {row['relval_failed']} RelVal(s) failing, "
+        f"{marker(row['build_warnings'])} {row['build_warnings']} build warning(s), "
+        f"{marker(row['unit_test_failed'])} {row['unit_test_failed']} unit test(s) failing."
+    )
+
+
 def _ib_results_summary_answer(
     question: str, context_tag: str | None, context_arch: str | None
 ) -> str | None:
@@ -5696,7 +5743,12 @@ def chat(req: ChatRequest):
             {"label": label, "question": action_question}
             for label, action_question in clarification.choices
         ]
-        return _chat_response(sid, original_question, clarification.question, "clarification", actions=actions)
+        clarification_message = clarification.question
+        if clarification.missing_field == "category" and clarification.context.get("tag"):
+            snapshot = _category_failure_snapshot(clarification.context["tag"])
+            if snapshot:
+                clarification_message = f"{snapshot}\n\n{clarification.question}"
+        return _chat_response(sid, original_question, clarification_message, "clarification", actions=actions)
     if planned.kind == PlanKind.DETERMINISTIC and planned.capability:
         planned_answer = _execute_planned_capability(planned.capability, question, sid)
         if planned_answer:
