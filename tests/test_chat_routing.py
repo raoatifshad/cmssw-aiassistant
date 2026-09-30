@@ -3574,6 +3574,61 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("CMSSW_20_1_X_2026-08-17-2300", execute.call_args.args[1])
 
     @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._category_failure_snapshot", return_value=None)
+    @patch("server.api_server._latest_ib_records")
+    def test_bare_failure_request_resolves_to_latest_tag_before_routing(
+        self, latest_ib_records, snapshot, restore, store_decision, store_pending, clear_pending
+    ):
+        # "what are failing" names no tag, no category (relval/build/unittest/
+        # clang), and doesn't even say "latest"/"IB" -- it used to fall all the
+        # way to the generic "I couldn't match that" fallback instead of the
+        # informative, tag-present "which category?" clarification.
+        latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
+        session_id = "bare-failure-resolve"
+
+        try:
+            result = chat(ChatRequest(question="what are failing", session_id=session_id))
+        finally:
+            from server.api_server import _request_planner
+            _request_planner.pending.pop(session_id, None)
+
+        self.assertEqual(result.route, "clarification")
+        self.assertIn("Do you want build warnings", result.answer)
+        snapshot.assert_called_once_with("CMSSW_20_1_X_2026-08-17-2300")
+
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._category_failure_snapshot", return_value=None)
+    @patch("server.api_server._latest_ib_records")
+    def test_bare_failure_request_reuses_an_existing_session_tag_over_latest(
+        self, latest_ib_records, snapshot, restore, store_decision, store_pending, clear_pending
+    ):
+        # A bare follow-up in a session that already has a tag from an
+        # earlier turn must reach the same tag-present clarification using
+        # THAT tag, never silently jump to the latest IB instead --
+        # RequestPlanner._clarification only looks at the question's own
+        # text, so the session tag must be injected into it, same as the
+        # no-session-tag case above.
+        session_id = "bare-failure-existing-context"
+        established_tag = "CMSSW_20_1_X_2026-07-01-1100"
+        _latest_ib_contexts[session_id] = established_tag
+        try:
+            result = chat(ChatRequest(question="what are failing", session_id=session_id))
+        finally:
+            _latest_ib_contexts.pop(session_id, None)
+            from server.api_server import _request_planner
+            _request_planner.pending.pop(session_id, None)
+
+        self.assertEqual(result.route, "clarification")
+        latest_ib_records.assert_not_called()
+        snapshot.assert_called_once_with(established_tag)
+
+    @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
     @patch("server.api_server._chat_response", side_effect=lambda *args, **kwargs: args[2])
