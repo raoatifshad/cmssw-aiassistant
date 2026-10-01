@@ -203,7 +203,14 @@ def dev_login(client: httpx.Client, username: str) -> None:
 
 
 def run(base_url: str, username: str, num_windows: int) -> int:
-    client = httpx.Client(base_url=base_url, timeout=30.0)
+    # Windows list is every historical window, not just adjacent ones --
+    # found live 2026-10-01: a window spanning two distant release series
+    # (e.g. CMSSW_16_1_X -> CMSSW_17_0_X) legitimately takes ~40s (confirmed
+    # server-side: 0 errors logged, a real 200 eventually), since a bigger
+    # generational diff means more newly-failing workflows, each needing its
+    # own PR/Issue evidence lookup. 30s was tripping on that real latency,
+    # not a hang -- this is a correctness checker, not a performance test.
+    client = httpx.Client(base_url=base_url, timeout=90.0)
 
     health = client.get("/api/health")
     health.raise_for_status()
