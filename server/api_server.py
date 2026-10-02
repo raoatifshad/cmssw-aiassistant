@@ -2986,12 +2986,26 @@ def _relval_exception_list_answer(question: str, context: dict[str, str | None] 
         # The question names a different IB than the cached exception context —
         # a stale session context must not silently answer for the wrong build.
         return None
+    # NOT a (RelVal)-[:HAS_EXCEPTION]->(RelValException) traversal, despite
+    # that relationship being documented in GRAPH_SCHEMA -- found live,
+    # 2026-10-02: it is never actually created anywhere in the ingestion
+    # pipeline (0 HAS_EXCEPTION relationships exist even though
+    # RelValException nodes are correctly populated, confirmed directly
+    # against the graph), so every query through it silently returned zero
+    # rows regardless of how much real data existed. This function has been
+    # returning "no exception signatures were found" even when thousands of
+    # real ones were imported, for as long as it's existed. Matches
+    # RelValException by its own ib_tag/arch/workflow_id properties
+    # directly instead -- the same already-correct pattern
+    # find_prs_for_error's exception_query uses.
     query = """
-        MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal)-[:HAS_EXCEPTION]->(exception:RelValException)
-        WHERE (ib.tag = $tag OR ib.parent_tag = $tag)
-          AND ($arch IS NULL OR ib.arch = $arch)
-        RETURN DISTINCT ib.arch AS arch, relval.workflow_id AS workflow_id, exception.text AS exception,
-               exception.category AS category, exception.source_url AS source_url
+        MATCH (ib:IB) WHERE ib.tag = $tag OR ib.parent_tag = $tag
+        WITH collect(DISTINCT ib.tag) AS all_tags
+        MATCH (exception:RelValException)
+        WHERE exception.ib_tag IN all_tags AND ($arch IS NULL OR exception.arch = $arch)
+        RETURN DISTINCT exception.arch AS arch, exception.workflow_id AS workflow_id,
+               exception.text AS exception, exception.category AS category,
+               exception.source_url AS source_url
         ORDER BY arch, workflow_id, exception
         LIMIT 100
     """
@@ -3431,20 +3445,34 @@ def _relval_exception_answer(question: str, context: dict[str, str | None] | Non
         )
 
     workflow_id = workflow_match.group(1)
+    # NOT a (RelVal)-[:HAS_EXCEPTION]->(RelValException) traversal -- found
+    # live, 2026-10-02: that relationship is documented in GRAPH_SCHEMA but
+    # never actually created by ingestion (0 HAS_EXCEPTION relationships
+    # exist in the graph even though RelValException nodes are correctly
+    # populated), so this function silently returned "no exception exists"
+    # for every real exception ever imported. Matches RelValException by its
+    # own ib_tag/arch/workflow_id properties directly, same pattern as
+    # find_prs_for_error's exception_query; RelVal also carries its own
+    # ib_tag/arch properties, so the workflow's display name is fetched the
+    # same direct way, no relationship traversal needed for that either.
     exception_query = """
-        MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal)-[:HAS_EXCEPTION]->(exception:RelValException)
-        WHERE (ib.tag = $tag OR ib.parent_tag = $tag)
-                    AND ($arch IS NULL OR ib.arch = $arch) AND relval.workflow_id = $workflow_id
+        MATCH (ib:IB) WHERE ib.tag = $tag OR ib.parent_tag = $tag
+        WITH collect(DISTINCT ib.tag) AS all_tags
+        MATCH (exception:RelValException)
+        WHERE exception.ib_tag IN all_tags AND exception.workflow_id = $workflow_id
+          AND ($arch IS NULL OR exception.arch = $arch)
+        OPTIONAL MATCH (relval:RelVal {workflow_id: $workflow_id, ib_tag: exception.ib_tag})
         RETURN DISTINCT exception.text AS exception, exception.category AS category,
                exception.source_url AS source_url, exception.context AS context, relval.name AS name
         ORDER BY exception
         LIMIT 20
     """
     related_workflows_query = """
-        MATCH (ib2:IB)-[:RAN_RELVAL]->(relval2:RelVal)-[:HAS_EXCEPTION]->(:RelValException {text:$text})
-        WHERE relval2.workflow_id <> $workflow_id
-        RETURN DISTINCT relval2.workflow_id AS workflow_id, relval2.name AS name,
-               ib2.tag AS tag, ib2.arch AS arch
+        MATCH (exception2:RelValException {text: $text})
+        WHERE exception2.workflow_id <> $workflow_id
+        OPTIONAL MATCH (relval2:RelVal {workflow_id: exception2.workflow_id, ib_tag: exception2.ib_tag})
+        RETURN DISTINCT exception2.workflow_id AS workflow_id, relval2.name AS name,
+               exception2.ib_tag AS tag, exception2.arch AS arch
         ORDER BY tag DESC, arch
         LIMIT 10
     """
