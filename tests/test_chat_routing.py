@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -73,6 +74,29 @@ from server.request_planner import Plan, PlanKind, RequestContext
 from server.agent import KGChatSession, propose_pr_search_signature, verify_answer_matches_question
 from graph.tools import TOOLS, get_failing_relvals, get_failing_unittests, search_issues_by_text
 from ingestion.build_graph import ib_parent_tag
+
+
+def _mock_kgchat_session(final_answer, tool_results=()):
+    """Build a replacement constructor for server.api_server.KGChatSession
+    (patched via @patch(..., side_effect=...)) that fires the real on_tool_call
+    hook _run_llm_investigation passes in for each (name, args, result) in
+    tool_results -- exactly how the real agentic loop reports evidence as it
+    calls tools -- then returns final_answer from the mock session's .ask().
+    factory.sessions holds every constructed mock session, in order, since
+    .side_effect (not .return_value) is what actually runs per call."""
+    sessions: list[MagicMock] = []
+
+    def factory(*, openai_client, model, tools_registry, system_prompt, on_tool_call=None):
+        if on_tool_call:
+            for name, args, result in tool_results:
+                on_tool_call(name, args, json.dumps(result, default=str))
+        session = MagicMock()
+        session.ask.return_value = final_answer
+        sessions.append(session)
+        return session
+
+    factory.sessions = sessions
+    return factory
 
 
 class ChatRoutingTests(unittest.TestCase):
@@ -3331,18 +3355,22 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
     @patch("server.api_server._chat_response", side_effect=lambda *args, **kwargs: args[2])
-    @patch("server.api_server.propose_investigation_plan", return_value={"capability": "unknown"})
+    @patch("server.api_server.KGChatSession")
     @patch("server.api_server._llm_client", object())
     @patch("server.api_server.search_concepts", return_value=[])
     def test_invalid_llm_plan_is_rejected_before_tool_execution(
-        self, concepts, propose_plan, chat_response, restore, store_decision, clear_pending
+        self, concepts, session_cls, chat_response, restore, store_decision, clear_pending
     ):
-        # Regression: an invalid/rejected LLM plan must not be a dead end --
+        # Regression: a question the agentic loop can't ground in any tool
+        # evidence (it never calls a tool at all) must not be a dead end --
         # it offers concrete next-step actions instead of a flat rejection.
+        kgchat_factory = _mock_kgchat_session("I don't have a tool for that.", tool_results=())
+        session_cls.side_effect = kgchat_factory
+
         result = chat(ChatRequest(question="Explain the graph topology", session_id="invalid-plan"))
 
         self.assertIn("couldn't match that to a specific local answer", result)
-        propose_plan.assert_called_once()
+        kgchat_factory.sessions[0].ask.assert_called_once()
         actions = chat_response.call_args.kwargs["actions"]
         self.assertIn({"label": "Latest IB", "question": "what is the latest IB"}, actions)
 
@@ -3351,26 +3379,23 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
     @patch("server.api_server._store_chat_turns")
-    @patch("server.api_server.synthesize_evidence_answer")
-    @patch("server.api_server.execute_read_only_plan")
-    @patch("server.request_planner.validate_llm_plan")
-    @patch("server.api_server.propose_investigation_plan", return_value={"capability": "investigation"})
+    @patch("server.api_server.KGChatSession")
     @patch("server.api_server._llm_client", object())
     @patch("server.api_server.search_concepts", return_value=[])
     def test_llm_fallback_answer_rejected_when_not_grounded_in_evidence(
-        self, concepts, propose_plan, validate_plan, execute_plan, synthesize,
-        store_chat_turns, restore, store_decision, clear_pending
+        self, concepts, session_cls, store_chat_turns, restore, store_decision, clear_pending
     ):
         # Regression guard for the one path with no other verification: the
-        # final LLM-fallback synthesizes free prose over real tool evidence,
-        # so a fabricated number in that prose must not reach the user as if
-        # it were a graph fact.
-        validate_plan.return_value.capability = "investigation"
-        validate_plan.return_value.tool_calls = []
-        evidence = [{"tool": "get_ib_summary", "arguments": {},
-                     "result": {"tag": "CMSSW_20_1_X_2026-08-17-2300", "failing_count": 5}}]
-        execute_plan.return_value = evidence
-        synthesize.return_value = "There are 42 failing workflows on CMSSW_20_1_X_2026-08-17-2300."
+        # agentic loop's own final free-text answer is only trusted if every
+        # number in it traces back to real tool evidence it actually called --
+        # a fabricated number must not reach the user as if it were a graph fact.
+        session_cls.side_effect = _mock_kgchat_session(
+            "There are 42 failing workflows on CMSSW_20_1_X_2026-08-17-2300.",
+            tool_results=[(
+                "get_ib_summary", {},
+                {"tag": "CMSSW_20_1_X_2026-08-17-2300", "failing_count": 5},
+            )],
+        )
 
         result = chat(ChatRequest(question="Explain the graph topology", session_id="llm-fallback-ungrounded"))
 
@@ -3384,37 +3409,35 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
     @patch("server.api_server._store_chat_turns")
-    @patch("server.api_server.synthesize_evidence_answer")
-    @patch("server.api_server.execute_read_only_plan")
-    @patch("server.request_planner.validate_llm_plan")
-    @patch("server.api_server.propose_investigation_plan", return_value={"capability": "investigation"})
+    @patch("server.api_server.KGChatSession")
     @patch("server.api_server._llm_client", object())
     @patch("server.api_server.search_concepts", return_value=[])
     def test_llm_fallback_answer_accepted_when_grounded_in_evidence(
-        self, concepts, propose_plan, validate_plan, execute_plan, synthesize,
-        store_chat_turns, restore, store_decision, clear_pending
+        self, concepts, session_cls, store_chat_turns, restore, store_decision, clear_pending
     ):
-        validate_plan.return_value.capability = "investigation"
-        validate_plan.return_value.tool_calls = []
-        evidence = [{"tool": "get_ib_summary", "arguments": {},
-                     "result": {"tag": "CMSSW_20_1_X_2026-08-17-2300", "failing_count": 5}}]
-        execute_plan.return_value = evidence
-        synthesize.return_value = "There are 5 failing workflows on CMSSW_20_1_X_2026-08-17-2300."
+        final_answer = "There are 5 failing workflows on CMSSW_20_1_X_2026-08-17-2300."
+        session_cls.side_effect = _mock_kgchat_session(
+            final_answer,
+            tool_results=[(
+                "get_ib_summary", {},
+                {"tag": "CMSSW_20_1_X_2026-08-17-2300", "failing_count": 5},
+            )],
+        )
 
         result = chat(ChatRequest(question="Explain the graph topology", session_id="llm-fallback-grounded"))
 
         self.assertEqual(result.route, "llm_validated")
-        self.assertEqual(result.answer, synthesize.return_value)
+        self.assertEqual(result.answer, final_answer)
 
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
     @patch("server.api_server._store_chat_turns")
-    @patch("server.api_server.propose_investigation_plan", side_effect=TimeoutError("gateway too slow"))
+    @patch("server.api_server.KGChatSession", side_effect=TimeoutError("gateway too slow"))
     @patch("server.api_server._llm_client", object())
     @patch("server.api_server.search_concepts", return_value=[])
     def test_llm_investigation_degrades_to_friendly_message_on_timeout(
-        self, concepts, propose_plan, store_chat_turns, restore, store_decision, clear_pending
+        self, concepts, session_cls, store_chat_turns, restore, store_decision, clear_pending
     ):
         # Found live via scripts/stress_test_bot.py, 2026-09-22: concurrent
         # LLM-heavy traffic pushed the gateway past 30-60s. A hung/failed
@@ -3430,18 +3453,15 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
     @patch("server.api_server._store_chat_turns")
-    @patch("server.api_server.synthesize_evidence_answer")
-    @patch("server.api_server.execute_read_only_plan")
-    @patch("server.request_planner.validate_llm_plan")
-    @patch("server.api_server.propose_investigation_plan", return_value={"capability": "investigation"})
+    @patch("server.api_server.KGChatSession")
     @patch("server.api_server._execute_planned_capability", return_value=None)
     @patch("server.api_server._latest_ib_records")
     @patch("server.api_server._llm_client", object())
     @patch("server.api_server.CAPABILITY_FALLBACK_TO_LLM_ENABLED", True)
     @patch("server.api_server.search_concepts", return_value=[])
     def test_capability_dead_end_falls_through_to_llm_investigation_when_flag_enabled(
-        self, concepts, latest_ib_records, execute_capability, propose_plan, validate_plan,
-        execute_plan, synthesize, store_chat_turns, restore, store_decision, clear_pending
+        self, concepts, latest_ib_records, execute_capability, session_cls,
+        store_chat_turns, restore, store_decision, clear_pending
     ):
         # RequestPlanner correctly identifies "relval" here (mirrors
         # test_latest_ib_phrase_resolves_to_a_tag_before_routing), but this time
@@ -3451,21 +3471,24 @@ class ChatRoutingTests(unittest.TestCase):
         # reach the same evidence-gated LLM investigation path used elsewhere,
         # never fabricate the answer itself.
         latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
-        validate_plan.return_value.capability = "investigation"
-        validate_plan.return_value.tool_calls = []
-        evidence = [{"tool": "get_failing_relvals", "arguments": {},
-                     "result": {"tag": "CMSSW_20_1_X_2026-08-17-2300", "failing_count": 7}}]
-        execute_plan.return_value = evidence
-        synthesize.return_value = "There are 7 failing workflows on CMSSW_20_1_X_2026-08-17-2300."
+        final_answer = "There are 7 failing workflows on CMSSW_20_1_X_2026-08-17-2300."
+        kgchat_factory = _mock_kgchat_session(
+            final_answer,
+            tool_results=[(
+                "get_failing_relvals", {},
+                {"tag": "CMSSW_20_1_X_2026-08-17-2300", "failing_count": 7},
+            )],
+        )
+        session_cls.side_effect = kgchat_factory
 
         result = chat(ChatRequest(
             question="how many relvals failing in the latest IB", session_id="capability-dead-end-rescue",
         ))
 
-        self.assertEqual(result.answer, synthesize.return_value)
+        self.assertEqual(result.answer, final_answer)
         self.assertEqual(result.route, "capability_dead_end_rescue:relval:llm_validated")
         execute_capability.assert_called_once()
-        propose_plan.assert_called_once()
+        kgchat_factory.sessions[0].ask.assert_called_once()
 
     @patch("server.api_server.CAPABILITY_FALLBACK_TO_LLM_ENABLED", False)
     @patch("server.api_server._clear_pending_clarification")
@@ -3474,9 +3497,9 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server._store_chat_turns")
     @patch("server.api_server._execute_planned_capability", return_value=None)
     @patch("server.api_server._latest_ib_records")
-    @patch("server.api_server.propose_investigation_plan")
+    @patch("server.api_server.KGChatSession")
     def test_capability_dead_end_keeps_flat_message_when_flag_disabled(
-        self, propose_plan, latest_ib_records, execute_capability,
+        self, session_cls, latest_ib_records, execute_capability,
         store_chat_turns, restore, store_decision, clear_pending
     ):
         # Rollback-path guard: with the flag at its default (off), the same
@@ -3492,17 +3515,14 @@ class ChatRoutingTests(unittest.TestCase):
             "No imported local evidence is available for the selected `relval` request", result.answer
         )
         self.assertEqual(result.route, "capability:relval:no_evidence")
-        propose_plan.assert_not_called()
+        session_cls.assert_not_called()
 
     @patch("server.api_server._retriever", None)
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
     @patch("server.api_server._store_chat_turns")
-    @patch("server.api_server.synthesize_evidence_answer")
-    @patch("server.api_server.execute_read_only_plan")
-    @patch("server.request_planner.validate_llm_plan")
-    @patch("server.api_server.propose_investigation_plan", return_value={"capability": "investigation"})
+    @patch("server.api_server.KGChatSession")
     @patch("server.api_server.verify_answer_matches_question", return_value=False)
     @patch("server.api_server._execute_planned_capability", return_value=("No failing RelVals were found.", []))
     @patch("server.api_server._latest_ib_records")
@@ -3510,8 +3530,8 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", True)
     @patch("server.api_server.search_concepts", return_value=[])
     def test_deterministic_answer_semantic_mismatch_falls_through_to_llm_investigation_when_flag_enabled(
-        self, concepts, latest_ib_records, execute_capability, verify_answer, propose_plan, validate_plan,
-        execute_plan, synthesize, store_chat_turns, restore, store_decision, clear_pending
+        self, concepts, latest_ib_records, execute_capability, verify_answer, session_cls,
+        store_chat_turns, restore, store_decision, clear_pending
     ):
         # Real bug found live 2026-09-22: "workflows that are NOT failing" and
         # "workflows that are failing" both trigger the same "failing" keyword
@@ -3522,22 +3542,25 @@ class ChatRoutingTests(unittest.TestCase):
         # must reroute through the same evidence-gated LLM investigation path
         # used for genuine dead ends, never fabricate a "corrected" answer itself.
         latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
-        validate_plan.return_value.capability = "investigation"
-        validate_plan.return_value.tool_calls = []
-        evidence = [{"tool": "get_relval_results", "arguments": {},
-                     "result": {"tag": "CMSSW_20_1_X_2026-08-17-2300", "passing_count": 592}}]
-        execute_plan.return_value = evidence
-        synthesize.return_value = "592 workflows are not failing on CMSSW_20_1_X_2026-08-17-2300."
+        final_answer = "592 workflows are not failing on CMSSW_20_1_X_2026-08-17-2300."
+        kgchat_factory = _mock_kgchat_session(
+            final_answer,
+            tool_results=[(
+                "get_relval_results", {},
+                {"tag": "CMSSW_20_1_X_2026-08-17-2300", "passing_count": 592},
+            )],
+        )
+        session_cls.side_effect = kgchat_factory
 
         result = chat(ChatRequest(
             question="how many relvals failing in the latest IB", session_id="semantic-mismatch-rescue",
         ))
 
-        self.assertEqual(result.answer, synthesize.return_value)
+        self.assertEqual(result.answer, final_answer)
         self.assertEqual(result.route, "capability_semantic_mismatch_rescue:relval:llm_validated")
         execute_capability.assert_called_once()
         verify_answer.assert_called_once()
-        propose_plan.assert_called_once()
+        kgchat_factory.sessions[0].ask.assert_called_once()
 
     def test_verification_session_context_is_none_without_an_established_tag(self):
         self.assertIsNone(_verification_session_context("what about unit tests", "no-context-session"))
