@@ -2723,9 +2723,14 @@ def _issue_detail_answer(question: str, context_number: int | None = None) -> st
     follow-up ("what is the title", "do you have info about it") resolve to
     whichever Issue was last explicitly named in the session
     (_last_issue_contexts), the same pronoun-resolution pattern
-    _latest_ib_contexts already provides for IBs."""
+    _latest_ib_contexts already provides for IBs. Also recognizes a bare
+    existence check ("do you have issue 52041?", "is there an issue
+    #51512") -- found live, 2026-10-02: naming a concrete issue number with
+    no other qualifier word fell all the way through to the generic
+    "I couldn't match that" fallback."""
     if not re.search(
-        r"\btitle\b|\babout\b|\bdetails?\b|\bdescribe\b|\bsummary\b|\bwhat\s+is\s+it\b|\btell\s+me\b",
+        r"\btitle\b|\babout\b|\bdetails?\b|\bdescribe\b|\bsummary\b|\bwhat\s+is\s+it\b|\btell\s+me\b|"
+        r"\bdo\s+you\s+have\b|\bis\s+there\b|\bdoes\s+it\s+exist\b|\bexists?\b|\bany\s+info",
         question, re.IGNORECASE,
     ):
         return None
