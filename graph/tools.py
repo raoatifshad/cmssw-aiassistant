@@ -58,7 +58,6 @@ EDGES:
   (Package)-[:CONTAINS]->(SourceFile)
   (SourceFile)-[:FLAGGED_BY]->(Checker)
   (IB)-[:RAN_RELVAL]->(RelVal)
-  (RelVal)-[:HAS_EXCEPTION]->(RelValException)
   (IB)-[:RAN_UNITTEST]->(UnitTest)
   (UnitTest)-[:IN_PACKAGE]->(Package)
   (PR)-[:AUTHORED_BY]->(Author)
@@ -94,6 +93,11 @@ release/architecture/workflow were present in that export -- coverage is
 whatever the export covered, not automatically comprehensive. source_url
 points at the run's log file with no line-range anchor, since ES stores a
 structured field, not a byte offset into a real file.
+RelValException has NO relationship to RelVal or IB -- match it directly by
+its own ib_tag/arch/workflow_id properties (e.g. MATCH (e:RelValException
+{workflow_id:$id}) WHERE e.ib_tag = $tag). A query that instead tries to
+traverse from RelVal or IB to reach a RelValException will silently return
+zero rows no matter how much real exception data is imported.
 """
 
 MAX_ROWS = 100

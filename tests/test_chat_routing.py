@@ -931,6 +931,33 @@ class ChatRoutingTests(unittest.TestCase):
         )
 
     @patch("server.api_server.get_driver")
+    def test_relval_exception_list_answer_never_traverses_has_exception(self, get_driver):
+        # Real bug found live 2026-10-02: GRAPH_SCHEMA documented
+        # (RelVal)-[:HAS_EXCEPTION]->(RelValException), and this function's
+        # query traversed exactly that -- but ingestion never actually
+        # creates that relationship (0 HAS_EXCEPTION edges exist even with
+        # 9,612+ real RelValException nodes imported, confirmed directly
+        # against the graph), so this silently returned "no exception
+        # signatures were found" for every real exception ever imported.
+        # Mocked session.run(return_value=[]) in the older tests below never
+        # caught this, since it doesn't care what Cypher text was sent --
+        # this test pins the query shape itself, not just its mocked result.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{
+            "arch": "el9_amd64_gcc14", "workflow_id": "136.899",
+            "exception": "LogicError: boom", "category": "LogicError", "source_url": None,
+        }]
+        question = "what are the relval exceptions in CMSSW_20_1_X_2026-08-12-1100?"
+
+        answer = _relval_exception_list_answer(question, _relval_exception_context(question))
+
+        query = session.run.call_args.args[0]
+        self.assertNotIn("HAS_EXCEPTION", query)
+        self.assertIn("exception.ib_tag", query)
+        self.assertIn("136.899", answer)
+        self.assertIn("LogicError", answer)
+
+    @patch("server.api_server.get_driver")
     def test_named_ib_relval_exception_list_reports_missing_import(self, get_driver):
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value = []
@@ -2607,6 +2634,35 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("exact match in title", answer)
         self.assertEqual(session.run.call_args.kwargs["workflow_id"], "37834.0")
         get_driver.return_value.close.assert_called_once()
+
+    @patch("server.api_server.get_driver")
+    def test_relval_exception_answer_never_traverses_has_exception(self, get_driver):
+        # Same bug, same function family as
+        # test_relval_exception_list_answer_never_traverses_has_exception --
+        # found live 2026-10-02 via a real "what is the latest exception"
+        # question that confidently (and wrongly) reported zero exceptions
+        # exist, when 9,612 real RelValException nodes were imported.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.side_effect = [
+            [{
+                "exception": "LogicError: boom", "category": "LogicError", "source_url": None,
+                "context": None, "name": "TTbar",
+            }],
+            [],
+            [],
+        ]
+
+        answer = _relval_exception_answer(
+            "what exception does workflow 37834.0 have?",
+            {"tag": "CMSSW_20_1_X_2026-08-12-1100", "arch": "el9_amd64_gcc13"},
+        )
+
+        exception_query = session.run.call_args_list[0].args[0]
+        related_query = session.run.call_args_list[2].args[0]
+        self.assertNotIn("HAS_EXCEPTION", exception_query)
+        self.assertIn("exception.ib_tag", exception_query)
+        self.assertNotIn("HAS_EXCEPTION", related_query)
+        self.assertIn("LogicError: boom", answer)
 
     @patch("server.api_server.get_driver")
     def test_relval_exception_search_returns_imported_artifact_matches(self, get_driver):
