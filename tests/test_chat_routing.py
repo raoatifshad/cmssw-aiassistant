@@ -3947,6 +3947,51 @@ class LatestTypoToleranceTests(unittest.TestCase):
         # dead end).
         self.assertIsNone(_clang_warning_answer("what are the lastest clang warnings"))
 
+    # -- Bare "last" as a synonym for "latest" -- found live, 2026-10-02:
+    # "last" had the exact same drift as the "lastest" typo above, except in
+    # reverse -- only _is_latest_ib_question had its own local `|last`
+    # addition, so _latest_issue_answer, _latest_clang_warning_answer, and
+    # _is_latest_comparison_question never recognized this extremely
+    # ordinary synonym at all. Folded into the shared _LATEST_WORD_RE itself
+    # this time instead of patched into one more call site.
+
+    def test_is_latest_ib_question_recognizes_bare_last(self):
+        self.assertTrue(_is_latest_ib_question("what workflows are failing in the last IB"))
+
+    def test_is_latest_comparison_question_recognizes_bare_last(self):
+        self.assertTrue(_is_latest_comparison_question("compare the last IB with the previous one"))
+
+    @patch("server.api_server.get_driver")
+    def test_latest_clang_warning_answer_recognizes_bare_last(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"tag": "CMSSW_20_1_X_2026-08-25-2300", "release": "CMSSW_20_1_X",
+             "arch": "el9_amd64_gcc14", "locations": 3, "occurrences": 7},
+        ]
+
+        answer = _latest_clang_warning_answer("what are the last clang warnings")
+
+        self.assertIsNotNone(answer)
+
+    @patch("server.api_server.get_driver")
+    def test_latest_issue_answer_recognizes_bare_last(self, get_driver):
+        # Real bug found live, 2026-10-02: "what is the last issue number you
+        # have?" fell all the way through to the generic "I couldn't match
+        # that" fallback, even though _latest_issue_answer already does
+        # exactly this lookup -- its trigger just never recognized "last".
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "number": 51644, "title": "x", "state": "open", "created_at": None,
+        }
+
+        answer = _latest_issue_answer("what is the last issue number you have")
+
+        self.assertIsNotNone(answer)
+        self.assertIn("51644", answer)
+
+    def test_clang_warning_answer_still_excludes_bare_last(self):
+        self.assertIsNone(_clang_warning_answer("what are the last clang warnings"))
+
 
 class ShiftSummaryCapabilityTests(unittest.TestCase):
     def test_trigger_regex_recognizes_shift_summary_phrasing(self):
