@@ -5722,11 +5722,57 @@ def _run_llm_investigation(
         )
 
 
+def _pasted_exception_response(sid: str, original_question: str, question: str):
+    """If the question is a pasted raw CMSSW exception log, answer it directly
+    -- regardless of what other capability keywords happen to appear
+    incidentally in the pasted text. Checked before RequestPlanner routing.
+
+    Found live, 2026-10-02: a pasted exception log whose Jenkins build-log
+    path contained the literal substring "build" (".../build-any-ib/w/
+    el9_amd64_gcc14/...") matched the "build" capability's keyword trigger
+    (`\\bbuild\\b`), so RequestPlanner scored it DETERMINISTIC for "build" --
+    a capability with no handler for this shape. With
+    CAPABILITY_FALLBACK_TO_LLM_ENABLED that rerouted straight to the generic
+    LLM investigation path, which also didn't recognize it, landing on the
+    generic "I couldn't match that" menu. This handler previously only lived
+    in the post-RequestPlanner legacy waterfall, so it was never even tried --
+    a pasted exception's own, highly distinctive signature
+    ("An exception of category '...' occurred while") is a far more reliable
+    signal of intent than an incidental keyword match, so it now runs first.
+
+    Returns None (not a ChatResponse) when the question isn't a pasted
+    exception at all, so normal routing proceeds unaffected."""
+    exception_signature = _pasted_exception_signature(question)
+    if not exception_signature:
+        return None
+    _pasted_exception_search_contexts[sid] = {"exception": exception_signature, "offset": 0}
+    pasted_exception_search_answer, github_matches = _pasted_exception_search_answer(exception_signature)
+    # The paste alone only names an exception *category*, never which workflow or
+    # IB hit it -- that needs a tag, which we only have when this session already
+    # established one (e.g. an earlier "what's failing in <tag>" turn). Additive,
+    # not a replacement: prepended when present, silently skipped when not.
+    context_tag = _latest_ib_contexts.get(sid)
+    if context_tag:
+        category = _exception_category_from_signature(exception_signature)
+        workflow_matches = category and _pasted_exception_workflow_matches(
+            category, context_tag, _latest_ib_arch_contexts.get(sid)
+        )
+        if workflow_matches:
+            pasted_exception_search_answer = f"{workflow_matches}\n\n{pasted_exception_search_answer}"
+    return _chat_response(
+        sid, original_question, pasted_exception_search_answer, "deterministic", github_matches=github_matches
+    )
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     sid = req.session_id or str(uuid.uuid4())
     original_question = req.question
     question = _normalize_deterministic_question(original_question)
+
+    pasted_exception_response = _pasted_exception_response(sid, original_question, question)
+    if pasted_exception_response:
+        return pasted_exception_response
 
     explicit_tags = IB_TAG_RE.findall(question)
     if len(explicit_tags) < 2 and _is_latest_comparison_question(question):
@@ -5979,25 +6025,10 @@ def chat(req: ChatRequest):
         pr_number_answer, prs = pr_number_result
         _pr_contexts[sid] = prs
         return _chat_response(sid, original_question, pr_number_answer, "deterministic")
-    exception_signature = _pasted_exception_signature(question)
-    if exception_signature:
-        _pasted_exception_search_contexts[sid] = {"exception": exception_signature, "offset": 0}
-        pasted_exception_search_answer, github_matches = _pasted_exception_search_answer(exception_signature)
-        # The paste alone only names an exception *category*, never which workflow or
-        # IB hit it -- that needs a tag, which we only have when this session already
-        # established one (e.g. an earlier "what's failing in <tag>" turn). Additive,
-        # not a replacement: prepended when present, silently skipped when not.
-        context_tag = _latest_ib_contexts.get(sid)
-        if context_tag:
-            category = _exception_category_from_signature(exception_signature)
-            workflow_matches = category and _pasted_exception_workflow_matches(
-                category, context_tag, _latest_ib_arch_contexts.get(sid)
-            )
-            if workflow_matches:
-                pasted_exception_search_answer = f"{workflow_matches}\n\n{pasted_exception_search_answer}"
-        return _chat_response(
-            sid, original_question, pasted_exception_search_answer, "deterministic", github_matches=github_matches
-        )
+    # (Pasted-exception detection itself now runs at the very top of chat(),
+    # before RequestPlanner routing -- see _pasted_exception_response. Only
+    # the "show me more results" follow-up stays here, since that phrasing
+    # alone never looks like a pasted exception or triggers any capability.)
     pasted_exception_context = _pasted_exception_search_contexts.get(sid)
     if pasted_exception_context and re.search(r"\b(?:more|next)\s+(?:results?|matches?)\b", question, re.IGNORECASE):
         offset = int(pasted_exception_context["offset"]) + 20
