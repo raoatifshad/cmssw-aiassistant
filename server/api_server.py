@@ -631,7 +631,16 @@ class FeedbackRequest(BaseModel):
 # _latest_issue_answer, _clang_warning_answer's "not latest" exclusion)
 # before only one got the typo fix, exactly the kind of silent divergence
 # several bugs this session came from. One shared fragment now.
-_LATEST_WORD_RE = r"latest|lastest|newest|most\s+recent|current"
+#
+# Bare "last" ("what is the last issue number you have?") drifted the exact
+# same way, found live 2026-10-02: only _is_latest_ib_question had its own
+# local `|last` addition (below) -- _latest_issue_answer, _latest_clang_
+# warning_answer, and _is_latest_comparison_question never got it, so "last"
+# (an extremely ordinary, everyday synonym for "latest") silently failed in
+# three of the four functions that needed it. Folded into the shared
+# fragment itself this time instead of patched into one more call site, so
+# every current and future _LATEST_WORD_RE reference gets it automatically.
+_LATEST_WORD_RE = r"latest|lastest|newest|most\s+recent|current|last"
 
 
 def _is_latest_ib_question(question: str) -> bool:
@@ -641,7 +650,7 @@ def _is_latest_ib_question(question: str) -> bool:
     # with no prior tag had no way to resolve "latest" into an actual tag and fell
     # through to the flat "No imported local evidence" message.
     return bool(
-        re.search(rf"\b(?:{_LATEST_WORD_RE}|last)\b", question, re.IGNORECASE)
+        re.search(rf"\b(?:{_LATEST_WORD_RE})\b", question, re.IGNORECASE)
         and re.search(r"\b(?:ib|integration\s+build|release)\b", question, re.IGNORECASE)
         and not re.search(r"\b(?:clang|warning)\b", question, re.IGNORECASE)
     )
