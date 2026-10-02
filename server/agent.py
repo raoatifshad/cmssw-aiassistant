@@ -12,31 +12,6 @@ from typing import Callable
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
 
-def propose_investigation_plan(client, model: str, question: str, capabilities: list[str], tool_names: list[str]) -> dict | None:
-    """Ask for a non-executable JSON investigation proposal with no tool access."""
-    prompt = (
-        "Return exactly one JSON object with capability, tool_calls, and answer_constraints. "
-        f"capability must be one of: {', '.join(capabilities)}. "
-        "tool_calls must be a JSON list of {name, arguments} objects, where name is one of: "
-        f"{', '.join(tool_names)}. Do not answer the question or issue any tool call. "
-        "answer_constraints must include local_only and evidence_only."
-    )
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": question},
-            ],
-            temperature=0,
-        )
-        content = response.choices[0].message.content or ""
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        return json.loads(match.group(0) if match else content)
-    except (AttributeError, json.JSONDecodeError, TypeError, ValueError):
-        return None
-
-
 def propose_capability_classification(client, model: str, question: str, capabilities: list[str]) -> dict | None:
     """Ask the LLM to independently pick which registered capability (if any)
     a question needs, for shadow-mode comparison against the deterministic
@@ -191,21 +166,6 @@ def propose_pr_search_signature(client, model: str, question: str) -> str | None
         return signature or None
     except (AttributeError, json.JSONDecodeError, TypeError, ValueError):
         return None
-
-
-def execute_read_only_plan(tool_calls: tuple[tuple[str, dict], ...], tools_registry: dict) -> list[dict]:
-    """Execute already-validated tools and retain each structured result as evidence."""
-    evidence = []
-    for name, arguments in tool_calls:
-        tool = tools_registry.get(name)
-        if tool is None:
-            return []
-        try:
-            result = tool(**arguments)
-        except Exception as exc:
-            result = {"error": str(exc)}
-        evidence.append({"tool": name, "arguments": arguments, "result": result})
-    return evidence
 
 
 def synthesize_evidence_answer(client, model: str, system_prompt: str, question: str, evidence: list[dict]) -> str | None:

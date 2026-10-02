@@ -40,9 +40,7 @@ from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # n
 from server.llm_client import DEFAULT_MODEL, get_client  # noqa: E402
 from server.agent import (  # noqa: E402
     KGChatSession,
-    execute_read_only_plan,
     propose_capability_classification,
-    propose_investigation_plan,
     propose_pr_search_signature,
     synthesize_evidence_answer,
     verify_answer_matches_question,
@@ -188,7 +186,6 @@ _request_planner = RequestPlanner((
     Capability(name="build", required_categories=frozenset({"build"}), priority=40),
     Capability(name="investigation", llm_only=True),
 ))
-_LLM_PLAN_TOOL_NAMES = frozenset(TOOLS)
 PR_QUERY_STOP_WORDS = {
     "about", "after", "any", "are", "can", "error", "errors", "failing", "find", "from",
     "anything", "did", "failure", "failures", "fix", "fixes", "following", "for", "have", "in",
@@ -5678,12 +5675,25 @@ def _verification_session_context(question: str, session_id: str) -> str | None:
 def _run_llm_investigation(
     sid: str, original_question: str, question: str, planned: Plan, route_prefix: str = ""
 ):
-    """LLM picks among already-vetted, read-only graph tools/capabilities to
-    answer a question nothing deterministic matched -- never from the LLM's
-    own knowledge, only from tool evidence validated by validate_llm_plan and
-    _evidence_grounded. This is the system's one paraphrase-robust layer:
-    unlike the regex-driven planner/capability helpers, it generalizes across
-    rephrasings without a new handler being hand-written for each one.
+    """LLM investigates a question nothing deterministic matched, via a real
+    agentic tool-calling loop (KGChatSession) over the same read-only graph
+    tools -- never from the LLM's own knowledge, only from tool evidence,
+    checked by _evidence_grounded before being shown. This is the system's
+    one paraphrase-robust layer: unlike the regex-driven planner/capability
+    helpers, it generalizes across rephrasings without a new handler being
+    hand-written for each one.
+
+    Rebuilt 2026-10-02 from a one-shot "guess a whole JSON plan from bare
+    tool names, no descriptions, one try" design (propose_investigation_plan)
+    to KGChatSession's existing agentic loop -- the same machinery already
+    used for feedback verification, which builds a real per-tool schema
+    (name, typed parameters, and a description pulled straight from that
+    tool's own docstring) and lets the model call a tool, see its actual
+    result, and decide what to do next, instead of blindly guessing the
+    whole plan upfront from a bare name list. Found live: real, ordinary
+    phrasings ("do you have issue 52041?") that an existing tool could
+    answer directly still failed under the old design, because it gave the
+    model nothing to recognize the right tool *by* beyond its bare name.
 
     Shared by chat()'s normal end-of-waterfall fallback and, when
     CAPABILITY_FALLBACK_TO_LLM_ENABLED, by the RequestPlanner-driven
@@ -5694,32 +5704,53 @@ def _run_llm_investigation(
     if _llm_client is None:
         raise HTTPException(503, "CERN API not configured — see .env")
     try:
-        raw_plan = propose_investigation_plan(
-            _llm_client,
-            DEFAULT_MODEL,
-            question,
-            [capability.name for capability in _request_planner.capabilities],
-            sorted(_LLM_PLAN_TOOL_NAMES),
-        )
-        from server.request_planner import validate_llm_plan
+        evidence: list[dict] = []
 
-        llm_plan = validate_llm_plan(raw_plan, _request_planner.capabilities, set(_LLM_PLAN_TOOL_NAMES))
-        if llm_plan is None or llm_plan.capability != "investigation":
-            fallback_answer, fallback_actions = _fallback_clarification(planned.context)
-            return _chat_response(sid, original_question, fallback_answer, f"{route_prefix}fallback_clarification", actions=fallback_actions)
-        tool_evidence = execute_read_only_plan(llm_plan.tool_calls, TOOLS)
-        if not tool_evidence:
-            fallback_answer, fallback_actions = _fallback_clarification(planned.context)
-            return _chat_response(sid, original_question, fallback_answer, f"{route_prefix}fallback_clarification", actions=fallback_actions)
+        def _collect(name: str, args: dict, result_text: str) -> None:
+            try:
+                result = json.loads(result_text)
+            except (json.JSONDecodeError, TypeError):
+                result = result_text
+            evidence.append({"tool": name, "arguments": args, "result": result})
+
+        session = KGChatSession(
+            openai_client=_llm_client,
+            model=DEFAULT_MODEL,
+            tools_registry=TOOLS,
+            system_prompt=SYSTEM_PROMPT,
+            on_tool_call=_collect,
+        )
+        answer = session.ask(question)
+
+        if answer.startswith("API error"):
+            print(f"WARNING: LLM investigation API error: {answer}")
+            return _chat_response(
+                sid, original_question,
+                "This is taking longer than usual to look up right now. Please try again in a moment.",
+                f"{route_prefix}llm_timeout",
+            )
+
         citations = _retriever.retrieve(question) if _retriever else []
         if citations:
-            tool_evidence.append({"tool": "local_log_retrieval", "arguments": {}, "result": citations})
-        answer = synthesize_evidence_answer(_llm_client, DEFAULT_MODEL, SYSTEM_PROMPT, question, tool_evidence)
-        if not answer:
-            answer = "The approved local evidence could not be synthesized into an answer."
-            return _chat_response(sid, original_question, answer, f"{route_prefix}llm_validated", citations)
-        if not _evidence_grounded(answer, tool_evidence):
-            answer = _format_raw_evidence(tool_evidence)
+            evidence.append({"tool": "local_log_retrieval", "arguments": {}, "result": citations})
+
+        if not evidence:
+            # The model never called a tool at all -- either nothing here fits
+            # (an out-of-domain question) or it tried to answer from its own
+            # knowledge, which SYSTEM_PROMPT forbids. Either way there's no
+            # evidence to trust, the same "couldn't form a usable plan"
+            # outcome the old design had -- a helpful menu, never a
+            # fabricated answer.
+            fallback_answer, fallback_actions = _fallback_clarification(planned.context)
+            return _chat_response(sid, original_question, fallback_answer, f"{route_prefix}fallback_clarification", actions=fallback_actions)
+        if not answer or answer == "(stopped after 8 tool calls)":
+            # Real evidence accumulated but the model never produced (or ran
+            # out of turns before producing) a final answer -- show the raw
+            # evidence rather than this unhelpful sentinel or nothing at all.
+            answer = _format_raw_evidence(evidence)
+            return _chat_response(sid, original_question, answer, f"{route_prefix}llm_ungrounded_fallback", citations)
+        if not _evidence_grounded(answer, evidence):
+            answer = _format_raw_evidence(evidence)
             return _chat_response(sid, original_question, answer, f"{route_prefix}llm_ungrounded_fallback", citations)
         return _chat_response(sid, original_question, answer, f"{route_prefix}llm_validated", citations)
     except Exception as exc:
