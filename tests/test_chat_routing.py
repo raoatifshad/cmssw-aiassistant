@@ -2721,6 +2721,33 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("#51640", answer)
         self.assertIn("Workflow 2025.0010001", answer)
 
+    @patch("server.api_server.get_driver")
+    def test_issue_detail_answer_recognizes_bare_existence_check(self, get_driver):
+        # Real bug found live, 2026-10-02: "do you have issue 52041?" names a
+        # concrete issue number with no other qualifier word ("title"/
+        # "about"/"who opened"/...) and fell all the way through to the
+        # generic "I couldn't match that" fallback, even though the number
+        # alone is already enough to answer -- same sensible default this
+        # function already applies to an unqualified bare number.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = None  # genuinely not imported
+
+        answer = _issue_detail_answer("do you have issue 52041?")
+
+        self.assertEqual(answer, "Neither an Issue nor a PR numbered #52041 is present in the imported graph.")
+
+    @patch("server.api_server.get_driver")
+    def test_issue_detail_answer_existence_check_reports_real_issue(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {
+            "title": "edm::RefToBase is deprecated", "state": "open", "created_at": "2023-09-07T20:16:18Z",
+        }
+
+        answer = _issue_detail_answer("do you have issue #42737?")
+
+        self.assertIn("#42737", answer)
+        self.assertIn("edm::RefToBase is deprecated", answer)
+
     def test_issue_number_recognizes_github_issues_url(self):
         # A pasted GitHub Issues URL is unambiguous -- no need to fall back
         # to the PR/Issue-ambiguous bare-number heuristic for this shape.
