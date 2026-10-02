@@ -1623,6 +1623,47 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertNotIn("Workflows in", result.answer)
         pasted_exception_workflow_matches.assert_not_called()
 
+    @patch("server.api_server._pasted_exception_search_answer")
+    @patch("server.api_server.get_driver")
+    def test_pasted_exception_wins_over_an_incidental_capability_keyword(
+        self, get_driver, pasted_exception_search_answer
+    ):
+        # Real bug found live, 2026-10-02: a pasted CMSSW crash log's own
+        # Jenkins build-log file path (".../build-any-ib/w/el9_amd64_gcc14/
+        # ...") contains the literal substring "build", which matches the
+        # "build" capability's keyword trigger. RequestPlanner used to score
+        # this DETERMINISTIC for "build" -- a capability with no handler for
+        # this shape -- so the pasted-exception search (only reachable from
+        # the post-RequestPlanner legacy waterfall) was never even tried,
+        # landing on the generic "I couldn't match that" fallback instead.
+        # Pasted-exception detection must win regardless of what capability
+        # keywords happen to appear incidentally in the pasted text.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.__iter__.return_value = iter([])
+        session.run.return_value.single.return_value = None
+        pasted_exception_search_answer.return_value = (
+            "Imported GitHub matches 1-1 of 1 for exception "
+            "`An exception of category 'StdException' occurred while`:\n"
+            "- **Issue #51512** - Some StdException issue (state `open`; match: body)",
+            [],
+        )
+
+        question = (
+            "An exception of category 'StdException' occurred while\n"
+            "Exception Message:\n"
+            "A std::exception was thrown.\n"
+            "/data/cmsbld/jenkins/workspace/build-any-ib/w/el9_amd64_gcc14/external/alpaka/"
+            "include/alpaka/kernel/TaskKernelGpuUniformCudaHipRt.hpp(275) "
+            "'cudaErrorLaunchOutOfResources': 'too many resources requested for launch'!"
+        )
+        result = chat(ChatRequest(session_id="pasted-exception-build-keyword", question=question))
+
+        self.assertIn("Imported GitHub matches", result.answer)
+        self.assertEqual(result.route, "deterministic")
+        pasted_exception_search_answer.assert_called_once_with(
+            "An exception of category 'StdException' occurred while"
+        )
+
     def test_variant_ib_has_its_primary_run_as_parent(self):
         self.assertEqual(
             ib_parent_tag("CMSSW_20_1_NONLTO_X_2026-08-10-2300"),
