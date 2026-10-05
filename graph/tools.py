@@ -47,6 +47,13 @@ NODES:
         a schedule by ingestion/generate_shift_summaries.py. markdown already carries
         every relevance-only caveat inline; do not re-summarize it as causal.
     (:UnitTest {key, ib_key, ib_tag, arch, name, status, errors, ok})
+    (:DocChunk {id, source_id, source_path, heading, text, chunk_index})
+        — a chunk of static CMSSW/CMSSDT shifter documentation (Jenkins job
+        runbooks, release-cycle procedures), ingested once from a local
+        clone of cms-sw/cmssdt-wiki and cmsrepo's own top-level docs, never
+        fetched live. Background/procedural knowledge, not a fact about any
+        specific IB -- searched via search_shifter_docs(), never query_graph
+        directly (it's indexed by a fulltext index, not a property match).
     (:ImportState {source_id, content_hash, source_type, source_path, last_ingested_at})
 
 EDGES:
@@ -1379,6 +1386,33 @@ def warnings_by_checker(ib_tag: str | None = None, limit: int = 20) -> list[dict
     )
 
 
+def search_shifter_docs(query: str, limit: int = 5) -> list[dict]:
+    """Search CMSSW/CMSSDT shifter documentation (Jenkins job runbooks,
+    release-cycle procedures, CI topology) for background/procedural context
+    relevant to a question. This is static documentation, not a live fact
+    about any specific IB -- always cite it separately from graph evidence,
+    never as a substitute for it."""
+    limit = min(limit, MAX_ROWS)
+    cypher = (
+        "CALL db.index.fulltext.queryNodes('shifterDocText', $query) "
+        "YIELD node, score "
+        "RETURN node.heading AS heading, node.text AS text, "
+        "node.source_path AS source_path, score "
+        "ORDER BY score DESC LIMIT $limit"
+    )
+    driver = get_driver()
+    try:
+        with driver.session() as s:
+            return [dict(r) for r in s.run(cypher, {"query": query, "limit": limit})]
+    except Exception:
+        # The fulltext index may not exist yet (shifter docs never ingested
+        # in this deployment) -- degrade to "no documentation evidence"
+        # rather than raising, same as any other tool with no matches.
+        return []
+    finally:
+        driver.close()
+
+
 def query_graph(cypher: str) -> dict:
     """Run a read-only Cypher query. Call get_graph_schema() first to see
     available node labels, properties, and edge types."""
@@ -1408,5 +1442,6 @@ TOOLS = {
     "find_prs_for_error": find_prs_for_error,
     "shared_header_packages": shared_header_packages,
     "warnings_by_checker": warnings_by_checker,
+    "search_shifter_docs": search_shifter_docs,
     "query_graph": query_graph,
 }

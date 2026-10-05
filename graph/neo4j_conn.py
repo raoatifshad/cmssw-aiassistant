@@ -60,6 +60,7 @@ def setup_schema(driver):
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Build) REQUIRE n.tag IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Service) REQUIRE n.name IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Host) REQUIRE n.name IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:DocChunk) REQUIRE n.id IS UNIQUE",
         "CREATE INDEX IF NOT EXISTS FOR (n:IB) ON (n.tag)",
         "CREATE INDEX IF NOT EXISTS FOR (n:IB) ON (n.release)",
         "CREATE INDEX IF NOT EXISTS FOR (n:IB) ON (n.parent_tag)",
@@ -76,6 +77,8 @@ def setup_schema(driver):
         "CREATE INDEX IF NOT EXISTS FOR (n:UserFeedback) ON (n.status)",
         "CREATE FULLTEXT INDEX github_artifact_text IF NOT EXISTS "
         "FOR (n:Issue|PR) ON EACH [n.title, n.body]",
+        "CREATE FULLTEXT INDEX shifterDocText IF NOT EXISTS "
+        "FOR (n:DocChunk) ON EACH [n.heading, n.text]",
     ]
     with driver.session() as s:
         s.run("MATCH (comment:PRComment) SET comment:GitHubComment")
