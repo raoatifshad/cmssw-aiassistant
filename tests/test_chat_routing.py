@@ -66,6 +66,7 @@ from server.api_server import (
     _render_metric_deltas,
     _request_planner,
     _evidence_grounded,
+    _shifter_doc_claims_grounded,
     _format_raw_evidence,
     chat,
     record_feedback,
@@ -922,6 +923,18 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(
             _normalize_deterministic_question("How much Rel-Val failures are in this integration-build?"),
             "how many relval failures are in this ib?",
+        )
+
+    def test_does_not_mangle_relvals_inside_an_unrelated_hyphenated_identifier(self):
+        # Regression: \b alone treats a hyphen as a word boundary, so the
+        # "relvals" -> "relval" normalization used to also fire inside the
+        # real Jenkins job name "ib-run-gpu-relvals", corrupting it to
+        # "ib-run-gpu-relval" before it ever reached routing or the LLM --
+        # traced back from a live shifter-doc answer that misattributed one
+        # job's details to another.
+        self.assertEqual(
+            _normalize_deterministic_question("what does ib-run-gpu-relvals depend on"),
+            "what does ib-run-gpu-relvals depend on",
         )
 
     def test_requested_ib_architecture_is_extracted(self):
@@ -3485,6 +3498,68 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(result.route, "llm_validated")
         self.assertEqual(result.answer, final_answer)
 
+    @patch("server.api_server._retriever", None)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.KGChatSession")
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_llm_fallback_has_shifter_docs_tool_available(
+        self, concepts, session_cls, store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # The agentic LLM-fallback loop is the only place a question with no
+        # recognizable graph entity (no IB tag, no package -- a CI-topology
+        # question like this one) can still reach an answer. Confirm
+        # search_shifter_docs (static CMSSW/CMSSDT documentation, not a live
+        # IB fact) is actually wired into its tool list, not just registered
+        # in graph.tools.TOOLS and never reaching the live call site.
+        captured = {}
+
+        def factory(*, openai_client, model, tools_registry, system_prompt, on_tool_call=None):
+            captured["tools_registry"] = tools_registry
+            session = MagicMock()
+            session.ask.return_value = "I don't have evidence for that."
+            return session
+
+        session_cls.side_effect = factory
+
+        chat(ChatRequest(question="what does ib-run-gpu-relvals depend on", session_id="shifter-docs-tool-wired"))
+
+        self.assertIn("search_shifter_docs", captured["tools_registry"])
+
+    @patch("server.api_server._retriever", None)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.KGChatSession")
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_llm_fallback_rejects_cross_entity_shifter_doc_attribution(
+        self, concepts, session_cls, store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # End-to-end regression for the live-found misattribution bug: the
+        # chat()-level route must actually reach _shifter_doc_claims_grounded
+        # and fall back to raw evidence, not just the unit-level function.
+        session_cls.side_effect = _mock_kgchat_session(
+            "ib-run-gpu-relvals' upstream project is ib-validation, and its "
+            "downstream project is update-das-queries.",
+            tool_results=[(
+                "search_shifter_docs", {"query": "ib-run-gpu-relvals"},
+                [self._gpu_relvals_chunk(), self._unrelated_job_chunk()],
+            )],
+        )
+
+        result = chat(ChatRequest(
+            question="what does ib-run-gpu-relvals depend on", session_id="shifter-doc-misattribution",
+        ))
+
+        self.assertTrue(result.route.endswith("llm_ungrounded_fallback"))
+        self.assertIn("more than one retrieved document", result.answer)
+        self.assertIn("ib-validation", result.answer)  # raw evidence still shown, just not as asserted prose
+
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
@@ -3771,6 +3846,72 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("get_ib_summary", rendered)
         self.assertIn("failing_count", rendered)
         self.assertIn("5", rendered)
+
+    def _gpu_relvals_chunk(self):
+        return {
+            "heading": "[ib-run-gpu-relvals](https://cmssdt.cern.ch/jenkins/job/ib-run-gpu-relvals)",
+            "text": "Downstream projects: [ib-run-relvals](#ib-run-relvals) Sub-projects: [ib-run-relvals](#ib-run-relvals)",
+            "source_path": "jenkins_reports/CMSSDT.md",
+        }
+
+    def _unrelated_job_chunk(self):
+        return {
+            "heading": "[process-relval-logs](https://cmssdt.cern.ch/jenkins/job/process-relval-logs)",
+            "text": "Upstream projects: [ib-validation](#ib-validation) Downstream: [update-das-queries](#update-das-queries)",
+            "source_path": "jenkins_reports/CMSSDT.md",
+        }
+
+    def test_shifter_doc_claims_rejects_cross_entity_attribution(self):
+        # Regression for a real live finding: question asked about
+        # ib-run-gpu-relvals, whose own retrieved chunk only mentions
+        # ib-run-relvals -- but the synthesized answer reported
+        # process-relval-logs's real upstream/downstream names
+        # (ib-validation, update-das-queries) as if they belonged to
+        # ib-run-gpu-relvals. Correct retrieval, wrong attribution.
+        evidence = [{
+            "tool": "search_shifter_docs", "arguments": {"query": "x"},
+            "result": [self._gpu_relvals_chunk(), self._unrelated_job_chunk()],
+        }]
+        answer = (
+            "ib-run-gpu-relvals' upstream projects are ib-validation, and its "
+            "downstream project is update-das-queries."
+        )
+
+        self.assertFalse(_shifter_doc_claims_grounded(
+            "what does ib-run-gpu-relvals depend on", answer, evidence,
+        ))
+
+    def test_shifter_doc_claims_accepts_facts_from_the_subjects_own_chunk(self):
+        evidence = [{
+            "tool": "search_shifter_docs", "arguments": {"query": "x"},
+            "result": [self._gpu_relvals_chunk(), self._unrelated_job_chunk()],
+        }]
+        answer = "ib-run-gpu-relvals is a sub-project of ib-run-relvals."
+
+        self.assertTrue(_shifter_doc_claims_grounded(
+            "what does ib-run-gpu-relvals depend on", answer, evidence,
+        ))
+
+    def test_shifter_doc_claims_ignores_prose_docs_with_no_job_headings(self):
+        # The forward-port/release-cycle style pages have no Jenkins-job-URL
+        # headings at all -- this guard must not engage for them, since
+        # there's nothing job-shaped to cross-check (verified correct live).
+        evidence = [{
+            "tool": "search_shifter_docs", "arguments": {"query": "x"},
+            "result": [{"heading": "Forward ports", "text": "auto-forward-port is a placeholder job.",
+                        "source_path": "forward-ports.md"}],
+        }]
+
+        self.assertTrue(_shifter_doc_claims_grounded(
+            "what is a forward port in CMSSW", "It's a placeholder job.", evidence,
+        ))
+
+    def test_shifter_doc_claims_ignores_non_doc_evidence(self):
+        # Ordinary graph-tool evidence (no search_shifter_docs call at all)
+        # must be completely unaffected by this guard.
+        evidence = [{"tool": "get_failing_relvals", "arguments": {}, "result": {"failed": 3}}]
+
+        self.assertTrue(_shifter_doc_claims_grounded("how many relvals are failing", "3 are failing.", evidence))
 
     # -- Regression tests for bugs found and fixed this session (Phase 0 golden set) --
 

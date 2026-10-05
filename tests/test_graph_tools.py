@@ -4,7 +4,7 @@ from unittest.mock import patch
 from graph.tools import (
     _ib_sort_key, diff_warnings, find_prs_before_ib, find_prs_for_error, find_prs_merged_between, list_ib_tags,
     latest_and_previous_primary_tags, variant_previous_tag, find_relval_regressions,
-    find_unittest_regressions, find_build_regressions, single_ib_status,
+    find_unittest_regressions, find_build_regressions, single_ib_status, search_shifter_docs,
 )
 
 
@@ -575,6 +575,31 @@ class FindPrsForErrorTests(unittest.TestCase):
 
         comment_query = session.run.call_args_list[5].args[0]
         self.assertIn("c.author <> 'cmsbuild'", comment_query)
+
+
+class SearchShifterDocsTests(unittest.TestCase):
+    @patch("graph.tools.get_driver")
+    def test_queries_the_fulltext_index_by_name(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"heading": "ib-run-gpu-relvals", "text": "...", "source_path": "jenkins_reports/CMSSDT.md", "score": 15.4}
+        ]
+
+        results = search_shifter_docs("ib-run-gpu-relvals dependency schedule")
+
+        query = session.run.call_args.args[0]
+        self.assertIn("db.index.fulltext.queryNodes('shifterDocText'", query)
+        self.assertEqual(results[0]["source_path"], "jenkins_reports/CMSSDT.md")
+
+    @patch("graph.tools.get_driver")
+    def test_missing_index_degrades_to_empty_list_not_an_exception(self, get_driver):
+        # A deployment that never ran ingest_shifter_docs.py has no
+        # shifterDocText fulltext index yet -- the tool must behave like "no
+        # documentation evidence found", not break the whole tool-calling turn.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.side_effect = Exception("no such fulltext schema index")
+
+        self.assertEqual(search_shifter_docs("anything"), [])
 
 
 if __name__ == "__main__":

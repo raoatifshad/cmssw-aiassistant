@@ -28,6 +28,17 @@ PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/b
   --cmsrepo cmsrepo --clang-root /home/rao/CHAT-BOT-AI/CLANG-LOGS --reconcile
 # add --clear only for a one-time full rebuild; --force to reimport unchanged sources
 
+# the user's actual daily refresh routine (manual, no cron — see "Shifter
+# documentation ingestion" below for why). Always run the cmsrepo half
+# FIRST, since --cmsrepo here also re-ingests cmsrepo's own top-level docs.
+cd cmsrepo && git fetch --prune origin master && git reset --hard origin/master \
+  && git sparse-checkout reapply && cd ..
+PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
+  --cmsrepo "$PWD/cmsrepo" --clang-root /home/rao/CHAT-BOT-AI/CLANG-LOGS --reconcile
+cd shifter-wiki && git fetch --prune origin master && git reset --hard origin/master && cd ..
+PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_shifter_docs.py \
+  --wiki-root "$PWD/shifter-wiki" --cmsrepo "$PWD/cmsrepo" --reconcile
+
 # run the API
 uvicorn server.api_server:app --reload --port 8001
 curl http://localhost:8001/api/health
@@ -119,6 +130,49 @@ dedupe across architectures. `CMSSW_<major>_<minor>_X_<timestamp>` is a
 *primary* IB; a tag with an inserted variant (e.g.
 `CMSSW_20_1_NONLTO_X_<timestamp>`) is a *sub-IB* whose `parent_tag` points at
 the primary tag, tracked via `ib_parent_tag()`.
+
+### Shifter documentation ingestion (`ingestion/ingest_shifter_docs.py`)
+
+A second, static evidence source added 2026-10-02 so the chat LLM can cite
+CMSSW/CMSSDT procedural knowledge (Jenkins job runbooks, release-cycle
+steps, CI topology) alongside live IB facts, exposed via the
+`search_shifter_docs` tool (`graph/tools.py`) over a `(:DocChunk)` node type
+and a Neo4j fulltext index (`shifterDocText`). Sources: a local clone of
+`cms-sw/cmssdt-wiki` at `shifter-wiki/`, plus `cmsrepo`'s own unused
+top-level `*.md` pages (`build_graph.py` only ever reads `cmsrepo/data/...`).
+Same trust model as everything else here — a local git clone, never fetched
+live during a chat request — and same incremental hashing
+(`source_needs_import`/`mark_source_imported`, reused directly from
+`build_graph.py`) so re-running is cheap.
+
+**There is no cron job for this, or for `build_graph.py` itself** — both are
+refreshed by hand, daily, as one combined routine (see the Commands section
+above). `shifter-wiki`'s own upstream commit history
+(`github.com/cms-sw/cmssdt-wiki/commits`) is never polled or watched; a new
+commit there only reaches the graph once someone runs `git fetch`/`reset`
+on `shifter-wiki/` and re-runs `ingest_shifter_docs.py` — this is a direct
+consequence of the "never call GitHub live" invariant below, not an
+oversight. If this ever needs to run on its own instead of by reminder, it's
+one crontab entry mirroring `ingestion/summarize_router_shadow.py`'s
+existing cron pattern — ask before adding it, since it's a durable
+system-level change.
+
+A real, found-live failure mode worth knowing when touching this: the
+Jenkins-job wiki pages are dozens of near-identical entries back to back
+(same Description/Upstream/Downstream/Sub-projects template), and an LLM
+synthesizing over several retrieved chunks at once can misattribute one
+job's real upstream/downstream names to a different job asked about —
+correct retrieval, wrong attribution, not caught by `_evidence_grounded`'s
+number-only check. `_shifter_doc_claims_grounded` (`server/api_server.py`)
+guards specifically against this (cross-checks any other named Jenkins job
+mentioned in the answer against the asked-about job's own retrieved chunk
+text) and degrades to raw evidence, same as `_evidence_grounded`, rather
+than showing the misattributed prose. A related, upstream bug found while
+building this: `_normalize_deterministic_question`'s `relvals`→`relval`
+regex used to also fire inside unrelated hyphenated identifiers like the
+Jenkins job name `ib-run-gpu-relvals` (`\b` treats a hyphen as a word
+boundary) — fixed with a lookbehind/lookahead that excludes hyphen-adjacency
+instead.
 
 ### Graph schema and tools (`graph/tools.py`)
 

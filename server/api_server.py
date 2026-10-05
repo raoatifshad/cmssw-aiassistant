@@ -91,6 +91,16 @@ changed_file_path, pr_title, pr_description, and pr_comment (a human PR comment,
 never cms-bot's own routine CI comments) are discovery signals. No match
 proves that a PR caused a warning or test failure.
 
+For questions about CMSSW/CMSSDT shifter procedures, what a Jenkins job does \
+or depends on, release-cycle steps, or any CI-topology question the other \
+tools have no data for (they only hold this deployment's own imported IB \
+results, never Jenkins job definitions) — including as a second attempt \
+after a named-entity lookup like get_failing_relvals comes back empty, since \
+a CI job name (e.g. ib-run-gpu-relvals) is not the same thing as a RelVal \
+workflow name — use search_shifter_docs. It returns static documentation, \
+never a live fact about any specific IB; cite it separately from graph
+evidence, never as a substitute for it.
+
 If a tool returns an error or nothing, say so plainly. Never fabricate excuses."""
 
 FEEDBACK_VERIFIER_PROMPT = f"""You are an evidence-only verifier for CMSSDT chatbot feedback.
@@ -505,13 +515,15 @@ def _synthesize_if_safe(question: str, deterministic_answer: str) -> str:
         return deterministic_answer
 
 
-def _format_raw_evidence(tool_evidence: list[dict]) -> str:
+def _format_raw_evidence(
+    tool_evidence: list[dict],
+    reason: str = "the generated answer mentioned a number not present in the evidence",
+) -> str:
     """Render tool evidence as plain fact, not LLM prose -- used when a
     synthesized answer fails grounding verification, so a shifter still sees
     the real evidence instead of nothing."""
-    lines = ["Evidence was found, but it could not be safely summarized into "
-             "prose (the generated answer mentioned a number not present in "
-             "the evidence). Showing the raw evidence instead:", ""]
+    lines = [f"Evidence was found, but it could not be safely summarized into "
+             f"prose ({reason}). Showing the raw evidence instead:", ""]
     for item in tool_evidence:
         tool = item.get("tool", "unknown_tool")
         arguments = item.get("arguments", {})
@@ -531,6 +543,64 @@ def _evidence_grounded(answer: str, tool_evidence: list[dict]) -> bool:
     verification unlike the deterministic-answer-rephrasing path above."""
     evidence_numbers = _extract_numbers(json.dumps(tool_evidence, default=str))
     return _extract_numbers(answer).issubset(evidence_numbers)
+
+
+# A job's own heading links its full Jenkins URL (`[name](https://.../job/name)`);
+# its upstream/downstream/sub-project cross-references within the body use an
+# in-page anchor instead (`[name](#name)`) -- both forms name a real job.
+_JENKINS_JOB_NAME_RE = re.compile(
+    r"\[([\w.-]+)\]\((?:https://cmssdt\.cern\.ch/jenkins/job/[\w.-]+|#[\w.-]+)\)"
+)
+
+
+def _shifter_doc_claims_grounded(question: str, answer: str, tool_evidence: list[dict]) -> bool:
+    """Crude, conservative guard for search_shifter_docs evidence specifically
+    -- the CMSSDT Jenkins-job wiki pages are dozens of near-identical entries
+    back to back (Description/Upstream/Downstream/Sub-projects/Triggers), and
+    found live: the model answered a question about one job
+    (`ib-run-gpu-relvals`) by reporting a DIFFERENT job's real
+    upstream/downstream names (`ib-validation`, `process-relval-logs`,
+    `update-das-queries`) as if they belonged to the one asked about --
+    correct retrieval, wrong attribution. _evidence_grounded's number check
+    doesn't catch this (no fabricated number involved, just a misattributed
+    real one). Returns True (nothing to reject) unless the question names a
+    specific real Jenkins job AND the answer names a *different* real job
+    that isn't actually mentioned inside that same job's own retrieved chunk
+    -- every other case (prose docs with no job-style headings at all, a
+    question with no named job, an answer naming no other job) is
+    unaffected, same "only ever adds a rejection, never changes an already-
+    passing case" discipline as _evidence_grounded itself."""
+    doc_chunks = []
+    for item in tool_evidence:
+        if item.get("tool") != "search_shifter_docs":
+            continue
+        result = item.get("result")
+        if isinstance(result, list):
+            doc_chunks.extend(chunk for chunk in result if isinstance(chunk, dict))
+    if not doc_chunks:
+        return True
+
+    all_job_names: set[str] = set()
+    for chunk in doc_chunks:
+        all_job_names.update(_JENKINS_JOB_NAME_RE.findall(chunk.get("heading") or ""))
+        all_job_names.update(_JENKINS_JOB_NAME_RE.findall(chunk.get("text") or ""))
+    if not all_job_names:
+        return True  # not Jenkins-job-style content (e.g. prose docs) -- nothing to cross-check
+
+    subject_names = [name for name in all_job_names if name in question]
+    if not subject_names:
+        return True  # question isn't about a specific named job -- nothing to anchor the check on
+
+    companion_names = {name for name in all_job_names if name in answer and name not in subject_names}
+    if not companion_names:
+        return True
+
+    subject_chunk_text = " ".join(
+        f"{chunk.get('heading') or ''} {chunk.get('text') or ''}"
+        for chunk in doc_chunks
+        if any(name in (chunk.get("heading") or "") for name in subject_names)
+    )
+    return all(name in subject_chunk_text for name in companion_names)
 
 
 def _chat_response(session_id: str, original_question: str, answer: str,
@@ -659,7 +729,14 @@ def _normalize_deterministic_question(question: str) -> str:
     for pattern, replacement in (
         (r"\bhow\s+much\b", "how many"),
         (r"\bnumber\s+of\b", "number"),
-        (r"\brel[\s-]*vals?\b", "relval"),
+        # (?<![\w-]) / (?![\w-]) instead of \b on both sides: \b alone treats
+        # a hyphen as a word boundary, so this used to also fire inside an
+        # unrelated hyphenated identifier like the Jenkins job name
+        # "ib-run-gpu-relvals" -- mangling it to "ib-run-gpu-relval" before
+        # it ever reached routing or the LLM (found live, 2026-10-02, while
+        # investigating a shifter-doc misattribution that traced back to the
+        # question itself already being corrupted).
+        (r"(?<![\w-])rel[\s-]*vals?(?![\w-])", "relval"),
         (r"\bintegration[\s-]*build\b", "ib"),
         (r"\b(?:unresolved|still\s+open|in\s+progress)\b", "open"),
         (r"\b(?:completed|done)\b", "closed"),
@@ -5779,6 +5856,11 @@ def _run_llm_investigation(
             return _chat_response(sid, original_question, answer, f"{route_prefix}llm_ungrounded_fallback", citations)
         if not _evidence_grounded(answer, evidence):
             answer = _format_raw_evidence(evidence)
+            return _chat_response(sid, original_question, answer, f"{route_prefix}llm_ungrounded_fallback", citations)
+        if not _shifter_doc_claims_grounded(question, answer, evidence):
+            answer = _format_raw_evidence(
+                evidence, reason="it combined details from more than one retrieved document into a single entity",
+            )
             return _chat_response(sid, original_question, answer, f"{route_prefix}llm_ungrounded_fallback", citations)
         return _chat_response(sid, original_question, answer, f"{route_prefix}llm_validated", citations)
     except Exception as exc:

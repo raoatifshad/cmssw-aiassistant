@@ -51,6 +51,30 @@ outside `cmsrepo` and must have this layout:
 /home/rao/CHAT-BOT-AI/CLANG-LOGS/<ib-tag>/<arch>/build-logs/**/log.html
 ```
 
+### Shifter documentation (optional, additive)
+
+A second, static evidence source the chat LLM can cite alongside live graph
+facts: CMSSW/CMSSDT shifter documentation (Jenkins job runbooks,
+release-cycle procedures, CI topology). Cloned locally once, like `cmsrepo`
+— never fetched live during a chat request.
+
+```bash
+git clone --depth 1 https://github.com/cms-sw/cmssdt-wiki.git shifter-wiki
+
+PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_shifter_docs.py \
+  --wiki-root shifter-wiki \
+  --cmsrepo cmsrepo \
+  --reconcile
+```
+
+`--cmsrepo` here additionally ingests `cmsrepo`'s own unused top-level `*.md`
+pages (`troubleshooting.md`, `faq.md`, etc.) — `build_graph.py` only ever
+reads `cmsrepo/data/...`, so these sit on disk unused otherwise. Re-running
+is incremental (same `ImportState` content-hashing as every other source);
+pass `--force` to reimport unchanged files. Skipping this step entirely is
+safe: `search_shifter_docs` degrades to "no documentation evidence" if the
+`DocChunk` fulltext index has nothing in it yet.
+
 ### RelVal exception logs
 
 The CMSSDT logreader (`cmssdt.cern.ch/SDT/cgi-bin/logreader/...`) requires a
