@@ -133,8 +133,31 @@ def build_scenarios(tag: str, arch: str) -> list[Scenario]:
             Turn("what is the latest IB", expect_contains=["CMSSW"]),
             Turn("compare latest branches", expect_contains=[]),
         ]),
-        Scenario("ambiguous request triggers clarification, not a guess", [
-            Turn(f"failures for {tag}", expect_contains=["Do you want"]),
+        # Used to expect the "Do you want build warnings, failed RelVals, ...?"
+        # clarification -- replaced 2026-10-06 by a direct every-category answer
+        # (126 of 128 clarifications in a replay of real sessions were this one,
+        # asked back for a question that already said what it wanted).
+        Scenario("category-less failure request answers every category, not a question back", [
+            Turn(f"failures for {tag}", expect_contains=["What's failing in", "RelVals", "Unit tests", "Build"]),
+            Turn("unit tests", expect_contains=["unit-test results"]),
+        ]),
+        Scenario("workflow follow-ups keep the workflow", [
+            Turn("why is workflow 512.0 failing on aarch64", expect_contains=["512.0", "aarch64"]),
+            Turn("since when is it failing", expect_contains=["512.0"]),
+            Turn("on which architectures", expect_contains=["512.0"]),
+        ]),
+        Scenario("scope-only follow-up repeats the previous question", [
+            Turn(f"unit tests for {tag}", expect_contains=["unit-test results"]),
+            Turn("and on aarch64 only", expect_contains=["unit-test results", "aarch64"]),
+        ]),
+        Scenario("exit code meaning in all three forms", [
+            Turn("what does exit code 65 mean", expect_contains=["OtherCMS"]),
+            Turn("what does exit code 8001 mean", expect_contains=["OtherCMS"]),
+            Turn("what does exit code 35584 mean", expect_contains=["SIGSEGV"]),
+        ]),
+        Scenario("small talk and write requests get a direct reply", [
+            Turn("hi", expect_contains=["What would you like to check"]),
+            Turn("please rerun workflow 512.0", expect_contains=["read-only"]),
         ]),
         Scenario("garbage / non-question input never crashes", [
             Turn("erfe", expect_contains=[]),
