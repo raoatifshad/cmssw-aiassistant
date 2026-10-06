@@ -49,7 +49,8 @@ SHIFT_SUMMARY_RE = re.compile(
     # of the above matched and the uppercase "IB" became a GitHub text search.
     r"\bnew(?:ly)?\b[^?!]{0,20}\b(?:broken|broke|regress(?:ed|ions?)?)\b|"
     r"\b(?:broken|broke|regress(?:ed|ions?)?)\b[^?!]{0,30}\bsince\b|"
-    r"\bsince\s+(?:this\s+morning|yesterday|last\s+night|today)\b",
+    r"\bsince\s+(?:(?:this|the)\s+morning|yesterday|(?:last|this)\s+night|today|the\s+last\s+(?:ib|build))\b|"
+    r"\bwhat'?s\s+new\b",
     re.IGNORECASE,
 )
 
@@ -130,9 +131,27 @@ class RequestContext:
             scope=scope,
             categories=frozenset(categories),
             has_summary_request=bool(re.search(r"\b(?:summary|summarize|results?|show|provide)\b", lowered)),
-            has_failure_request=bool(re.search(r"\b(?:fail(?:ing|ed|ures?)|errors?)\b", lowered)),
+            # "anything red on aarch64", "how bad is the latest IB", "is it broken"
+            # are failure questions too -- found live 2026-10-06 (held-out tester
+            # set) never reaching the failure overview.
+            has_failure_request=bool(re.search(
+                r"\b(?:fail(?:ing|ed|ures?)|errors?|red|green|clean|broken|breaks?|problems?|unhealthy|health)\b|"
+                r"\ball\s+(?:good|ok|fine)\b|\beverything\s+(?:ok|fine|good|passing)\b|"
+                r"\bhow\s+(?:bad|healthy|good)\b|\bwhat(?:'s|\s+is)\s+wrong\b|"
+                r"\bstatus\s+of\s+(?:the\s+)?(?:today'?s\s+|latest\s+|last\s+|current\s+)?ibs?\b",
+                lowered,
+            )),
             has_comparison_request=bool(re.search(r"\b(?:compare|comparison|delta|difference)\b", lowered)),
-            has_relationship_request=bool(re.search(r"\b(?:why|parent|sub[\s-]*ib|variant)\b", lowered)),
+            # Bare "why" used to count -- found live 2026-10-06 (held-out set 2):
+            # "why is HeterogeneousCore/MPICore failing" was answered "<tag> is a
+            # primary IB, not a sub-IB variant". "why" only signals the
+            # relationship question when it's about how an IB was shown/classed.
+            has_relationship_request=bool(re.search(
+                r"\b(?:parent|sub[\s-]*ib|variant)\b|"
+                r"\bwhy\b[^?!]{0,40}\b(?:show(?:n|ed)?|list(?:ed)?|call(?:ed)?|consider(?:ed)?|treat(?:ed)?|"
+                r"mark(?:ed)?|classif(?:y|ied)|primary)\b",
+                lowered,
+            )),
             has_shift_summary_request=bool(SHIFT_SUMMARY_RE.search(question)),
             is_bare_ib_tag=bare_tag,
         )

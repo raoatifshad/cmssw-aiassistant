@@ -4040,6 +4040,156 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("unit tests", _normalize_deterministic_question("UT failures"))
         self.assertEqual(_normalize_deterministic_question("but ut is fine"), "but ut is fine")
 
+    def test_step_numbering_does_not_count_as_an_ungrounded_number(self):
+        # Found live: every multi-step shifter-docs answer was rejected and
+        # dumped as raw JSON solely because of its own "1.", "2." numbering.
+        from server.api_server import _evidence_grounded
+        evidence = [{"tool": "search_shifter_docs", "result": [{"text": "Open a PR, then wait for 5 approvals."}]}]
+        self.assertTrue(_evidence_grounded("1. Open a PR\n2. Wait for 5 approvals\n| **3. Merge** |\nStep 4: done", evidence))
+        self.assertFalse(_evidence_grounded("1. Open a PR\n2. Wait for 7 approvals", evidence))
+
+    @patch("server.api_server.search_issues_by_text",
+           return_value={"issues": [{"number": 49574, "title": "Multiple RelVals failed with cudaErrorLaunchOutOfResources", "state": "closed"}]})
+    @patch("server.api_server.find_prs_for_error", return_value=[])
+    def test_pasted_error_in_failure_overview_searches_evidence_instead(self, prs, issues):
+        from server.api_server import _looks_like_pasted_error_text
+        question = ("A previous API call (not this one) set the error : 'cudaErrorLaunchOutOfResources': "
+                    "'too many resources requested for launch'! CMSSW_20_1_X_2026-10-05-2300")
+        self.assertTrue(_looks_like_pasted_error_text(question))
+        self.assertFalse(_looks_like_pasted_error_text("what is failing in the latest IB CMSSW_20_1_X_2026-10-05-2300"))
+
+        answer, _ = _execute_planned_capability("failure_overview", question, "pasted-error")
+
+        prs.assert_called_once_with("cudaErrorLaunchOutOfResources", limit=8)
+        self.assertIn("Issue #49574", answer)
+        self.assertIn("do not prove a fix or causal relationship", answer)
+
+    @patch("server.api_server._store_chat_turns")
+    def test_help_request_lists_what_can_be_asked(self, store_chat_turns):
+        result = chat(ChatRequest(question="what can you help me with?", session_id="help"))
+        self.assertEqual(result.route, "conversational:help")
+        self.assertIn("why is workflow 512.0 failing", result.answer)
+
+    def test_recurrence_intent_covers_recurrence_pattern(self):
+        from server.api_server import _RECURRING_FAILURE_INTENT_RE
+        self.assertTrue(_RECURRING_FAILURE_INTENT_RE.search("tell me the recurrence pattern for workflow 136.899"))
+
+    def test_ib_variant_glossary_answers_definitions_but_not_results(self):
+        from server.api_server import _ib_variant_glossary_answer
+        answer = _ib_variant_glossary_answer("what is a sub-IB and what does ASAN mean")
+        self.assertIn("sub-IB", answer)
+        self.assertIn("AddressSanitizer", answer)
+        self.assertIn("cms-bot `config.map`", answer)
+        self.assertNotIn("UBSAN", answer)  # only the named variant
+        self.assertIsNone(_ib_variant_glossary_answer("ASAN failures in the latest IB"))
+        self.assertIsNone(_ib_variant_glossary_answer("what is the latest IB"))
+
+    @patch("server.api_server.variant_previous_tag", return_value="CMSSW_20_1_X_2026-10-05-1100")
+    @patch("server.api_server.get_driver")
+    def test_persistent_failures_splits_still_new_and_resolved(self, get_driver, previous):
+        from server.api_server import _persistent_failures_answer
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.side_effect = [
+            [{"a": "el9_amd64_gcc14"}],
+            [{"n": "HeterogeneousCore/MPICore"}, {"n": "HLTrigger/Tools"}],   # now
+            [{"n": "HeterogeneousCore/MPICore"}, {"n": "IOPool/Tests"}],      # before
+        ]
+        sid = "persistent"
+        _latest_ib_contexts[sid] = "CMSSW_20_1_X_2026-10-05-2300"
+        try:
+            answer = _persistent_failures_answer("which unit tests also failed in the previous IB", sid)
+        finally:
+            _latest_ib_contexts.pop(sid, None)
+
+        self.assertIn("**still failing** (also failed before): `HeterogeneousCore/MPICore`", answer)
+        self.assertIn("**newly failing**: `HLTrigger/Tools`", answer)
+        self.assertIn("**resolved** since then: `IOPool/Tests`", answer)
+        self.assertIsNone(_persistent_failures_answer("which unit tests are failing", sid))
+
+    def test_held_out_phrasings_reach_the_right_place(self):
+        # Found live 2026-10-06 on a held-out tester set (never tuned on).
+        from server.api_server import _request_planner, _with_workflow_follow_up_context, _last_workflow_contexts
+        from server.request_planner import RequestContext
+        tag = " CMSSW_20_1_X_2026-10-05-2300"
+        for q in ("anything red on aarch64 in the last build?", "how bad is the latest IB",
+                  "give me the status of today's IBs", "is the latest build broken"):
+            plan = _request_planner.plan(RequestContext.extract(_normalize_deterministic_question(q) + tag))
+            self.assertEqual(plan.capability, "failure_overview", q)
+        self.assertEqual(_normalize_deterministic_question("show the latest build warnings"), "show the latest build warnings")
+        self.assertTrue(_is_latest_comparison_question("compare today and yesterday IBs"))
+        sid = "wf-issue-follow-up"
+        _last_workflow_contexts[sid] = "136.817"
+        try:
+            self.assertEqual(_with_workflow_follow_up_context("is there an issue for it?", sid),
+                             "is there an issue for it? (workflow 136.817)")
+        finally:
+            _last_workflow_contexts.pop(sid, None)
+
+    @patch("server.api_server.get_driver")
+    def test_issue_author_accepts_issue_number_without_hash(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {"author": "iarspider", "title": "t", "state": "closed"}
+        answer = _issue_author_answer("who opened issue 49574")
+        self.assertIn("49574", answer)
+        self.assertEqual(_resolve_issue_number("do you have issue 52041?", None), None)  # still PR-or-Issue ambiguous
+
+    def test_llm_prompt_is_told_the_current_cern_date(self):
+        from server.api_server import _current_date_note
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("Europe/Zurich")).strftime("%Y-%m-%d")
+        self.assertIn(today, _current_date_note())
+        self.assertIn("yesterday", _current_date_note())
+
+    @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-10-05-2300"}])
+    @patch("server.api_server.get_driver")
+    def test_known_error_concept_is_explained_from_the_data(self, get_driver, latest):
+        from server.api_server import _known_error_concept_answer
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"message": "GridPacks were built for x86_64", "n": 49, "archs": ["el9_aarch64_gcc14"]}]
+        answer = _known_error_concept_answer("what is a known error")
+        self.assertIn("excluded from failing counts", answer)
+        self.assertIn("49 workflow(s): \"GridPacks were built for x86_64\"", answer)
+        self.assertIsNone(_known_error_concept_answer("which known errors are in the latest IB"))
+
+    def test_bare_why_is_not_an_ib_relationship_question(self):
+        # Found live (held-out set 2): "why is HeterogeneousCore/MPICore failing"
+        # was answered "<tag> is a primary IB, not a sub-IB variant".
+        from server.request_planner import RequestContext
+        self.assertFalse(RequestContext.extract("why is HeterogeneousCore/MPICore failing").has_relationship_request)
+        self.assertTrue(RequestContext.extract("why did you show CMSSW_20_1_TF_X_2026-08-14-1100 as a sub IB?").has_relationship_request)
+        self.assertTrue(RequestContext.extract("is everything green on el8_amd64_gcc14?").has_failure_request)
+
+    @patch("server.api_server.search_issues_by_text",
+           return_value={"issues": [{"number": 50547, "title": "testMPIAutosplitter appears to fail occasionally", "state": "open"}]})
+    @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-10-05-2300"}])
+    @patch("server.api_server.get_driver")
+    def test_package_status_answer_shows_every_record_history_and_open_issues(self, get_driver, latest, issues):
+        from server.api_server import _package_status_answer
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.side_effect = [
+            [{"variant": "primary", "arch": "el9_amd64_gcc14", "status": "FAILED", "errors": 1},
+             {"variant": "ASAN", "arch": "el9_amd64_gcc14", "status": "PASSED", "errors": 0}],
+            MagicMock(single=MagicMock(return_value={"total": 323, "failed": 62, "first_failed": "2026-09-29-2300"})),
+        ]
+        answer = _package_status_answer("why is HeterogeneousCore/MPICore failing", "pkg-status")
+        self.assertIn("failing in 1 of 2", answer)
+        self.assertIn("62 of 323", answer)
+        self.assertIn("Issue #50547", answer)
+        self.assertIn("relevance only", answer)
+        self.assertIsNone(_package_status_answer("any PR for HeterogeneousCore/MPICore", "pkg-status"))
+
+    @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-10-05-2300"}])
+    @patch("server.api_server.get_driver")
+    def test_named_sub_ib_flavour_resolves_to_its_newest_tag(self, get_driver, latest):
+        from server.api_server import _with_variant_ib_context
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {"tag": "CMSSW_20_1_UBSAN_X_2026-10-05-2300"}
+        self.assertEqual(_with_variant_ib_context("which unit tests broke in the UBSAN IB"),
+                         "which unit tests broke in the UBSAN IB CMSSW_20_1_UBSAN_X_2026-10-05-2300")
+        self.assertEqual(session.run.call_args.kwargs["prefix"], "CMSSW_20_1_UBSAN_X_")
+        self.assertEqual(_with_variant_ib_context("what does the ASAN IB mean"), "what does the ASAN IB mean")
+        self.assertEqual(_with_variant_ib_context("ASAN"), "ASAN")
+
     def test_llm_absence_claim_detector(self):
         for text in (
             "No failing RelVal workflows were recorded for the build.",
