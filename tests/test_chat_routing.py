@@ -3506,6 +3506,11 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server.KGChatSession")
     @patch("server.api_server._llm_client", object())
     @patch("server.api_server.search_concepts", return_value=[])
+    # The question routes to the `relval` capability (the job name contains
+    # "relvals") and dead-ends there, so it only reaches the LLM loop via the
+    # capability-fallback rescue -- patch it explicitly rather than relying on
+    # whatever the local .env happens to set (CI has no .env).
+    @patch("server.api_server.CAPABILITY_FALLBACK_TO_LLM_ENABLED", True)
     def test_llm_fallback_has_shifter_docs_tool_available(
         self, concepts, session_cls, store_chat_turns, restore, store_decision, clear_pending
     ):
@@ -3537,6 +3542,11 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server.KGChatSession")
     @patch("server.api_server._llm_client", object())
     @patch("server.api_server.search_concepts", return_value=[])
+    # The question routes to the `relval` capability (the job name contains
+    # "relvals") and dead-ends there, so it only reaches the LLM loop via the
+    # capability-fallback rescue -- patch it explicitly rather than relying on
+    # whatever the local .env happens to set (CI has no .env).
+    @patch("server.api_server.CAPABILITY_FALLBACK_TO_LLM_ENABLED", True)
     def test_llm_fallback_rejects_cross_entity_shifter_doc_attribution(
         self, concepts, session_cls, store_chat_turns, restore, store_decision, clear_pending
     ):
