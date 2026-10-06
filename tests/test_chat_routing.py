@@ -4190,6 +4190,26 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(_with_variant_ib_context("what does the ASAN IB mean"), "what does the ASAN IB mean")
         self.assertEqual(_with_variant_ib_context("ASAN"), "ASAN")
 
+    def test_docs_answer_must_mostly_use_the_retrieved_wording(self):
+        # Found live: an invented six-step PR approval process ("GitHub Actions",
+        # "squash-merge") passed every check once step numbers stopped tripping
+        # the number guard -- nothing checked the content itself.
+        from server.api_server import _doc_answer_terms_grounded
+        doc = ("This page is a short summary of the process we use for accepting code changes from CMS "
+               "developers into CMSSW. Go to the pull request page to have an overview of the status of all "
+               "the pull requests. Click on a given pull request to have the whole discussion about the pull "
+               "request approval process. Signatures from the L2 conveners of every touched category are required.")
+        evidence = [{"tool": "search_shifter_docs", "result": [{"text": doc}]}]
+        genuine = ("CMSSW accepts code changes from CMS developers through pull requests. The pull request page gives "
+                   "an overview of the status of all pull requests, and each pull request shows the whole discussion "
+                   "about the approval process, including signatures from the L2 conveners of every touched category.")
+        invented = ("GitHub Actions run automated continuous integration pipelines, maintainers perform squash merges, "
+                    "release managers publish nightly tarballs, reviewers attach labels like needs-review, and "
+                    "quality gates enforce mandatory coverage thresholds before deployment to production servers.")
+        self.assertTrue(_doc_answer_terms_grounded(genuine, evidence))
+        self.assertFalse(_doc_answer_terms_grounded(invented, evidence))
+        self.assertTrue(_doc_answer_terms_grounded(invented, [{"tool": "get_failing_relvals", "result": []}]))
+
     def test_llm_absence_claim_detector(self):
         for text in (
             "No failing RelVal workflows were recorded for the build.",
