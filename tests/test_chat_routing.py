@@ -1,6 +1,6 @@
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from server.api_server import (
@@ -58,6 +58,12 @@ from server.api_server import (
     _latest_ib_arch_contexts,
     _latest_ib_contexts,
     _verification_session_context,
+    _llm_answer_is_absence_claim,
+    _question_has_scope_qualifier,
+    _conversational_response,
+    _relval_known_error_lines,
+    _workflow_why_failing_answer,
+    _failure_overview_answer,
     _parse_recency_window_days,
     _latest_and_days_ago_ib_tags,
     _shift_summary_answer,
@@ -2465,6 +2471,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertNotIn("el8_amd64_gcc14", answer)
         self.assertNotIn("el9_aarch64_gcc14", answer)
 
+    @patch("server.api_server._relval_known_error_lines", new=lambda rows: [])
     @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags")
     @patch("server.api_server._relval_scope_records")
@@ -3221,9 +3228,23 @@ class ChatRoutingTests(unittest.TestCase):
 
         answer = _latest_ib_answer("What is the latest IB for el9_amd64_gcc13?")
 
-        latest_ib_record.assert_called_once_with("el9_amd64_gcc13")
+        latest_ib_record.assert_called_once_with("el9_amd64_gcc13", None)
         self.assertIn("for `el9_amd64_gcc13`", answer)
         self.assertIn("Sub-IB variants", answer)
+
+    @patch("server.api_server._latest_ib_records")
+    def test_latest_ib_answer_honors_an_explicit_release_series(self, latest_ib_record):
+        # Found live 2026-10-06: "latest 20_0_X IB" returned the 20_1_X IB.
+        latest_ib_record.return_value = [{
+            "tag": "CMSSW_20_0_X_2026-10-06-1100", "release": "CMSSW_20_0_X",
+            "architectures": ["el8_amd64_gcc13"], "sub_ib_tags": [], "build_timestamp": "2026-10-06-1100",
+        }]
+
+        answer = _latest_ib_answer("latest 20_0_X IB")
+
+        latest_ib_record.assert_called_once_with(None, (20, 0))
+        self.assertIn("CMSSW_20_0_X_2026-10-06-1100", answer)
+        self.assertIn("release series `CMSSW_20_0_X`", answer)
 
     @patch("server.api_server._latest_ib_records")
     def test_latest_ib_answer_lists_timestamp_ties(self, latest_ib_records):
@@ -3302,22 +3323,24 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server._store_pending_clarification")
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
-    @patch("server.api_server._chat_response", side_effect=lambda *args, **kwargs: args[2])
-    @patch("server.api_server._execute_planned_capability")
-    def test_ambiguous_failure_request_returns_choices_without_llm(
-        self, execute, chat_response, restore, store_decision, store_pending, clear_pending
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.KGChatSession")
+    @patch("server.api_server._failure_overview_answer", return_value=("everything failing", [{"label": "a", "question": "b"}]))
+    def test_ambiguous_failure_request_answers_with_failure_overview_without_llm(
+        self, overview, session_cls, store_chat_turns, restore, store_decision, store_pending, clear_pending
     ):
-        session_id = "planner-clarification"
+        # "failures for <tag>" names no category. It used to get "Do you want
+        # build warnings, failed RelVals, unit-test results, or a combined IB
+        # summary?" -- 126 of 128 clarifications in the 2026-10-06 replay of
+        # real sessions. Now answered directly with every failing item.
         tag = "CMSSW_20_1_X_2026-08-10-1100"
-        try:
-            result = chat(ChatRequest(question=f"failures for {tag}", session_id=session_id))
-        finally:
-            from server.api_server import _request_planner
-            _request_planner.pending.pop(session_id, None)
+        result = chat(ChatRequest(question=f"failures for {tag}", session_id="planner-failure-overview"))
 
-        self.assertIn("Do you want build warnings", result)
-        execute.assert_not_called()
-        store_pending.assert_called_once()
+        self.assertEqual(result.route, "capability:failure_overview")
+        self.assertEqual(result.answer, "everything failing")
+        overview.assert_called_once_with(tag, None)
+        store_pending.assert_not_called()
+        session_cls.assert_not_called()
 
     @patch("server.api_server.get_driver")
     def test_category_failure_snapshot_reports_real_counts_with_markers(self, get_driver):
@@ -3371,54 +3394,39 @@ class ChatRoutingTests(unittest.TestCase):
         # -- the caller falls back to the plain question when this is None.
         self.assertIsNone(_category_failure_snapshot("CMSSW_20_1_X_2026-08-10-1100"))
 
-    @patch("server.api_server._clear_pending_clarification")
-    @patch("server.api_server._store_pending_clarification")
-    @patch("server.api_server._store_planning_decision")
-    @patch("server.api_server._restore_pending_clarification")
-    @patch("server.api_server._category_failure_snapshot")
-    def test_ambiguous_failure_request_is_enriched_with_real_counts(
-        self, snapshot, restore, store_decision, store_pending, clear_pending
-    ):
-        # The blind "Do you want build warnings, failed RelVals, unit-test
-        # results, or a combined IB summary?" menu is now informed by real
-        # graph facts (never LLM-guessed) so the user can see what's
-        # actually failing before picking a category.
-        snapshot.return_value = (
-            "For `CMSSW_20_1_X_2026-08-10-1100` across 2 imported architecture(s): "
-            "🔴 3 RelVal(s) failing, 🟢 0 build warning(s), 🟢 0 unit test(s) failing."
-        )
-        session_id = "planner-clarification-snapshot"
-        tag = "CMSSW_20_1_X_2026-08-10-1100"
-        try:
-            result = chat(ChatRequest(question=f"failures for {tag}", session_id=session_id))
-        finally:
-            from server.api_server import _request_planner
-            _request_planner.pending.pop(session_id, None)
-
-        snapshot.assert_called_once_with(tag)
-        self.assertIn("🔴 3 RelVal(s) failing", result.answer)
-        self.assertIn("Do you want build warnings", result.answer)
+    def test_planner_without_failure_overview_still_asks_for_category(self):
+        # The category clarification remains the fallback for a planner built
+        # without the failure_overview capability registered.
+        from server.request_planner import Capability, PlanKind, RequestContext, RequestPlanner
+        planner = RequestPlanner(capabilities=(
+            Capability(name="relval", required_categories=frozenset({"relval"}), priority=65),
+        ))
+        plan = planner.plan(RequestContext.extract("failures for CMSSW_20_1_X_2026-08-10-1100"))
+        self.assertEqual(plan.kind, PlanKind.CLARIFICATION)
+        self.assertEqual(plan.clarification.missing_field, "category")
 
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_pending_clarification")
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
     @patch("server.api_server._chat_response", side_effect=lambda *args, **kwargs: args[2])
-    @patch("server.api_server._execute_planned_capability", return_value=("unit-test evidence", []))
-    def test_category_reply_reuses_pending_ib_scope(
+    @patch("server.api_server._execute_planned_capability", return_value=("evidence", []))
+    def test_category_follow_up_after_failure_overview_keeps_the_ib(
         self, execute, chat_response, restore, store_decision, store_pending, clear_pending
     ):
         session_id = "planner-category-reply"
         tag = "CMSSW_20_1_X_2026-08-10-1100"
         try:
             chat(ChatRequest(question=f"failures for {tag}", session_id=session_id))
-            result = chat(ChatRequest(question="unit tests", session_id=session_id))
+            self.assertEqual(execute.call_args.args[0], "failure_overview")
+            self.assertEqual(_latest_ib_contexts[session_id], tag)
+            chat(ChatRequest(question="unit tests", session_id=session_id))
         finally:
-            from server.api_server import _request_planner
-            _request_planner.pending.pop(session_id, None)
+            _latest_ib_contexts.pop(session_id, None)
+            _latest_ib_arch_contexts.pop(session_id, None)
 
-        self.assertEqual(result, "unit-test evidence")
-        self.assertEqual(execute.call_args.args[:2], ("unittest", f"unit tests {tag}"))
+        self.assertEqual(execute.call_args.args[0], "unittest")
+        self.assertEqual(execute.call_args.args[2], session_id)  # handler resolves the session tag
 
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")
@@ -3694,7 +3702,7 @@ class ChatRoutingTests(unittest.TestCase):
         session_cls.side_effect = kgchat_factory
 
         result = chat(ChatRequest(
-            question="how many relvals failing in the latest IB", session_id="semantic-mismatch-rescue",
+            question="how many relvals are NOT failing in the latest IB", session_id="semantic-mismatch-rescue",
         ))
 
         self.assertEqual(result.answer, final_answer)
@@ -3702,6 +3710,351 @@ class ChatRoutingTests(unittest.TestCase):
         execute_capability.assert_called_once()
         verify_answer.assert_called_once()
         kgchat_factory.sessions[0].ask.assert_called_once()
+
+    @patch("server.api_server._retriever", None)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.KGChatSession")
+    @patch("server.api_server.verify_answer_matches_question", return_value=False)
+    @patch(
+        "server.api_server._execute_planned_capability",
+        return_value=("`CMSSW_20_1_EVTGEN3_X_2026-08-09-2300` has **13 failed RelVal(s)**.", []),
+    )
+    @patch("server.api_server._latest_ib_records")
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", True)
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_semantic_mismatch_rescue_never_replaces_answer_with_llm_absence_claim(
+        self, concepts, latest_ib_records, execute_capability, verify_answer, session_cls,
+        store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # Found live, 2026-10-06 tester replay: the verifier wrongly flagged a
+        # correct "13 failed RelVals" answer, and the rescue's LLM -- having
+        # called a tool with the wrong arguments -- replaced it with "No failing
+        # RelVal workflows were recorded". An unverified absence claim must
+        # never override a real deterministic answer.
+        latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
+        session_cls.side_effect = _mock_kgchat_session(
+            "No failing RelVal workflows were recorded for the build. The query returned an empty list.",
+            tool_results=[("get_failing_relvals", {"ib_tag": "CMSSW_20_1_EVTGEN3_X_2026-08-09-2300"}, [])],
+        )
+
+        result = chat(ChatRequest(
+            question="how many relvals errors in CMSSW_20_1_EVTGEN3_X_2026-08-09-2300, not counting warnings",
+            session_id="rescue-absence-claim",
+        ))
+
+        self.assertIn("13 failed RelVal", result.answer)
+        self.assertEqual(result.route, "capability:relval:verifier_rescue_unusable")
+
+    @patch("server.api_server._retriever", None)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.KGChatSession")
+    @patch("server.api_server.verify_answer_matches_question", return_value=False)
+    @patch(
+        "server.api_server._execute_planned_capability",
+        return_value=("IB comparison: 2 newly failing workflows.", [{"label": "x", "question": "y"}]),
+    )
+    @patch("server.api_server._latest_ib_records")
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", True)
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_semantic_mismatch_rescue_keeps_deterministic_answer_over_raw_evidence_dump(
+        self, concepts, latest_ib_records, execute_capability, verify_answer, session_cls,
+        store_chat_turns, restore, store_decision, clear_pending
+    ):
+        latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
+        session_cls.side_effect = _mock_kgchat_session(
+            "There are 42 newly failing workflows.",  # 42 not in evidence -> ungrounded
+            tool_results=[("get_failing_relvals", {}, [{"workflow_id": "1.0"}])],
+        )
+
+        result = chat(ChatRequest(
+            question="compare CMSSW_20_1_X_2026-10-05-1100 and CMSSW_20_1_X_2026-10-05-2300 but only el9_amd64_gcc14",
+            session_id="rescue-raw-dump",
+        ))
+
+        self.assertEqual(result.answer, "IB comparison: 2 newly failing workflows.")
+        self.assertEqual(result.route, "capability:comparison:verifier_rescue_unusable")
+        self.assertEqual([(a.label, a.question) for a in result.actions], [("x", "y")])
+
+    @patch("server.api_server._retriever", None)
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.KGChatSession")
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_llm_fallback_absence_claim_is_not_presented_as_fact(
+        self, concepts, session_cls, store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # Found live: "and on aarch64 only" -> the LLM called list_ib_tags with
+        # arch="aarch64" (not a real arch name), got [], and answered "no IBs
+        # with that architecture have been imported" -- false, there are
+        # hundreds. An LLM's "no such data" is shown as an empty lookup, not a fact.
+        session_cls.side_effect = _mock_kgchat_session(
+            "I couldn't find any Integration Build records for the aarch64 architecture in the current graph.",
+            tool_results=[("list_ib_tags", {"arch": "aarch64"}, [])],
+        )
+
+        result = chat(ChatRequest(question="Explain the graph topology", session_id="llm-absence-claim"))
+
+        self.assertEqual(result.route, "llm_unverified_absence")
+        self.assertNotIn("couldn't find any Integration Build", result.answer)
+        self.assertIn("doesn't prove the data isn't there", result.answer)
+
+    @patch("server.api_server._clear_pending_clarification")
+    @patch("server.api_server._store_planning_decision")
+    @patch("server.api_server._restore_pending_clarification")
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.verify_answer_matches_question", return_value=False)
+    @patch("server.api_server._execute_planned_capability", return_value=("13 failed RelVal(s).", []))
+    @patch("server.api_server._latest_ib_records")
+    @patch("server.api_server._llm_client", object())
+    @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", True)
+    @patch("server.api_server.search_concepts", return_value=[])
+    def test_semantic_verifier_skipped_without_scope_qualifier(
+        self, concepts, latest_ib_records, execute_capability, verify_answer,
+        store_chat_turns, restore, store_decision, clear_pending
+    ):
+        # 60 of 63 live verifier flags were false alarms on plain questions with
+        # no negation/exclusion/scope word -- the verifier must not even run there.
+        latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
+
+        result = chat(ChatRequest(
+            question="how many relvals errors in CMSSW_20_1_EVTGEN3_X_2026-08-09-2300", session_id="no-qualifier",
+        ))
+
+        verify_answer.assert_not_called()
+        self.assertEqual(result.route, "capability:relval")
+        self.assertEqual(result.answer, "13 failed RelVal(s).")
+
+    def test_scope_qualifier_detector(self):
+        for q in ("workflows NOT failing", "which archs have no build warnings", "everything except ASAN",
+                  "only aarch64", "relvals that didn't fail"):
+            self.assertTrue(_question_has_scope_qualifier(q), q)
+        for q in ("how many relvals errors in CMSSW_20_1_X_2026-08-09-2300", "compare the last two IBs",
+                  "what is the latest IB", "is workflow 140.051 a known issue"):
+            self.assertFalse(_question_has_scope_qualifier(q), q)
+
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server.KGChatSession")
+    def test_conversational_replies_never_reach_routing_or_llm(self, session_cls, store_chat_turns):
+        # Found live 2026-10-06: "hi", "thanks!", and "please rerun workflow
+        # 512.0" all got the generic "I couldn't match that" menu.
+        for question, route, phrase in (
+            ("hi", "conversational:greeting", "What would you like to check"),
+            ("Heelo!", "conversational:greeting", "What would you like to check"),
+            ("thanks!", "conversational:thanks", "welcome"),
+            ("please rerun workflow 512.0 for me", "conversational:read_only", "read-only"),
+            ("delete all relval data for the latest IB", "conversational:read_only", "read-only"),
+        ):
+            result = chat(ChatRequest(question=question, session_id=f"conv-{route}"))
+            self.assertEqual(result.route, route, question)
+            self.assertIn(phrase, result.answer)
+        session_cls.assert_not_called()
+
+    def test_conversational_patterns_leave_real_questions_alone(self):
+        from server.api_server import _GREETING_RE, _THANKS_RE
+        self.assertIsNone(_GREETING_RE.fullmatch("hi, what is the latest IB"))
+        self.assertIsNone(_THANKS_RE.fullmatch("ok"))  # may be a reply to a clarification
+        self.assertIsNone(_conversational_response("s", "which relvals were rerun in the latest IB"))
+        self.assertIsNone(_conversational_response("s", "merged PRs in the latest IB"))
+
+    @patch("server.api_server.get_driver")
+    def test_relval_known_error_lines_names_workflows_grouped_by_reason(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"workflow_id": "512.0", "message": "Architecture incompetibility. GridPacks were built for x86_64"},
+            {"workflow_id": "513.0", "message": "Architecture incompetibility. GridPacks were built for x86_64"},
+            {"workflow_id": "10805.31", "message": "Triton Server Instance for non-x86_64"},
+        ]
+        record = {"tag": "CMSSW_20_1_X_2026-10-05-2300", "arch": "el9_aarch64_gcc14", "known_error_relvals": 3}
+
+        lines = _relval_known_error_lines([("el9_aarch64_gcc14", record), ("x", {"known_error_relvals": 0})])
+
+        text = "\n".join(lines)
+        self.assertIn("excluded from the failing count", text)
+        self.assertIn("2 known error(s) -- \"Architecture incompetibility. GridPacks were built for x86_64\": `512.0`, `513.0`", text)
+        self.assertIn("`10805.31`", text)
+        session.run.assert_called_once()  # records without known errors are not queried
+
+    def test_relval_known_error_lines_skips_query_when_none(self):
+        self.assertEqual(_relval_known_error_lines([("a", {"known_error_relvals": 0})]), [])
+
+    def test_workflow_follow_up_resolves_to_last_mentioned_workflow(self):
+        # Found live 2026-10-06: after "tell me about workflow 512.0", "since
+        # when is it failing" and "on which architectures" lost the workflow.
+        from server.api_server import _last_workflow_contexts, _with_workflow_follow_up_context
+        sid = "wf-follow-up"
+        try:
+            self.assertEqual(_with_workflow_follow_up_context("tell me about workflow 512.0", sid),
+                             "tell me about workflow 512.0")
+            self.assertEqual(_with_workflow_follow_up_context("since when is it failing", sid),
+                             "since when is it failing (workflow 512.0)")
+            self.assertEqual(_with_workflow_follow_up_context("on which architectures", sid),
+                             "on which architectures (workflow 512.0)")
+            # Never hijack a question that names its own entity or another category.
+            for q in ("since when is CMSSW_20_1_X_2026-10-05-2300 failing", "is it in PR #52028",
+                      "which unit tests are failing", "what is the latest IB"):
+                self.assertEqual(_with_workflow_follow_up_context(q, sid), q)
+        finally:
+            _last_workflow_contexts.pop(sid, None)
+
+    @patch("server.api_server.get_relval_recurrence",
+           return_value={"total_appearances": 313, "failed_appearances": 41, "known_error_appearances": 33})
+    @patch("server.api_server.get_exit_code_names", return_value={16640: "OtherCMS"})
+    @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-10-05-2300"}])
+    @patch("server.api_server.get_driver")
+    def test_workflow_why_answer_defaults_to_latest_ib_and_explains_known_error(
+        self, get_driver, latest, names, recurrence
+    ):
+        # Found live: "why is workflow 512.0 failing on aarch64" answered
+        # "Please provide the Integration Build tag".
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.side_effect = [
+            [{"tag": "CMSSW_20_1_X_2026-10-05-2300", "arch": "el9_aarch64_gcc14", "variant": "primary",
+              "name": "DYTollJets_LO_Mad_13TeV_py8", "status": "FAILED", "exitcode": 16640, "errors": 0,
+              "known_error": True, "known_error_message": "GridPacks were built for x86_64"}],
+            [{"tag": "CMSSW_20_1_X_2026-10-05-2300", "arch": "el9_aarch64_gcc14", "step": "step1",
+              "category": "ExternalLHEProducer", "text": "Child failed with exit code 2.", "source_url": "https://x"}],
+        ]
+
+        answer = _workflow_why_failing_answer("why is workflow 512.0 failing on aarch64", "why-latest")
+
+        self.assertIn("the latest IB", answer)
+        self.assertIn("CMSSW_20_1_X_2026-10-05-2300", answer)
+        self.assertIn("16640 (OtherCMS)", answer)
+        self.assertIn("known error", answer)
+        self.assertIn("GridPacks were built for x86_64", answer)
+        self.assertIn("ExternalLHEProducer", answer)
+        self.assertIn("41 of 313", answer)
+        self.assertIn("CONTAINS $family", session.run.call_args_list[0].args[0])
+        self.assertEqual(session.run.call_args_list[0].kwargs["family"], "aarch64")
+
+    def test_workflow_why_answer_leaves_pr_and_unrelated_questions_alone(self):
+        self.assertIsNone(_workflow_why_failing_answer("why is workflow 512.0 failing, any open issue?", "s"))
+        self.assertIsNone(_workflow_why_failing_answer("why is the build red", "s"))
+
+    @patch("server.api_server.get_exit_code_names", return_value={62720: "SIGSEGV"})
+    @patch("server.api_server.get_driver")
+    def test_failure_overview_lists_every_category_and_separates_known_errors(self, get_driver, names):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [
+            {"tag": "T", "arch": "el9_aarch64_gcc14", "variant": "primary", "build_status": "passed",
+             "failed_relvals": [], "known_errors": 50, "failed_unittests": ["SimG4Core/Geometry"]},
+            {"tag": "T_ASAN", "arch": "el9_amd64_gcc14", "variant": "ASAN", "build_status": "warning",
+             "failed_relvals": [{"wf": "136.817", "name": "RunDoubleEG2017E", "exitcode": 62720}],
+             "known_errors": 0, "failed_unittests": []},
+        ]
+
+        answer, actions = _failure_overview_answer("T", None)
+
+        self.assertIn("no build errors", answer)
+        self.assertIn("Built with compilation warnings: `ASAN` `el9_amd64_gcc14`", answer)
+        self.assertIn("`136.817` RunDoubleEG2017E (exit 62720 (SIGSEGV))", answer)
+        self.assertIn("50 known-error RelVal(s), excluded", answer)
+        self.assertIn("`SimG4Core/Geometry`", answer)
+        self.assertNotIn("None", answer)
+        self.assertEqual({a["label"] for a in actions} >= {"RelVal details", "Unit-test details"}, True)
+
+    def test_recurrence_intent_covers_failed_before(self):
+        from server.api_server import _RECURRING_FAILURE_INTENT_RE
+        for q in ("has workflow 140.051 failed before", "did it fail previously", "was it failing in the past"):
+            self.assertTrue(_RECURRING_FAILURE_INTENT_RE.search(q), q)
+
+    @patch("server.api_server.get_driver")
+    def test_arch_family_follow_up_resolves_only_when_unambiguous(self, get_driver):
+        from server.api_server import _with_arch_family_context
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        sid = "arch-family"
+        _latest_ib_contexts[sid] = "CMSSW_20_1_X_2026-10-05-2300"
+        try:
+            session.run.return_value = [{"arch": "el9_aarch64_gcc14"}]
+            self.assertEqual(_with_arch_family_context("and on aarch64 only", sid),
+                             "and on aarch64 only el9_aarch64_gcc14")
+            session.run.return_value = [{"arch": "el8_aarch64_gcc13"}, {"arch": "el9_aarch64_gcc14"}]
+            self.assertEqual(_with_arch_family_context("and on arm", sid), "and on arm")  # never guess
+            self.assertEqual(_with_arch_family_context("on el9_amd64_gcc14", sid), "on el9_amd64_gcc14")
+        finally:
+            _latest_ib_contexts.pop(sid, None)
+
+    def test_scope_only_follow_up_repeats_previous_capability(self):
+        from server.api_server import _last_capability_contexts, _with_previous_capability_context
+        sid = "prev-capability"
+        _last_capability_contexts[sid] = "unittest"
+        try:
+            self.assertEqual(_with_previous_capability_context("and on aarch64 only el9_aarch64_gcc14", sid),
+                             "unit tests and on aarch64 only el9_aarch64_gcc14")
+            self.assertEqual(_with_previous_capability_context("all architectures", sid), "unit tests all architectures")
+            for q in ("relvals on el9_amd64_gcc14", "what is the latest IB", "hello el9_amd64_gcc14 is great and I want to know more about it"):
+                self.assertEqual(_with_previous_capability_context(q, sid), q)
+        finally:
+            _last_capability_contexts.pop(sid, None)
+
+    @patch("server.api_server._latest_ib_records", return_value=[{"release": "CMSSW_20_1_X", "tag": "CMSSW_20_1_X_2026-10-05-2300"}])
+    @patch("server.api_server.get_driver")
+    def test_ib_slot_availability_resolves_yesterday_in_cern_time(self, get_driver, latest):
+        # Found live: the LLM decided "yesterday" was two days ago.
+        from server.api_server import _ib_slot_availability_answer
+        from zoneinfo import ZoneInfo
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        yesterday = (datetime.now(ZoneInfo("Europe/Zurich")) - timedelta(days=1)).strftime("%Y-%m-%d")
+        session.run.side_effect = [
+            [{"tag": f"CMSSW_20_1_X_{yesterday}-2300", "arch": "el9_amd64_gcc14", "parent_tag": f"CMSSW_20_1_X_{yesterday}-2300", "variant": None}],
+            [{"tag": f"CMSSW_20_1_X_{yesterday}-2300"}],
+        ]
+
+        answer = _ib_slot_availability_answer("is the 23:00 IB of yesterday available?")
+
+        self.assertIn(f"{yesterday} 23:00", answer)
+        self.assertIn(f"CMSSW_20_1_X_{yesterday}-2300", answer)
+        self.assertEqual(session.run.call_args_list[0].kwargs["stamps"], [f"_{yesterday}-2300"])
+        self.assertIsNone(_ib_slot_availability_answer("what is the latest IB"))
+        self.assertIsNone(_ib_slot_availability_answer("did the latest IB build successfully?"))
+
+    def test_planner_ignores_category_words_inside_jenkins_job_names(self):
+        from server.request_planner import RequestContext
+        self.assertEqual(RequestContext.extract("what does ib-run-gpu-relvals depend on").categories, frozenset())
+        self.assertEqual(RequestContext.extract("what does the build-any-ib jenkins job do").categories, frozenset())
+        self.assertNotIn("relval", RequestContext.extract("how does the PR approval workflow work").categories)
+        self.assertIn("relval", RequestContext.extract("failing relvals in the latest IB").categories)
+        self.assertIn("relval", RequestContext.extract("which workflows failed").categories)
+        self.assertIn("pr_evidence", RequestContext.extract("any PRs for this").categories)
+
+    def test_explicit_pr_question_outranks_the_category_it_mentions(self):
+        from server.api_server import _request_planner
+        from server.request_planner import RequestContext
+        plan = _request_planner.plan(RequestContext.extract("any PR fixing the MPICore unit test failure?"))
+        self.assertEqual(plan.capability, "pr_evidence")
+
+    def test_latest_typos_are_normalized(self):
+        self.assertIn("latest", _normalize_deterministic_question("lates ib relval failurs"))
+        self.assertIn("failures", _normalize_deterministic_question("lates ib relval failurs"))
+        self.assertIn("unit tests", _normalize_deterministic_question("UT failures"))
+        self.assertEqual(_normalize_deterministic_question("but ut is fine"), "but ut is fine")
+
+    def test_llm_absence_claim_detector(self):
+        for text in (
+            "No failing RelVal workflows were recorded for the build.",
+            "The graph does not contain `CMSSW_20_1_X_2026-09-07-1100`.",
+            "The query returned an empty list, indicating that all unit tests passed.",
+            "I couldn't find any IB records for the requested tag.",
+            "No unit tests failed in the build CMSSW_20_1_X_2026-09-20-2300.",
+        ):
+            self.assertTrue(_llm_answer_is_absence_claim(text), text)
+        for text in (
+            "There are 5 failing workflows on CMSSW_20_1_X_2026-08-17-2300.",
+            "The `build-any-ib` job is the entry point for creating an Integration Build.",
+            "Exit code 16640 means OtherCMS.",
+        ):
+            self.assertFalse(_llm_answer_is_absence_claim(text), text)
 
     def test_verification_session_context_is_none_without_an_established_tag(self):
         self.assertIsNone(_verification_session_context("what about unit tests", "no-context-session"))
@@ -3759,7 +4112,7 @@ class ChatRoutingTests(unittest.TestCase):
         session_id = "verification-context-followup"
         _latest_ib_contexts[session_id] = tag
         try:
-            result = chat(ChatRequest(question="what about unit tests", session_id=session_id))
+            result = chat(ChatRequest(question="what about unit tests, only the failing ones", session_id=session_id))
         finally:
             _latest_ib_contexts.pop(session_id, None)
 
@@ -3951,43 +4304,36 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server._store_pending_clarification")
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
-    @patch("server.api_server._category_failure_snapshot", return_value=None)
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server._failure_overview_answer", return_value=("overview", []))
     @patch("server.api_server._latest_ib_records")
     def test_bare_failure_request_resolves_to_latest_tag_before_routing(
-        self, latest_ib_records, snapshot, restore, store_decision, store_pending, clear_pending
+        self, latest_ib_records, overview, store_chat_turns, restore, store_decision, store_pending, clear_pending
     ):
-        # "what are failing" names no tag, no category (relval/build/unittest/
-        # clang), and doesn't even say "latest"/"IB" -- it used to fall all the
-        # way to the generic "I couldn't match that" fallback instead of the
-        # informative, tag-present "which category?" clarification.
+        # "what are failing" names no tag, no category, and doesn't even say
+        # "latest"/"IB" -- it must still resolve to the latest IB and answer.
         latest_ib_records.return_value = [{"tag": "CMSSW_20_1_X_2026-08-17-2300"}]
         session_id = "bare-failure-resolve"
-
         try:
             result = chat(ChatRequest(question="what are failing", session_id=session_id))
         finally:
-            from server.api_server import _request_planner
-            _request_planner.pending.pop(session_id, None)
+            _latest_ib_contexts.pop(session_id, None)
 
-        self.assertEqual(result.route, "clarification")
-        self.assertIn("Do you want build warnings", result.answer)
-        snapshot.assert_called_once_with("CMSSW_20_1_X_2026-08-17-2300")
+        self.assertEqual(result.route, "capability:failure_overview")
+        overview.assert_called_once_with("CMSSW_20_1_X_2026-08-17-2300", None)
 
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_pending_clarification")
     @patch("server.api_server._store_planning_decision")
     @patch("server.api_server._restore_pending_clarification")
-    @patch("server.api_server._category_failure_snapshot", return_value=None)
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server._failure_overview_answer", return_value=("overview", []))
     @patch("server.api_server._latest_ib_records")
     def test_bare_failure_request_reuses_an_existing_session_tag_over_latest(
-        self, latest_ib_records, snapshot, restore, store_decision, store_pending, clear_pending
+        self, latest_ib_records, overview, store_chat_turns, restore, store_decision, store_pending, clear_pending
     ):
-        # A bare follow-up in a session that already has a tag from an
-        # earlier turn must reach the same tag-present clarification using
-        # THAT tag, never silently jump to the latest IB instead --
-        # RequestPlanner._clarification only looks at the question's own
-        # text, so the session tag must be injected into it, same as the
-        # no-session-tag case above.
+        # A bare follow-up in a session that already has a tag must use THAT
+        # tag, never silently jump to the latest IB instead.
         session_id = "bare-failure-existing-context"
         established_tag = "CMSSW_20_1_X_2026-07-01-1100"
         _latest_ib_contexts[session_id] = established_tag
@@ -3995,12 +4341,10 @@ class ChatRoutingTests(unittest.TestCase):
             result = chat(ChatRequest(question="what are failing", session_id=session_id))
         finally:
             _latest_ib_contexts.pop(session_id, None)
-            from server.api_server import _request_planner
-            _request_planner.pending.pop(session_id, None)
 
-        self.assertEqual(result.route, "clarification")
+        self.assertEqual(result.route, "capability:failure_overview")
         latest_ib_records.assert_not_called()
-        snapshot.assert_called_once_with(established_tag)
+        overview.assert_called_once_with(established_tag, None)
 
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")

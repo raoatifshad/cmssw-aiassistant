@@ -43,7 +43,13 @@ SHIFT_SUMMARY_RE = re.compile(
     # Reversed order: "relval failures are new [between <A> and <B>]" --
     # found live alongside the gap above, same underlying question, just
     # phrased with the category noun and "new" swapped.
-    r"\b(?:failures?|errors?|warnings?|issues?)\b[^?!]{0,10}\b(?:is|are)\s+new\b",
+    r"\b(?:failures?|errors?|warnings?|issues?)\b[^?!]{0,10}\b(?:is|are)\s+new\b|"
+    # "anything new broken since this morning's IB?" / "what regressed since
+    # yesterday" -- found live 2026-10-06 tester run: no failure noun, so none
+    # of the above matched and the uppercase "IB" became a GitHub text search.
+    r"\bnew(?:ly)?\b[^?!]{0,20}\b(?:broken|broke|regress(?:ed|ions?)?)\b|"
+    r"\b(?:broken|broke|regress(?:ed|ions?)?)\b[^?!]{0,30}\bsince\b|"
+    r"\bsince\s+(?:this\s+morning|yesterday|last\s+night|today)\b",
     re.IGNORECASE,
 )
 
@@ -89,15 +95,25 @@ class RequestContext:
         architecture = "_".join(architecture_match.groups()).lower() if architecture_match else None
         lowered = question.lower()
         categories: set[str] = set()
-        if re.search(r"\brel[\s-]*vals?\b", lowered) or re.search(r"\b(?:wfs?|work\s*flows?)\b", lowered):
+        # (?<![\w-]) / (?![\w-]) rather than \b: a hyphen is a \b boundary, so
+        # Jenkins job names like "ib-run-gpu-relvals" / "build-any-ib" used to
+        # trigger the relval / build categories (found live 2026-10-06; the same
+        # bug _normalize_deterministic_question already fixed for its own
+        # relvals->relval rewrite). "workflow" in a process sense ("PR approval
+        # workflow", "release workflow") isn't a RelVal workflow either.
+        if re.search(r"(?<![\w-])rel[\s-]*vals?(?![\w-])", lowered) or re.search(
+            r"(?<!approval )(?<!review )(?<!release )(?<!request )(?<!github )(?<!jenkins )(?<!ci )"
+            r"(?<![\w-])(?:wfs?|work\s*flows?)(?![\w-])",
+            lowered,
+        ):
             categories.add("relval")
         if re.search(r"\bunit(?:[\s-]*tests?)?\b", lowered) or re.search(r"\bpackages?\b", lowered):
             categories.add("unittest")
         if re.search(r"\bclang\b", lowered):
             categories.add("clang")
-        if re.search(r"\b(?:build|warnings?)\b", lowered):
+        if re.search(r"(?<![\w-])(?:build|warnings?)(?![\w-])", lowered):
             categories.add("build")
-        if re.search(r"\b(?:pr|mr|pull\s+request|merge\s+request|issues?)\b", lowered):
+        if re.search(r"\b(?:prs?|mrs?|pull\s+requests?|merge\s+requests?|issues?)\b", lowered):
             categories.add("pr_evidence")
         scope = Scope.EXPLICIT_ARCHITECTURE if architecture else (
             Scope.ALL if re.search(r"\b(?:all|everything)\b", lowered) else Scope.DEFAULT
@@ -134,6 +150,7 @@ class Capability:
     requires_comparison: bool = False
     requires_relationship: bool = False
     requires_shift_summary: bool = False
+    requires_no_categories: bool = False
     bare_tag_only: bool = False
     llm_only: bool = False
     priority: int = 0
@@ -156,6 +173,8 @@ class Capability:
         if self.requires_shift_summary and not context.has_shift_summary_request:
             return None
         if self.bare_tag_only and not context.is_bare_ib_tag:
+            return None
+        if self.requires_no_categories and context.categories:
             return None
         score = self.priority
         score += 20 * len(self.required_categories)
@@ -270,11 +289,17 @@ class RequestPlanner:
         arch_suffix = f" {pending.context['arch']}" if pending.context.get("arch") else ""
         return RequestContext.extract(f"{context.question} {pending.context['tag']}{arch_suffix}")
 
-    @staticmethod
-    def _clarification(context: RequestContext) -> Clarification | None:
+    def _clarification(self, context: RequestContext) -> Clarification | None:
+        # "what is failing in <tag>" with no category used to ask "build
+        # warnings, failed RelVals, unit-test results, or a combined IB
+        # summary?" -- 126 of 128 clarifications in the 2026-10-06 replay of
+        # real sessions. It is now answered directly by the "failure_overview"
+        # capability (everything failing, every category); this branch only
+        # remains for a planner built without that capability registered.
         if (
             context.tag and context.has_failure_request
             and not context.categories and not context.has_shift_summary_request
+            and not any(capability.name == "failure_overview" for capability in self.capabilities)
         ):
             arch_suffix = f" {context.architecture}" if context.architecture else ""
             clarification_context = {"tag": context.tag}
