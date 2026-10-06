@@ -584,6 +584,37 @@ _JENKINS_JOB_NAME_RE = re.compile(
 )
 
 
+_DOC_TERM_STOP_WORDS = frozenset(
+    "about above after again against because before being below between could does doing during each "
+    "further having here into itself just more most other over same should some such than that their them "
+    "then there these they this those through under until very what when where which while will with would "
+    "your also only once both answer question below following summary summarized steps details".split()
+)
+
+
+def _doc_terms(text: str) -> set[str]:
+    words = re.findall(r"[a-z][a-z0-9_-]{4,}", text.lower())
+    return {re.sub(r"(?:ing|ed|es|s)$", "", w) for w in words if w not in _DOC_TERM_STOP_WORDS}
+
+
+def _doc_answer_terms_grounded(answer: str, tool_evidence: list[dict], min_ratio: float = 0.35) -> bool:
+    """For an answer built on search_shifter_docs evidence: most of its
+    distinctive wording must come from the retrieved documentation. Found
+    live 2026-10-06: "how does the CMSSW pull request approval workflow work"
+    produced a confident six-step process ("GitHub Actions", "squash-merge")
+    that is not in the wiki page at all -- only 21% of its distinctive words
+    appear in the retrieved chunks, vs 44-72% for genuine docs answers. It
+    had only ever been rejected by accident (its step numbers tripped the
+    number check), not by anything checking the content."""
+    if not any(item.get("tool") == "search_shifter_docs" for item in tool_evidence):
+        return True
+    terms = _doc_terms(answer)
+    if len(terms) < 12:
+        return True
+    evidence_terms = _doc_terms(json.dumps(tool_evidence, default=str))
+    return len(terms & evidence_terms) / len(terms) >= min_ratio
+
+
 def _shifter_doc_claims_grounded(question: str, answer: str, tool_evidence: list[dict]) -> bool:
     """Crude, conservative guard for search_shifter_docs evidence specifically
     -- the CMSSDT Jenkins-job wiki pages are dozens of near-identical entries
@@ -6224,6 +6255,11 @@ def _run_llm_investigation(
             return _respond(answer, f"{route_prefix}llm_ungrounded_fallback", citations)
         if not _evidence_grounded(answer, evidence):
             answer = _format_raw_evidence(evidence)
+            return _respond(answer, f"{route_prefix}llm_ungrounded_fallback", citations)
+        if not _doc_answer_terms_grounded(answer, evidence):
+            answer = _format_raw_evidence(
+                evidence, reason="most of its wording does not come from the retrieved documentation",
+            )
             return _respond(answer, f"{route_prefix}llm_ungrounded_fallback", citations)
         if not _shifter_doc_claims_grounded(question, answer, evidence):
             answer = _format_raw_evidence(
