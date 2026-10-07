@@ -6110,6 +6110,30 @@ _LLM_ABSENCE_CLAIM_RE = re.compile(
 )
 
 
+_PROCEDURAL_START_RE = re.compile(
+    r"^\s*(?:how\s+(?:do|does|is|are|can|to|should)|where\s+(?:is|are|do|does|can)|why\s+(?:do|does|are|is\s+there)|"
+    r"what\s+(?:is|are|does|do)\s+(?:the\s+)?(?:process|procedure|steps?|purpose|role|meaning)|"
+    r"explain\s+(?:how|the\s+process)|describe)\b",
+    re.IGNORECASE,
+)
+_RESULTS_WORD_RE = re.compile(
+    r"\b(?:fail\w*|errors?|broken|passing|passed|status|count|how\s+many|latest|newest|current|today|"
+    r"yesterday|last|previous|known\s+error|red|green)\b|\b\d{1,6}\.\d+\b|#\d+",
+    re.IGNORECASE,
+)
+
+
+def _is_procedural_question(question: str) -> bool:
+    """A question about how the IB system works ("how are IB unit tests run",
+    "where are the unit test logs"), not about specific imported results."""
+    return bool(
+        _PROCEDURAL_START_RE.search(question)
+        and not _RESULTS_WORD_RE.search(question)
+        and not IB_TAG_RE.search(question)
+        and not _requested_ib_arch(question)
+    )
+
+
 def _current_date_note() -> str:
     """The model has no clock: found live 2026-10-06 (held-out tester set), it
     answered "today's IBs" and "today vs yesterday" with the previous day's
@@ -7191,6 +7215,15 @@ def chat(req: ChatRequest):
             if snapshot:
                 clarification_message = f"{snapshot}\n\n{clarification.question}"
         return _chat_response(sid, original_question, clarification_message, "clarification", actions=actions)
+    if (
+        planned.kind == PlanKind.DETERMINISTIC and planned.capability
+        and _llm_client is not None and _is_procedural_question(original_question)
+    ):
+        # "how are IB unit tests run" / "where are the unit test logs" mention
+        # a category word but ask how the system works, not for results --
+        # found live 2026-10-07 answering "Name an Integration Build tag".
+        # The documentation-backed investigation path answers these.
+        return _run_llm_investigation(sid, original_question, question, planned, route_prefix="procedural:")
     if planned.kind == PlanKind.DETERMINISTIC and planned.capability:
         planned_answer = _execute_planned_capability(planned.capability, question, sid)
         if planned_answer:

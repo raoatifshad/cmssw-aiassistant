@@ -4210,6 +4210,25 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertFalse(_doc_answer_terms_grounded(invented, evidence))
         self.assertTrue(_doc_answer_terms_grounded(invented, [{"tool": "get_failing_relvals", "result": []}]))
 
+    def test_procedural_questions_are_not_treated_as_results_requests(self):
+        # Found live 2026-10-07: "how are IB unit tests run" / "where are the unit
+        # test logs of an IB" got "Name an Integration Build tag".
+        from server.api_server import _is_procedural_question
+        for q in ("where are the unit test logs of an IB", "how are IB unit tests run",
+                  "how are relvals selected for an IB", "what are the steps to start a new release cycle"):
+            self.assertTrue(_is_procedural_question(q), q)
+        for q in ("how many relvals are failing", "where is workflow 512.0 failing", "what is the latest IB",
+                  "how do unit tests fail in ASAN", "how are unit tests in CMSSW_20_1_X_2026-10-05-2300"):
+            self.assertFalse(_is_procedural_question(q), q)
+
+    @patch("server.api_server._store_chat_turns")
+    @patch("server.api_server._run_llm_investigation", return_value="docs answer")
+    @patch("server.api_server._llm_client", object())
+    def test_procedural_unit_test_question_goes_to_the_docs_path(self, investigate, store_chat_turns):
+        result = chat(ChatRequest(question="how are IB unit tests run", session_id="procedural"))
+        self.assertEqual(result, "docs answer")
+        self.assertEqual(investigate.call_args.kwargs["route_prefix"], "procedural:")
+
     def test_llm_absence_claim_detector(self):
         for text in (
             "No failing RelVal workflows were recorded for the build.",
