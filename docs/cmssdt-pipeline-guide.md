@@ -214,6 +214,35 @@ Clang diagnostics are kept independently of `cmsrepo` under this layout:
 The parser extracts diagnostic locations and associates them with package,
 file, and checker facts.
 
+### IB test logs (cmssdt9-02)
+
+The dashboard data only says whether each test passed. The raw logs on
+`cmssdt9-02:/data/sdt/buildlogs/` (`unitTestLogs.zip`, `addOnTests.zip`,
+`pyRelValMatrixLogs.zip` per IB, architecture and GPU/other variant) show
+what happened inside, and the server deletes them after about one week.
+
+```text
+cmssdt9-02 --rsync--> IB-TEST-LOGS/server-copy/ --fetch_ib_test_logs.py--> results/*.json.gz --ingest_test_logs.py--> Neo4j
+                                   (deleted once scanned)                  (kept, a few MB/day)
+```
+
+- `ib_test_log_scanner.py` reads every log line by line and keeps every
+  test/workflow with its status, plus exceptions, crashes, sanitizer
+  reports, assertions, tracebacks and infrastructure errors, with the test
+  they belong to and whether it passed. Warnings and plain error lines are
+  grouped, and debug output is dropped.
+- `fetch_ib_test_logs.py` keeps a ledger, so nothing is scanned twice. It
+  keeps the local copy of a zip that failed and retries it, and at the end
+  lists every zip the dashboard expects that was never scanned.
+- `ingest_test_logs.py` stores `TestLogRun`, `LogProblem`,
+  `ProblemSignature` and `ProblemFirstSeen` nodes (see
+  `current-neo4j-database-structure.md`, section 7).
+
+The copy is a pull from the chatbot host (`rsync root@cmssdt9-02.cern.ch:...`),
+which works for `/data/sdt/buildlogs/` (used daily since 2026-10-12). The exact
+rsync command and the routine are in the README section "IB test logs". Run it
+at least every few days, or logs are lost.
+
 ## Incremental Ingestion
 
 `ingestion/build_graph.py` hashes every source unit. When a file's hash has

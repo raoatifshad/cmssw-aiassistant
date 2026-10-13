@@ -39,6 +39,15 @@ cd shifter-wiki && git fetch --prune origin master && git reset --hard origin/ma
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_shifter_docs.py \
   --wiki-root "$PWD/shifter-wiki" --cmsrepo "$PWD/cmsrepo" --reconcile
 
+# IB test logs from cmssdt9-02 (unit/addOn/RelVal zips; the server deletes
+# them after ~1 week, so run at least every few days). The user copies with
+# their own rsync (full command in README "IB test logs"), then:
+PYTHONPATH=ingestion venv/bin/python ingestion/fetch_ib_test_logs.py --no-server --delete-local
+PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_test_logs.py \
+  --results /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results
+# scan one zip by hand (read-only report, writes nothing)
+PYTHONPATH=ingestion venv/bin/python ingestion/ib_test_log_scanner.py <zip> [--addon-log addOnTests.log] [--json out.json]
+
 # run the API
 uvicorn server.api_server:app --reload --port 8001
 curl http://localhost:8001/api/health
@@ -121,6 +130,43 @@ additionally deletes graph records whose backing source file is gone
   CERN SSO so staging individual logs didn't scale). An exception only
   attaches if its release/architecture/workflow already matches an ingested
   `RelVal`.
+- **IB test logs** — a separate three-step pipeline, not part of
+  `build_graph.py`: `ib_test_log_scanner.py` (pure parser, streams zip
+  members line by line with a 64 KB per-line cap -- a CLANG unit log has a
+  single 2 GB line, and the DBG unit zip is 13 GB unpacked),
+  `fetch_ib_test_logs.py` (copy → scan → `results/*.json.gz` + ledger →
+  delete the copy; `results/` is the durable copy, never delete it) and
+  `ingest_test_logs.py` (results → `TestLogRun`/`LogProblem`/
+  `ProblemSignature`/`ProblemFirstSeen`, ImportState prefix `testlogs:`, so
+  `build_graph.py --reconcile` never touches it). Its purpose: problems
+  inside tests the dashboard shows as PASSED. Invariants: it never creates
+  `IB` nodes (MATCH only, relinked later) so "latest IB" can't shift; a test
+  is never relabeled failed; nothing is marked "expected" automatically (the
+  user confirms each); a detected problem is never silently dropped.
+  Chat side: `_pasted_exception_response` (`server/api_server.py`, runs
+  before the planner) prepends `_test_log_problem_answer` (backed by
+  `search_test_log_problems` in `graph/tools.py`, fulltext index
+  `logProblemText`) to the GitHub evidence, and also handles sanitizer /
+  traceback / assertion pastes that have no exception category. The paste
+  is read by the scanner itself (`parse_pasted_error`, built on the
+  scanner's `problem_details`, the same function that produced the stored
+  `names`/`modules`/`context_keys`) and searched through parallel channels
+  (`search_test_log_problems_report`): signature lookup (exact), text
+  (contains the paste), the `logProblemNames` index (specific names matched
+  whole; producer keys = same producer, any message) and same-category in
+  the pasted IB. Results are merged per problem and labelled exact /
+  contains / related / module / weak / same_ib -- the exception category
+  alone never counts, weak matches only show when nothing stronger does.
+  The answer ends with "Searched the test logs by: ..." (every key and its
+  count; a channel that failed is said, not hidden). "Not in the test logs"
+  is only said when the logs could actually be searched. GitHub is searched by
+  those same names together (`_pasted_names_github_answer`, ranked by how
+  many each item mentions), before the category-only list. Tests:
+  `tests/test_test_log_answers.py`; live: the three "pasted ..." scenarios in
+  `scripts/validate_bot.py`. When
+  changing detection or normalization, bump `SCANNER_VERSION`, and measure
+  "new" generic lines over a week of data -- run-specific text (timestamps,
+  hosts, paths) leaking into a signature makes every build look "new".
 - `--github-issues` — optional raw CMSSW GitHub Issues export
   (dir or `.tar`/`.tar.gz`), imports PR/Issue bodies, labels, comments, and
   explicit `#number`/URL cross-references. Never calls GitHub live.
@@ -342,9 +388,10 @@ contradicted, one grace period if newly undecidable). `search_concepts`
 `relval_recurrence`, `latest_ib_stalled`, `unittest_failure_count`,
 `build_failure_count`) evaluated on demand via `evaluate_rules()`
 (`POST /api/alerts/evaluate`), notifying through a `Notifier` protocol
-(currently only `LogNotifier`). There is deliberately no `addon_*` rule type:
-addon test results are not imported into the graph at all (no ingestion path
-exists for them), so an addon alert would have nothing to check against.
+(currently only `LogNotifier`). There is no `addon_*` rule type yet: the
+dashboard data has no per-test addOn results, and the addOn results now
+imported from the raw logs (`TestLogRun {suite:'addon'}`) aren't wired into
+any rule.
 
 ### Log RAG (`log_rag/`)
 

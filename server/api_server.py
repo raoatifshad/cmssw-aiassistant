@@ -35,6 +35,7 @@ from tools import (  # noqa: E402
     get_unittest_names, relval_failure_architectures, search_concepts, search_issues_by_text,
     search_workflow_ids, store_shift_summary, top_recurring_relval_failures,
     latest_and_previous_primary_tags, variant_previous_tag, single_ib_status,
+    search_test_log_problems, search_test_log_problems_report, test_log_coverage, parse_pasted_error,
 )
 from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # noqa: E402
 from server.llm_client import DEFAULT_MODEL, get_client  # noqa: E402
@@ -6284,6 +6285,277 @@ def _run_llm_investigation(
         )
 
 
+_LOG_PROBLEM_PASTE_RE = re.compile(
+    r"Begin Fatal Exception|An exception of category|ERROR: (?:Address|Leak|Thread|Memory)Sanitizer|"
+    r"runtime error:|Traceback \(most recent call last\)|Assertion [`'].*failed|"
+    r"terminate called after throwing|A fatal system signal has occurred"
+)
+_LOG_KIND_LABELS = {
+    "fatal_exception": "fatal exception", "sanitizer": "sanitizer report", "ubsan": "UBSan report",
+    "crash": "crash", "assertion": "assertion failure", "uncaught_exception": "uncaught exception",
+    "python_traceback": "Python traceback", "infrastructure_error": "infrastructure error",
+    "message_logger": "MessageLogger message", "generic_error_line": "error line",
+}
+
+
+def _test_log_problem_answer(question: str, category: str | None = None) -> str | None:
+    """Where a pasted error appears in the imported raw IB test logs (unit tests,
+    addOn tests, RelVal steps) -- including inside tests the dashboard shows as
+    PASSED, which no other evidence source here can see. None when nothing matches,
+    so callers add it to, never replace, their other evidence."""
+    try:
+        report = search_test_log_problems_report(question, category=category, limit=4)
+    except Exception as exc:
+        print(f"WARNING: test-log search failed: {exc}")
+        return None
+    problems = report["problems"]
+    try:
+        parsed = parse_pasted_error(question)
+    except Exception:
+        parsed = {}
+    names = (parsed.get("message_names") or []) + (parsed.get("context_names") or [])
+    exact_found = any(p.get("match", "exact") in ("exact", "contains") for p in problems)
+    if not problems and not names:
+        return None
+    asked_tags = set(IB_TAG_RE.findall(question))
+    try:
+        coverage = test_log_coverage()
+    except Exception:
+        coverage = {}
+    searched = bool(coverage.get("runs"))  # "not found" only when the logs could be searched
+    if not problems and not searched:
+        return None
+    lines = []
+    if not exact_found and names and searched:
+        span = (f" (IBs from {coverage['first'][:10]} to {coverage['last'][:10]})"
+                if coverage.get("first") and coverage.get("last") else "")
+        not_found = {item["key"] for item in report["searched"] if item["by"] == "name" and not item["found"]}
+        missing = [n for n in names if n in not_found][:4]
+        lines.append(f"**This exact error is not in the imported IB test logs**{span}"
+                     + (": no unit-test, addOn or RelVal log there mentions " + ", ".join(f"`{n}`" for n in missing)
+                        if missing else "") + ".")
+        context_note = _pasted_error_context_note(parsed)
+        if context_note:
+            lines.append(context_note)
+    headers = {
+        "exact": "**This exact error is in the imported IB test logs** (raw unit-test, addOn and RelVal logs):",
+        "contains": "**Found in the imported IB test logs** -- problems whose log text contains your pasted text:",
+        "related": "**Found in the imported IB test logs** by the specific names in your paste (not a match of the "
+                   "whole error -- compare the evidence):",
+        "module": "**Same producer, different message** -- `{category}` problems raised in the same producer or "
+                  "executable as your paste:",
+        "weak": "**Weak matches only** -- one or two ordinary identifiers in common, probably a different problem:",
+        "same_ib": "**Other `{category}` problems in {tags}** (the IB in your paste) -- a different error, shown only "
+                   "because it hit the same build:",
+    }
+    shown_header = None
+    for index, problem in enumerate(problems, 1):
+        how = problem.get("match", "exact")
+        if how != shown_header:
+            shown_header = how
+            lines.append("\n" + headers[how].format(
+                category=parsed.get("category") or category or "",
+                tags=", ".join(f"`{t}`" for t in parsed.get("ib_tags") or [])))
+        kind = _LOG_KIND_LABELS.get(problem["kind"], problem["kind"])
+        category_text = f" **{problem['category']}**" if problem.get("category") else ""
+        lines.append(f"\n{index}. {kind}{category_text}: {problem['summary']}")
+        if how in ("related", "weak") and problem.get("shared_terms"):
+            lines.append("   - Shares with your paste: " + ", ".join(f"`{t}`" for t in problem["shared_terms"][:5]))
+        if how == "module" and problem.get("shared_terms"):
+            lines.append("   - Same producer: " + ", ".join(f"`{k.split('|', 1)[1]}`" for k in problem["shared_terms"][:3]))
+        if problem.get("modules"):
+            lines.append("   - Raised in module(s): " + ", ".join(f"`{m}`" for m in problem["modules"][:4])
+                         + (f" +{len(problem['modules']) - 4} more" if len(problem["modules"]) > 4 else ""))
+        pasted_modules = parsed.get("modules") or []
+        if pasted_modules and how in ("exact", "contains"):
+            evidence_text = problem.get("evidence") or ""
+            if not any(m.split("/", 1)[0] in evidence_text for m in pasted_modules):
+                stored = re.findall(r"\bmodule (?:of type )?(\w+/'[^']*')", evidence_text)
+                lines.append("   - Same message, but your paste's module " + ", ".join(f"`{m}`" for m in pasted_modules)
+                             + " is not in the stored example" + (f" (which is from `{stored[0]}`)" if stored else "")
+                             + ": the same message can come from several modules, and only one example per "
+                             "test-log zip is kept.")
+        for test, counts in sorted(problem["tests"].items(), key=lambda kv: -sum(v for k, v in kv[1].items() if k != "suite"))[:6]:
+            total = counts["passed"] + counts["failed"] + counts["other"]
+            if counts["passed"] == total:
+                status = f"**reported as PASSED in all {total} runs** that show it"
+            elif counts["failed"] == total:
+                status = f"reported as failed in all {total} runs that show it"
+            else:
+                status = f"passed in {counts['passed']}, failed in {counts['failed']} of {total} runs that show it"
+            lines.append(f"   - `{test}` ({counts['suite']}): {status}")
+        if len(problem["tests"]) > 6:
+            lines.append(f"   - ... and {len(problem['tests']) - 6} more tests/workflows")
+        archs = problem["architectures"]
+        arch_text = ", ".join(f"`{a}`" for a in archs[:4]) + (f" +{len(archs) - 4} more" if len(archs) > 4 else "")
+        lines.append(f"   - Seen in **{problem['ib_count']} IBs** on {len(archs)} architecture(s) ({arch_text}); "
+                     f"first in `{problem['first_seen_tag']}`, last in `{problem['last_seen_tag']}`.")
+        if problem["series_gone"]:
+            gone = problem["series_gone"]
+            lines.append(f"   - Not seen in newer builds of {len(gone)} of {problem['series_total']} affected build series "
+                         f"(e.g. newest `{gone[0]['newest']}`).")
+        else:
+            lines.append("   - Still present in the newest imported build of every affected build series.")
+        for tag in sorted(asked_tags):
+            hits = sorted({place.split(" ")[1] for place in problem["places"] if place.split(" ")[0] == tag})
+            lines.append(f"   - In `{tag}`: " + (f"present ({', '.join(f'`{a}`' for a in hits)})." if hits
+                                                   else "not found in its imported logs."))
+        if problem.get("origin") in ("cmssw", "infrastructure"):
+            lines.append(f"   - Origin from the stack/location: {problem['origin']}.")
+        if problem.get("intentional_hint"):
+            lines.append(f"   - Text next to it in the log suggests it may be deliberate: \"{problem['intentional_hint'][:160]}\"")
+        evidence = "\n".join((problem.get("evidence") or "").splitlines()[:14])
+        lines.append(f"   - Evidence from `{problem['example_tag']}` `{problem['example_arch']}`, "
+                     f"`{problem['example_member']}` line {problem['example_line']} "
+                     f"(zip `{problem['example_path']}`; the server deletes it after about a week):")
+        lines.append("```\n" + evidence + "\n```")
+    searched_line = _searched_for_line(report)
+    if searched_line:
+        lines.append("\n" + searched_line)
+    first = coverage.get("first")
+    if problems:
+        any_passed = any(c["passed"] for p in problems for c in p["tests"].values())
+        lines.append(
+            ("\n\"Reported as PASSED\" is the test framework's verdict; the log of that same test contains this error. "
+             if any_passed else "\n")
+            + "The logs show where and when it happens, not why."
+            + (f" Test logs are only imported for IBs from {first[:10]} on, so \"first seen\" means first seen since then."
+               if first else "")
+        )
+    return "\n".join(lines)
+
+
+def _searched_for_line(report: dict) -> str | None:
+    """Every key the test logs were searched by and how many problems each found,
+    so a miss is visible (and a channel that could not run is said, not hidden)."""
+    parts = []
+    for item in report.get("searched") or []:
+        label = {"signature": "whole error", "text": "pasted text", "same IB": "same IB"}.get(item["by"])
+        key = f"`{item['key']}`" if item["by"] in ("name", "producer") else label
+        prefix = "producer " if item["by"] == "producer" else ""
+        parts.append(f"{prefix}{key} {item['found']}")
+    if not parts:
+        return None
+    line = "Searched the test logs by: " + "; ".join(parts) + " (problems found per key)."
+    if report.get("failed"):
+        line += " Could not search: " + ", ".join(report["failed"]) + "."
+    return line
+
+
+_BUILD_TIME_EXECUTABLES = {"edmWriteConfigs", "edmPluginRefresh", "edmPluginHelp", "genreflex", "rootcling"}
+
+
+def _pasted_error_context_note(parsed: dict) -> str | None:
+    """What the paste's own context lines say about where it was raised -- e.g. an
+    exception from edmWriteConfigs happened while the build wrote cfi files, so it
+    belongs in build logs, which is why the test logs may not have it."""
+    where = []
+    if parsed.get("ib_tags"):
+        where.append("IB " + ", ".join(f"`{t}`" for t in parsed["ib_tags"]))
+    if parsed.get("architectures"):
+        where.append(", ".join(f"`{a}`" for a in parsed["architectures"]))
+    if parsed.get("packages"):
+        where.append("package " + ", ".join(f"`{p}`" for p in parsed["packages"]))
+    note = "Your paste is from " + ", ".join(where) + "." if where else ""
+    executable = parsed.get("executable")
+    if executable in _BUILD_TIME_EXECUTABLES:
+        note += (f" It was raised while running `{executable}`, which runs during the build itself (e.g. writing "
+                 "cfi files from the plugins' ParameterSetDescriptions), not inside a test -- so it shows up in the "
+                 "build logs, which are not part of the imported test logs.")
+    elif executable:
+        note += f" It was raised while running `{executable}`."
+    return note.strip() or None
+
+
+_GITHUB_NAME_WEIGHTS = (("message_names", 3, 2), ("context_names", 2, 2), ("libraries", 2, 1))
+
+
+def _pasted_names_github_answer(parsed: dict) -> str | None:
+    """PRs/Issues that mention the specific names of a pasted error (the plugin,
+    class or module in its message, the module and library in its context), ranked
+    by how many of them they mention -- instead of one search term or the bare
+    exception category. Relevance evidence only, never a cause or a fix."""
+    weights: dict[str, int] = {}
+    for field, weight, cap in _GITHUB_NAME_WEIGHTS:
+        for name in (parsed.get(field) or [])[:cap]:
+            if len(name) >= 6 and name != parsed.get("category"):
+                weights.setdefault(name, weight)
+    if not weights:
+        return None
+
+    def lookup(name):
+        try:
+            prs = find_prs_for_error(name, limit=6)
+            issues = search_issues_by_text(name, include_comments=True, limit=6)
+            return name, prs, (issues.get("issues", []) if isinstance(issues, dict) else [])
+        except Exception as exc:
+            print(f"WARNING: GitHub name search failed for {name}: {exc}")
+            return name, None, []
+
+    items: dict[tuple, dict] = {}
+    searched = []
+    with ThreadPoolExecutor(max_workers=len(weights)) as pool:
+        for name, prs, issues in pool.map(lookup, weights):
+            if prs is None:
+                continue  # not searched -- never reported as "no mention"
+            searched.append(name)
+            for pr in prs:
+                item = items.setdefault(("PR", pr["pr_number"]), dict(
+                    title=pr["title"], status=f"merged {pr['merged_at'][:10]}" if pr.get("merged_at") else "not merged",
+                    names=[], score=0))
+                item["names"].append(name)
+                item["score"] += weights[name]
+            for issue in issues:
+                item = items.setdefault(("Issue", issue.get("number")), dict(
+                    title=issue.get("title"), status=f"state `{issue.get('state')}`", names=[], score=0))
+                item["names"].append(name)
+                item["score"] += weights[name]
+    if not searched:
+        return None
+    if not items:
+        return "No imported CMSSW PR or Issue text mentions " + ", ".join(f"`{n}`" for n in searched) + "."
+    ranked = sorted(items.items(), key=lambda kv: (-kv[1]["score"], -(kv[0][1] or 0)))[:6]
+    lines = ["Imported GitHub items mentioning the specific names in your paste (most names first):"]
+    for (kind, number), item in ranked:
+        lines.append(f"- **{kind} #{number}** - {item['title']} ({item['status']}; mentions "
+                     + ", ".join(f"`{n}`" for n in item["names"]) + ")")
+    if len(items) > len(ranked):
+        lines.append(f"- ... and {len(items) - len(ranked)} more mentioning fewer of these names")
+    lines.append("These are textual matches in imported PR/Issue titles, bodies, or comments; they do not prove a fix "
+                 "or causal relationship.")
+    return "\n".join(lines)
+
+
+def _referenced_items_note(question: str) -> str | None:
+    """PRs/Issues a pasted report names by number (e.g. "after the io_v1 change
+    (#50968)"), as imported -- so the answer says what the graph knows about them."""
+    numbers = sorted({int(n) for n in re.findall(r"(?<![\w/])#(\d{4,6})\b", question)})[:5]
+    if not numbers:
+        return None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (x) WHERE (x:PR OR x:Issue) AND x.repo = 'cmssw' AND x.number IN $numbers "
+                "RETURN labels(x)[0] AS kind, x.number AS number, x.title AS title, x.merged_at AS merged_at, "
+                "x.state AS state ORDER BY x.number", numbers=numbers)]
+    except Exception as exc:
+        print(f"WARNING: referenced PR/Issue lookup failed: {exc}")
+        return None
+    finally:
+        driver.close()
+    found = {row["number"] for row in rows}
+    lines = ["Referenced in your text:"]
+    for row in rows:
+        status = (f"merged {row['merged_at'][:10]}" if row.get("merged_at")
+                  else f"state `{row['state']}`" if row.get("state") else "status not in the imported data")
+        lines.append(f"- **{row['kind']} #{row['number']}** - {row['title']} ({status})")
+    for number in numbers:
+        if number not in found:
+            lines.append(f"- #{number}: not in the imported PR/Issue data")
+    return "\n".join(lines)
+
+
 def _pasted_exception_response(sid: str, original_question: str, question: str):
     """If the question is a pasted raw CMSSW exception log, answer it directly
     -- regardless of what other capability keywords happen to appear
@@ -6305,10 +6577,36 @@ def _pasted_exception_response(sid: str, original_question: str, question: str):
     Returns None (not a ChatResponse) when the question isn't a pasted
     exception at all, so normal routing proceeds unaffected."""
     exception_signature = _pasted_exception_signature(question)
-    if not exception_signature:
+    if not exception_signature and not _LOG_PROBLEM_PASTE_RE.search(question):
         return None
-    _pasted_exception_search_contexts[sid] = {"exception": exception_signature, "offset": 0}
-    pasted_exception_search_answer, github_matches = _pasted_exception_search_answer(exception_signature)
+    # The paste is read like a log (the scanner's own parser), so it is searched by
+    # its specific names -- the plugin/class in its message, the module and library
+    # in its context -- not by a single token or the bare category.
+    try:
+        names_answer = _pasted_names_github_answer(parse_pasted_error(question))
+    except Exception as exc:
+        print(f"WARNING: pasted-error name search failed: {exc}")
+        names_answer = None
+    if not exception_signature:
+        # A sanitizer report, traceback, assertion or crash: no category to search
+        # GitHub by, so its most specific names are used, next to the test logs.
+        log_answer = _test_log_problem_answer(question)
+        github_answer = names_answer or _pasted_error_evidence_answer(question)
+        combined = "\n\n".join(part for part in (log_answer, _referenced_items_note(question), github_answer) if part)
+        if not combined:
+            return None
+        return _chat_response(sid, original_question, combined, "deterministic:test_log_problem")
+    # The test logs are searched with the whole paste, not just the category: they
+    # are the only source that sees an exception inside a test reported as passed.
+    # When they match, the category-only GitHub list is broad context, so it is
+    # shortened and labelled as such (precise evidence first, never diluted).
+    log_answer = _test_log_problem_answer(question, _exception_category_from_signature(exception_signature))
+    names_found = bool(names_answer) and not names_answer.startswith("No imported")
+    page_size = 5 if log_answer or names_found else 20
+    _pasted_exception_search_contexts[sid] = {"exception": exception_signature, "offset": 0, "limit": page_size}
+    pasted_exception_search_answer, github_matches = _pasted_exception_search_answer(
+        exception_signature, limit=page_size
+    )
     # The paste alone only names an exception *category*, never which workflow or
     # IB hit it -- that needs a tag, which we only have when this session already
     # established one (e.g. an earlier "what's failing in <tag>" turn). Additive,
@@ -6321,6 +6619,13 @@ def _pasted_exception_response(sid: str, original_question: str, question: str):
         )
         if workflow_matches:
             pasted_exception_search_answer = f"{workflow_matches}\n\n{pasted_exception_search_answer}"
+    if log_answer or names_answer:
+        referenced = _referenced_items_note(question)
+        pasted_exception_search_answer = "\n\n".join(part for part in (
+            log_answer, names_answer, referenced,
+            "Broader context -- GitHub items mentioning only this exception *category* "
+            "(not necessarily this problem):\n" + pasted_exception_search_answer,
+        ) if part)
     return _chat_response(
         sid, original_question, pasted_exception_search_answer, "deterministic", github_matches=github_matches
     )
@@ -7345,8 +7650,9 @@ def chat(req: ChatRequest):
     # alone never looks like a pasted exception or triggers any capability.)
     pasted_exception_context = _pasted_exception_search_contexts.get(sid)
     if pasted_exception_context and re.search(r"\b(?:more|next)\s+(?:results?|matches?)\b", question, re.IGNORECASE):
-        offset = int(pasted_exception_context["offset"]) + 20
+        offset = int(pasted_exception_context["offset"]) + int(pasted_exception_context.get("limit", 20))
         pasted_exception_context["offset"] = offset
+        pasted_exception_context["limit"] = 20
         pasted_exception_search_answer, github_matches = _pasted_exception_search_answer(
             str(pasted_exception_context["exception"]), offset=offset
         )

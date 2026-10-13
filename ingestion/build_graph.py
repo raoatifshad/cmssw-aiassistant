@@ -188,7 +188,31 @@ def _reset_source_nodes(session, relation: str, label: str, source_id: str, curr
     )
 
 
+# The node labels each reconciled source prefix writes `source_id` onto. The
+# delete is scoped to these labels (each has a source_id index, neo4j_conn.py)
+# instead of an unlabeled `MATCH (node) WHERE node.source_id=...`, which
+# scanned all ~2.2M nodes once per removed source -- the reason --reconcile
+# seemed to hang. Add the label here when an ingest_* function starts writing
+# source_id onto a new label for one of these prefixes.
+RECONCILE_LABELS = {
+    "relvals:": ("RelVal",),
+    "relval-exceptions:": ("RelValException",),
+    "unittests:": ("UnitTest",),
+    "prs:": ("PR",),
+    "commands:": ("WorkflowCommand",),
+    "clang:": ("Warning",),
+}
+
+
+def _reconcile_labels(prefix: str) -> tuple[str, ...]:
+    for known, labels in RECONCILE_LABELS.items():
+        if prefix.startswith(known):
+            return labels
+    raise ValueError(f"no RECONCILE_LABELS entry for source prefix {prefix!r}")
+
+
 def _reconcile_missing_sources(driver, prefix: str, active_sources: set[str]):
+    labels = _reconcile_labels(prefix)
     with driver.session() as session:
         records = session.run(
             "MATCH (state:ImportState) WHERE state.source_id STARTS WITH $prefix "
@@ -200,11 +224,8 @@ def _reconcile_missing_sources(driver, prefix: str, active_sources: set[str]):
         if source_id in active_sources:
             continue
         with driver.session() as session:
-            session.run(
-                "MATCH (node) WHERE node.source_id=$source_id AND NOT node:ImportState "
-                "DETACH DELETE node",
-                source_id=source_id,
-            )
+            for label in labels:
+                session.run(f"MATCH (node:{label} {{source_id:$source_id}}) DETACH DELETE node", source_id=source_id)
             session.run("MATCH (state:ImportState {source_id:$source_id}) DELETE state", source_id=source_id)
         print(f"  removed missing source: {source_id}")
 

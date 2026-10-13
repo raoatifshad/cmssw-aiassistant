@@ -200,6 +200,58 @@ def build_scenarios(tag: str, arch: str) -> list[Scenario]:
                 expect_contains=["PR evidence matching", "Open CMSSW Issues matching"],
             ),
         ]),
+        # A real report (2026-10-12) of tests that pass although the cmsRun job
+        # inside fails: only the imported raw test logs (LogProblem) can see that.
+        # Fixed facts in the graph, so not templated on the latest tag.
+        Scenario("pasted exception from a test reported as passed", [
+            Turn(
+                "While checking the unit tests in CMSSW_20_1_ASAN_X_2026-10-05-2300, SubmitPVrbr is reported as "
+                "successful but cmsRun stops with:\n"
+                "An exception of category 'DictionaryNotFound' occurred while\n"
+                "   [0] Constructing the EventProcessor\n"
+                "No data dictionary found for the following classes:\n  DCSRecord\n  L1GlobalTriggerReadoutRecord",
+                expect_contains=["Found in the imported IB test logs", "SubmitPVrbr", "reported as PASSED",
+                                 "In `CMSSW_20_1_ASAN_X_2026-10-05-2300`: present"],
+            ),
+        ]),
+        Scenario("pasted sanitizer fragment found in the test logs", [
+            Turn(
+                "ERROR: AddressSanitizer: global-buffer-overflow in HGCalGeometry::getNewCorners",
+                expect_contains=["Found in the imported IB test logs", "test_dumpRecoGeometry_Run4"],
+            ),
+        ]),
+        # A build-time exception (edmWriteConfigs) that is not in the test logs: the answer
+        # must say so, search by its specific names (not the bare category) and rank the PR
+        # mentioning most of them first -- found live 2026-10-13, it used to list unrelated
+        # PluginNotFound problems that shared only the category word.
+        Scenario("pasted build-time exception absent from the test logs", [
+            Turn(
+                "----- Begin Fatal Exception 12-Oct-2026 15:45:18 CEST-----------------------\n"
+                "An exception of category 'PluginNotFound' occurred while\n"
+                "   [0] Running executable \"edmWriteConfigs\"\n"
+                "   [1] Processing library /build/muz/del/CMSSW_20_1_X_2026-10-11-0000/tmp/el9_amd64_gcc14/src/"
+                "RecoTICL/Interpretation/plugins/RecoTICLInterpretationPlugins/libRecoTICLInterpretationPlugins.so\n"
+                "   [2] Writing cfi files using ParameterSetDescriptions for module of base type EDProducer with "
+                "plugin name 'TICLCandidateProducer'\n"
+                "Exception Message:\n"
+                "Unable to find plugin 'TracksterInferenceByPFN' because the category "
+                "'PluginDescriptorTracksterInferenceAlgoFactory' has no known plugins\n"
+                "----- End Fatal Exception -------------------------------------------------",
+                expect_contains=["This exact error is not in the imported IB test logs", "edmWriteConfigs",
+                                 "specific names in your paste", "PR #52138", "Searched the test logs by:"],
+            ),
+        ]),
+        # Searched by the producer in the "[N]" context lines, not only the message: this
+        # 'Test' exception has no message at all, only its module.
+        Scenario("pasted exception searched by its producer/module", [
+            Turn(
+                "An exception of category 'Test' occurred while\n"
+                "   [1] Running path 'p1'\n"
+                "   [2] Calling method for module BusyWaitIntProducer/'busy1'",
+                expect_contains=["imported IB test logs", "BusyWaitIntProducer", "Raised in module(s)",
+                                 "producer `Test|BusyWaitIntProducer`"],
+            ),
+        ]),
     ]
 
 

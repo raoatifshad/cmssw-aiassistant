@@ -1731,7 +1731,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("Imported GitHub matches", result.answer)
         self.assertEqual(result.route, "deterministic")
         pasted_exception_search_answer.assert_called_once_with(
-            "An exception of category 'StdException' occurred while"
+            "An exception of category 'StdException' occurred while", limit=20
         )
 
     def test_variant_ib_has_its_primary_run_as_parent(self):

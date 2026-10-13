@@ -61,6 +61,10 @@ def setup_schema(driver):
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Service) REQUIRE n.name IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Host) REQUIRE n.name IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:DocChunk) REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:TestLogRun) REQUIRE n.key IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:LogProblem) REQUIRE n.key IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:ProblemSignature) REQUIRE n.signature_id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:ProblemFirstSeen) REQUIRE n.key IS UNIQUE",
         "CREATE INDEX IF NOT EXISTS FOR (n:IB) ON (n.tag)",
         "CREATE INDEX IF NOT EXISTS FOR (n:IB) ON (n.release)",
         "CREATE INDEX IF NOT EXISTS FOR (n:IB) ON (n.parent_tag)",
@@ -79,6 +83,26 @@ def setup_schema(driver):
         "FOR (n:Issue|PR) ON EACH [n.title, n.body]",
         "CREATE FULLTEXT INDEX shifterDocText IF NOT EXISTS "
         "FOR (n:DocChunk) ON EACH [n.heading, n.text]",
+        # build_graph.py --reconcile deletes by (label, source_id) -- see RECONCILE_LABELS
+        "CREATE INDEX IF NOT EXISTS FOR (n:RelVal) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:RelValException) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:UnitTest) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:PR) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:WorkflowCommand) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:Warning) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:TestLogRun) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:TestLogRun) ON (n.ib_key)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.ib_key)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.kind, n.in_passed)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:ProblemFirstSeen) ON (n.first_seen_when)",
+        "CREATE FULLTEXT INDEX logProblemText IF NOT EXISTS "
+        "FOR (n:LogProblem) ON EACH [n.summary, n.text]",
+        # every specific name and "<category>|<producer>" key of a test-log problem, matched
+        # whole (whitespace analyzer: no splitting at '::', '_' or '.', no stemming)
+        "CREATE FULLTEXT INDEX logProblemNames IF NOT EXISTS "
+        "FOR (n:LogProblem) ON EACH [n.names_text, n.context_keys_text] "
+        "OPTIONS {indexConfig: {`fulltext.analyzer`: 'whitespace'}}",
     ]
     with driver.session() as s:
         s.run("MATCH (comment:PRComment) SET comment:GitHubComment")

@@ -13,6 +13,8 @@ The graph is built from local files only:
 - `cmsrepo/cmssw-prs-cache.json` for the supplied PR-to-commit mapping.
 - An optional, separately supplied Issues/PR export for Issue bodies and comments.
 - An optional local Clang-log directory for compiler diagnostics.
+- Scan results of the raw IB test logs (unit tests, addOn tests, RelVals)
+  copied from cmssdt9-02, kept under `/home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results/`.
 
 The importer does not call GitHub. A PR relationship is created only from an
 exact commit-hash match in the supplied local files.
@@ -123,7 +125,57 @@ When local Clang logs are imported, the graph additionally has:
 Build-status warning totals on `IB` and parsed individual `Warning` records
 are separate evidence types. They must not be summed or treated as equivalent.
 
-## 7. Import Tracking and Updates
+## 7. Test-Log Layer
+
+Imported by `ingestion/ingest_test_logs.py` from the results that
+`ingestion/fetch_ib_test_logs.py` extracts from the raw log zips (see the
+README section "IB test logs"). Its purpose is the problems the dashboard
+can't see: an exception, crash or sanitizer report inside a test that is
+reported as PASSED.
+
+```text
+(IB)-[:HAS_TEST_LOG]->(TestLogRun)
+(TestLogRun)-[:HAS_PROBLEM]->(LogProblem)
+(LogProblem)-[:HAS_SIGNATURE]->(ProblemSignature)
+(ProblemFirstSeen)            -- standalone, keyed by suite|test|signature
+```
+
+- `TestLogRun` — one zip of one IB: `suite` is `unit`, `addon` or `relval`;
+  `run_variant` is `''` or e.g. `gpu/nvidia_t4` / `other/rntuple` (not the
+  same as `IB.variant`). It lists every test or workflow by status
+  (`passed_tests`, `failed_tests`, `other_tests`), and RelVal step
+  statuses and exit codes for failed workflows (`failed_details`).
+- `LogProblem` — one distinct problem found in that zip, with every test or
+  workflow step that hit it (`owners`, `owner_statuses`), `in_passed` /
+  `in_failed`, `kind`, `category`, `origin` (cmssw / infrastructure /
+  unclassified), up to 60 evidence lines, and the zip's `server_path`.
+  `serious` is true for exceptions, crashes, sanitizer/UBSan reports,
+  assertions, uncaught exceptions, Python tracebacks and infrastructure
+  errors. MessageLogger messages and plain error lines are stored grouped.
+  The evidence is one example block, but these are collected from every
+  occurrence in the zip (scanner v3; for older results the import computes
+  them from each test's stored block), so a second producer raising the same
+  message is not lost:
+  `modules` (`Type/'label'`), `producers` (module types, cfi plugin names,
+  source types), `names` (every specific name: quoted names, producers,
+  labels, C++/Python identifiers and their scope parts), `context_keys`
+  (`<category>|<producer>`, `<category>|exe:<executable>`) and `contexts`
+  (the normalized `[N] ...` lines; ones not in the example are appended to
+  `text`). The fulltext index `logProblemText` covers `summary` and `text`;
+  `logProblemNames` (whitespace analyzer, names matched whole, lowercased)
+  covers `names_text` and `context_keys_text`.
+- `ProblemSignature` — the same normalized problem across all IBs, with
+  `first_seen_tag` / `last_seen_tag`.
+- `ProblemFirstSeen` — the first IB in which a serious problem or plain error
+  line appeared for one specific test; this is what "new" means for the shifter.
+
+`IB` nodes are never created by this import; a run whose IB isn't imported
+yet is linked on a later run. Test statuses come from the logs and are never
+changed: a problem in a passed test is reported as exactly that.
+`intentional_hint` is text near the problem (for example "intentional") and
+only a hint. A problem is treated as expected only after a person confirms it.
+
+## 8. Import Tracking and Updates
 
 Every source file has an `ImportState` node containing:
 
@@ -160,7 +212,7 @@ By default, command ingestion uses the latest snapshot for each
 architecture/release/flavor. `--command-history` imports all historical command
 snapshots for a specific investigation.
 
-## 8. Worked Examples
+## 9. Worked Examples
 
 ### Example A: A workflow result for one build
 
@@ -242,7 +294,7 @@ If that comment contains `#12345`, the importer also records a `REFERENCES`
 edge to PR `#12345`. This means only that the comment mentions the PR. It does
 not prove a dependency, a fix, or a causal relationship.
 
-## 9. Operational Metadata
+## 10. Operational Metadata
 
 The same Neo4j instance also contains application metadata:
 
@@ -253,7 +305,7 @@ The same Neo4j instance also contains application metadata:
 These records are separate from imported CMSSDT evidence and do not modify the
 source-derived nodes above.
 
-## 10. Complete Schema Inventory
+## 11. Complete Schema Inventory
 
 This section lists every label with a uniqueness rule in the current Neo4j
 schema. A label being available in the schema does not mean its records are
@@ -273,6 +325,10 @@ imported.
 | `Warning` | `key` | Local Clang logs |
 | `SourceFile` | `path` | Local Clang logs |
 | `Checker` | `name` | Local Clang logs |
+| `TestLogRun` | `key` | IB test-log scan results (one zip of one IB) |
+| `LogProblem` | `key` | IB test-log scan results (one distinct problem per zip) |
+| `ProblemSignature` | `signature_id` | IB test-log scan results (same problem across IBs) |
+| `ProblemFirstSeen` | `key` | IB test-log scan results (first IB per test and problem) |
 
 ### Supplied PR and Issue facts
 
@@ -304,7 +360,7 @@ imported.
 | `Service` | `name` | Log RAG event projection when the event supplies a service |
 | `Host` | `name` | Log RAG event projection when the event supplies a host |
 
-## 11. Complete Relationship Inventory
+## 12. Complete Relationship Inventory
 
 All relationship names below are written in their stored Neo4j direction.
 
@@ -328,13 +384,16 @@ All relationship names below are written in their stored Neo4j direction.
 | `Warning` | `CHECKED_BY` | `Checker` | The warning has this compiler checker/flag. |
 | `Package` | `CONTAINS` | `SourceFile` | The package contains this imported warning file. |
 | `SourceFile` | `FLAGGED_BY` | `Checker` | A checker flagged this file. |
+| `IB` | `HAS_TEST_LOG` | `TestLogRun` | The scanned unit/addOn/RelVal log zip of this IB and architecture. |
+| `TestLogRun` | `HAS_PROBLEM` | `LogProblem` | A problem found in that zip's logs. |
+| `LogProblem` | `HAS_SIGNATURE` | `ProblemSignature` | The normalized problem it is an instance of. |
 | `ChatSession` | `HAS_TURN` | `ChatTurn` | A persisted user or assistant message belongs to the chat session. |
 | `UserFeedback` | `ABOUT` | `IB` | Feedback explicitly names an IB. |
 | `Build` | `CONTAINS_EVENT` | `EventOccurrence` | A normalized Log RAG event belongs to a build. |
 | `EventOccurrence` | `EMITTED_BY` | `Service` | A normalized Log RAG event names a service. |
 | `EventOccurrence` | `OBSERVED_ON` | `Host` | A normalized Log RAG event names a host. |
 
-## 12. What Counts as a Fact
+## 13. What Counts as a Fact
 
 The chatbot should phrase answers according to the strength of the imported
 evidence:
@@ -346,6 +405,8 @@ evidence:
 | `MATCHES_CACHE_COMMIT` plus `MERGED_AS` | “The supplied PR cache maps this command hash to this PR commit.” |
 | `REFERENCES` | “The imported text mentions this PR or Issue.” |
 | `Warning` | “The local Clang log records this diagnostic at this location.” |
+| `LogProblem` with `in_passed` | “This test's log contains this error although the test is reported as passed.” |
+| `ProblemSignature.first_seen_tag` | “The first imported log showing this problem is from this IB” (not when it really started: logs exist only from when collection began). |
 
 The following are not established unless a future source provides explicit
 evidence: a PR caused a failure, a PR fixed a failure, one item depends on
