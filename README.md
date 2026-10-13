@@ -122,6 +122,127 @@ been deleted. Use `--force` only when intentionally reprocessing all sources.
 IBs are identified by both their timestamped tag and architecture, so results
 for `el9_amd64_gcc13` and `el9_amd64_gcc14` remain distinct.
 
+### IB test logs (unit tests, addOn tests, RelVals) from cmssdt9-02
+
+The dashboard only says whether a test passed. A test can pass even though
+its log contains a fatal exception, a crash, a sanitizer report or an
+infrastructure error, and nobody sees it. This pipeline reads the raw logs
+so those problems are stored and can be shown to the shifter.
+
+**Source:** `cmssdt9-02:/data/sdt/buildlogs/<arch>/www/<day>/<queue>/<IB tag>/`
+(plus `gpu/<type>/` and `other/<name>/` sub-folders) holds
+`unitTestLogs.zip`, `addOnTests.zip` (+ `addOnTests.log`) and
+`pyRelValMatrixLogs.zip` for every IB. **The server deletes them after about
+one week**, so the routine below has to run at least every few days.
+
+**Flow:** copy → scan → keep the extracted facts → delete the copy. The raw
+logs are never kept; `results/` (a few MB per day) is.
+
+1. Copy new zips into `/home/rao/CHAT-BOT-AI/IB-TEST-LOGS/server-copy/`
+   with rsync. `results/rsync-exclude.txt` (rewritten by every scan run)
+   keeps already-finished zips from being downloaded again:
+
+   ```bash
+   mkdir -p /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results && touch /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results/rsync-exclude.txt   # first time only
+   rsync -a --prune-empty-dirs --info=progress2 \
+     --exclude-from=/home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results/rsync-exclude.txt \
+     --exclude='/filtered/' \
+     --include='/*/' --include='/*/www/' --include='/*/www/*/' --include='/*/www/*/*/' \
+     --include='/*/www/*/*/CMSSW_*/' \
+     --include='/*/www/*/*/CMSSW_*/gpu/' --include='/*/www/*/*/CMSSW_*/gpu/*/' \
+     --include='/*/www/*/*/CMSSW_*/other/' --include='/*/www/*/*/CMSSW_*/other/*/' \
+     --include='unitTestLogs.zip' --include='unitTestLogs.zip.checked' \
+     --include='addOnTests.zip' --include='addOnTests.zip.checked' --include='addOnTests.log' \
+     --include='pyRelValMatrixLogs.zip' \
+     --exclude='*' \
+     root@cmssdt9-02.cern.ch:/data/sdt/buildlogs/ /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/server-copy/
+   ```
+
+   A full week is ~250 GB, ~100 GB of it the three DBG RelVal zips (~33 GB
+   each). When disk is short, add `--max-size=5G` first (skips only the DBG
+   RelVal zips), run step 2, then rsync again without it.
+
+2. Scan and delete the copies (`--dry-run` first to see what it would do):
+
+   ```bash
+   cd cmsrepo && git fetch --prune origin master && git reset --hard origin/master \
+     && git sparse-checkout reapply && cd ..
+   nohup env PYTHONPATH=ingestion venv/bin/python ingestion/fetch_ib_test_logs.py \
+     --no-server --delete-local > /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/fetch.log 2>&1 &
+   ```
+
+   It can run while rsync is still copying (it only takes zips rsync has
+   finished); run it once more after rsync ends. Each zip's facts go to
+   `results/<suite>/<arch>/<tag>/<variant>/*.json.gz` and
+   `results/ledger.jsonl`; only then is the zip deleted. A zip that fails to
+   scan keeps its local copy and is retried next run. The end of `fetch.log`
+   lists every zip the dashboard data (cmsrepo) expects that is neither
+   scanned nor in `server-copy/` (`MISSING`, also in `results/missing.txt`):
+   copy those before the server deletes them.
+
+   Without `--no-server` the script lists and copies from the server itself
+   over ssh (open one ssh `ControlMaster` connection first, see the script's
+   docstring); `--delete-local` is then only needed for zips you copied by hand.
+
+3. Import into Neo4j (incremental; unchanged results files are skipped):
+
+   ```bash
+   PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python \
+     ingestion/ingest_test_logs.py --results /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results
+   ```
+
+**What is extracted** (`ingestion/ib_test_log_scanner.py`, logs are streamed,
+never loaded whole — one CLANG log has a single 2 GB line):
+
+- every unit test, addOn test step and RelVal workflow, with its status from
+  the log itself — passing ones included;
+- fatal exceptions, sanitizer/UBSan reports, crashes, assertions, uncaught
+  exceptions, Python tracebacks and known infrastructure errors, with up to
+  60 evidence lines, the test they belong to and whether it passed;
+- MessageLogger warnings/errors grouped by category, and plain lines that
+  say error/failed, both grouped (millions of repeated lines become a few
+  hundred records); `%MSG-i`/`%MSG-d` debug output is dropped.
+
+Each problem gets a normalized signature (dates, paths, IB names, numbers,
+host names, GUIDs and hex values stripped), so the same problem is
+recognised across IBs and architectures. That gives "first seen"/"last seen",
+and lets a pasted exception (whole or a fragment) be matched later through the
+`logProblemText` fulltext index.
+
+**Not stored:** the raw logs, `%MSG-i`/`%MSG-d` messages, minified JavaScript
+(a test prints a downloaded web page), stack frames beyond 20, evidence
+beyond 60 lines per problem, and plain error lines beyond 1,000 distinct ones
+per test (those are still counted). The server path of each zip is kept,
+even though it stops resolving after about a week.
+
+**In the chat:** a pasted error -- a CMSSW exception, sanitizer report,
+traceback, assertion or crash, whole or a fragment -- is looked up in these
+logs first (`search_test_log_problems`, also available to the LLM path). The
+paste is read with the same parser as the logs, so the same problem from
+another run is an exact match; otherwise the answer says the exact error is
+not in the logs and shows, each under its own heading, problems that contain
+the pasted text, problems sharing its specific names (plugin, class, module,
+library -- never just the exception category), and same-category problems in
+an IB the paste names. All of these run at once: an exact signature lookup,
+the pasted text, every specific name (matched whole in the `logProblemNames`
+index, which holds the modules, producers and names of *every* occurrence --
+not just the stored example) and the producer ("same producer, different
+message"). Weak matches (only ordinary identifiers in common) are shown only
+when nothing stronger is found, and the answer ends with every key it
+searched by and how many problems each found. When the paste shows it was raised by a build-time
+tool such as `edmWriteConfigs`, the answer says it belongs in build logs, not
+test logs. The answer lists the tests/workflows that hit it and their status ("reported as
+PASSED in all N runs"), how many IBs and architectures, first/last IB seen,
+whether newer builds no longer show it, any IB named in the question, and one
+evidence excerpt with its log location. PRs/Issues the text names by number are
+looked up, PRs/Issues mentioning the paste's specific names are listed (most
+names first), and the category-only GitHub matches follow, shortened and
+labelled as broader context.
+
+The graph never gets new `IB` nodes from this import: results attach to IBs
+already imported from the dashboard data, and ones imported earlier are linked
+on a later run once their IB exists.
+
 ### Primary and sub-IB runs
 
 `CMSSW_<major>_<minor>_X_<timestamp>` is a primary Integration Build run.
@@ -392,6 +513,9 @@ ingestion/
   clang_parser.py    — standalone clang warning extractor (same proven regex)
   build_graph.py     — reads raw sources, builds the Neo4j graph
   ingest_json_logs.py — chunked JSONL importer for large backfills
+  ib_test_log_scanner.py — streams unit/addOn/RelVal log zips, extracts tests + problems
+  fetch_ib_test_logs.py  — copy → scan → results/ → delete, for the cmssdt9-02 test logs
+  ingest_test_logs.py    — imports results/ into Neo4j (TestLogRun, LogProblem, ...)
 graph/
   neo4j_conn.py      — connection helper, schema constraints
   tools.py           — Cypher query tools the LLM calls

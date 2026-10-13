@@ -11,6 +11,7 @@ Two kinds, same rationale as the old SQL system:
 """
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -55,6 +56,34 @@ NODES:
         specific IB -- searched via search_shifter_docs(), never query_graph
         directly (it's indexed by a fulltext index, not a property match).
     (:ImportState {source_id, content_hash, source_type, source_path, last_ingested_at})
+    (:TestLogRun {key, ib_key, ib_tag, arch, suite, run_variant, queue, server_path, total, passed,
+        failed, other, passed_tests, failed_tests, other_tests, failed_details, scanned_at})
+        — one scanned test-log zip of one IB: suite is 'unit' (unitTestLogs.zip), 'addon'
+        (addOnTests.zip) or 'relval' (pyRelValMatrixLogs.zip); run_variant is '' or e.g.
+        'gpu/nvidia_t4', 'other/rntuple' (NOT the same as IB.variant). passed_tests etc. are
+        lists of names: unit 'Package/Sub/testName', addon 'test:stepN', relval workflow
+        folder '<number>_<name>'. Statuses come from the logs themselves.
+    (:LogProblem {key, ib_key, ib_tag, arch, suite, run_variant, kind, category, severity, origin,
+        serious, summary, message, evidence, signature_id, count, owners, owner_statuses,
+        in_passed, in_failed, intentional_hint, example_member, example_line, server_path,
+        modules, producers, names, context_keys, contexts})
+        — one distinct problem found in one zip's logs. evidence is one example block;
+        modules ("Type/'label'"), producers (module types, cfi plugin names, source types),
+        names (every specific name), context_keys ("<category>|<producer>") and contexts
+        (normalized "[N] ..." lines) come from every occurrence in that zip. kind: fatal_exception, sanitizer,
+        ubsan, crash, assertion, uncaught_exception, python_traceback, infrastructure_error
+        (serious=true), message_logger (grouped %MSG-w/e), generic_error_line. owners lists
+        every test/workflow(:stepN) that hit it, owner_statuses their status (parallel list);
+        in_passed=true means it appeared in a test the dashboard shows as PASSED. origin:
+        cmssw, infrastructure or unclassified. server_path is the zip on cmssdt9-02,
+        which deletes it after ~1 week. intentional_hint is text from the log near the
+        problem suggesting it is deliberate -- a hint only, never proof.
+        Full-text index logProblemText on [summary, text] for pasted exceptions.
+    (:ProblemSignature {signature_id, kind, category, signature, summary, first_seen_tag,
+        first_seen_when, last_seen_tag, last_seen_when})
+        — the same normalized problem across all IBs (when = 'YYYY-MM-DD-HHMM' from the tag).
+    (:ProblemFirstSeen {key, suite, owner, signature_id, first_seen_tag, first_seen_when, arch})
+        — first IB in which a serious problem or generic error line appeared for one test.
 
 EDGES:
   (IB)-[:REPORTED]->(Warning)
@@ -67,6 +96,9 @@ EDGES:
   (IB)-[:RAN_RELVAL]->(RelVal)
   (IB)-[:RAN_UNITTEST]->(UnitTest)
   (UnitTest)-[:IN_PACKAGE]->(Package)
+  (IB)-[:HAS_TEST_LOG]->(TestLogRun)
+  (TestLogRun)-[:HAS_PROBLEM]->(LogProblem)
+  (LogProblem)-[:HAS_SIGNATURE]->(ProblemSignature)
   (PR)-[:AUTHORED_BY]->(Author)
     (Issue)-[:AUTHORED_BY]->(Author)
     ((PR|Issue))-[:HAS_COMMENT]->(GitHubComment)
@@ -1413,6 +1445,331 @@ def search_shifter_docs(query: str, limit: int = 5) -> list[dict]:
         driver.close()
 
 
+_LOG_TERM_STOPWORDS = {
+    "exception", "message", "category", "occurred", "while", "processing", "running", "constructing",
+    "following", "classes", "however", "reported", "succeeded", "failed", "failure", "begin", "fatal",
+    "the", "test", "tests", "error", "errors", "found", "unable", "cmsrun", "cmssw",
+}
+_LOG_IB_TAG_RE = re.compile(r"\bCMSSW_\d+_\d+_[A-Za-z0-9_]*?X_\d{4}-\d\d-\d\d-\d{4}\b")
+
+
+def log_search_terms(text: str, limit: int = 12) -> list[str]:
+    """The distinctive words of a pasted error: identifiers (CamelCase, with
+    digits, '::' or '_'), quoted names and file names -- not English words,
+    IB tags, dates or numbers, which say nothing about which problem it is."""
+    text = _LOG_ARCH_RE.sub(" ", _LOG_IB_TAG_RE.sub(" ", text))
+    terms: list[str] = []
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_.]*[A-Za-z0-9]", text):
+        token = token.strip(".")
+        if len(token) < 5 or token.lower() in _LOG_TERM_STOPWORDS:
+            continue
+        identifier_like = (
+            re.search(r"[a-z][A-Z]|[A-Z]{2,}[a-z]", token) or re.search(r"\d", token)
+            or "_" in token or "." in token
+        )
+        if identifier_like and token.lower() not in {t.lower() for t in terms}:
+            terms.append(token)
+    return terms[:limit]
+
+
+_LOG_ARCH_RE = re.compile(r"\b(?:el|slc|cc|cs|fc|alma|rhel)\d+_[a-z0-9]+_[a-z]+\d+\b")
+_LIBRARY_RE = re.compile(r"\blib([A-Za-z0-9_]+)\.so\b")
+_PACKAGE_IN_PATH_RE = re.compile(r"/src/([A-Z][A-Za-z0-9]+/[A-Za-z0-9_]+)/")
+
+
+def _test_log_scanner():
+    try:
+        import ib_test_log_scanner as scanner  # ingestion/ on the path (scripts, tests)
+    except ImportError:
+        from ingestion import ib_test_log_scanner as scanner  # repo root on the path (API server)
+    return scanner
+
+
+def parse_pasted_error(text: str) -> dict:
+    """Reads a pasted error the way the test-log scanner reads a log, so it can be
+    recognised, not just keyword-searched. Uses the scanner's own functions, so the
+    paste gets the same keys as the stored problems: signature ids (an exact paste
+    is an exact lookup, run-specific text normalized away), the exception category,
+    message_names (quoted names in the message -- the most specific part: which
+    plugin/class/product), context_names (from the "[N] ..." lines: producer/module
+    type and label, cfi plugin name, source type), names (every specific name,
+    as stored in LogProblem.names), context_keys ("<category>|<producer>"),
+    modules, executable, libraries, packages, IB tags and architectures."""
+    scanner = _test_log_scanner()
+    lines = text.replace("\r\n", "\n").split("\n")
+    if (scanner.EXCEPTION_CATEGORY_RE.search(text) and not any(scanner.FATAL_BEGIN_RE.match(l.strip()) for l in lines)):
+        # pasted without the "----- Begin Fatal Exception" banner: the scanner needs it
+        lines = ["----- Begin Fatal Exception -----"] + lines + ["----- End Fatal Exception -----"]
+    issues = [i for i in scanner.scan_lines(lines) if i["kind"] != "generic_error_line"]
+    category = next((i["category"] for i in issues if i["kind"] == "fatal_exception" and i.get("category")), None)
+    if not category:  # a fragment like "exception of category 'X' ..." without the rest
+        m = re.search(r"exception of category '([^']+)'", text)
+        category = m.group(1) if m else None
+    message = next((i.get("message") or "" for i in issues if i["kind"] == "fatal_exception"), "")
+    read_as_exception = any(i["kind"] == "fatal_exception" for i in issues)
+    if not message:
+        m = re.search(r"Exception Message:\s*(.+?)(?:-{3,} End Fatal|$)", text, re.S)
+        message = " ".join(m.group(1).split()) if m else ""
+    if not message and not read_as_exception:  # a fragment: all but the context lines is the message
+        message = " ".join(l.strip() for l in lines if l.strip() and not scanner.CONTEXT_LINE_RE.match(l))
+    details = scanner.problem_details(lines, category)
+    context = "\n".join(l for l in lines if scanner.CONTEXT_LINE_RE.match(l))
+    context_names = list(dict.fromkeys(
+        details["producers"]
+        + [label for _, label in scanner.MODULE_RE.findall(context) if len(label) >= 4]
+        + scanner.QUOTED_NAME_RE.findall(scanner.PATH_NAME_RE.sub(" ", scanner.MODULE_RE.sub(" ", context)))))
+    context_names = [n for n in context_names if n != category and n != details["executable"]]
+    message_names = [n for n in dict.fromkeys(scanner.QUOTED_NAME_RE.findall(message))
+                     if n != category and n not in context_names]
+    return dict(
+        signature_ids=list(dict.fromkeys(scanner.signature_id(i["signature"]) for i in issues)),
+        kinds=[i["kind"] for i in issues],
+        category=category,
+        message=message,
+        message_names=message_names,
+        context_names=context_names,
+        names=details["names"],
+        context_keys=details["context_keys"],
+        modules=details["modules"],
+        executable=details["executable"],
+        libraries=list(dict.fromkeys(_LIBRARY_RE.findall(text))),
+        packages=list(dict.fromkeys(_PACKAGE_IN_PATH_RE.findall(text))),
+        ib_tags=list(dict.fromkeys(_LOG_IB_TAG_RE.findall(text))),
+        architectures=list(dict.fromkeys(_LOG_ARCH_RE.findall(text))),
+    )
+
+
+def _ib_when(tag: str) -> str:
+    return tag[-15:] if _LOG_IB_TAG_RE.fullmatch(tag or "") else ""
+
+
+MATCH_LEVELS = ("exact", "contains", "related", "module", "same_ib", "weak")
+# in the context lines of nearly every CMSSW exception: says nothing about which problem it is
+_FRAMEWORK_NAMES = {"eventprocessor", "edproducer", "edanalyzer", "edfilter", "esproducer", "parameterset",
+                    "parametersetdescriptions", "inputsource", "eventsetup", "runtocompletion", "streamid"}
+
+
+def _lucene_terms(terms) -> str:
+    return " OR ".join('"%s"' % re.sub(r'["\\]', " ", t) for t in terms)
+
+
+def _channel(driver, cypher: str, params: dict):
+    """One search channel in its own session; None when it failed (so a failed
+    search is reported as not searched, never as "nothing found")."""
+    try:
+        with driver.session() as s:
+            return [dict(r) for r in s.run(cypher, params)]
+    except Exception:
+        return None
+
+
+def search_test_log_problems_report(text: str, category: str | None = None, limit: int = 5) -> dict:
+    """search_test_log_problems plus what was searched: {"problems": [...],
+    "searched": [{"by", "key", "found"}...], "failed": [channel names]}.
+
+    The paste is parsed by the scanner itself (parse_pasted_error) and searched
+    through five channels at once, merged per problem with how it matched:
+      exact     the same signature (category + normalized message) -- a direct lookup
+      contains  the stored problem's text contains the pasted text word for word
+      related   shares specific names (message names weigh 3; producer/module/library 2;
+                other identifiers 1) -- a weight-2+ name or three identifiers; the
+                exception category alone never counts
+      module    the same producer/executable with the same category, any message
+      same_ib   the same category in an IB the paste names (only when nothing exact)
+      weak      only one or two ordinary identifiers in common (shown only when
+                nothing else matched)
+    """
+    limit = min(limit, MAX_ROWS)
+    try:
+        parsed = parse_pasted_error(text)
+    except Exception:
+        parsed = dict(signature_ids=[], category=None, message="", message_names=[], context_names=[],
+                      names=[], context_keys=[], libraries=[], ib_tags=[])
+    category = category or parsed["category"]
+    weights: dict[str, int] = {}
+    for names, weight in ((parsed["message_names"], 3), (parsed["context_names"], 2), (parsed["libraries"], 2),
+                          (parsed.get("names") or [], 1), (log_search_terms(parsed["message"] or text), 1)):
+        for name in names:
+            weights.setdefault(name, weight)
+    weights.pop(category or "", None)
+    for name in list(weights):
+        if name.lower() in _FRAMEWORK_NAMES:
+            del weights[name]
+    keys = parsed.get("context_keys") or []
+    pasted_core = " ".join((parsed["message"] or text).split()).lower()
+    channels = {
+        "signature": ("MATCH (g:ProblemSignature) WHERE g.signature_id IN $ids RETURN g.signature_id AS sid",
+                      {"ids": parsed["signature_ids"]}) if parsed["signature_ids"] else None,
+        "names": ("CALL db.index.fulltext.queryNodes('logProblemNames', $q, {limit: 3000}) YIELD node "
+                  "RETURN DISTINCT node.signature_id AS sid, node.names_text AS names_text, "
+                  "node.context_keys_text AS keys_text, node.category AS category",
+                  {"q": _lucene_terms([t.lower() for t in list(weights) + keys])}) if weights or keys else None,
+        "text": ("CALL db.index.fulltext.queryNodes('logProblemText', $q, {limit: 3000}) YIELD node "
+                 "RETURN DISTINCT node.signature_id AS sid, node.text AS text, node.owners AS owners, "
+                 "node.category AS category",
+                 {"q": _lucene_terms(weights)}) if weights else None,
+        "same IB": ("MATCH (p:LogProblem) WHERE p.ib_tag IN $tags AND p.category = $category "
+                    "RETURN p.signature_id AS sid, count(*) AS n ORDER BY n DESC LIMIT 3",
+                    {"tags": parsed["ib_tags"], "category": category}) if category and parsed["ib_tags"] else None,
+    }
+    driver = get_driver()
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {name: pool.submit(_channel, driver, *spec) for name, spec in channels.items() if spec}
+            found = {name: future.result() for name, future in futures.items()}
+    finally:
+        driver.close()
+    failed = [name for name, rows in found.items() if rows is None]
+    if "names" in failed and "text" not in failed and "text" in found:
+        failed.remove("names")  # index not created yet (data imported before it): text covers the names
+    rows_of = {name: rows or [] for name, rows in found.items()}
+
+    # per problem: shared names (whole-name match in the names index, or substring in the text)
+    shared_by_sid: dict[str, set] = {}
+    keys_by_sid: dict[str, set] = {}
+    category_of: dict[str, str] = {}
+    lowered = {t: t.lower() for t in weights}
+    for hit in rows_of.get("names", []):
+        tokens = set((hit["names_text"] or "").split())
+        key_tokens = set((hit["keys_text"] or "").split())
+        shared_by_sid.setdefault(hit["sid"], set()).update(t for t, low in lowered.items() if low in tokens)
+        keys_by_sid.setdefault(hit["sid"], set()).update(k for k in keys if k.lower() in key_tokens)
+        category_of[hit["sid"]] = hit["category"]
+    contains: set[str] = set()
+    for hit in rows_of.get("text", []):
+        haystack = ((hit["text"] or "") + " " + " ".join(hit["owners"] or [])).lower()
+        shared_by_sid.setdefault(hit["sid"], set()).update(t for t, low in lowered.items() if low in haystack)
+        category_of[hit["sid"]] = hit["category"]
+        if len(pasted_core) >= 30 and pasted_core in " ".join(haystack.split()):
+            contains.add(hit["sid"])
+
+    match: dict[str, tuple[str, int, list[str]]] = {}  # sid -> (level, score, shared names)
+    for row in rows_of.get("signature", []):
+        match[row["sid"]] = ("exact", 100, [])
+    total_weight = sum(weights.values())
+    for sid in set(shared_by_sid) | set(keys_by_sid):
+        if sid in match:
+            continue
+        shared = [t for t in weights if t in shared_by_sid.get(sid, set())]
+        score = sum(weights[t] for t in shared) + (1 if category and category_of.get(sid) == category else 0)
+        strong = any(weights[t] >= 2 for t in shared) or len(shared) >= 3 or (shared and total_weight < 2)
+        if sid in contains:
+            match[sid] = ("contains", score, shared)
+        elif strong:
+            match[sid] = ("related", score, shared)
+        elif keys_by_sid.get(sid) and category_of.get(sid) == category:
+            match[sid] = ("module", score, sorted(keys_by_sid[sid]))
+        elif shared:
+            match[sid] = ("weak", score, shared)
+    related = [sid for sid, m in match.items() if m[0] == "related"]
+    if related:  # far weaker "related" problems are noise next to the best ones
+        top = max(match[sid][1] for sid in related)
+        for sid in related:
+            if match[sid][1] < top * 0.5:
+                match[sid] = ("weak",) + match[sid][1:]
+    if not any(m[0] == "exact" for m in match.values()):
+        for row in rows_of.get("same IB", []):
+            if match.get(row["sid"], ("weak",))[0] == "weak":
+                match[row["sid"]] = ("same_ib", 0, [])
+    if any(m[0] != "weak" for m in match.values()):  # weak matches only when nothing else was found
+        match = {sid: m for sid, m in match.items() if m[0] != "weak"}
+
+    searched = []
+    if parsed["signature_ids"]:
+        searched.append(dict(by="signature", key="the whole error (category + message)",
+                             found=len(rows_of.get("signature", []))))
+    if len(pasted_core) >= 30:
+        searched.append(dict(by="text", key="your pasted text, word for word", found=len(contains)))
+    for name in sorted(weights, key=lambda t: -weights[t])[:10]:
+        searched.append(dict(by="name", key=name, found=sum(name in v for v in shared_by_sid.values())))
+    for key in keys:
+        searched.append(dict(by="producer", key=key, found=sum(key in v for v in keys_by_sid.values())))
+    if channels["same IB"]:
+        searched.append(dict(by="same IB", key=f"{category} in " + ", ".join(parsed["ib_tags"]),
+                             found=len(rows_of.get("same IB", []))))
+    if not match:
+        return {"problems": [], "searched": searched, "failed": failed}
+    rank = {level: i for i, level in enumerate(MATCH_LEVELS)}
+    chosen = sorted(match, key=lambda sid: (rank[match[sid][0]], -match[sid][1]))[:limit]
+    return {"problems": _log_problem_details(chosen, match), "searched": searched, "failed": failed}
+
+
+def search_test_log_problems(text: str, category: str | None = None, limit: int = 5) -> list[dict]:
+    """Find a pasted error (whole or partial) in the problems scanned from the raw IB
+    test logs -- unit tests, addOn tests and RelVal steps, including tests the dashboard
+    shows as PASSED. The paste is read by the log scanner itself and searched by its
+    signature, its text, every specific name (plugin, class, producer/module type and
+    label, library) and its producer; each result says how it matched ("match":
+    exact / contains / related / module / same_ib / weak; "shared_terms"). Returns one
+    entry per distinct problem across all imported IBs: which tests/workflows hit it
+    and with what status, which IBs/architectures, first and last IB seen, whether
+    newer builds of the same series no longer show it, the modules it was raised in,
+    and one evidence excerpt with its log location. Text matches only -- not a cause."""
+    return search_test_log_problems_report(text, category, limit)["problems"]
+
+
+def _log_problem_details(chosen: list[str], match: dict) -> list[dict]:
+    rows = _run_query(
+        "MATCH (p:LogProblem) WHERE p.signature_id IN $sids "
+        "WITH p ORDER BY p.ib_tag DESC "
+        "WITH p.signature_id AS sid, collect(p) AS ps "
+        "RETURN sid, ps[0].kind AS kind, ps[0].category AS category, ps[0].summary AS summary, "
+        "ps[0].origin AS origin, ps[0].evidence AS evidence, ps[0].ib_tag AS example_tag, "
+        "ps[0].arch AS example_arch, ps[0].server_path AS example_path, ps[0].example_member AS example_member, "
+        "ps[0].example_line AS example_line, "
+        "[x IN ps | {tag:x.ib_tag, arch:x.arch, variant:coalesce(x.run_variant, ''), suite:x.suite}] AS places, "
+        "reduce(acc = [], x IN ps | acc + [i IN range(0, size(x.owners) - 1) | "
+        "x.suite + '|' + x.owners[i] + '|' + x.owner_statuses[i]]) AS owner_statuses, "
+        "head([x IN ps WHERE x.intentional_hint IS NOT NULL | x.intentional_hint]) AS intentional_hint, "
+        "reduce(acc = [], x IN ps | acc + coalesce(x.modules, [])) AS all_modules",
+        {"sids": chosen},
+    )
+    results = []
+    order = {sid: i for i, sid in enumerate(chosen)}
+    for row in sorted(rows, key=lambda r: order.get(r["sid"], len(order))):
+        places = row.pop("places")
+        tests: dict[str, dict] = {}
+        for entry in row.pop("owner_statuses"):
+            suite, owner, status = entry.split("|", 2)
+            counts = tests.setdefault(owner, {"suite": suite, "passed": 0, "failed": 0, "other": 0})
+            counts[status if status in ("passed", "failed") else "other"] += 1
+        tags = sorted({p["tag"] for p in places}, key=_ib_when)
+        series_last: dict[tuple, str] = {}
+        for p in places:
+            key = (p["tag"][:-15], p["arch"], p["variant"], p["suite"])
+            series_last[key] = max(series_last.get(key, ""), _ib_when(p["tag"]))
+        newer = _run_query(
+            "UNWIND $series AS s MATCH (r:TestLogRun {arch:s.arch, run_variant:s.variant, suite:s.suite}) "
+            "WHERE r.ib_tag STARTS WITH s.prefix AND substring(r.ib_tag, size(r.ib_tag) - 15) > s.last "
+            "RETURN s.prefix + s.arch + s.variant + s.suite AS key, count(r) AS newer_builds, max(r.ib_tag) AS newest",
+            {"series": [dict(prefix=k[0], arch=k[1], variant=k[2], suite=k[3], last=v)
+                        for k, v in series_last.items()]},
+        ) if series_last else []
+        row.update(
+            match=match[row['sid']][0], shared_terms=match[row['sid']][2],
+            modules=list(dict.fromkeys(row.pop('all_modules') or []))[:10],
+            tests=tests, ib_tags=tags, ib_count=len(tags), first_seen_tag=tags[0] if tags else None,
+            last_seen_tag=tags[-1] if tags else None,
+            architectures=sorted({p["arch"] for p in places}),
+            variants=sorted({p["variant"] for p in places if p["variant"]}),
+            places=[f"{p['tag']} {p['arch']}{' ' + p['variant'] if p['variant'] else ''} ({p['suite']})"
+                    for p in places],
+            series_total=len(series_last),
+            series_gone=[dict(r) for r in newer if r["newer_builds"]],
+        )
+        results.append(row)
+    return results
+
+
+def test_log_coverage() -> dict:
+    """First/last IB whose raw test logs are imported, and how many zips."""
+    rows = _run_query(
+        "MATCH (r:TestLogRun) WITH substring(r.ib_tag, size(r.ib_tag) - 15) AS w, r "
+        "RETURN min(w) AS first, max(w) AS last, count(r) AS runs"
+    )
+    return rows[0] if rows else {"first": None, "last": None, "runs": 0}
+
+
 def query_graph(cypher: str) -> dict:
     """Run a read-only Cypher query. Call get_graph_schema() first to see
     available node labels, properties, and edge types."""
@@ -1443,5 +1800,6 @@ TOOLS = {
     "shared_header_packages": shared_header_packages,
     "warnings_by_checker": warnings_by_checker,
     "search_shifter_docs": search_shifter_docs,
+    "search_test_log_problems": search_test_log_problems,
     "query_graph": query_graph,
 }
