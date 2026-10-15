@@ -98,6 +98,42 @@ class WorkflowWhereTests(unittest.TestCase):
         self.assertIn("| `CMSSW_20_1` | primary | `el9_amd64_gcc14` | 1 / 2 | `CMSSW_20_1_X_2026-10-13-2300` |", answer)
         self.assertIn("Passed in every run of: `CMSSW_17_0` primary.", answer)
 
+    def test_recovered_workflow_says_so_and_ignores_other_names_and_stale_exceptions(self):
+        """Found live 2026-10-15 on 1349.0: failed only in the 10-09..10-11 builds, passing
+        since, but the answer read as still failing; it also showed test-log DAS errors
+        from CMSSW_8_0 (a differently named 1349.0) and an August EVTGEN3 exception."""
+        relvals = (_rows("CMSSW_20_1_X_2026-10-09-2300", ["el9_amd64_gcc14"], status="FAILED", exitcode=256, name="BsToMuMu_13")
+                   + _rows("CMSSW_20_1_X_2026-10-12-2300", ["el9_amd64_gcc14"], status="PASSED", exitcode=0, name="BsToMuMu_13")
+                   + _rows("CMSSW_8_0_X_2026-10-11-0000", ["slc7_amd64_gcc530"], status="DAS_ERROR", name="BsToMuMu_13+INPUT"))
+        details = ["1349.0_BsToMuMu_13: step1=PASSED step2=PASSED step3=FAILED; exit 0 0 256",
+                   "1349.0_BsToMuMu_13+INPUT: step1=DAS_ERROR step2=NOTRUN; exit 1 0"]
+        exceptions = [
+            {"tag": "CMSSW_20_1_X_2026-10-09-2300", "arch": "el9_amd64_gcc14", "category": "LogicError", "message": "now"},
+            {"tag": "CMSSW_20_1_EVTGEN3_X_2026-08-12-2300", "arch": "el9_amd64_gcc13", "category": "PluginNotFound",
+             "message": "EvtGen130"},
+        ]
+        with self._patch_graph(relvals, details, exceptions), \
+                patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is workflow 1349.0 failing", "s")
+        self.assertIn("**1 of 2** imported run(s) did not pass", answer)
+        self.assertIn("**Now: passing again everywhere**", answer)
+        self.assertIn("last failure `CMSSW_20_1_X_2026-10-09-2300`", answer)
+        self.assertIn("step3=FAILED", answer)
+        self.assertNotIn("DAS_ERROR", answer)
+        self.assertIn("**[LogicError]** now", answer)
+        self.assertNotIn("EvtGen130", answer)
+        self.assertIn("Not counted above: 1 run(s) in `CMSSW_8_0`", answer)
+
+    def test_still_failing_track_is_named_with_its_start(self):
+        relvals = (_rows("CMSSW_20_1_X_2026-10-12-2300", ["el9_amd64_gcc14"], status="PASSED", exitcode=0, name="W")
+                   + _rows("CMSSW_20_1_X_2026-10-13-2300", ["el9_amd64_gcc14"], status="FAILED", exitcode=256, name="W")
+                   + _rows("CMSSW_20_1_X_2026-10-14-2300", ["el9_amd64_gcc14"], status="FAILED", exitcode=256, name="W")
+                   + _rows("CMSSW_20_1_X_2026-10-14-2300", ["el8_amd64_gcc14"], status="PASSED", exitcode=0, name="W"))
+        with self._patch_graph(relvals), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is 7.0 workflow failing", "s")
+        self.assertIn("**Now: still not passing in 1**", answer)
+        self.assertIn("`CMSSW_20_1` primary `el9_amd64_gcc14` (failing since `CMSSW_20_1_X_2026-10-13-2300`)", answer)
+
     def test_why_without_tag_falls_back_to_every_build_when_latest_ib_lacks_it(self):
         from server.api_server import _workflow_why_failing_answer
         relvals = _rows("CMSSW_20_1_X_2026-10-14-2300", ["el9_amd64_gcc14"])
