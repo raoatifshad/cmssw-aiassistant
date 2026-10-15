@@ -5512,6 +5512,55 @@ def _addon_shift_table(rows: list[dict]) -> list[str]:
     )
 
 
+def _variants_text(variants: list[str]) -> str:
+    named = ["the primary build" if not v else v for v in sorted(variants, key=lambda v: (v != "", v))]
+    if len(named) <= 6:
+        return ", ".join(named)
+    return ", ".join(named[:6]) + f" and {len(named) - 6} more"
+
+
+def _clang_parsed(tag: str, arch: str) -> bool:
+    """Were clang build logs parsed for this (tag, arch)? ImportState 'clang:<tag>:<arch>:...'.
+    The clang logs are staged by hand (--clang-root); without them "no new warnings" means
+    not checked, not clean."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            return bool(session.run(
+                "MATCH (s:ImportState) WHERE s.source_id STARTS WITH $prefix RETURN count(s) > 0 AS ok",
+                prefix=f"clang:{tag}:{arch}:",
+            ).single()["ok"])
+    finally:
+        driver.close()
+
+
+def _digest_coverage_notes(
+    latest_tag: str, before_rv: dict[str, set], after_rv: dict[str, set],
+    before_ut: dict[str, set], after_ut: dict[str, set], latest_has_build: bool,
+) -> list[str]:
+    """What the "to" build doesn't have imported yet on one architecture, per category.
+    Found live 2026-10-15: the default window ended at CMSSW_20_1_X_2026-10-15-0900, whose
+    RelVals weren't imported yet, and the Shift Console showed "0 newly failing" and
+    "All clear" -- missing data read as good news. Each note starts with its category
+    ("RelVal results:", "Unit-test results:", "Build:") so the frontend can tell which
+    tiles are not known yet."""
+    if not latest_has_build:
+        return [f"Build: `{latest_tag}` has no build on this architecture yet, so nothing here is compared."]
+    notes = []
+    for label, before, after in (("RelVal results", before_rv, after_rv), ("Unit-test results", before_ut, after_ut)):
+        missing = [v for v, items in before.items() if items and not after.get(v)]
+        partial = [(v, len(after[v]), len(items)) for v, items in before.items()
+                   if items and after.get(v) and len(after[v]) < 0.9 * len(items)]
+        if missing:
+            had = sum(len(before[v]) for v in missing)
+            notes.append(f"{label}: none imported yet for `{latest_tag}` in {_variants_text(missing)} "
+                         f"(the previous build had {had:,}), so \"None\" below means not checked yet, not passing.")
+        for variant, have, had in partial:
+            notes.append(f"{label}: only {have:,} of {had:,} imported for `{latest_tag}` in "
+                         f"{_variants_text([variant])}; it may still be running.")
+    return notes
+
+
 def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None = None) -> str:
     """Compose a virtual-shifter digest for latest_tag vs previous_tag: per-arch
     newly-failing/resolved RelVals and UnitTests (real per-item detail), new/
@@ -5651,7 +5700,19 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
             if ra:
                 resolved_addon.append(ra)
 
+        coverage_notes = _digest_coverage_notes(
+            latest_tag, before_ran_by_variant, after_ran_by_variant,
+            before_ran_ut_by_variant, after_ran_ut_by_variant,
+            latest_has_build=bool(after_ran_by_variant or after_ran_ut_by_variant or after_status_by_variant),
+        )
+        unparsed = [tag for tag in (previous_tag, latest_tag) if not _clang_parsed(tag, one_arch)]
+        if unparsed and not (coverage_notes and coverage_notes[0].startswith("Build:")):
+            coverage_notes.append(
+                "Clang warnings: build logs not parsed for "
+                + " and ".join(f"`{tag}`" for tag in unparsed)
+                + " on this architecture, so the Clang sections below are not checked, not clean.")
         per_arch.append({
+            "coverage_notes": coverage_notes,
             "arch": one_arch, "newly_failing_relvals": newly_failing_arch, "resolved_relvals": resolved_arch,
             "warnings_diff": warnings_diff, "sub_ib_notes": sub_ib_notes,
             "newly_failing_unittests": newly_failing_unittests, "resolved_unittests": resolved_unittests,
@@ -5687,8 +5748,14 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
         one_arch = arch_result["arch"]
         warnings_diff = arch_result["warnings_diff"]
         lines.extend(["", f"### `{one_arch}`"])
+        # Real #### sections (the Shift Console's parser drops blocks outside one: the old
+        # "**Sub-IB baselines:**" paragraph never reached the console). Coverage first, so a
+        # shifter reads "not imported yet" before any "None.".
+        if arch_result["coverage_notes"]:
+            lines.extend(["", "#### Results not imported yet"])
+            lines.extend(f"- {note}" for note in arch_result["coverage_notes"])
         if arch_result["sub_ib_notes"]:
-            lines.extend(["", "**Sub-IB baselines:**"])
+            lines.extend(["", "#### Sub-IB baselines"])
             lines.extend(f"- {note}" for note in arch_result["sub_ib_notes"])
         lines.extend(["", "#### Newly failing RelVal workflows"])
         lines.extend(_newly_failing_relval_table(
