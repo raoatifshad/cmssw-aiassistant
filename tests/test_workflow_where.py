@@ -84,6 +84,9 @@ class WorkflowWhereTests(unittest.TestCase):
         self.assertIn("`CMSSW_20_0`, `CMSSW_20_1`", answer)
         self.assertIn("`step1=DAS_ERROR step2=NOTRUN; exit 1 0` -- 2 run(s)", answer)
         self.assertIn("Most recent: `CMSSW_20_1_X_2026-10-14-2300`", answer)
+        # no "<IB tag>" placeholder: the Shift Console rendered it as "[object Object]"
+        self.assertNotIn("<", answer)
+        self.assertIn("\"why is workflow 38551.85 failing in CMSSW_20_1_X_2026-10-14-2300\"", answer)
 
     def test_mixed_results_list_where_it_failed(self):
         relvals = (_rows("CMSSW_20_1_X_2026-10-13-2300", ["el9_amd64_gcc14"], status="FAILED", exitcode=256, name="W")
