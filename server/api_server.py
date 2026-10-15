@@ -742,6 +742,34 @@ def _shifter_doc_claims_grounded(question: str, answer: str, tool_evidence: list
 _default_tag_notes: dict[str, str] = {}
 
 
+def _no_relvals_message(tag: str) -> str:
+    """No RelVal records for this IB -- usually because its RelVals are still running: say
+    so and name the newest IB that has them (found in the held-out pass 2026-10-15)."""
+    base = f"No RelVal results are imported for `{tag}` yet (its RelVals may still be running) -- unknown, not zero."
+    try:
+        newest = _newest_primary_tag_with_results("relval")
+    except Exception:
+        newest = None
+    if newest and newest != tag:
+        base += f" The newest IB with RelVal results is `{newest}`: ask e.g. \"how many relvals failed in {newest}\"."
+    return base
+
+
+def _newest_tag_with_merged_prs() -> str | None:
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                tags = [r["tag"] for r in session.run(
+                    "MATCH (:PR)-[:MERGED_BEFORE]->(ib:IB) WHERE ib.variant IS NULL RETURN DISTINCT ib.tag AS tag")]
+        finally:
+            driver.close()
+    except Exception:
+        return None
+    tags = [t for t in tags if _PRIMARY_IB_TAG_RE.match(t)]
+    return max(tags, key=_ib_sort_key) if tags else None
+
+
 def _newest_primary_tag_with_results(kind: str) -> str | None:
     """Newest primary IB tag (newest release series first) with any RelVal / unit-test record."""
     rel = "RAN_RELVAL" if kind == "relval" else "RAN_UNITTEST"
@@ -896,6 +924,8 @@ def _normalize_deterministic_question(question: str) -> str:
         (r"\bpackages?\s+(?:that\s+)?(?:needs?|require|requires)\s+(?:fixing|to\s+be\s+fixed|a\s+fix|attention)\b",
          "failed unit-test packages"),
         (r"\bhow\s+much\b", "how many"),
+        # "which PRs went into <tag>" = merged in (found in a held-out pass 2026-10-15)
+        (r"\b(?:went|got|go|come|came)\s+into\b|\b(?:are|were)\s+included\s+in\b", "were merged in"),
         (r"\bnumber\s+of\b", "number"),
         # (?<![\w-]) / (?![\w-]) instead of \b on both sides: \b alone treats
         # a hyphen as a word boundary, so this used to also fire inside an
@@ -1446,7 +1476,7 @@ def _relval_failure_count_answer(question: str, session_id: str) -> str | None:
     tag = tag_match.group(1)
     records = _relval_scope_records(tag, include_sub_ibs=False)
     if not records:
-        return f"No imported RelVal records were found for `{tag}`."
+        return _no_relvals_message(tag)
     if all_requested:
         return _relval_scope_summary(records, f"All imported RelVal results for `{tag}`")
     if selected_arch:
@@ -1471,7 +1501,7 @@ def _relval_data_availability_answer(question: str, session_id: str) -> str | No
     tag = tag_match.group(1)
     records = _relval_scope_records(tag, include_sub_ibs=False)
     if not records:
-        return f"No imported RelVal data is available for `{tag}`."
+        return _no_relvals_message(tag)
     all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
     selected_arch = _requested_ib_arch(question)
     resolved = _relval_scope_or_choice(session_id, tag, records, all_requested, selected_arch)
@@ -1494,7 +1524,7 @@ def _relval_ib_summary_answer(question: str, session_id: str) -> str | None:
     tag = tag_match.group(1)
     records = _relval_scope_records(tag, include_sub_ibs=False)
     if not records:
-        return f"No imported RelVal data is available for `{tag}`."
+        return _no_relvals_message(tag)
     all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
     selected_arch = _requested_ib_arch(question)
     # A specific architecture named explicitly means "every IB in this
@@ -3693,7 +3723,7 @@ def _relval_error_count_answer(question: str, session_id: str) -> str | None:
     tag = tag_match.group(1)
     records = _relval_scope_records(tag, include_sub_ibs=True)
     if not records:
-        return f"No imported RelVal records were found for `{tag}`."
+        return _no_relvals_message(tag)
     all_requested = bool(re.search(r"\b(?:all|everything)\b", question, re.IGNORECASE))
     resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
     if isinstance(resolved, str):
@@ -3899,6 +3929,8 @@ def _parse_recency_window_days(question: str, default: int | None = 7) -> int | 
     # bare "1\s+" alternative already had one, but "one"/"a" didn't --
     # "one month" was requiring the literal text "onemonth" to match).
     if re.search(rf"\b{_RECENCY_PREFIX}\s+(?:(?:one|a|1)\s+)?week\b", question, re.IGNORECASE):
+        return 7
+    if re.search(r"\b(?:the|this|a)\s+week\b|\bweekly\b", question, re.IGNORECASE):  # "summarize the week"
         return 7
     if re.search(rf"\b{_RECENCY_PREFIX}\s+(?:(?:one|a|1)\s+)?month\b", question, re.IGNORECASE):
         return 30
@@ -6952,6 +6984,7 @@ regarding related to with of in into from by at as or and do does did have has h
 please tell me show give find list search look check know get open opened closed created reported filed new old
 recent recently latest issue issues pr prs pull request requests bug bugs ticket tickets github cmssw item items
 already yet still ever someone anyone who which what when where why how already exist exists existing
+merged merge today yesterday week weeks day days went into recently
 """.split())
 
 
@@ -7263,7 +7296,9 @@ _LOG_PROBLEM_PASTE_RE = re.compile(
     # "cudaErrorLaunchOutOfResources: too many resources requested for launch"
     r"(?:Segmentation fault|Bus error|Aborted|Floating point exception|Illegal instruction) \(core dumped\)|"
     r"\bcuda[A-Za-z]*Error[A-Za-z]*\b|"
-    r"^\s*[A-Z][A-Za-z0-9_]*(?:Error|Exception):\s+\S.{8,}"
+    r"^\s*[A-Z][A-Za-z0-9_]*(?:Error|Exception):\s+\S.{8,}|"
+    # MessageLogger lines: "%MSG-e PluginNotFound: Unable to find plugin ..."
+    r"%MSG-[ewf]\s+\w+"
 )
 _LOG_KIND_LABELS = {
     "fatal_exception": "fatal exception", "sanitizer": "sanitizer report", "ubsan": "UBSan report",
@@ -7535,7 +7570,7 @@ def _pasted_error_message(question: str) -> tuple[str | None, str] | None:
     """(category or None, message) from a pasted error: the line after "Exception Message:"
     of a full Fatal Exception block, or a one-line "Category: message", or a bare one-line
     message of at least 30 characters. None for anything that reads like a question."""
-    text = question.strip()
+    text = re.sub(r"^%MSG-[ewif]\s+", "", question.strip())
     block = re.search(r"Exception Message:\s*\n?\s*(.+)", text)
     if block:
         category = re.search(r"exception of category '([^']+)'", text)
@@ -7777,9 +7812,19 @@ def _exit_code_meaning_answer(question: str) -> str | None:
     if not bare and not re.search(r"\b(?:mean(?:s|ing)?|what(?:'s| is| does)|stand for|explain|signif)", question, re.IGNORECASE):
         return None
     match = _EXIT_CODE_QUESTION_RE.search(question)
-    if not match:
-        return None
-    code = int(match.group(1) or match.group(2))
+    code = int(match.group(1) or match.group(2)) if match else None
+    if code is None:
+        # "what does SIGSEGV mean for a relval" -- a name from the exit-code table instead of
+        # a number (held-out pass 2026-10-15 got RelVal counts)
+        try:
+            by_name = {name.lower(): number for number, name in get_exit_code_names().items()}
+        except Exception:
+            return None
+        named = next((by_name[w.lower()] for w in re.findall(r"\b[A-Za-z][A-Za-z0-9]{3,}\b", question)
+                      if w.lower() in by_name and (w.isupper() or w[0].isupper())), None)
+        if named is None:
+            return None
+        code = named
     try:
         names = get_exit_code_names()
     except Exception as exc:
@@ -7816,8 +7861,22 @@ def _exit_code_meaning_answer(question: str) -> str | None:
             f"{len(names)} entries), so I can't name it from local data."
         )
     raw, how = candidates[0]
-    lines = [f"Exit code `{code}` means **{names[raw]}**.", f"- {how}."]
-    if names[raw].startswith("SIG"):
+    asked_by_name = not match
+    if asked_by_name:
+        lines = [f"**{names[raw]}** is recorded in RelVal results as exit code `{raw}`."]
+    else:
+        lines = [f"Exit code `{code}` means **{names[raw]}**.", f"- {how}."]
+    signal_meaning = {
+        "SIGSEGV": "a segmentation fault: the process read or wrote memory it doesn't own (a crash, usually a bug)",
+        "SIGABRT": "the process aborted itself, typically a failed assertion, std::terminate or an uncaught exception",
+        "SIGKILL": "the process was killed from outside, typically for exceeding a memory or time limit",
+        "SIGBUS": "a bus error: invalid memory alignment or a mapped file that went away",
+        "SIGFPE": "a floating-point exception, e.g. an integer division by zero",
+        "SIGTERM": "the process was asked to terminate, e.g. by the job's watchdog",
+    }.get(names[raw])
+    if signal_meaning:
+        lines.append(f"- `{names[raw]}` is {signal_meaning}; the job was killed by that signal, not by a CMSSW exception.")
+    elif names[raw].startswith("SIG"):
         lines.append(f"- `{names[raw]}` means the job was killed by that signal, not a CMSSW exception.")
     elif names[raw] != "TimeOut":
         lines.append(
@@ -7976,6 +8035,56 @@ def _not_failing_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _relval_by_exit_code_answer(question: str) -> str | None:
+    """ "How many workflows failed with LogicError in <tag>?" / "which relvals failed with exit
+    code 256 in <tag>" -- held-out pass 2026-10-15 answered with all 938 failures, not the 885
+    with that exit code."""
+    tag_match = IB_TAG_RE.search(question)
+    if not tag_match or not re.search(r"\bfail(?:ed|ing|s)?\s+with\b|\bwith\s+exit\s+code\b", question, re.IGNORECASE):
+        return None
+    try:
+        names = get_exit_code_names()
+    except Exception:
+        return None
+    number = re.search(r"\bexit\s*(?:code|status)?\s*(\d{1,6})\b", question, re.IGNORECASE)
+    if number:
+        code = int(number.group(1))
+    else:
+        by_name = {name.lower(): n for n, name in names.items()}
+        code = next((by_name[w.lower()] for w in re.findall(r"\b[A-Za-z][A-Za-z0-9]{3,}\b", question)
+                     if w.lower() in by_name and w[0].isupper()), None)
+    if code is None:
+        return None
+    tag = tag_match.group(1)
+    arch = _requested_ib_arch(question)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE (ib.tag = $t OR ib.parent_tag = $t) AND ($arch IS NULL OR ib.arch = $arch) "
+                "MATCH (ib)-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE r.exitcode = $code "
+                "AND NOT coalesce(r.known_error, false) "
+                "RETURN ib.tag AS tag, ib.arch AS arch, count(r) AS n, collect(r.workflow_id)[0..5] AS examples "
+                "ORDER BY n DESC", t=tag, arch=arch, code=code)]
+            total_failed = session.run(
+                "MATCH (ib:IB) WHERE (ib.tag = $t OR ib.parent_tag = $t) AND ($arch IS NULL OR ib.arch = $arch) "
+                "MATCH (ib)-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE NOT coalesce(r.known_error, false) "
+                "RETURN count(r) AS n", t=tag, arch=arch).single()["n"]
+    finally:
+        driver.close()
+    label = _format_exit_code(code, names)
+    scope = f" on `{arch}`" if arch else ""
+    if not rows:
+        return (f"No RelVal in `{tag}` or its sub-IBs{scope} failed with exit code {label} "
+                f"({total_failed:,} failed with other exit codes).")
+    n = sum(r["n"] for r in rows)
+    lines = [f"**{n:,} RelVal workflow(s)** failed with exit code {label} in `{tag}` and its sub-IBs{scope} "
+             f"(of {total_failed:,} failing):", ""]
+    for r in rows[:10]:
+        lines.append(f"- `{r['tag']}` on `{r['arch']}`: **{r['n']:,}**, e.g. " + ", ".join(f"`{w}`" for w in r["examples"]))
+    return "\n".join(lines)
+
+
 def _basic_term_answer(question: str) -> str | None:
     """ "What is an IB?" -- found live 2026-10-15 getting the "couldn't match that" menu.
     Fixed definitions of the terms the answers use; nothing is looked up."""
@@ -7998,7 +8107,8 @@ def _ib_variant_glossary_answer(question: str) -> str | None:
     asks_sub_ib = re.search(r"\bsub[\s-]*ibs?\b|\b(?:ib\s+)?(?:variants?|flavou?rs?)\b", question, re.IGNORECASE)
     if not named and not asks_sub_ib:
         return None
-    if re.search(r"\bfail|\berror|\bwarning|\bbroken|\bcompare\b", question, re.IGNORECASE):
+    if re.search(r"\bfail|\berror|\bwarning|\bbroken|\bbroke\b|\bcompare\b|\bstatus\b|\bhealth|\bok(?:ay)?\b|"
+                 r"\bdoing\b|\bresults?\b|\bhow\s+is\b|\bhow's\b", question, re.IGNORECASE):
         return None  # a results question about a variant, not a definition
     lines = []
     if asks_sub_ib:
@@ -8441,6 +8551,8 @@ _WORKFLOW_WHY_RE = re.compile(
     r"\btell\s+me\s+about\b|\bstatus\s+of\b|\bdetails?\b|\binfo(?:rmation)?\b|"
     r"\b(?:show|display|check|look\s*up)\b|\bexit\s*code\b|\beverywhere\b|"
     r"\b(?:on\s+)?which\s+arch(?:itecture)?s?\b|\bwhat\s+about\b|\bwhat\s+is\s+(?:wf|workflow)\b|"
+    # "give me the log of workflow 1.0 in <tag>", "what step failed for 1349.0 in <tag>"
+    r"\blogs?\b|\bstep\b|"
     r"^\s*(?:wf|workflow)\s*\d+\.\d+\s*\??\s*$",
     re.IGNORECASE,
 )
@@ -8956,7 +9068,8 @@ def _test_log_question_answer(question: str, session_id: str) -> str | None:
 _VARIANT_NAMES = ("ASAN", "UBSAN", "CLANG", "CPP23", "CUDART", "DBG", "DEVEL", "EVTGEN3", "G4ADEPT", "G4VECGEOM",
                   "GEANT4", "MULTIARCHSV4", "MULTIARCHS", "NONLTO", "PY314", "ROOT640", "ROOT6", "TF", "ROCK")
 _VARIANT_DAY_INTENT_RE = re.compile(
-    r"\b(?:fail(?:s|ed|ing|ures?)?|broken|break|wrong|why|status|errors?|red|problems?|crash(?:ed|es|ing)?|ok(?:ay)?)\b",
+    r"\b(?:fail(?:s|ed|ing|ures?)?|broken|broke|break(?:s|ing)?|wrong|why|status|health(?:y)?|errors?|red|problems?|"
+    r"crash(?:ed|es|ing)?|ok(?:ay)?|doing|look(?:s|ing)?\s+like|results?)\b",
     re.IGNORECASE)
 
 
@@ -9082,6 +9195,16 @@ def chat(req: ChatRequest):
     question = _with_arch_family_context(question, sid)
     question = _with_previous_capability_context(question, sid)
 
+    if (re.search(r"\b(?:prs?|pull\s+requests?)\b", question, re.IGNORECASE)
+            and re.search(r"\bmerged\b", question, re.IGNORECASE)
+            and re.search(r"\b(?:today|yesterday|recently|lately|latest|last\s+(?:ib|build)|newest)\b", question, re.IGNORECASE)
+            and not IB_TAG_RE.search(question)):
+        # "was there a PR merged today?" -> the newest IB's merged-PR list (held-out pass
+        # 2026-10-15: a text search for "merged today" matched a 2016 backport)
+        newest = _newest_tag_with_merged_prs()
+        if newest:
+            question = f"which PRs were merged in {newest}"
+
     exit_code_answer = _exit_code_meaning_answer(question)
     if exit_code_answer:
         return _chat_response(sid, original_question, exit_code_answer, "deterministic:exit_code")
@@ -9098,6 +9221,10 @@ def chat(req: ChatRequest):
     known_error_answer = _known_error_concept_answer(question)
     if known_error_answer:
         return _chat_response(sid, original_question, known_error_answer, "deterministic:known_error_concept")
+
+    by_exit = _relval_by_exit_code_answer(question)
+    if by_exit:
+        return _chat_response(sid, original_question, by_exit, "deterministic:relval_by_exit_code")
 
     not_failing = _not_failing_answer(question)
     if not_failing:
@@ -9126,7 +9253,7 @@ def chat(req: ChatRequest):
     if test_log_answer:
         return _chat_response(sid, original_question, test_log_answer, "deterministic:test_log_changes")
 
-    variant_day = _variant_day_failure_answer(question, sid)
+    variant_day = _variant_day_failure_answer(_normalize_deterministic_question(original_question), sid)
     if variant_day:
         answer, actions = variant_day
         return _chat_response(sid, original_question, answer, "deterministic:variant_day", actions=actions)
@@ -9228,6 +9355,10 @@ def chat(req: ChatRequest):
         elif (
             bare_context.categories & {"relval", "unittest"} and not _latest_ib_contexts.get(sid)
             and not names_workflow and not how_to and not bare_context.pr_number
+            # rankings over time and definitions are not about one IB
+            and not re.search(r"\btop\b|\bmost\b|\bweek|\bdays?\b|\boften\b|\brecurr|\bmean(?:s|ing)?\b|"
+                              r"\bhistory\b|\btrend|\bissues?\b|\bprs?\b|\bpull\s+requests?\b|\bgithub\b|\bticket",
+                              question, re.IGNORECASE)
             and re.search(r"\b(?:fail\w*|broken|how\s+many|which|what|list|show|give|names?|details?)\b",
                           question, re.IGNORECASE)
         ):

@@ -78,7 +78,7 @@ class Scenario:
     turns: list[Turn]
 
 
-_NO_RELVAL_DATA_YET = ["No imported RelVal records were found", "No failing RelVals were found"]
+_NO_RELVAL_DATA_YET = ["No imported RelVal records were found", "No failing RelVals were found", "No RelVal results are imported for"]
 # A legitimate, intentional outcome (not a routing dead end): the "latest"
 # tag genuinely has >1 architecture simultaneously flagged
 # is_relval_default, which _relval_scope_or_choice correctly asks about
