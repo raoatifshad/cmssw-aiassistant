@@ -4983,12 +4983,16 @@ def _relval_exit_code_cell(row: dict, exit_code_names: dict[int, str]) -> str:
 
 
 def _ib_pair_architectures(previous_tag: str, latest_tag: str) -> list[str]:
-    """Distinct architectures with an imported record for either tag."""
+    """Distinct architectures with an imported record for either tag or any of their
+    sub-IBs. Found live 2026-10-15: the primary CMSSW_20_1_X_2026-10-08-2300 had no
+    el9_amd64_gcc15 build, so the digest had no section for that architecture at all
+    and its ASAN sub-IB's 927 newly failing RelVals never appeared."""
     driver = get_driver()
     try:
         with driver.session() as session:
             rows = [dict(record) for record in session.run(
-                "MATCH (ib:IB) WHERE ib.tag IN $tags RETURN DISTINCT ib.arch AS arch ORDER BY arch",
+                "MATCH (ib:IB) WHERE ib.tag IN $tags OR ib.parent_tag IN $tags "
+                "RETURN DISTINCT ib.arch AS arch ORDER BY arch",
                 tags=[previous_tag, latest_tag],
             )]
     finally:
@@ -5035,10 +5039,18 @@ def _group_names_by_variant(rows: list[dict]) -> dict[str, set[str]]:
     return by_variant
 
 
+def _variant_tag(primary_tag: str, variant: str | None) -> str:
+    """CMSSW_20_1_X_<when> + "ROOT6" -> CMSSW_20_1_ROOT6_X_<when> (primary_tag for no variant)."""
+    if not variant:
+        return primary_tag
+    head, when = primary_tag.rsplit("_X_", 1)
+    return f"{head}_{variant}_X_{when}"
+
+
 def _variant_diff_baseline(
     variant: str, arch: str, previous_tag: str,
     before_by_variant: dict[str, list[dict]], after_by_variant: dict[str, list[dict]],
-    before_ran_variants: set[str], fetch_fn, label: str,
+    before_ran_variants: set[str], fetch_fn, label: str, latest_tag: str | None = None,
 ) -> tuple[list[dict], str | None, bool]:
     """Resolve the "before" rows to diff one sub-IB variant's current state against,
     for one data type (RelVal/UnitTest) in one shift-summary architecture. Three
@@ -5066,10 +5078,14 @@ def _variant_diff_baseline(
     if variant in before_ran_variants:
         return before_by_variant.get(variant, []), None, True
     after_rows = after_by_variant.get(variant, [])
-    if not after_rows:
+    if not after_rows and not latest_tag:
         return [], None, True
     variant_name = variant or "primary"
-    own_current_tag = after_rows[0]["ib_tag"]
+    # A variant with NO failures in the newer build still needs its own previous build as
+    # baseline, or what it fixed is never shown as resolved. Found live 2026-10-15: DBG,
+    # DEVEL, ROOT6 and ROOT640 each fixed a workflow (10804.31 / 10805.31) on
+    # 10-14-2300, none built at 10-14-1100, and the digest showed nothing resolved.
+    own_current_tag = after_rows[0]["ib_tag"] if after_rows else _variant_tag(latest_tag, variant)
     own_previous_tag = _variant_previous_tag(own_current_tag, variant or None, arch)
     if not own_previous_tag:
         return (
@@ -5591,8 +5607,8 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
     for one_arch in architectures:
         sub_ib_notes: list[str] = []
 
-        before_rows = get_failing_relvals(previous_tag, arch=one_arch, limit=200)
-        after_rows = get_failing_relvals(latest_tag, arch=one_arch, limit=200)
+        before_rows = get_failing_relvals(previous_tag, arch=one_arch, limit=None)
+        after_rows = get_failing_relvals(latest_tag, arch=one_arch, limit=None)
         before_by_variant = _group_relvals_by_variant(before_rows)
         after_by_variant = _group_relvals_by_variant(after_rows)
         # "Did this variant's IB node exist at all at previous_tag/latest_tag" (any
@@ -5605,11 +5621,13 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
         after_ran_by_variant = _group_ids_by_variant(get_relval_workflow_ids(latest_tag, arch=one_arch))
         newly_failing_arch: list[dict] = []
         resolved_arch: list[dict] = []
-        for variant in sorted(set(before_by_variant) | set(after_by_variant) | set(before_ran_by_variant)):
+        for variant in sorted(set(before_by_variant) | set(after_by_variant) | set(before_ran_by_variant)
+                              | set(after_ran_by_variant)):
             variant_before, note, has_baseline = _variant_diff_baseline(
                 variant, one_arch, previous_tag, before_by_variant, after_by_variant,
                 set(before_ran_by_variant),
-                lambda tag, arch: get_failing_relvals(tag, arch=arch, limit=200), "RelVal",
+                lambda tag, arch: get_failing_relvals(tag, arch=arch, limit=None), "RelVal",
+                latest_tag=latest_tag,
             )
             if note:
                 sub_ib_notes.append(note)
@@ -5623,8 +5641,8 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
 
         warnings_diff = diff_warnings(previous_tag, latest_tag, one_arch)
 
-        before_unittests = get_failing_unittests(previous_tag, arch=one_arch, limit=200, include_sub_ibs=True)
-        after_unittests = get_failing_unittests(latest_tag, arch=one_arch, limit=200, include_sub_ibs=True)
+        before_unittests = get_failing_unittests(previous_tag, arch=one_arch, limit=None, include_sub_ibs=True)
+        after_unittests = get_failing_unittests(latest_tag, arch=one_arch, limit=None, include_sub_ibs=True)
         before_ut_by_variant = _group_relvals_by_variant(before_unittests)
         after_ut_by_variant = _group_relvals_by_variant(after_unittests)
         before_ran_ut_by_variant = _group_names_by_variant(
@@ -5635,12 +5653,13 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
         )
         newly_failing_unittests: list[dict] = []
         resolved_unittests: list[dict] = []
-        for variant in sorted(set(before_ut_by_variant) | set(after_ut_by_variant) | set(before_ran_ut_by_variant)):
+        for variant in sorted(set(before_ut_by_variant) | set(after_ut_by_variant) | set(before_ran_ut_by_variant)
+                              | set(after_ran_ut_by_variant)):
             variant_before, note, has_baseline = _variant_diff_baseline(
                 variant, one_arch, previous_tag, before_ut_by_variant, after_ut_by_variant,
                 set(before_ran_ut_by_variant),
-                lambda tag, arch: get_failing_unittests(tag, arch=arch, limit=200, include_sub_ibs=True),
-                "UnitTest",
+                lambda tag, arch: get_failing_unittests(tag, arch=arch, limit=None, include_sub_ibs=True),
+                "UnitTest", latest_tag=latest_tag,
             )
             if note:
                 sub_ib_notes.append(note)
@@ -8847,7 +8866,7 @@ def release_explorer_failing(tag: str, archs: str | None = None, username: str =
     relvals: list[dict] = []
     unittests: list[dict] = []
     for one_arch in arch_list:
-        for row in get_failing_relvals(tag, arch=one_arch, limit=200):
+        for row in get_failing_relvals(tag, arch=one_arch, limit=None):
             relvals.append({
                 "arch": one_arch,
                 "variant": row["variant"] or "primary",
@@ -8856,7 +8875,7 @@ def release_explorer_failing(tag: str, archs: str | None = None, username: str =
                 "errors": row["errors"],
                 "exit_code": _format_exit_code(row["exitcode"], exit_code_names) if row.get("exitcode") else "0",
             })
-        unit_rows = get_failing_unittests(tag, arch=one_arch, limit=200, include_sub_ibs=True)
+        unit_rows = get_failing_unittests(tag, arch=one_arch, limit=None, include_sub_ibs=True)
         details = get_unittest_log_details([(row.get("ib_tag") or tag, one_arch) for row in unit_rows]) if one_arch else {}
         for row in unit_rows:
             fields = _unittest_failure_fields(row, one_arch, details, tag)

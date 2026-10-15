@@ -91,7 +91,7 @@ def deactivate_rule(rule_id: str) -> bool:
 def _check_relval_failure_count(params: dict, threshold: float) -> tuple[bool, str, dict]:
     tag = params["tag"]
     arch = params.get("arch")
-    failing = get_failing_relvals(tag, arch=arch, limit=100)
+    failing = get_failing_relvals(tag, arch=arch, limit=None)
     count = len(failing)
     triggered = count >= threshold
     message = f"`{tag}`{f' on `{arch}`' if arch else ''} has {count} failing RelVal(s) (threshold {threshold:g})."
@@ -115,7 +115,7 @@ def _check_relval_recurrence(params: dict, threshold: float) -> tuple[bool, str,
 def _check_unittest_failure_count(params: dict, threshold: float) -> tuple[bool, str, dict]:
     tag = params["tag"]
     arch = params.get("arch")
-    failing = get_failing_unittests(tag, arch=arch, limit=100)
+    failing = get_failing_unittests(tag, arch=arch, limit=None)
     count = len(failing)
     triggered = count >= threshold
     message = (

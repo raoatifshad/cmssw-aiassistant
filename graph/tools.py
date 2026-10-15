@@ -607,7 +607,19 @@ def top_packages_by_warnings(ib_tag: str | None = None, arch: str | None = None,
     )
 
 
-def get_failing_relvals(ib_tag: str, arch: str | None = None, limit: int = 50) -> list[dict]:
+# An internal caller that diffs or counts failing rows must see ALL of them: the digest,
+# regression alerts and the Release Explorer passed limit=None, which MAX_ROWS (100) clamped
+# per build, so a build type with >100 failures was compared as two arbitrary first-100
+# slices. Found live 2026-10-15: CLANG 10-14-2300 had 938 newly failing RelVals and the
+# digest listed 100. limit=None means no cap; an int is still clamped to MAX_ROWS (LLM tools).
+_UNCAPPED = 1_000_000
+
+
+def _row_limit(limit: int | None) -> int:
+    return _UNCAPPED if limit is None else min(limit, MAX_ROWS)
+
+
+def get_failing_relvals(ib_tag: str, arch: str | None = None, limit: int | None = 50) -> list[dict]:
     """Failed RelVals for an IB, including sub-IBs when given a primary tag. Excludes
     known_error=true workflows (e.g. "Grid-packs missing asan and non-asan shared
     libraries") to match the real CMSDT dashboard's own failing count/list, which
@@ -625,8 +637,8 @@ def get_failing_relvals(ib_tag: str, arch: str | None = None, limit: int = 50) -
     generate_shift_summary's diff then saw an empty "before" set for primary and
     reported an already-failing workflow as brand new -- a false "newly failing"
     alert. Per-node limiting guarantees every variant present gets its own fair
-    share of the cap instead of one variant starving the rest."""
-    limit = min(limit, MAX_ROWS)
+    share of the cap instead of one variant starving the rest. limit=None: no cap."""
+    limit = _row_limit(limit)
     driver = get_driver()
     try:
         with driver.session() as s:
@@ -664,7 +676,7 @@ def get_failing_relvals(ib_tag: str, arch: str | None = None, limit: int = 50) -
 
 
 def get_failing_unittests(
-    ib_tag: str, arch: str | None = None, limit: int = 50, include_sub_ibs: bool = False,
+    ib_tag: str, arch: str | None = None, limit: int | None = 50, include_sub_ibs: bool = False,
 ) -> list[dict]:
     """Unit tests with status=FAILED for a given IB. include_sub_ibs=True also pulls
     in every sub-IB whose parent_tag equals ib_tag (same "primary tag expands to its
@@ -677,9 +689,10 @@ def get_failing_unittests(
     correlated subquery) rather than globally, and this bypasses _run_query's own
     MAX_ROWS post-slice -- the identical fix get_failing_relvals needed, for the
     identical reason: a single heavily-failing sub-IB must not crowd out every
-    other variant's rows (including the primary's) under one flat limit."""
-    limit = min(limit, MAX_ROWS)
-    if not include_sub_ibs:
+    other variant's rows (including the primary's) under one flat limit. limit=None: no cap."""
+    capped = limit is not None
+    limit = _row_limit(limit)
+    if not include_sub_ibs and capped:
         return _run_query(
             "MATCH (ib:IB {tag:$t})-[:RAN_UNITTEST]->(ut:UnitTest {status:'FAILED'}) "
             "WHERE $arch IS NULL OR ib.arch = $arch "
@@ -692,7 +705,7 @@ def get_failing_unittests(
         with driver.session() as s:
             rows = [dict(r) for r in s.run(
                 "MATCH (ib:IB) "
-                "WHERE (ib.tag = $t OR ib.parent_tag = $t) AND ($arch IS NULL OR ib.arch = $arch) "
+                "WHERE (ib.tag = $t OR ($subs AND ib.parent_tag = $t)) AND ($arch IS NULL OR ib.arch = $arch) "
                 "CALL (ib) { "
                 "  MATCH (ib)-[:RAN_UNITTEST]->(ut:UnitTest {status:'FAILED'}) "
                 "  RETURN ut "
@@ -701,7 +714,7 @@ def get_failing_unittests(
                 "} "
                 "RETURN ib.tag AS ib_tag, ib.variant AS variant, ut.name AS name, ut.errors AS errors, ut.ok AS ok "
                 "ORDER BY ib.tag, ut.name",
-                {"t": ib_tag, "arch": arch, "lim": limit},
+                {"t": ib_tag, "arch": arch, "lim": limit, "subs": include_sub_ibs},
             )]
     finally:
         driver.close()
@@ -960,8 +973,8 @@ def find_relval_regressions(arch: str | None = None) -> dict:
 
     newly_failing = []
     for one_arch in architectures:
-        after_rows = get_failing_relvals(latest_tag, arch=one_arch, limit=200)
-        before_rows = get_failing_relvals(previous_tag, arch=one_arch, limit=200)
+        after_rows = get_failing_relvals(latest_tag, arch=one_arch, limit=None)
+        before_rows = get_failing_relvals(previous_tag, arch=one_arch, limit=None)
         # "Does this variant's IB node exist at all at previous_tag" must be checked
         # via positive proof (any status, not just FAILED) -- get_relval_workflow_ids,
         # never via "does it have a FAILING row" (get_failing_relvals's before_rows):
@@ -985,7 +998,7 @@ def find_relval_regressions(arch: str | None = None) -> dict:
                 own_previous_tag = variant_previous_tag(own_current_tag, variant, one_arch)
                 if not own_previous_tag:
                     continue  # no baseline at all -- can't claim anything is newly failing
-                before_ids = {r["workflow_id"] for r in get_failing_relvals(own_previous_tag, arch=one_arch, limit=200)}
+                before_ids = {r["workflow_id"] for r in get_failing_relvals(own_previous_tag, arch=one_arch, limit=None)}
             for row in rows:
                 if row["workflow_id"] not in before_ids:
                     newly_failing.append({
@@ -1027,8 +1040,8 @@ def find_unittest_regressions(arch: str | None = None) -> dict:
 
     newly_failing = []
     for one_arch in architectures:
-        after_rows = get_failing_unittests(latest_tag, arch=one_arch, limit=200, include_sub_ibs=True)
-        before_rows = get_failing_unittests(previous_tag, arch=one_arch, limit=200, include_sub_ibs=True)
+        after_rows = get_failing_unittests(latest_tag, arch=one_arch, limit=None, include_sub_ibs=True)
+        before_rows = get_failing_unittests(previous_tag, arch=one_arch, limit=None, include_sub_ibs=True)
         before_ran_variants = {
             row["variant"] for row in get_unittest_names(previous_tag, arch=one_arch, include_sub_ibs=True)
         }
@@ -1049,7 +1062,7 @@ def find_unittest_regressions(arch: str | None = None) -> dict:
                     continue  # no baseline at all -- can't claim anything is newly failing
                 before_names = {
                     r["name"] for r in
-                    get_failing_unittests(own_previous_tag, arch=one_arch, limit=200, include_sub_ibs=True)
+                    get_failing_unittests(own_previous_tag, arch=one_arch, limit=None, include_sub_ibs=True)
                 }
             for row in rows:
                 if row["name"] not in before_names:
@@ -1497,17 +1510,25 @@ def _relval_exception_rows(session, workflow_id: str, ib_tag: str | None) -> lis
     return deduped[:3]
 
 
-def _relval_evidence_terms(workflow_id: str, row: dict) -> set:
+def _relval_evidence_terms(workflow_id: str, row: dict, include_id: bool = True) -> set:
     module_match = re.search(r"Calling method for module\s+([\w:]+)/", row.get("context") or "")
     module = module_match.group(1) if module_match else None
-    return {value for value in (workflow_id, row["exception"], module) if value}
+    return {value for value in ((workflow_id if include_id else None), row["exception"], module) if value}
 
 
-def _rank_relval_evidence(workflow_id: str, rows: list[dict], candidates_for, limit: int) -> list[dict]:
+# A digest with more newly failing workflows than this skips the bare workflow-id search
+# terms (exception text and module are kept): each id is one more regex over every
+# PR/Issue/comment text, and an id-only match is only ever shown as a weak "names workflow
+# X only" note. Found 2026-10-15: 940 newly failing CLANG workflows made one digest ~54 s.
+_EVIDENCE_ID_TERMS_MAX_WORKFLOWS = 60
+
+
+def _rank_relval_evidence(workflow_id: str, rows: list[dict], candidates_for, limit: int,
+                          include_id: bool = True) -> list[dict]:
     results = []
     for row in rows:
         exception = row["exception"]
-        terms = _relval_evidence_terms(workflow_id, row)
+        terms = _relval_evidence_terms(workflow_id, row, include_id)
         if not terms:
             continue
         candidates = candidates_for(terms, limit)
@@ -1562,12 +1583,13 @@ def prefetch_relval_exception_evidence(requests: list[tuple[str, str | None]], l
     requests = list(dict.fromkeys(requests))
     if not requests:
         return
+    include_id = len({workflow_id for workflow_id, _ in requests}) <= _EVIDENCE_ID_TERMS_MAX_WORKFLOWS
     driver = get_driver()
     try:
         with driver.session() as session:
             rows_by_request = {req: _relval_exception_rows(session, req[0], req[1]) for req in requests}
             all_terms = sorted({term for (workflow_id, _), rows in rows_by_request.items()
-                                for row in rows for term in _relval_evidence_terms(workflow_id, row)})
+                                for row in rows for term in _relval_evidence_terms(workflow_id, row, include_id)})
             items = [dict(record) for record in session.run(
                 _ARTIFACT_EVIDENCE_QUERY,
                 **_artifact_query_params(all_terms, {workflow_id for workflow_id, _ in requests}),
@@ -1588,7 +1610,7 @@ def prefetch_relval_exception_evidence(requests: list[tuple[str, str | None]], l
     now = time.monotonic()
     for (workflow_id, ib_tag), rows in rows_by_request.items():
         _EVIDENCE_CACHE[(workflow_id, ib_tag, limit)] = (
-            now, _rank_relval_evidence(workflow_id, rows, candidates_for, limit))
+            now, _rank_relval_evidence(workflow_id, rows, candidates_for, limit, include_id))
 
 def shared_header_packages(file_path: str) -> list[dict]:
     """Which packages are all affected by warnings in the same shared header?

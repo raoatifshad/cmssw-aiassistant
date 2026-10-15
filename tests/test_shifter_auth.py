@@ -311,8 +311,8 @@ class ProtectedEndpointTests(unittest.TestCase):
         self.assertEqual(
             get_relvals.call_args_list,
             [
-                call("CMSSW_20_1_X_2026-09-08-2300", arch="el9_amd64_gcc14", limit=200),
-                call("CMSSW_20_1_X_2026-09-08-2300", arch="el9_aarch64_gcc14", limit=200),
+                call("CMSSW_20_1_X_2026-09-08-2300", arch="el9_amd64_gcc14", limit=None),
+                call("CMSSW_20_1_X_2026-09-08-2300", arch="el9_aarch64_gcc14", limit=None),
             ],
         )
 

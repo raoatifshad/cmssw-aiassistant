@@ -75,6 +75,8 @@ def setup_schema(driver):
         # read every RelVal (~950k db hits, 110 ms at 475k rows, 2026-10-15) and grew with them
         "CREATE INDEX IF NOT EXISTS FOR (n:RelVal) ON (n.workflow_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:RelValException) ON (n.ib_key, n.workflow_id)",
+        # per-workflow exception lookups (digest evidence, chat) filter on workflow_id alone
+        "CREATE INDEX IF NOT EXISTS FOR (n:RelValException) ON (n.workflow_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:UnitTest) ON (n.ib_key)",
         "CREATE INDEX IF NOT EXISTS FOR (n:Warning) ON (n.package)",
         "CREATE INDEX IF NOT EXISTS FOR (n:ChatTurn) ON (n.turn_order)",

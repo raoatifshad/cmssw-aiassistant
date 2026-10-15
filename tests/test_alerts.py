@@ -100,7 +100,7 @@ class CheckUnittestFailureCountTests(unittest.TestCase):
         )
 
         get_failing_unittests.assert_called_once_with(
-            "CMSSW_20_1_X_2026-08-25-2300", arch="el9_amd64_gcc13", limit=100,
+            "CMSSW_20_1_X_2026-08-25-2300", arch="el9_amd64_gcc13", limit=None,
         )
 
 
