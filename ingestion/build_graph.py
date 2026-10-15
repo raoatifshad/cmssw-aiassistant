@@ -248,7 +248,8 @@ def relval_status(steps: list[dict]) -> str:
     2026-10-15: DAS_ERROR was stored as PASSED (only "FAILED" was checked), so
     workflow 38551.85 -- DAS_ERROR at step1 in all 250 imported runs -- read as
     passing everywhere. DAS_ERROR is kept apart from FAILED: it is an input-data
-    problem, not a code failure, and is not in the dashboard's failing count."""
+    problem, not a code failure -- although the IB dashboard itself counts it as failed
+    (num_failed), so answers say so when they list DAS errors separately."""
     statuses = {step.get("status") for step in steps}
     if "FAILED" in statuses:
         return "FAILED"

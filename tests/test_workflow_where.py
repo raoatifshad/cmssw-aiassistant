@@ -44,7 +44,7 @@ class RelvalStatusTests(unittest.TestCase):
                   "failed_relvals": 0, "passed_relvals": 950, "known_error_relvals": 0, "das_error_relvals": 1}
         answer = _relval_scope_summary([record], "RelVals")
         self.assertTrue(answer.startswith("🟠"))  # not green: one workflow could not run
-        self.assertIn("950 passed, 1 DAS error (input files not found, nothing ran)", answer)
+        self.assertIn("950 passed, 1 DAS error (input files not found, nothing ran; the IB dashboard counts these as failed)", answer)
         self.assertIn("1 DAS error(s): `38551.85`", answer)
 
 
