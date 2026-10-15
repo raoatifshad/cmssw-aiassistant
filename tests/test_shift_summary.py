@@ -691,3 +691,25 @@ class NewlyFailingUnittestTableTests(unittest.TestCase):
         self.assertLessEqual(len(exceptions[0].replace("\\|", "|")), 300)
         self.assertIn("| C/D | 1 | 1 failed / 4 | not found in the imported log |  | First failure in this series; 0/0 overall. |",
                       lines[3])
+
+
+class DigestCoverageNoteTests(unittest.TestCase):
+    """Found live 2026-10-15: the default window ended at a build whose RelVals were not
+    imported yet and the Shift Console showed "0 newly failing" / "All clear"."""
+
+    def test_missing_partial_and_no_build(self):
+        from server.api_server import _digest_coverage_notes
+        tag = "CMSSW_20_1_X_2026-10-15-0900"
+        notes = _digest_coverage_notes(
+            tag,
+            before_rv={"": {"1.0", "2.0"}, "CLANG": {"1.0"}}, after_rv={},
+            before_ut={"": set(map(str, range(100)))}, after_ut={"": set(map(str, range(40)))},
+            latest_has_build=True,
+        )
+        self.assertEqual(notes[0], f"RelVal results: none imported yet for `{tag}` in the primary build, CLANG "
+                                   "(the previous build had 3), so \"None\" below means not checked yet, not passing.")
+        self.assertEqual(notes[1], f"Unit-test results: only 40 of 100 imported for `{tag}` in the primary build; "
+                                   "it may still be running.")
+        self.assertEqual(_digest_coverage_notes(tag, {}, {}, {}, {}, latest_has_build=False),
+                         [f"Build: `{tag}` has no build on this architecture yet, so nothing here is compared."])
+        self.assertEqual(_digest_coverage_notes(tag, {"": {"1.0"}}, {"": {"1.0"}}, {}, {}, latest_has_build=True), [])
