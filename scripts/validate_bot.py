@@ -95,10 +95,10 @@ def build_scenarios(tag: str, arch: str) -> list[Scenario]:
         # overview, a bare "38551.85" the "couldn't match that" menu. Workflow 1.0 runs in
         # every release series, so this holds whatever the graph's current data is.
         Scenario("where is a workflow failing, no tag", [
-            Turn("where is workflow 1.0 failing?", expect_contains=["Workflow `1.0`", "imported run(s) did not pass"]),
+            Turn("where is workflow 1.0 failing?", expect_contains=["Workflow `1.0`", "Runs:"]),
         ]),
         Scenario("bare workflow ID", [
-            Turn("1.0", expect_contains=["Workflow `1.0`", "imported run(s) did not pass"]),
+            Turn("1.0", expect_contains=["Workflow `1.0`", "Runs:"]),
         ]),
         Scenario("relval failure count", [
             Turn(

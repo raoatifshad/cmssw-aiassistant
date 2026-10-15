@@ -77,13 +77,13 @@ class WorkflowWhereTests(unittest.TestCase):
                 patch("server.api_server.get_exit_code_names", return_value={}):
             for question in ("where is 38551.85 failing?", "38551.85", "wf 38551.85", "is workflow 38551.85 failing"):
                 answer = _workflow_where_failing_answer(question, "s")
-                self.assertIn("**4 of 4** imported run(s) did not pass", answer, question)
-        self.assertIn("🟠 **DAS error** in 4 run(s)", answer)
+                self.assertIn("is **failing everywhere**: it did not pass in any of its 4 imported run(s)",
+                              answer, question)
+        self.assertIn("Runs: 🟠 4 DAS error", answer)
         self.assertIn("could not get its input files from DAS", answer)
-        self.assertIn("did not pass **anywhere**", answer)
-        self.assertIn("`CMSSW_20_0`, `CMSSW_20_1`", answer)
+        self.assertIn("every run of `CMSSW_20_0`, `CMSSW_20_1`, in 2 build type(s) (primary, CLANG)", answer)
+        self.assertNotIn("| Release |", answer)  # the sentence already says "everywhere"
         self.assertIn("`step1=DAS_ERROR step2=NOTRUN; exit 1 0` -- 2 run(s)", answer)
-        self.assertIn("Most recent: `CMSSW_20_1_X_2026-10-14-2300`", answer)
         # no "<IB tag>" placeholder: the Shift Console rendered it as "[object Object]"
         self.assertNotIn("<", answer)
         self.assertIn("\"why is workflow 38551.85 failing in CMSSW_20_1_X_2026-10-14-2300\"", answer)
@@ -94,9 +94,10 @@ class WorkflowWhereTests(unittest.TestCase):
                    + _rows("CMSSW_17_0_X_2026-10-13-2300", ["el8_amd64_gcc12"], status="PASSED", exitcode=0, name="W"))
         with self._patch_graph(relvals), patch("server.api_server.get_exit_code_names", return_value={}):
             answer = _workflow_where_failing_answer("where is 512.0 failing", "s")
-        self.assertIn("**1 of 3** imported run(s) did not pass", answer)
-        self.assertIn("| `CMSSW_20_1` | primary | `el9_amd64_gcc14` | 1 / 2 | `CMSSW_20_1_X_2026-10-13-2300` |", answer)
-        self.assertIn("Passed in every run of: `CMSSW_17_0` primary.", answer)
+        self.assertTrue(answer.startswith("Workflow `512.0` (`W`) is **now failing in 1 place**"))
+        self.assertIn("`CMSSW_20_1` primary on `el9_amd64_gcc14` (failing since `CMSSW_20_1_X_2026-10-13-2300`)", answer)
+        self.assertIn("Runs: 🔴 1 failed · 🟢 2 passed", answer)
+        self.assertIn("Never failed in 1 other release series (`CMSSW_17_0`).", answer)
 
     def test_recovered_workflow_says_so_and_ignores_other_names_and_stale_exceptions(self):
         """Found live 2026-10-15 on 1349.0: failed only in the 10-09..10-11 builds, passing
@@ -115,9 +116,9 @@ class WorkflowWhereTests(unittest.TestCase):
         with self._patch_graph(relvals, details, exceptions), \
                 patch("server.api_server.get_exit_code_names", return_value={}):
             answer = _workflow_where_failing_answer("where is workflow 1349.0 failing", "s")
-        self.assertIn("**1 of 2** imported run(s) did not pass", answer)
-        self.assertIn("**Now: passing again everywhere**", answer)
-        self.assertIn("last failure `CMSSW_20_1_X_2026-10-09-2300`", answer)
+        self.assertIn("is **not failing now**: the newest run passed everywhere. "
+                      "It last failed in `CMSSW_20_1_X_2026-10-09-2300`", answer)
+        self.assertIn("Earlier failures, passing since: `CMSSW_20_1` primary (build 2026-10-09-2300).", answer)
         self.assertIn("step3=FAILED", answer)
         self.assertNotIn("DAS_ERROR", answer)
         self.assertIn("**[LogicError]** now", answer)
@@ -131,8 +132,21 @@ class WorkflowWhereTests(unittest.TestCase):
                    + _rows("CMSSW_20_1_X_2026-10-14-2300", ["el8_amd64_gcc14"], status="PASSED", exitcode=0, name="W"))
         with self._patch_graph(relvals), patch("server.api_server.get_exit_code_names", return_value={}):
             answer = _workflow_where_failing_answer("where is 7.0 workflow failing", "s")
-        self.assertIn("**Now: still not passing in 1**", answer)
-        self.assertIn("`CMSSW_20_1` primary `el9_amd64_gcc14` (failing since `CMSSW_20_1_X_2026-10-13-2300`)", answer)
+        self.assertIn("is **now failing in 1 place**", answer)
+        self.assertIn("`CMSSW_20_1` primary on `el9_amd64_gcc14` (failing since `CMSSW_20_1_X_2026-10-13-2300`)", answer)
+
+    def test_known_errors_are_not_counted_as_failing_places(self):
+        relvals = (_rows("CMSSW_20_1_CLANG_X_2026-10-14-2300", ["el9_amd64_gcc14"], variant="CLANG",
+                         status="FAILED", exitcode=18944, name="W")
+                   + _rows("CMSSW_20_1_X_2026-10-14-2300", ["el9_amd64_gcc14"], status="PASSED", exitcode=0, name="W"))
+        known = _rows("CMSSW_17_0_X_2026-10-14-2300", ["el8_aarch64_gcc13"], status="FAILED", exitcode=256, name="W")
+        known[0].update(known_error=True, known_error_message="GridPacks were built for x86_64")
+        with self._patch_graph(relvals + known), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is 512.0 failing", "s")
+        self.assertIn("is **now failing in 1 place**", answer)
+        self.assertIn("`CMSSW_20_1` CLANG on `el9_amd64_gcc14` (failing since", answer)
+        self.assertIn("Known error, excluded from failure counts, in 1 place: `CMSSW_17_0` primary on "
+                      "`el8_aarch64_gcc13` (known error since `CMSSW_17_0_X_2026-10-14-2300`).", answer)
 
     def test_why_without_tag_falls_back_to_every_build_when_latest_ib_lacks_it(self):
         from server.api_server import _workflow_why_failing_answer
@@ -152,7 +166,8 @@ class WorkflowWhereTests(unittest.TestCase):
                 patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-10-15-0900"}]), \
                 patch("server.api_server.get_exit_code_names", return_value={}):
             answer = _workflow_why_failing_answer("why is workflow 38551.85 failing", "why-no-tag")
-        self.assertIn("🟠 **DAS error** in 1 run(s)", answer)
+        self.assertIn("is **failing everywhere**", answer)
+        self.assertIn("Runs: 🟠 1 DAS error", answer)
         self.assertNotIn("has no imported RelVal record", answer)
 
     def test_other_handlers_keep_their_questions(self):
