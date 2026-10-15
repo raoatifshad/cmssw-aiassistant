@@ -136,17 +136,29 @@ def to_iso(unix_ts) -> str | None:
         return None
 
 
-def _source_hash(driver, source_id: str) -> str | None:
+def _source_state(driver, source_id: str) -> dict | None:
     with driver.session() as session:
         record = session.run(
-            "MATCH (state:ImportState {source_id:$source_id}) RETURN state.content_hash AS content_hash",
+            "MATCH (state:ImportState {source_id:$source_id}) "
+            "RETURN state.content_hash AS content_hash, state.pruned_at IS NOT NULL AS pruned",
             source_id=source_id,
         ).single()
-    return record["content_hash"] if record else None
+    return dict(record) if record else None
+
+
+def _source_hash(driver, source_id: str) -> str | None:
+    state = _source_state(driver, source_id)
+    return state["content_hash"] if state else None
 
 
 def source_needs_import(driver, source_id: str, content_hash: str, force: bool = False) -> bool:
-    return not is_unchanged(_source_hash(driver, source_id), content_hash, force)
+    """A source whose data prune_old_data.py deleted (ImportState.pruned_at) is never
+    re-imported, not even with --force: it is past the retention window, and its file
+    can still be on disk (IB-TEST-LOGS/results is kept for good)."""
+    state = _source_state(driver, source_id)
+    if state and state.get("pruned"):
+        return False
+    return not is_unchanged(state["content_hash"] if state else None, content_hash, force)
 
 
 def mark_source_imported(driver, source_id: str, content_hash: str, source_type: str, source_path: Path):

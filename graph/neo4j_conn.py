@@ -71,6 +71,9 @@ def setup_schema(driver):
         "CREATE INDEX IF NOT EXISTS FOR (n:PR) ON (n.repo, n.number)",
         "CREATE INDEX IF NOT EXISTS FOR (n:WorkflowCommand) ON (n.workflow_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:RelVal) ON (n.ib_key)",
+        # get_relval_recurrence looks a workflow up across every build; without this it
+        # read every RelVal (~950k db hits, 110 ms at 475k rows, 2026-10-15) and grew with them
+        "CREATE INDEX IF NOT EXISTS FOR (n:RelVal) ON (n.workflow_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:RelValException) ON (n.ib_key, n.workflow_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:UnitTest) ON (n.ib_key)",
         "CREATE INDEX IF NOT EXISTS FOR (n:Warning) ON (n.package)",
