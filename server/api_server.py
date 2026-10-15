@@ -549,7 +549,7 @@ def _format_raw_evidence(
     if not specific:
         return ("I couldn't find evidence specific to this question in the imported data. "
                 "Try naming an IB tag, architecture, workflow ID or PR number -- e.g. "
-                "\"what's failing in the latest IB\" or \"failed relvals for <IB tag>\".")
+                "\"what's failing in the latest IB\" or \"failed relvals for [IB tag]\".")
     lines = [f"Evidence was found, but it could not be safely summarized into "
              f"prose ({reason}). Showing the raw evidence instead:", ""]
     for item in specific:
@@ -7711,6 +7711,8 @@ def _workflow_why_failing_answer(question: str, session_id: str) -> str | None:
         )
         if recurrence.get("known_error_appearances"):
             history += f", plus {recurrence['known_error_appearances']} known-error record(s)"
+        if recurrence.get("das_error_appearances"):
+            history += f", plus **{recurrence['das_error_appearances']} DAS-error** record(s)"
         lines.append(history + ".")
     return "\n".join(lines)
 
@@ -7839,8 +7841,8 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
         archs = sorted({r["arch"] for r in problems})
         if not counts["passed"]:
             lines += ["", f"It did not pass **anywhere**: every imported run of {', '.join(f'`{x}`' for x in series_names)}, "
-                          f"in {len(variants)} build type(s) ({', '.join(variants[:12])}"
-                          f"{', ...' if len(variants) > 12 else ''}) and on {len(archs)} architecture(s) "
+                          f"in {len(variants)} build type(s) ({', '.join(variants[:30])}"
+                          f"{', ...' if len(variants) > 30 else ''}) and on {len(archs)} architecture(s) "
                           f"({', '.join(f'`{a}`' for a in archs)})."]
         else:
             groups: dict[tuple, list[dict]] = {}
@@ -7889,8 +7891,11 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
         lines.append(f"\nNot counted above: {len(other_rows)} run(s) in {', '.join(f'`{x}`' for x in other_series[:6])} "
                      f"where this number has a different workflow name ({other_bad} of them did not pass) -- "
                      f"older release series can define the number differently.")
+    # a real tag, never a "<IB tag>" placeholder: the Shift Console's markdown renderer
+    # reads <...> as an HTML element and showed "[object Object]" (found 2026-10-15)
+    example_tag = max(problems or rows, key=lambda r: _ib_sort_key(r["tag"]))["tag"]
     lines.append(f"\nThe dashboard data keeps about two weeks of builds. For one build's detail, ask "
-                 f"\"why is workflow {workflow_id} failing in <IB tag>\".")
+                 f"\"why is workflow {workflow_id} failing in {example_tag}\".")
     return "\n".join(lines)
 
 
@@ -7928,11 +7933,11 @@ def _conversational_response(sid: str, original_question: str):
         message = (
             "I answer from imported CMSSW Integration Build data -- read-only, never from the web. For example:\n"
             "- **Latest / availability:** \"what is the latest IB\", \"is yesterday's 23:00 IB out?\", \"latest 20_0_X IB\"\n"
-            "- **What's failing:** \"what is failing in the latest IB\", \"failed RelVals for <tag> el9_amd64_gcc14\", "
+            "- **What's failing:** \"what is failing in the latest IB\", \"failed RelVals for [IB tag] el9_amd64_gcc14\", "
             "\"which unit tests are failing\"\n"
             "- **One workflow:** \"why is workflow 512.0 failing on aarch64\", \"has 140.051 failed before\"\n"
-            "- **Changes:** \"give me a shift summary\", \"compare the last two IBs\", \"which PRs were merged in <tag>\"\n"
-            "- **Evidence:** \"any PR or open issue about <error or package>\", \"what does exit code 65 mean\"\n"
+            "- **Changes:** \"give me a shift summary\", \"compare the last two IBs\", \"which PRs were merged in [IB tag]\"\n"
+            "- **Evidence:** \"any PR or open issue about [error or package]\", \"what does exit code 65 mean\"\n"
             "- **Procedures:** \"what does the build-any-ib Jenkins job do\""
         )
         return _chat_response(sid, original_question, message, "conversational:help", actions=_CAPABILITY_ACTIONS)
