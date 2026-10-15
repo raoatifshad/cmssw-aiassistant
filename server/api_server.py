@@ -7750,8 +7750,11 @@ def _workflow_where_failing_answer(question: str, session_id: str) -> str | None
         if re.search(r"\b(?:prs?|pull requests?|issues?|github|ticket|exceptions?|logs?|commands?|cmsdriver|"
                      r"why|reason|cause[sd]?|history|how\s+often|before|recurr\w*)\b", question, re.IGNORECASE):
             return None  # PR/Issue evidence, exception/log/command lookups, "why", history: other handlers
-        match = re.search(r"\b(?:wf|workflow|relval)s?\s*#?\s*(\d{1,6}\.\d{1,6})(?![\d.])", question, re.IGNORECASE) \
-            or re.search(r"(?<![\d.\w-])(\d{3,6}\.\d{1,6})(?![\d.])", question)
+        # a short ID ("1.0", "7.0") only when the question says it is a workflow, anywhere
+        # ("where is 7.0 workflow failing", "where this workflow is failing 1.0")
+        says_workflow = re.search(r"\b(?:wf|workflow|relval)s?\b", question, re.IGNORECASE)
+        match = re.search(r"(?<![\d.\w-])(\d{3,6}\.\d{1,6})(?![\d.])", question) or (
+            says_workflow and re.search(r"(?<![\d.\w-])(\d{1,6}\.\d{1,6})(?![\d.])", question))
         if not match:
             return None
         workflow_id = match.group(1)
@@ -7782,11 +7785,11 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
                 "RETURN detail",
                 prefix=f"{workflow_id}_", arch=arch, family=family,
             )]
-            exceptions = [dict(r) for r in session.run(
+            exception_rows = [dict(r) for r in session.run(
                 "MATCH (e:RelValException {workflow_id:$wf}) "
                 "WHERE ($arch IS NULL OR e.arch = $arch) AND ($family IS NULL OR e.arch CONTAINS $family) "
-                "RETURN e.category AS category, left(coalesce(e.message, ''), 200) AS message, count(*) AS n "
-                "ORDER BY n DESC LIMIT 3",
+                "RETURN e.ib_tag AS tag, e.arch AS arch, e.category AS category, "
+                "left(coalesce(e.message, ''), 200) AS message",
                 wf=workflow_id, arch=arch, family=family,
             )]
     finally:
@@ -7819,6 +7822,18 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
         row["series"] = series.group(1) if series else row["tag"]
     counts = {k: sum(1 for r in rows if r["kind"] == k) for k in ("failed", "das", "known", "passed")}
     problems = [r for r in rows if r["kind"] != "passed"]
+    # Test-log details and exception text only from this workflow's own runs that did
+    # not pass. Found live 2026-10-15 on 1349.0: two DAS_ERROR test-log runs were from
+    # CMSSW_8_0, where 1349.0 is a differently named workflow, and the exception shown
+    # (PluginNotFound EvtGen130) came from August EVTGEN3 builds, not from its failures.
+    step_details = [d for d in step_details if d.startswith(f"{workflow_id}_{current_name}:")]
+    problem_builds = {(r["tag"], r["arch"]) for r in problems}
+    by_exception: dict[tuple, int] = {}
+    for e in exception_rows:
+        if (e["tag"], e["arch"]) in problem_builds:
+            by_exception[(e["category"], e["message"])] = by_exception.get((e["category"], e["message"]), 0) + 1
+    exceptions = [{"category": c, "message": m, "n": n}
+                  for (c, m), n in sorted(by_exception.items(), key=lambda kv: -kv[1])[:3]]
     first, last = min(r["when"] for r in rows)[:10], max(r["when"] for r in rows)[:10]
     names = get_exit_code_names()
 
@@ -7834,6 +7849,46 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
         lines.append(f"- 🟠 **Known error** in {counts['known']} run(s){reason_text}, excluded from failure counts.")
     if counts["passed"]:
         lines.append(f"- 🟢 **Passed** in {counts['passed']} run(s).")
+
+    if problems:
+        # Is it still failing? Judged per track (release, build type, architecture) by
+        # that track's newest run -- found live 2026-10-15: 1349.0 failed only in the
+        # 10-09..10-11 builds and passed in every 20_1 run since, but the answer read as
+        # if it were still failing.
+        tracks: dict[tuple, list[dict]] = {}
+        for r in rows:
+            tracks.setdefault((r["series"], r["variant"], r["arch"]), []).append(r)
+        still_bad, recovered = [], []
+        for key, track in tracks.items():
+            track.sort(key=lambda r: _ib_sort_key(r["tag"]))
+            if all(r["kind"] == "passed" for r in track):
+                continue
+            if track[-1]["kind"] == "passed":
+                recovered.append(key)
+                continue
+            streak_start = len(track) - 1
+            while streak_start > 0 and track[streak_start - 1]["kind"] != "passed":
+                streak_start -= 1
+            still_bad.append((key, track[streak_start]["tag"], track[-1]["kind"]))
+        failed_builds = sorted({r["when"] for r in problems})
+        builds_text = (", ".join(failed_builds) if len(failed_builds) <= 8
+                       else f"{len(failed_builds)} builds, {failed_builds[0]} to {failed_builds[-1]}")
+        lines.append(f"\nBuilds where it did not pass: {builds_text}.")
+        if not counts["passed"]:
+            lines.append("**Now: still not passing anywhere** -- it has not passed in any imported run.")
+        elif not still_bad:
+            last = max(problems, key=lambda r: _ib_sort_key(r["tag"]))
+            lines.append(f"**Now: passing again everywhere** -- the newest run of every release/build type/architecture "
+                         f"passed; last failure `{last['tag']}` (`{last['arch']}`).")
+        else:
+            kind_label = {"failed": "failing", "das": "DAS error", "known": "known error"}
+            shown = "; ".join(f"`{series}` {variant} `{a}` ({kind_label[kind]} since `{since}`)"
+                              for (series, variant, a), since, kind in sorted(still_bad)[:8])
+            more = f"; +{len(still_bad) - 8} more" if len(still_bad) > 8 else ""
+            lines.append(f"**Now: still not passing in {len(still_bad)}** release/build type/architecture "
+                         f"track(s), judged by each one's newest run: {shown}{more}.")
+            if recovered:
+                lines.append(f"Passing again in the other {len(recovered)} track(s) where it failed earlier.")
 
     if problems:
         series_names = sorted({r["series"] for r in problems})
