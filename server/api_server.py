@@ -8476,8 +8476,13 @@ def export_chat_markdown(session_id: str):
     return "\n".join(lines)
 
 
+# Write endpoints need a shifter session (2026-10-15, before opening the system to testers):
+# they were open to anyone who could reach the port. Read-only chat/search/digest are not
+# changed; /api/feedback stays open on purpose (the chat widget posts it cross-origin,
+# without the session cookie, and feedback never overwrites imported facts).
 @app.post("/api/ingest")
-async def ingest(request: Request, source: str, build: str | None = None):
+async def ingest(request: Request, source: str, build: str | None = None,
+                 username: str = Depends(require_shifter)):
     """Ingest JSON, JSONL, or Clang HTML with immutable source provenance."""
     if _pipeline is None:
         raise HTTPException(503, "Log RAG pipeline is not initialized")
@@ -8660,7 +8665,7 @@ def record_feedback(req: FeedbackRequest):
 
 
 @app.post("/api/alerts")
-def create_alert_rule(req: AlertRuleRequest):
+def create_alert_rule(req: AlertRuleRequest, username: str = Depends(require_shifter)):
     """Register a rule that reuses an existing capability's query on a
     schedule (see ingestion/run_alerts.py) instead of a chat turn."""
     try:
@@ -8678,14 +8683,14 @@ def get_alert_rules(active_only: bool = True):
 
 
 @app.delete("/api/alerts/{rule_id}")
-def remove_alert_rule(rule_id: str):
+def remove_alert_rule(rule_id: str, username: str = Depends(require_shifter)):
     if not deactivate_rule(rule_id):
         raise HTTPException(404, "No alert rule with that ID.")
     return {"status": "deactivated"}
 
 
 @app.post("/api/alerts/evaluate")
-def evaluate_alert_rules_now():
+def evaluate_alert_rules_now(username: str = Depends(require_shifter)):
     """Evaluate every active rule immediately (for testing a rule without
     waiting for the next scheduled run of ingestion/run_alerts.py)."""
     fired = evaluate_rules()

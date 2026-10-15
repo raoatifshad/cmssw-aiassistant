@@ -139,6 +139,31 @@ class ProtectedEndpointTests(unittest.TestCase):
         response = self.client.get("/api/alerts/status", follow_redirects=False)
         self.assertEqual(response.status_code, 401)
 
+    @patch("server.shifter_auth.DEV_SHIFTER_LOGIN", True)
+    @patch("server.api_server.evaluate_rules")
+    @patch("server.api_server.create_rule")
+    @patch("server.api_server.deactivate_rule")
+    def test_write_endpoints_without_a_session_are_refused(self, deactivate_rule, create_rule, evaluate_rules):
+        rule = {"name": "n", "rule_type": "relval_failure_count", "params": {}, "threshold": 1}
+        for method, path, kwargs in (
+            ("post", "/api/ingest?source=x", {"content": b"{}"}),
+            ("post", "/api/alerts", {"json": rule}),
+            ("delete", "/api/alerts/abc", {}),
+            ("post", "/api/alerts/evaluate", {}),
+        ):
+            response = getattr(self.client, method)(path, follow_redirects=False, **kwargs)
+            self.assertEqual(response.status_code, 401, path)
+        create_rule.assert_not_called()
+        deactivate_rule.assert_not_called()
+        evaluate_rules.assert_not_called()
+
+    @patch("server.api_server.evaluate_rules", return_value=[])
+    def test_alert_evaluate_works_for_a_shifter(self, evaluate_rules):
+        app.dependency_overrides[require_shifter] = lambda: "alice"
+        response = self.client.post("/api/alerts/evaluate")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"fired": 0, "alerts": []})
+
     @patch("server.api_server._shift_summary_answer", return_value="a digest")
     def test_shift_summary_api_serves_the_digest_for_an_authorized_shifter(self, answer):
         app.dependency_overrides[require_shifter] = lambda: "alice"

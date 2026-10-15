@@ -1,6 +1,9 @@
+# restart: always -- podman-restart.service (enabled for the user, with linger) starts
+# these at boot; the machine powers off now and then (2026-10-15).
 services:
   neo4j:
     image: docker.io/library/neo4j:5
+    restart: always
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-change-me}
     ports:
@@ -16,6 +19,7 @@ services:
 
   opensearch:
     image: docker.io/opensearchproject/opensearch:2.15.0
+    restart: always
     environment:
       discovery.type: single-node
       DISABLE_INSTALL_DEMO_CONFIG: "true"
@@ -37,6 +41,7 @@ services:
 
   logstash:
     image: docker.io/opensearchproject/logstash-oss-with-opensearch-output-plugin:8.9.0
+    restart: always
     environment:
       OPENSEARCH_URL: http://opensearch:9200
     ports:
@@ -49,6 +54,7 @@ services:
 
   api:
     build: .
+    restart: always
     env_file: .env
     environment:
       NEO4J_URI: bolt://neo4j:7687
