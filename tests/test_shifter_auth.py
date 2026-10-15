@@ -217,11 +217,12 @@ class ProtectedEndpointTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 401)
 
+    @patch("server.api_server.get_unittest_log_details")
     @patch("server.api_server.get_exit_code_names", return_value={16640: "OtherCMS"})
     @patch("server.api_server.get_failing_unittests")
     @patch("server.api_server.get_failing_relvals")
     def test_release_explorer_failing_api_queries_each_requested_arch_and_tags_variant(
-        self, get_relvals, get_unittests, get_exit_codes,
+        self, get_relvals, get_unittests, get_exit_codes, get_log_details,
     ):
         # One architecture has a primary-build failure (variant=None -> "primary")
         # plus a sub-IB failure (variant="CLANG"); the other has nothing -- both
@@ -239,8 +240,16 @@ class ProtectedEndpointTests(unittest.TestCase):
         def unittests_side_effect(tag, arch=None, limit=200, include_sub_ibs=False):
             self.assertTrue(include_sub_ibs)
             if arch == "el9_amd64_gcc14":
-                return [{"ib_tag": tag, "variant": None, "name": "FastSimulation/Utilities", "errors": 3}]
+                return [{"ib_tag": tag, "variant": None, "name": "FastSimulation/Utilities", "errors": 3, "ok": 9}]
             return []
+
+        tag = "CMSSW_20_1_X_2026-09-08-2300"
+        get_log_details.side_effect = lambda builds: {
+            (tag, "el9_amd64_gcc14"): dict(
+                imported=True,
+                failed_tests=["FastSimulation/Utilities/testA", "FastSimulation/Utilities/testB", "Other/Pkg/testC"],
+                problems={"FastSimulation/Utilities/testB": ("fatal_exception", "ProductNotFound | in\nmodule x")},
+            )} if builds else {}
 
         get_relvals.side_effect = relvals_side_effect
         get_unittests.side_effect = unittests_side_effect
@@ -269,7 +278,10 @@ class ProtectedEndpointTests(unittest.TestCase):
         )
         self.assertEqual(
             body["unittests"],
-            [{"arch": "el9_amd64_gcc14", "variant": "primary", "name": "FastSimulation/Utilities", "errors": 3}],
+            [{"arch": "el9_amd64_gcc14", "variant": "primary", "name": "FastSimulation/Utilities", "errors": 3,
+              "total": 12, "logs_imported": True, "failed_tests": ["testA", "testB"],
+              # only testB's own error; testA has none, never another test's
+              "exception": "testB: ProductNotFound | in module x"}],
         )
         self.assertEqual(
             get_relvals.call_args_list,

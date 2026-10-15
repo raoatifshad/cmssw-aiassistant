@@ -36,6 +36,7 @@ from tools import (  # noqa: E402
     search_workflow_ids, store_shift_summary, top_recurring_relval_failures,
     latest_and_previous_primary_tags, variant_previous_tag, single_ib_status,
     search_test_log_problems, search_test_log_problems_report, test_log_coverage, parse_pasted_error,
+    get_test_log_changes, get_unittest_log_details, get_unittest_recurrence, prefetch_relval_exception_evidence,
 )
 from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # noqa: E402
 from server.llm_client import DEFAULT_MODEL, get_client  # noqa: E402
@@ -541,17 +542,32 @@ def _format_raw_evidence(
     """Render tool evidence as plain fact, not LLM prose -- used when a
     synthesized answer fails grounding verification, so a shifter still sees
     the real evidence instead of nothing."""
+    # The database overview (node counts per label) says nothing about any question;
+    # shown alone it read as a broken answer (found live 2026-10-15: "anything I should
+    # worry about as shifter right now?" got a page of node counts).
+    specific = [item for item in tool_evidence if item.get("tool") not in _GENERIC_EVIDENCE_TOOLS]
+    if not specific:
+        return ("I couldn't find evidence specific to this question in the imported data. "
+                "Try naming an IB tag, architecture, workflow ID or PR number -- e.g. "
+                "\"what's failing in the latest IB\" or \"failed relvals for <IB tag>\".")
     lines = [f"Evidence was found, but it could not be safely summarized into "
              f"prose ({reason}). Showing the raw evidence instead:", ""]
-    for item in tool_evidence:
+    for item in specific:
         tool = item.get("tool", "unknown_tool")
         arguments = item.get("arguments", {})
+        result = json.dumps(item.get("result"), default=str, indent=2)
+        if len(result) > _RAW_EVIDENCE_CHARS:
+            result = result[:_RAW_EVIDENCE_CHARS] + "\n... (truncated)"
         lines.append(f"**{tool}**({json.dumps(arguments, default=str)})")
         lines.append("```json")
-        lines.append(json.dumps(item.get("result"), default=str, indent=2))
+        lines.append(result)
         lines.append("```")
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+_GENERIC_EVIDENCE_TOOLS = frozenset({"get_database_overview"})
+_RAW_EVIDENCE_CHARS = 4000
 
 
 def _evidence_grounded(answer: str, tool_evidence: list[dict]) -> bool:
@@ -562,6 +578,24 @@ def _evidence_grounded(answer: str, tool_evidence: list[dict]) -> bool:
     verification unlike the deterministic-answer-rephrasing path above."""
     evidence_numbers = _extract_numbers(json.dumps(tool_evidence, default=str))
     return _extract_numbers(_strip_enumerations(answer)).issubset(evidence_numbers)
+
+
+# CMSSW architecture names (el9_amd64_gcc14, slc7_amd64_gcc12, ...) and the generic
+# "x86_64", which is never a CMSSW architecture
+_ARCH_CLAIM_RE = re.compile(r"\b(?:(?:el|slc|cc|cs|fc)\d+_[a-z0-9]+_(?:gcc|clang|icc)\d+|x86_64)\b")
+
+
+def _identifiers_grounded(answer: str, tool_evidence: list[dict], question: str = "") -> bool:
+    """Every IB tag and architecture an LLM answer names must appear in the question or
+    in what the tools returned.
+    _evidence_grounded only compares numbers, so an invented tag whose digits occur
+    elsewhere passed (found live 2026-10-15: "is SubmitPVrbr really passing?" answered
+    about `CMSSW_20_1_X_2026-10-15-1230` on `x86_64` -- neither exists)."""
+    # tool *results* only: a tag the model invented and passed as a tool argument
+    # would otherwise be "in the evidence" (the live case above did exactly that)
+    evidence_text = question + json.dumps([item.get("result") for item in tool_evidence], default=str)
+    claimed = set(IB_TAG_RE.findall(answer)) | set(_ARCH_CLAIM_RE.findall(answer))
+    return all(identifier in evidence_text for identifier in claimed)
 
 
 # List/step numbering ("1. Open a PR", "**2. Review**", "Step 3:") is layout,
@@ -1964,7 +1998,7 @@ def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
                 "RETURN collect(DISTINCT {number:target.number, "
                 "kind:CASE WHEN target:Issue THEN 'Issue' ELSE 'PR' END, title:target.title}) AS references } "
                 "RETURN pr.repo AS repo, pr.number AS pr_number, pr.title AS title, "
-                "pr.body AS body, pr.merged_at AS merged_at, pr.release AS release, "
+                "pr.body AS body, pr.merged_at AS merged_at, pr.github_state AS state, pr.release AS release, "
                 "pr.labels AS labels, pr.additions AS additions, pr.deletions AS deletions, "
                 "pr.changed_files AS changed_files, author, comment_count, comments, references, comment_references",
                 number=int(match.group(1)),
@@ -2093,7 +2127,7 @@ def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
         f"- **Repository:** `{pr['repo']}`",
         f"- **Author:** `{pr['author'] or 'unknown'}`",
         f"- **Release:** `{pr['release'] or 'unknown'}`",
-        f"- **Status:** {'Merged ' + pr['merged_at'] if pr['merged_at'] else 'Not merged'}",
+        f"- **Status:** {_pr_status(pr['merged_at'], pr.get('state'))[:1].upper()}{_pr_status(pr['merged_at'], pr.get('state'))[1:]}",
     ]
     if pr["changed_files"] is not None or pr["additions"] is not None or pr["deletions"] is not None:
         lines.append(
@@ -2788,7 +2822,10 @@ def _artifact_search_answer(question: str) -> str | None:
     scope = _artifact_search_scope(question)
     if scope is None:
         return None
-    identifiers = _pr_search_terms(question)
+    # An IB tag is not a GitHub search term: "status of <IB tag>" asks for the build's
+    # results, and used to get "No imported Issues or PRs match `<tag>`" (found live
+    # 2026-10-15) -- left to the IB handlers instead.
+    identifiers = [t for t in _pr_search_terms(question) if not IB_TAG_RE.fullmatch(t)]
     if not identifiers:
         return None
 
@@ -2994,7 +3031,8 @@ def _issue_detail_answer(question: str, context_number: int | None = None) -> st
             if ambiguous and not issue_record:
                 pr_record = session.run(
                     "MATCH (pr:PR {number:$number}) "
-                    "RETURN pr.repo AS repo, pr.title AS title, pr.merged_at AS merged_at",
+                    "RETURN pr.repo AS repo, pr.title AS title, pr.merged_at AS merged_at, "
+                    "pr.github_state AS state",
                     number=number,
                 ).single()
     finally:
@@ -3005,7 +3043,7 @@ def _issue_detail_answer(question: str, context_number: int | None = None) -> st
             f"(state: `{issue_record['state']}`, created {issue_record['created_at'] or 'unknown'})."
         )
     if pr_record:
-        merged = f"merged {pr_record['merged_at']}" if pr_record["merged_at"] else "not merged"
+        merged = _pr_status(pr_record["merged_at"], pr_record.get("state"))
         return f"**{pr_record['repo']} PR #{number}** - {pr_record['title']} ({merged})."
     if ambiguous:
         return f"Neither an Issue nor a PR numbered #{number} is present in the imported graph."
@@ -3150,6 +3188,64 @@ def _build_warning_answer(question: str, context_tag: str | None = None) -> str 
             f"**{row['ignored_warnings']}** ignored warning(s), status `{row['status']}`."
         )
     lines.append("These are CMSSW build-status counts, not parsed Clang warning locations or occurrences.")
+    return "\n".join(lines)
+
+
+_BUILD_STATUS_WORDS_RE = re.compile(
+    r"\b(?:errors?|status|fail(?:s|ed|ing|ures?)?|broken|break|ok|okay|pass(?:ed|ing)?|green|red|results?)\b",
+    re.IGNORECASE,
+)
+
+
+def _build_status_answer(question: str, context_tag: str | None = None) -> str | None:
+    """"build errors in <tag>" / "did the build fail for <tag>": the imported CMS
+    build status of the IB and its sub-IBs, per architecture. The "build" capability
+    had no handler for this shape (only build *warnings* and the log-analysis summary),
+    so it answered "No imported local evidence" (found live 2026-10-15)."""
+    if re.search(r"\bclang\b", question, re.IGNORECASE):
+        return None
+    if not re.search(r"\b(?:build|builds|compilation|compile)\b", question, re.IGNORECASE):
+        return None
+    if not _BUILD_STATUS_WORDS_RE.search(question):
+        return None
+    tag_match = IB_TAG_RE.search(question)
+    tag = tag_match.group(1) if tag_match else context_tag
+    if not tag:
+        return None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(record) for record in session.run(
+                "MATCH (ib:IB) WHERE (ib.tag = $tag OR ib.parent_tag = $tag) AND ib.build_status IS NOT NULL "
+                "RETURN ib.tag AS tag, coalesce(ib.variant, 'primary') AS variant, ib.arch AS arch, "
+                "ib.build_status AS status, coalesce(ib.comp_warnings, 0) AS comp_warnings "
+                "ORDER BY variant <> 'primary', variant, arch",
+                tag=tag,
+            )]
+    finally:
+        driver.close()
+    requested_arch = _requested_ib_arch(question)
+    if requested_arch:
+        rows = [row for row in rows if row["arch"] == requested_arch]
+    scope = f" on `{requested_arch}`" if requested_arch else ""
+    if not rows:
+        return f"No CMS build-status record is imported for **{tag}**{scope}."
+    failed = [row for row in rows if str(row["status"]).lower() == "error"]
+    warned = [row for row in rows if str(row["status"]).lower() == "warning"]
+    headline = "🔴" if failed else ("🟠" if warned else "🟢")
+    if failed:
+        verdict = f"**{len(failed)} of {len(rows)}** IB/architecture build(s) failed"
+    else:
+        verdict = f"no build errors in **{len(rows)}** IB/architecture build(s)"
+    lines = [f"{headline} Build status for `{tag}` and its sub-IBs{scope}: {verdict}.", "",
+             "| IB variant | Architecture | Build status | Compilation warnings |",
+             "| --- | --- | --- | ---: |"]
+    lines.extend(
+        f"| {row['variant']} | `{row['arch']}` | `{row['status']}` | {row['comp_warnings']} |" for row in rows
+    )
+    lines.append("")
+    lines.append("Build status comes from the CMS IB build-status export (`error` = failed build, "
+                 "`warning` = built with compilation warnings). Parsed Clang diagnostics are separate.")
     return "\n".join(lines)
 
 
@@ -3317,6 +3413,19 @@ def _concept_answer(question: str) -> str | None:
         lines.append(f"- Re: \"{match['question']}\" — {match['definition']}")
     lines.append("This came from expert-reviewed chat feedback, not the live IB/RelVal graph facts.")
     return "\n".join(lines)
+
+
+def _pr_status(merged_at, state) -> str:
+    """A PR's status as imported: merged (date from the cms-sw.github.io PR data),
+    else its state in the GitHub export -- "not merged" alone hid whether a PR is
+    still open, which is what a shifter asking "is there a PR already" needs."""
+    if merged_at:
+        return f"merged {str(merged_at)[:10]}"
+    if state == "open":
+        return "open, not merged (per GitHub export)"
+    if state == "closed":
+        return "closed, no merge recorded"
+    return "not merged"
 
 
 def _format_exit_code(code: int, names: dict[int, str]) -> str:
@@ -4252,13 +4361,29 @@ def _clang_warning_answer(question: str, context_tag: str | None = None) -> str 
                 "OPTIONAL MATCH (ib)-[:REPORTED]->(warning:Warning) "
                 "WITH ib, count(warning) AS locations, coalesce(sum(warning.count), 0) AS occurrences "
                 "RETURN ib.arch AS arch, coalesce(ib.is_relval_default, false) AS is_default, "
-                "locations, occurrences ORDER BY arch",
+                "locations, occurrences, "
+                "EXISTS { MATCH (s:ImportState) WHERE s.source_id STARTS WITH 'clang:' + ib.tag + ':' + ib.arch + ':' } "
+                "AS parsed ORDER BY arch",
                 tag=tag,
             )]
+            newest_parsed = None
+            if rows and not any(row.get("parsed", True) for row in rows):
+                record = session.run(
+                    "MATCH (ib:IB)-[:REPORTED]->(:Warning) WITH DISTINCT ib.tag AS tag "
+                    "RETURN tag ORDER BY split(tag, '_X_')[1] DESC LIMIT 1"
+                ).single()
+                newest_parsed = record["tag"] if record else None
     finally:
         driver.close()
     if not rows:
         return f"No imported IB record was found for `{tag}`."
+    if not any(row.get("parsed", True) for row in rows):
+        # "0 warnings" here used to read as a clean build (found live 2026-10-15): the
+        # Clang build logs of this IB were simply never staged/parsed.
+        newest = f" The newest IB with parsed Clang logs is `{newest_parsed}`." if newest_parsed else ""
+        return (f"No Clang build logs have been parsed for `{tag}`, so its Clang warnings are unknown "
+                f"(not zero).{newest} Clang logs are staged and imported separately "
+                f"(`build_graph.py --clang-root`).")
 
     requested_arch = _requested_ib_arch(question)
     if requested_arch:
@@ -4277,7 +4402,8 @@ def _clang_warning_answer(question: str, context_tag: str | None = None) -> str 
         "| --- | ---: | ---: |",
     ]
     lines.extend(
-        f"| `{row['arch']}` | {row['locations']:,} | {row['occurrences']:,} |"
+        f"| `{row['arch']}` | {row['locations']:,} | {row['occurrences']:,} |" if row.get("parsed", True)
+        else f"| `{row['arch']}` | not parsed | not parsed |"
         for row in rows
     )
     lines.append("These are parsed Clang diagnostics, not CMS build-status compilation-warning counts.")
@@ -4704,7 +4830,7 @@ def _render_relval_change_summary(
     if newly_failing:
         lines.append("**Newly failing:**")
         for row in sorted(newly_failing, key=lambda r: (r["arch"], r["variant"], r["workflow_id"])):
-            exit_code_cell = _format_exit_code(row["exitcode"], exit_code_names)
+            exit_code_cell = _relval_exit_code_cell(row, exit_code_names)
             lines.append(f"- `{row['workflow_id']}` (`{row['name']}`) on `{row['arch']}` ({row['variant']}) -- {exit_code_cell}")
     if resolved:
         if lines:
@@ -4769,10 +4895,43 @@ def _diff_failing_relvals(
 def _split_relval_diff(
     diff: list[tuple[tuple, dict | None, dict | None]]
 ) -> tuple[list[dict], list[dict]]:
-    """Split a _diff_failing_relvals result into (newly_failing, resolved) row lists."""
+    """Split a _diff_failing_relvals result into (newly_failing, resolved) row lists.
+    A workflow that fails in both builds at a different step or with a different exit
+    code is one changed failure, not a resolution plus a new failure: it is listed once,
+    as newly failing, with its old failure under "previous_failure" (rendered as
+    "was <exit code>"), and left out of resolved. Listing it in both tables read as a
+    self-contradiction to shifters (found live 2026-10-15: 1001.2 ASAN, exit 256 ->
+    62720 SIGSEGV, shown as both newly failing and resolved)."""
     newly_failing = [after for _, before, after in diff if after and not before]
     resolved = [before for _, before, after in diff if before and not after]
+    previous = {}
+    for row in resolved:
+        previous.setdefault(row["workflow_id"], row)
+    changed = {row["workflow_id"] for row in newly_failing} & set(previous)
+    newly_failing = [
+        {**row, "previous_failure": {"step": previous[row["workflow_id"]].get("step"),
+                                     "exitcode": previous[row["workflow_id"]].get("exitcode")}}
+        if row["workflow_id"] in changed else row
+        for row in newly_failing
+    ]
+    resolved = [row for row in resolved if row["workflow_id"] not in changed]
     return newly_failing, resolved
+
+
+def _relval_exit_code_cell(row: dict, exit_code_names: dict[int, str]) -> str:
+    """Exit code of a failing RelVal row, plus "; was <old>" when the same workflow
+    failed differently in the baseline build (see _split_relval_diff)."""
+    cell = _format_exit_code(row["exitcode"], exit_code_names) if row.get("exitcode") else "0"
+    previous = row.get("previous_failure")
+    if previous:
+        if previous.get("exitcode") != row.get("exitcode"):
+            was = _format_exit_code(previous["exitcode"], exit_code_names) if previous.get("exitcode") else "0"
+        else:
+            was = "same exit code"
+        if previous.get("step") and previous.get("step") != row.get("step"):
+            was += f" at {previous['step']}"
+        cell += f"; was {_table_cell(was)}"
+    return cell
 
 
 def _ib_pair_architectures(previous_tag: str, latest_tag: str) -> list[str]:
@@ -4935,8 +5094,13 @@ def _workflow_evidence_cells(workflow_id: str, row: dict, latest_tag: str) -> tu
         failed_tags = recurrence.get("failed_tags", [])
         # failed_tags can repeat the same tag once per architecture that failed --
         # dedupe for display, preserving get_relval_recurrence's most-recent-first order.
+        # "prior" excludes the build being reported and its sub-IBs (same timestamp):
+        # the recurrence used to count it, so "Failed in 8 prior build(s) (most recent
+        # <this very build>)" was 7 earlier builds plus this one (found live 2026-10-15).
+        current_when = latest_tag.rsplit("_X_", 1)[-1]
         in_series = list(dict.fromkeys(
-            tag for tag in failed_tags if series_prefix and tag.startswith(series_prefix)
+            tag for tag in failed_tags
+            if series_prefix and tag.startswith(series_prefix) and not tag.endswith("_X_" + current_when)
         ))
         if in_series:
             recurrence_cell = (
@@ -5006,7 +5170,7 @@ def _newly_failing_relval_table(
         recurrence_cell, pr_cell = evidence[row["workflow_id"]]
         lines.append(
             f"| `{row['workflow_id']}` | {row['name']} | {row.get('errors') or 0} | "
-            f"{_format_exit_code(row['exitcode'], exit_code_names) if row.get('exitcode') else 0} | "
+            f"{_relval_exit_code_cell(row, exit_code_names)} | "
             f"{row.get('variant') or 'primary'} | "
             f"{recurrence_cell} | {pr_cell} |"
         )
@@ -5058,6 +5222,100 @@ def _unittest_shift_table(rows: list[dict]) -> list[str]:
         variant = row.get("variant")
         return f"{row['name']} ({variant})" if variant else row["name"]
     return _plain_shift_table(["Name", "Errors"], [[label(row), row.get("errors") or 0] for row in rows])
+
+
+UNITTEST_NO_LOGS = "no logs imported for this build yet"
+UNITTEST_NOT_IN_LOG = "not found in the imported log"
+_UNITTEST_MAX_FAILED_TESTS = 8
+_UNITTEST_MAX_EXCEPTIONS = 3
+_UNITTEST_EXCEPTION_CHARS = 300
+
+
+def _unittest_failure_fields(row: dict, arch: str | None, details: dict, default_tag: str | None = None) -> dict:
+    """What a failing unit-test package row adds from the raw logs: total tests
+    (errors + ok), whether the build's unit logs are imported, which tests of this
+    package failed (package prefix stripped) and, per failed test, the most serious
+    error its log shows ("<test>: <message>"). Looked up by the row's own IB tag,
+    so a sub-IB row uses that sub-IB's logs. Never invents an error: a failed test
+    whose log has none is simply left out of the exceptions."""
+    package = row["name"]
+    errors = row.get("errors") or 0
+    total = errors + row["ok"] if row.get("ok") is not None else None
+    detail = details.get((row.get("ib_tag") or default_tag, arch)) or {}
+    imported = bool(detail.get("imported"))
+    prefix = package + "/"
+    tests = [t for t in detail.get("failed_tests", []) if t.startswith(prefix)] if imported else []
+    exceptions = []
+    for test in tests:
+        hit = detail.get("problems", {}).get(test)
+        if not hit:
+            continue
+        entry = f"{test[len(prefix):]}: {' '.join(str(hit[1]).split())}"
+        if len(entry) > _UNITTEST_EXCEPTION_CHARS:
+            entry = entry[:_UNITTEST_EXCEPTION_CHARS - 1] + "…"
+        exceptions.append(entry)
+    return dict(total=total, errors=errors, logs_imported=imported,
+                failed_tests=[t[len(prefix):] for t in tests] if imported else None, exceptions=exceptions)
+
+
+def _capped(items: list[str], cap: int) -> list[str]:
+    return items[:cap] + ([f"+{len(items) - cap} more"] if len(items) > cap else [])
+
+
+def _unittest_exception_text(exceptions: list[str]) -> str:
+    return "<br>".join(_capped(exceptions, _UNITTEST_MAX_EXCEPTIONS))
+
+
+def _unittest_recurrence_cell(row: dict, history: dict, default_tag: str) -> str:
+    """Same wording as the RelVal Recurrence column, matched on package + variant + arch;
+    "prior" is strictly before this build."""
+    tag = row.get("ib_tag") or default_tag
+    when = tag.rsplit("_X_", 1)[-1]
+    series = re.match(r"(CMSSW_\d+_\d+_)", tag)
+    results = history.get((row["name"], row.get("variant") or ""), [])
+    failed_all = sum(1 for _, status in results if status == "FAILED")
+    prior = list(dict.fromkeys(
+        t for t, status in results
+        if status == "FAILED" and series and t.startswith(series.group(1)) and t.rsplit("_X_", 1)[-1] < when
+    ))
+    overall = f"{failed_all}/{len(results)} overall."
+    if prior:
+        return f"Failed in {len(prior)} prior build(s) this series (most recent {prior[0]}); {overall}"
+    return f"First failure in this series; {overall}"
+
+
+def _md_cell(text: str) -> str:
+    """A table cell that may carry a literal "|": escaped as "\\|", which the
+    frontend's splitTableRow (and scripts/validate_shift_summary.py) unescape."""
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def _newly_failing_unittest_table(rows: list[dict], arch: str, latest_tag: str) -> list[str]:
+    """"Newly failing Unit Tests": Name and Errors first and unchanged (existing parsers
+    keep working), then Tests ("2 failed / 26"), Failed tests (from the build's own
+    raw unit-test logs, or one of two fixed strings), Exception (per failed test, the
+    most serious error its log shows) and Recurrence (package + variant + arch)."""
+    headers = ["Name", "Errors", "Tests", "Failed tests", "Exception", "Recurrence"]
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"]
+    if not rows:
+        return lines
+    details = get_unittest_log_details([(row.get("ib_tag") or latest_tag, arch) for row in rows])
+    history = get_unittest_recurrence([row["name"] for row in rows], arch)
+    for row in rows:
+        fields = _unittest_failure_fields(row, arch, details, latest_tag)
+        label = f"{row['name']} ({row['variant']})" if row.get("variant") else row["name"]
+        tests = f"{fields['errors']} failed / {fields['total']}" if fields["total"] is not None else ""
+        if not fields["logs_imported"]:
+            failed = UNITTEST_NO_LOGS
+        elif not fields["failed_tests"]:
+            failed = UNITTEST_NOT_IN_LOG
+        else:
+            failed = "<br>".join(_md_cell(t) for t in _capped(fields["failed_tests"], _UNITTEST_MAX_FAILED_TESTS))
+        exception = "<br>".join(_md_cell(e) for e in _capped(fields["exceptions"], _UNITTEST_MAX_EXCEPTIONS))
+        cells = [_table_cell(label), _table_cell(str(row.get("errors") or 0)), tests, failed, exception,
+                 _md_cell(_unittest_recurrence_cell(row, history, latest_tag))]
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines
 
 
 def _build_and_addon_status(previous_tag: str, latest_tag: str) -> dict[tuple[str, str], dict]:
@@ -5317,10 +5575,18 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
     # row -- the same workflow can newly-fail on several architectures at once) and
     # embedded directly as extra table columns, which the frontend auto-hides behind
     # a per-row "Show evidence" toggle rather than a separate always-open section.
-    evidence = {
-        workflow_id: _workflow_evidence_cells(workflow_id, row, latest_tag)
-        for workflow_id, row in newly_failing_by_workflow.items()
-    }
+    # One shared GitHub scan for every workflow's evidence terms, then the per-workflow
+    # cells (recurrence + evidence) in parallel: one scan per workflow, one after the
+    # other, made a digest with 62 newly failing RelVals take 78-120 s (2026-10-15).
+    try:
+        prefetch_relval_exception_evidence(
+            [(workflow_id, row.get("ib_tag")) for workflow_id, row in newly_failing_by_workflow.items()], limit=5)
+    except Exception as exc:  # per-workflow lookups below still work, only slower
+        print(f"WARNING: RelVal evidence prefetch failed: {exc}")
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="digest-evidence") as pool:
+        cells = pool.map(lambda item: _workflow_evidence_cells(item[0], item[1], latest_tag),
+                         list(newly_failing_by_workflow.items()))
+        evidence = dict(zip(newly_failing_by_workflow, cells))
 
     for arch_result in per_arch:
         one_arch = arch_result["arch"]
@@ -5344,7 +5610,7 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
         lines.extend(["", "#### Resolved Build"])
         lines.extend(_build_shift_table(arch_result["resolved_build"]))
         lines.extend(["", "#### Newly failing Unit Tests"])
-        lines.extend(_unittest_shift_table(arch_result["newly_failing_unittests"]))
+        lines.extend(_newly_failing_unittest_table(arch_result["newly_failing_unittests"], one_arch, latest_tag))
         lines.extend(["", "#### Resolved Unit Tests"])
         lines.extend(_unittest_shift_table(arch_result["resolved_unittests"]))
         lines.extend(["", "#### Newly failing AddOn"])
@@ -5658,7 +5924,7 @@ def _pasted_error_evidence_answer(question: str) -> str | None:
         return f"No imported CMSSW PR or Issue text mentions `{term}`."
     lines = [f"Imported GitHub evidence mentioning `{term}`:"]
     for pr in prs:
-        state = f"merged {pr['merged_at'][:10]}" if pr.get("merged_at") else "not merged"
+        state = _pr_status(pr.get("merged_at"), pr.get("state"))
         lines.append(f"- **PR #{pr['pr_number']}** - {pr['title']} ({state}; matched in {', '.join(pr.get('evidence') or ['text'])})")
     for issue in issue_rows:
         lines.append(f"- **Issue #{issue.get('number')}** - {issue.get('title')} (state `{issue.get('state')}`)")
@@ -5947,6 +6213,7 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
     if capability == "build":
         answer = (
             _build_warning_answer(question, _latest_ib_contexts.get(session_id))
+            or _build_status_answer(question, _latest_ib_contexts.get(session_id))
             or _build_summary_answer(question)
             or _warning_count_answer(question)
         )
@@ -6106,7 +6373,10 @@ _LLM_ABSENCE_CLAIM_RE = re.compile(
     r"(?:graph|database) (?:does not|doesn.t) contain|have not been imported|"
     r"(?:has|have) not been (?:recorded|ingested)|"
     r"\bno (?:failing|failed) (?:relval|unit|workflow)|no (?:relval )?workflows? (?:failed|were recorded)|"
-    r"no unit tests? failed|no prs? (?:were )?merged|no ib(?:s| records)",
+    r"no unit tests? failed|no prs? (?:were )?merged|no ib(?:s| records)|"
+    # found live 2026-10-15: "No such `TestLogRun` nodes exist for the IB ... There are
+    # no tests that passed yet reported errors" -- false, the runs exist
+    r"\bthere (?:are|were|is) no\b|\bno such\b[^.\n]{0,40}\bexists?\b|\b(?:do|does) not exist\b",
     re.IGNORECASE,
 )
 
@@ -6257,6 +6527,17 @@ def _run_llm_investigation(
         if not _evidence_grounded(answer, evidence):
             answer = _format_raw_evidence(evidence)
             return _respond(answer, f"{route_prefix}llm_ungrounded_fallback", citations)
+        if not _identifiers_grounded(answer, evidence, question):
+            # The lookups themselves were made for a build that is neither asked about nor
+            # returned (the live case queried an invented tag on "x86_64"), so their raw
+            # results would only repeat the invention -- say so instead of showing them.
+            _, actions = _fallback_clarification(planned.context)
+            return _respond(
+                "I couldn't answer this reliably: my lookup used an IB tag or architecture that is not in "
+                "the imported data. Please name the IB tag (or say \"latest IB\") and, if it matters, the "
+                "architecture -- e.g. \"unit tests for the latest IB on el9_amd64_gcc14\".",
+                f"{route_prefix}llm_ungrounded_identifiers", actions=actions,
+            )
         if not _doc_answer_terms_grounded(answer, evidence):
             answer = _format_raw_evidence(
                 evidence, reason="most of its wording does not come from the retrieved documentation",
@@ -6288,7 +6569,15 @@ def _run_llm_investigation(
 _LOG_PROBLEM_PASTE_RE = re.compile(
     r"Begin Fatal Exception|An exception of category|ERROR: (?:Address|Leak|Thread|Memory)Sanitizer|"
     r"runtime error:|Traceback \(most recent call last\)|Assertion [`'].*failed|"
-    r"terminate called after throwing|A fatal system signal has occurred"
+    r"terminate called after throwing|A fatal system signal has occurred|"
+    # a shell's report of a killed test command, as the scanner reads it (SHELL_KILL_RE,
+    # PLAIN_SIGNAL_RE): "test_x.sh: line 10: 2006489 Aborted (core dumped) ..." used to be
+    # answered with an IB summary or a one-term PR search (found live 2026-10-15). A bare
+    # report needs "(core dumped)" here, unlike in the scanner: a typed question can be
+    # just "segmentation fault".
+    r"line \d+:\s+\d+ (?:Segmentation fault|Aborted|Bus error|Killed|Floating point exception|Illegal instruction)|"
+    r"(?m:^\s*(?:Segmentation fault|Bus error|Aborted|Floating point exception|Illegal instruction) "
+    r"\(core dumped\)\s*$)"
 )
 _LOG_KIND_LABELS = {
     "fatal_exception": "fatal exception", "sanitizer": "sanitizer report", "ubsan": "UBSan report",
@@ -6501,7 +6790,7 @@ def _pasted_names_github_answer(parsed: dict) -> str | None:
             searched.append(name)
             for pr in prs:
                 item = items.setdefault(("PR", pr["pr_number"]), dict(
-                    title=pr["title"], status=f"merged {pr['merged_at'][:10]}" if pr.get("merged_at") else "not merged",
+                    title=pr["title"], status=_pr_status(pr.get("merged_at"), pr.get("state")),
                     names=[], score=0))
                 item["names"].append(name)
                 item["score"] += weights[name]
@@ -6538,7 +6827,7 @@ def _referenced_items_note(question: str) -> str | None:
             rows = [dict(r) for r in session.run(
                 "MATCH (x) WHERE (x:PR OR x:Issue) AND x.repo = 'cmssw' AND x.number IN $numbers "
                 "RETURN labels(x)[0] AS kind, x.number AS number, x.title AS title, x.merged_at AS merged_at, "
-                "x.state AS state ORDER BY x.number", numbers=numbers)]
+                "coalesce(x.state, x.github_state) AS state ORDER BY x.number", numbers=numbers)]
     except Exception as exc:
         print(f"WARNING: referenced PR/Issue lookup failed: {exc}")
         return None
@@ -6855,7 +7144,10 @@ def _package_status_answer(question: str, session_id: str) -> str | None:
     return "\n".join(lines)
 
 
-_PERSISTENCE_RE = re.compile(r"\b(?:also|still|both|again|persist\w*|same\s+ones?|carried\s+over)\b", re.IGNORECASE)
+# "new"/"newly" too: "which of these are new compared to the previous IB?" (found live
+# 2026-10-15) wants the same still/newly/resolved split against the previous build
+_PERSISTENCE_RE = re.compile(
+    r"\b(?:also|still|both|again|persist\w*|same\s+ones?|carried\s+over|new|newly)\b", re.IGNORECASE)
 _PREVIOUS_IB_RE = re.compile(r"\b(?:previous|prior|last|earlier|yesterday'?s?|before)\b", re.IGNORECASE)
 
 
@@ -6868,6 +7160,10 @@ def _persistent_failures_answer(question: str, session_id: str) -> str | None:
     getting a whole-IB failure overview instead."""
     if not (_PERSISTENCE_RE.search(question) and _PREVIOUS_IB_RE.search(question)):
         return None
+    if not _PERSISTENCE_RE.search(re.sub(r"\bnew(?:ly)?\b", " ", question, flags=re.IGNORECASE)) and not re.search(
+        r"\b(?:these|those|them|fail\w*|relvals?|workflows?|unit|tests?|errors?|packages?)\b", question, re.IGNORECASE
+    ):
+        return None  # "is there a new IB since yesterday" is not about failures
     if len(IB_TAG_RE.findall(question)) > 1:
         return None
     tag_match = IB_TAG_RE.search(question)
@@ -7093,38 +7389,70 @@ def _with_variant_ib_context(question: str) -> str:
     return f"{question} {row['tag']}" if row else question
 
 
-def _with_arch_family_context(question: str, session_id: str) -> str:
-    """Resolve a loose CPU-family reference ("and on aarch64 only", "on arm")
-    to the one full architecture it can mean for the IB in scope, when there
-    is exactly one. Found live 2026-10-06: "and on aarch64 only" after a
-    unit-test answer reached the LLM, which passed arch="aarch64" to a tool,
-    got nothing back, and claimed no aarch64 IBs exist. Two or more matches
-    (e.g. el8_ and el9_aarch64) are left alone -- never guess between them."""
+def _arch_scope_matches(question: str, session_id: str) -> tuple[str, str, list[str], list[str]] | None:
+    """For a loose architecture reference -- a CPU family ("aarch64", "arm", "x86") or
+    an OS family ("el9", "slc7") -- and the IB in scope: (tag, the words used, the
+    architectures of that IB they match, every architecture of that IB). None when
+    the question names a full architecture or no loose reference/IB."""
     if _requested_ib_arch(question):
-        return question
+        return None
     family = _arch_family(question)
-    if not family:
-        return question
+    os_match = _OS_FAMILY_RE.search(question)
+    os_prefix = os_match.group(1).lower() + "_" if os_match else None
+    if not family and not os_prefix:
+        return None
     tag_match = IB_TAG_RE.search(question)
     tag = tag_match.group(1) if tag_match else _latest_ib_contexts.get(session_id)
     if not tag:
-        return question
+        return None
     try:
         driver = get_driver()
         try:
             with driver.session() as session:
-                archs = sorted({r["arch"] for r in session.run(
-                    "MATCH (ib:IB {tag:$tag}) WHERE ib.arch CONTAINS $family RETURN DISTINCT ib.arch AS arch",
-                    tag=tag, family=family,
-                )})
+                available = sorted({r["arch"] for r in session.run(
+                    "MATCH (ib:IB {tag:$tag}) RETURN DISTINCT ib.arch AS arch", tag=tag)})
         finally:
             driver.close()
     except Exception as exc:
         print(f"WARNING: could not resolve architecture family: {exc}")
+        return None
+    matches = [arch for arch in available
+               if (not family or family in arch) and (not os_prefix or arch.startswith(os_prefix))]
+    words = " ".join(word for word in (os_prefix and os_prefix[:-1], family) if word)
+    return tag, words, matches, available
+
+
+def _with_arch_family_context(question: str, session_id: str) -> str:
+    """Resolve a loose CPU-family reference ("and on aarch64 only", "on arm") or OS
+    family ("only el9") to the one full architecture it can mean for the IB in scope,
+    when there is exactly one. Found live 2026-10-06: "and on aarch64 only" after a
+    unit-test answer reached the LLM, which passed arch="aarch64" to a tool, got
+    nothing back, and claimed no aarch64 IBs exist; "only el9" (2026-10-15) was not
+    resolved at all. Two or more matches (e.g. el8_ and el9_aarch64) are left alone --
+    never guess between them."""
+    scope = _arch_scope_matches(question, session_id)
+    if not scope or len(scope[2]) != 1:
         return question
-    if len(archs) != 1:
-        return question
-    return f"{question} {archs[0]}"
+    return f"{question} {scope[2][0]}"
+
+
+def _arch_unavailable_answer(question: str, session_id: str) -> str | None:
+    """A scope-only follow-up ("what about aarch64") for an IB that has no build of
+    that architecture: say so and list what it has. It used to fall through to a
+    PR/Issue text search for the word "aarch64" (found live 2026-10-15)."""
+    if not _CAPABILITY_FOLLOW_UP_KEYWORD.get(_last_capability_contexts.get(session_id) or ""):
+        return None
+    if len(question.split()) > 9:
+        return None
+    context = RequestContext.extract(question)
+    if context.categories or context.workflow_id or context.pr_number or len(context.ib_tags) > 1:
+        return None
+    scope = _arch_scope_matches(question, session_id)
+    if not scope or scope[2]:
+        return None
+    tag, words, _, available = scope
+    listed = ", ".join(f"`{arch}`" for arch in available) or "none"
+    return f"`{tag}` has no imported `{words}` build. Architectures imported for it: {listed}."
 
 
 def _with_workflow_follow_up_context(question: str, session_id: str) -> str:
@@ -7162,6 +7490,8 @@ _WORKFLOW_WHY_RE = re.compile(
     re.IGNORECASE,
 )
 _ARCH_FAMILY_RE = re.compile(r"\b(aarch64|arm(?:64)?|amd64|x86(?:_64)?|riscv64)\b", re.IGNORECASE)
+# an OS family named alone ("only el9", "slc7"), never part of a full architecture name
+_OS_FAMILY_RE = re.compile(r"(?<![\w])(el\d+|slc\d+|cc\d+|cs\d+)(?![\w])", re.IGNORECASE)
 
 
 def _arch_family(question: str) -> str | None:
@@ -7352,6 +7682,9 @@ def chat(req: ChatRequest):
 
     question = _with_variant_ib_context(question)
     question = _with_workflow_follow_up_context(question, sid)
+    arch_unavailable = _arch_unavailable_answer(question, sid)
+    if arch_unavailable:
+        return _chat_response(sid, original_question, arch_unavailable, "deterministic:arch_unavailable")
     question = _with_arch_family_context(question, sid)
     question = _with_previous_capability_context(question, sid)
 
@@ -8058,14 +8391,43 @@ def release_explorer_failing(tag: str, archs: str | None = None, username: str =
                 "errors": row["errors"],
                 "exit_code": _format_exit_code(row["exitcode"], exit_code_names) if row.get("exitcode") else "0",
             })
-        for row in get_failing_unittests(tag, arch=one_arch, limit=200, include_sub_ibs=True):
+        unit_rows = get_failing_unittests(tag, arch=one_arch, limit=200, include_sub_ibs=True)
+        details = get_unittest_log_details([(row.get("ib_tag") or tag, one_arch) for row in unit_rows]) if one_arch else {}
+        for row in unit_rows:
+            fields = _unittest_failure_fields(row, one_arch, details, tag)
             unittests.append({
                 "arch": one_arch,
                 "variant": row.get("variant") or "primary",
                 "name": row["name"],
                 "errors": row["errors"],
+                "total": fields["total"],
+                "logs_imported": fields["logs_imported"],
+                "failed_tests": fields["failed_tests"],
+                "exception": _unittest_exception_text(fields["exceptions"]),
             })
     return {"tag": tag, "relvals": relvals, "unittests": unittests}
+
+
+@app.get("/api/test-log-problems")
+def test_log_problems(
+    from_tag: str = Query(..., alias="from"),
+    to_tag: str = Query(..., alias="to"),
+    arch: str | None = None,
+    username: str = Depends(require_shifter),
+):
+    """Problems inside tests the dashboard shows as PASSED (raw IB test logs), as
+    structured JSON for the Shift Console: per architecture, what is new (first time
+    ever for that test), returned (seen before, absent in the baseline: intermittent),
+    gone, and how many are still present, between the same `from`/`to` builds the
+    shift digest compares (primary IB + its sub-IBs, each run variant compared with
+    its own previous build when `from` has no log of it). A separate endpoint, not a
+    section of /api/shift-summary, so the digest's markdown contract is unchanged.
+    `coverage.to_imported` is false when `to` has no imported logs yet -- the
+    frontend must say so instead of showing zero problems."""
+    try:
+        return get_test_log_changes(to_tag, from_tag, arch or None)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
 
 
 @app.delete("/api/chat/{session_id}")

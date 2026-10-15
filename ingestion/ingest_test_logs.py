@@ -91,6 +91,13 @@ def problem_records(data: dict, run_key: str) -> list[dict]:
     grouped: dict[str, dict] = {}
     details: dict[str, dict] = {}
     for p in data["problems"]:
+        # older results (their zips are deleted) are re-signed with today's normalization,
+        # so the same problem compares equal across every imported build
+        signature = scanner.current_signature(p)
+        p = dict(p, signature=signature, signature_id=scanner.signature_id(signature))
+        if p["kind"] == "crash" and scanner.SIGNAL_RE.search(p.get("message") or ""):
+            name = scanner.signal_name(p.get("category"))  # glued thread output, scanner v<6
+            p.update(category=name, summary=f"cmsRun crash: fatal system signal ({name})")
         sid = p["signature_id"]
         own = p if "names" in p else scanner.problem_details(p.get("block") or [], p.get("category"))
         scanner.merge_details(details.setdefault(sid, {}), own)
@@ -128,18 +135,31 @@ def problem_records(data: dict, run_key: str) -> list[dict]:
     return list(grouped.values())
 
 
+def first_seen_key(suite: str, tag: str, owner: str, signature_id: str) -> str:
+    """Per release series: a test of CMSSW_20_1_X must not count as "seen before"
+    because the same test hit the same problem in CMSSW_13_2_X."""
+    return f"{suite}|{release_series(tag)}|{owner}|{signature_id}"
+
+
+def release_series(tag: str) -> str:
+    """CMSSW_20_1_ASAN_X_2026-10-05-2300 -> CMSSW_20_1 (sub-IBs share their series)."""
+    return "_".join(tag.split("_")[:3])
+
+
 def first_seen_records(data: dict, problems: list[dict]) -> list[dict]:
     """(test, signature) pairs for serious problems and generic error lines:
     the shifter is shown one only the first time it is ever seen for that
-    test. MessageLogger warnings are grouped per IB and never 'new'."""
+    test in that release series. MessageLogger warnings are grouped per IB and
+    never 'new'."""
     suite, tag = data["kind"], data["source"]["tag"]
     out = []
     for rec in problems:
         if not (rec["serious"] or rec["kind"] == "generic_error_line"):
             continue
         for owner in sorted(set(rec["owners"])):
-            out.append(dict(key=f"{suite}|{owner}|{rec['signature_id']}", suite=suite, owner=owner,
-                            signature_id=rec["signature_id"], tag=tag, arch=data["source"]["arch"]))
+            out.append(dict(key=first_seen_key(suite, tag, owner, rec["signature_id"]), suite=suite,
+                            series=release_series(tag), owner=owner, signature_id=rec["signature_id"],
+                            tag=tag, arch=data["source"]["arch"]))
     return out
 
 
