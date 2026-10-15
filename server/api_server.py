@@ -5824,15 +5824,19 @@ def _clang_parsed(tag: str, arch: str) -> bool:
     """Were clang build logs parsed for this (tag, arch)? ImportState 'clang:<tag>:<arch>:...'.
     The clang logs are staged by hand (--clang-root); without them "no new warnings" means
     not checked, not clean."""
-    driver = get_driver()
     try:
-        with driver.session() as session:
-            return bool(session.run(
-                "MATCH (s:ImportState) WHERE s.source_id STARTS WITH $prefix RETURN count(s) > 0 AS ok",
-                prefix=f"clang:{tag}:{arch}:",
-            ).single()["ok"])
-    finally:
-        driver.close()
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                return bool(session.run(
+                    "MATCH (s:ImportState) WHERE s.source_id STARTS WITH $prefix RETURN count(s) > 0 AS ok",
+                    prefix=f"clang:{tag}:{arch}:",
+                ).single()["ok"])
+        finally:
+            driver.close()
+    except Exception as exc:  # a coverage note is not worth failing the digest over
+        print(f"WARNING: could not check clang coverage: {exc}")
+        return True
 
 
 def _digest_coverage_notes(

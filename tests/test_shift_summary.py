@@ -20,16 +20,20 @@ from server.api_server import (
 
 
 _PREFETCH_PATCH = patch("server.api_server.prefetch_relval_exception_evidence")
+# the per-arch "clang logs parsed?" coverage check queries ImportState directly
+_CLANG_PARSED_PATCH = patch("server.api_server._clang_parsed", return_value=True)
 
 
 def setUpModule():
     # generate_shift_summary prefetches RelVal evidence with one shared scan; these tests
     # mock get_relval_exception_evidence itself, so the prefetch must not reach a database
     _PREFETCH_PATCH.start()
+    _CLANG_PARSED_PATCH.start()
 
 
 def tearDownModule():
     _PREFETCH_PATCH.stop()
+    _CLANG_PARSED_PATCH.stop()
 
 
 class DiffFailingRelvalsTests(unittest.TestCase):
