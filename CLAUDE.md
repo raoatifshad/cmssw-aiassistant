@@ -49,6 +49,9 @@ PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/i
 # router shadow logs). Pruned sources get ImportState.pruned_at and are never
 # re-imported, not even with --force. Keeps IB, ProblemFirstSeen, PR/Issue, Concept.
 NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/prune_old_data.py [--days 90] [--apply]
+# one-off: re-derive RelVal.status from the cmsrepo files (e.g. after a status-rule
+# change -- DAS_ERROR was stored as PASSED until 2026-10-15); only differing rows written
+NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/backfill_relval_status.py --cmsrepo cmsrepo [--apply]
 # scan one zip by hand (read-only report, writes nothing)
 PYTHONPATH=ingestion venv/bin/python ingestion/ib_test_log_scanner.py <zip> [--addon-log addOnTests.log] [--json out.json]
 
