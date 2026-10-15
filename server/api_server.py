@@ -3832,6 +3832,9 @@ def _failed_relval_list_answer(question: str, context: dict[str, str] | None) ->
     # guards this (e.g. _latest_ib_answer's `f" for \`{arch}\`" if arch else ""`).
     arch_clause = f" on `{context['arch']}`" if context.get("arch") else ""
     if not rows:
+        if context.get("arch") and not get_relval_workflow_ids(context["tag"], arch=context["arch"]):
+            return (f"`{context['tag']}` has no RelVal results on `{context['arch']}` (no build there yet, or its "
+                    f"RelVals are not imported) -- unknown, not passing.")
         return f"No failing RelVals were found for `{context['tag']}`{arch_clause}."
     exit_code_names = get_exit_code_names()
     shown_cap = 100
@@ -7650,6 +7653,21 @@ def _relval_exception_message_answer(question: str) -> str | None:
                 "collect(DISTINCT e.workflow_id) AS workflows, min(e.message) AS message",
                 needle=needle,
             )]
+            quoted = [q.lower() for q in re.findall(r"'([^'\s]{4,})'", message)]
+            matched_by_names = False
+            if not rows and quoted:
+                # same error, different wording around the names ("%MSG-e PluginNotFound: Unable to find
+                # plugin 'EvtGen130' in category 'EvtGenFactory'" vs the recorded "... because the
+                # category 'EvtGenFactory' has no known plugins"): match on all quoted names
+                rows = [dict(r) for r in session.run(
+                    "MATCH (e:RelValException) WHERE all(q IN $quoted WHERE toLower(e.message) CONTAINS q) "
+                    "RETURN e.ib_tag AS tag, e.arch AS arch, e.category AS category, e.step AS step, "
+                    "collect(DISTINCT e.workflow_id) AS workflows, min(e.message) AS message",
+                    quoted=quoted,
+                )]
+                if rows:
+                    needle = quoted[0]
+                    matched_by_names = True
             if not rows:
                 return None
             # GitHub text quotes the distinctive first sentence more often than the whole line
@@ -7677,7 +7695,9 @@ def _relval_exception_message_answer(question: str) -> str | None:
     # newest builds first: the question is usually "is this happening now"
     ordered = sorted(by_build.items(), key=lambda kv: (_ib_sort_key(kv[0][0]), len(kv[1]["workflows"])), reverse=True)
     shown_category = category or rows[0]["category"]
-    lines = [f"**This exact error was recorded in {total_runs:,} RelVal workflow run(s)** across "
+    what = ("**An error with the same names (" + ", ".join(f"`{q}`" for q in quoted) + ") was recorded in "
+            if matched_by_names else "**This exact error was recorded in ")
+    lines = [f"{what}{total_runs:,} RelVal workflow run(s)** across "
              f"{len(by_build)} build/architecture pair(s) (imported RelVal exceptions"
              + (f", category `{shown_category}`" if shown_category else "") + "):", ""]
     wf_key = lambda w: float(w) if re.fullmatch(r"[\d.]+", w) else 0
