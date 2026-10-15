@@ -5078,40 +5078,53 @@ _RECURRENCE_EVIDENCE_CAVEAT = (
 )
 
 
-def _workflow_evidence_cells(workflow_id: str, row: dict, latest_tag: str) -> tuple[str, str]:
-    """(recurrence, pr_evidence) cell text for one newly-failing workflow, each a single
-    sanitized table-cell line. Every claim here is relevance/history, never causality --
-    see the module docstring's evidence-only invariant. Computed once per distinct
-    workflow_id by the caller (generate_shift_summary), not once per architecture row,
-    since the same workflow can newly-fail on several architectures at once."""
-    series_match = re.match(r"^CMSSW_(\d+)_(\d+)_", latest_tag)
-    series_prefix = f"CMSSW_{series_match.group(1)}_{series_match.group(2)}_" if series_match else None
+def _workflow_evidence_cells(
+    workflow_id: str, row: dict, latest_tag: str, arch: str | None = None, recurrence: dict | None = None,
+) -> tuple[str, str]:
+    """(recurrence, pr_evidence) cell text for one newly-failing (workflow, build, arch)
+    row, each a single sanitized table-cell line. Every claim here is relevance/history,
+    never causality -- see the module docstring's evidence-only invariant.
 
-    recurrence = get_relval_recurrence(workflow_id)
+    Recurrence counts prior failures on the same track only: same release series, same
+    variant (primary or the same sub-IB) and same architecture, strictly before this
+    build, plus how many of them had the same exit code. Found live 2026-10-15: CLANG
+    workflow 1.0 newly failed with a never-seen LogicError (exit 18944), and the cell
+    said "Failed in 7 prior build(s) this series" -- those 7 were MULTIARCHS/NONLTO/
+    primary builds failing with exit 256 days earlier, a different problem; in CLANG
+    itself it had failed once before. `recurrence` lets the caller reuse one
+    get_relval_recurrence result for every row of the same workflow."""
+    tag = row.get("ib_tag") or latest_tag
+    series_match = re.match(r"^(CMSSW_\d+_\d+_)", tag)
+    series_prefix = series_match.group(1) if series_match else None
+    variant = row.get("variant") or "primary"
+    current_when = tag.rsplit("_X_", 1)[-1]
+
+    if recurrence is None:
+        recurrence = get_relval_recurrence(workflow_id)
     if not recurrence.get("total_appearances"):
         recurrence_cell = "No prior appearance of this workflow ID in the imported graph."
     else:
-        failed_tags = recurrence.get("failed_tags", [])
-        # failed_tags can repeat the same tag once per architecture that failed --
-        # dedupe for display, preserving get_relval_recurrence's most-recent-first order.
-        # "prior" excludes the build being reported and its sub-IBs (same timestamp):
-        # the recurrence used to count it, so "Failed in 8 prior build(s) (most recent
-        # <this very build>)" was 7 earlier builds plus this one (found live 2026-10-15).
-        current_when = latest_tag.rsplit("_X_", 1)[-1]
-        in_series = list(dict.fromkeys(
-            tag for tag in failed_tags
-            if series_prefix and tag.startswith(series_prefix) and not tag.endswith("_X_" + current_when)
-        ))
-        if in_series:
+        overall = f"{recurrence['failed_appearances']}/{recurrence['total_appearances']} overall."
+        prior = [
+            record for record in recurrence.get("failure_history", [])
+            if series_prefix and record["tag"].startswith(series_prefix)
+            and (record.get("variant") or "primary") == variant
+            and (arch is None or record.get("arch") == arch)
+            and record["tag"].rsplit("_X_", 1)[-1] < current_when
+        ]
+        # one entry per build (history is most-recent-first already)
+        prior_tags = list(dict.fromkeys(record["tag"] for record in prior))
+        track = f"{variant} build(s) this series" + (f" on {arch}" if arch else "")
+        if prior_tags:
+            same_code = len({record["tag"] for record in prior
+                             if row.get("exitcode") is not None and record.get("exitcode") == row.get("exitcode")})
             recurrence_cell = (
-                f"Failed in {len(in_series)} prior build(s) this series (most recent {in_series[0]}); "
-                f"{recurrence['failed_appearances']}/{recurrence['total_appearances']} overall."
+                f"Failed in {len(prior_tags)} prior {track} (most recent {prior_tags[0]}), "
+                f"{same_code} with the same exit code; {overall}"
             )
         else:
-            recurrence_cell = (
-                f"No prior failure this series; "
-                f"{recurrence['failed_appearances']}/{recurrence['total_appearances']} overall."
-            )
+            recurrence_cell = f"First failure in {variant} builds this series" + (
+                f" on {arch}" if arch else "") + f"; {overall}"
 
     # Searches Issue/PR text for the workflow's actual exception message and the module
     # it failed in - not the bare workflow_id, which a PR/Issue essentially never quotes
@@ -5131,30 +5144,59 @@ def _workflow_evidence_cells(workflow_id: str, row: dict, latest_tag: str) -> tu
     # is partial, see get_failing_relvals) now correctly shows no evidence instead of a
     # misleadingly specific but wrong one.
     exception_evidence = get_relval_exception_evidence(workflow_id, ib_tag=row.get("ib_tag"), limit=5)
-    mentions = []
+    # Only an item quoting this exception's own text becomes a badge-shaped mention
+    # ("[cmssw PR #N](url) (state)", which the frontend's EVIDENCE_MENTION_RE turns into
+    # a PR badge on the alert card). An item that only names the workflow number or the
+    # module is listed as plain text saying exactly that, with no badge: found live
+    # 2026-10-15, CLANG workflows 1.0/10.0/10001.0 showed "PR #52092 Merged" style
+    # badges for PRs that matched only on the number ("1.0" inside "tags/v3.1.0"), and
+    # even a genuine "test `10001.0`" mention says nothing about this failure.
+    mentions, weak = [], {}
     for entry in exception_evidence:
         category = f"[{entry['category']}] " if entry.get("category") else ""
+        if entry.get("matched_by") == "module" and entry.get("module"):
+            reason = f"module {entry['module']}"
+        elif entry.get("matched_by") in ("workflow_id", "module"):
+            reason = f"workflow {workflow_id}"
+        else:
+            reason = None
         for match in entry["matches"][:3]:
             state = "merged" if match["kind"] == "PR" and match.get("merged_at") else str(match.get("state") or "unknown")
             # cms-sw/cmssw is the only repo get_relval_exception_evidence's artifact_query
             # searches (WHERE item.repo = 'cmssw'), so the URL is always this shape.
             path = "issues" if match["kind"] == "Issue" else "pull"
             url = f"https://github.com/cms-sw/cmssw/{path}/{match['number']}"
-            mentions.append(f"{category}[cmssw {match['kind']} #{match['number']}]({url}) ({state})")
+            if reason:
+                weak.setdefault(reason, {})[match["number"]] = (match["kind"], url)
+            else:
+                mentions.append(f"{category}[cmssw {match['kind']} #{match['number']}]({url}) ({state})")
+    caveat = f"relevance only, {_RECURRENCE_EVIDENCE_CAVEAT.split(' and ')[-1]}"
+    weak_text = ""
+    if weak:
+        # links only when the cell has no badges: the frontend renders a cell without
+        # badge mentions as inline markdown, but the text after a badge list as plain text
+        weak_text = "; ".join(
+            f"{'Also names' if mentions else 'Names'} {reason} only, not this error: " + ", ".join(
+                f"{kind} #{number}" if mentions else f"[{kind} #{number}]({url})"
+                for number, (kind, url) in list(items.items())[:5])
+            for reason, items in weak.items()
+        )
     # Empty (not a "no evidence" placeholder sentence) when nothing matched -- an empty
     # pipe-table cell is a deliberate signal the frontend should render as "nothing here"
     # (hide the evidence badge/row entirely), not text implying a search happened and
     # came up empty. See the frontend coordination note for this change.
-    pr_cell = (
-        f"{', '.join(mentions[:5])} -- relevance only, {_RECURRENCE_EVIDENCE_CAVEAT.split(' and ')[-1]}"
-        if mentions else ""
-    )
+    if mentions:
+        pr_cell = f"{', '.join(mentions[:5])} -- " + (f"{weak_text}. " if weak_text else "") + caveat
+    elif weak_text:
+        pr_cell = f"{weak_text} -- {caveat}"
+    else:
+        pr_cell = ""
 
     return _table_cell(recurrence_cell), _table_cell(pr_cell)
 
 
 def _newly_failing_relval_table(
-    rows: list[dict], exit_code_names: dict[int, str], evidence: dict[str, tuple[str, str]],
+    rows: list[dict], exit_code_names: dict[int, str], evidence: dict[tuple, tuple[str, str]], arch: str,
 ) -> list[str]:
     """Like _relval_table, but with two extra evidence columns the frontend auto-hides
     behind a per-row "Show evidence" toggle -- everything past the first five
@@ -5167,7 +5209,7 @@ def _newly_failing_relval_table(
         "| --- | --- | ---: | ---: | --- | --- | --- |",
     ]
     for row in rows:
-        recurrence_cell, pr_cell = evidence[row["workflow_id"]]
+        recurrence_cell, pr_cell = evidence[(row["workflow_id"], row.get("ib_tag"), arch)]
         lines.append(
             f"| `{row['workflow_id']}` | {row['name']} | {row.get('errors') or 0} | "
             f"{_relval_exit_code_cell(row, exit_code_names)} | "
@@ -5448,7 +5490,7 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
 
     status_by_tag_arch = _build_and_addon_status(previous_tag, latest_tag)
     per_arch: list[dict] = []
-    newly_failing_by_workflow: dict[str, dict] = {}
+    newly_failing_by_workflow: dict[tuple, dict] = {}
     for one_arch in architectures:
         sub_ib_notes: list[str] = []
 
@@ -5569,23 +5611,28 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
             "newly_failing_addon": newly_failing_addon, "resolved_addon": resolved_addon,
         })
         for row in newly_failing_arch:
-            newly_failing_by_workflow.setdefault(row["workflow_id"], row)
+            newly_failing_by_workflow.setdefault((row["workflow_id"], row.get("ib_tag"), one_arch), row)
 
-    # Evidence is computed once per distinct workflow_id (not once per architecture
-    # row -- the same workflow can newly-fail on several architectures at once) and
-    # embedded directly as extra table columns, which the frontend auto-hides behind
-    # a per-row "Show evidence" toggle rather than a separate always-open section.
-    # One shared GitHub scan for every workflow's evidence terms, then the per-workflow
-    # cells (recurrence + evidence) in parallel: one scan per workflow, one after the
-    # other, made a digest with 62 newly failing RelVals take 78-120 s (2026-10-15).
+    # Evidence is computed per (workflow_id, build, arch) row: the PR/Issue search is
+    # scoped to that row's own build's exception, and the recurrence to its own variant
+    # + arch track -- keying on workflow_id alone showed a CLANG row's evidence on the
+    # same workflow's ASAN row too. Embedded directly as extra table columns, which the
+    # frontend auto-hides behind a per-row "Show evidence" toggle.
+    # One shared GitHub scan for every workflow's evidence terms, and one recurrence
+    # lookup per distinct workflow_id, then the per-row cells in parallel: one scan per
+    # workflow, one after the other, made a digest with 62 newly failing RelVals take
+    # 78-120 s (2026-10-15).
     try:
         prefetch_relval_exception_evidence(
-            [(workflow_id, row.get("ib_tag")) for workflow_id, row in newly_failing_by_workflow.items()], limit=5)
+            [(workflow_id, ib_tag) for workflow_id, ib_tag, _ in newly_failing_by_workflow], limit=5)
     except Exception as exc:  # per-workflow lookups below still work, only slower
         print(f"WARNING: RelVal evidence prefetch failed: {exc}")
     with ThreadPoolExecutor(max_workers=8, thread_name_prefix="digest-evidence") as pool:
-        cells = pool.map(lambda item: _workflow_evidence_cells(item[0], item[1], latest_tag),
-                         list(newly_failing_by_workflow.items()))
+        workflow_ids = list(dict.fromkeys(key[0] for key in newly_failing_by_workflow))
+        recurrences = dict(zip(workflow_ids, pool.map(get_relval_recurrence, workflow_ids)))
+        cells = pool.map(
+            lambda item: _workflow_evidence_cells(item[0][0], item[1], latest_tag, item[0][2], recurrences[item[0][0]]),
+            list(newly_failing_by_workflow.items()))
         evidence = dict(zip(newly_failing_by_workflow, cells))
 
     for arch_result in per_arch:
@@ -5596,7 +5643,8 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
             lines.extend(["", "**Sub-IB baselines:**"])
             lines.extend(f"- {note}" for note in arch_result["sub_ib_notes"])
         lines.extend(["", "#### Newly failing RelVal workflows"])
-        lines.extend(_newly_failing_relval_table(arch_result["newly_failing_relvals"], exit_code_names, evidence))
+        lines.extend(_newly_failing_relval_table(
+            arch_result["newly_failing_relvals"], exit_code_names, evidence, one_arch))
         lines.extend(["", "#### Resolved RelVal workflows"])
         lines.extend(_relval_table(arch_result["resolved_relvals"], exit_code_names))
         lines.extend(["", "#### New Clang warning locations"])
