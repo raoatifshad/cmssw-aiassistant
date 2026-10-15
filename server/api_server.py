@@ -1148,6 +1148,27 @@ def _relval_das_error_lines(labelled_records: list[tuple[str, dict]], cap: int =
                 "excluded from the failing count):", *lines]
 
 
+def _relval_archs_without_results(tags: set[str], arch: str | None = None) -> list[tuple[str, str]]:
+    """(tag, arch) of these exact IBs that have a build but no RelVal record (not run or not
+    imported yet) -- _relval_scope_records drops them, so a count silently left them out
+    (found live 2026-10-15: CMSSW_20_1_X_2026-10-14-2300 on el9_aarch64_gcc14)."""
+    if not tags:
+        return []
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                return [(r["tag"], r["arch"]) for r in session.run(
+                    "MATCH (ib:IB) WHERE ib.tag IN $tags AND ($arch IS NULL OR ib.arch = $arch) "
+                    "AND NOT (ib)-[:RAN_RELVAL]->() RETURN ib.tag AS tag, ib.arch AS arch ORDER BY tag, arch",
+                    tags=sorted(tags), arch=arch)]
+        finally:
+            driver.close()
+    except Exception as exc:  # supplementary note only
+        print(f"WARNING: could not list IBs without RelVals: {exc}")
+        return []
+
+
 def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: list[str] | None = None) -> str:
     """Format a complete RelVal count without merging architecture-specific facts."""
     total = sum(record["relval_total"] or 0 for record in records)
@@ -1200,6 +1221,12 @@ def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: li
         lines.extend(failing_lines)
     lines.extend(_relval_known_error_lines([(record["arch"], record) for record in records]))
     lines.extend(_relval_das_error_lines([(record["arch"], record) for record in records]))
+    missing = _relval_archs_without_results({record["tag"] for record in records})
+    if missing:
+        lines.append("")
+        lines.append("No RelVal results imported yet (not run, or still running) -- unknown there, not passing: "
+                     + ", ".join(f"`{tag}` on `{arch}`" for tag, arch in missing[:8])
+                     + (f" (+{len(missing) - 8} more)" if len(missing) > 8 else "") + ".")
     note = _sub_ib_variant_note(records[0]["tag"], sub_ib_variants)
     if note:
         lines.append("")
@@ -4293,8 +4320,12 @@ def _ib_results_summary_answer(
             "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
             *(
                 f"| `{row['arch']}` | `{row['build_status'] or 'not imported'}` | {row['build_warnings']:,} | "
-                f"{row['ignored_warnings']:,} | {row['relval_failed']:,} / {row['relval_total']:,} | "
-                f"{row['unit_test_failed']:,} / {row['unit_test_total']:,} | {row['unit_test_errors']:,} |"
+                f"{row['ignored_warnings']:,} | "
+                # "0 / 0" read as "nothing failed"; no records at all means not imported yet
+                + (f"{row['relval_failed']:,} / {row['relval_total']:,}" if row['relval_total'] else "not imported")
+                + " | "
+                + (f"{row['unit_test_failed']:,} / {row['unit_test_total']:,}" if row['unit_test_total'] else "not imported")
+                + f" | {row['unit_test_errors']:,} |"
                 for row in section_rows
             ),
         ]
@@ -6146,6 +6177,7 @@ def _condense_shift_summary_for_chat(markdown: str) -> str:
         body = body[: footer_match.start()]
 
     kept_blocks = []
+    counts: dict[str, int] = {}
     for arch_block in re.split(r"\n(?=### )", body):
         heading_match = re.match(r"### (.*)", arch_block.strip())
         if not heading_match:
@@ -6156,7 +6188,11 @@ def _condense_shift_summary_for_chat(markdown: str) -> str:
             if not sub_heading_match:
                 continue
             if not _is_empty_digest_table(sub[sub_heading_match.end():]):
-                kept_subs.append(sub.rstrip())
+                kept_subs.append(_cap_digest_table_rows(sub.rstrip()))
+                section = sub_heading_match.group(1)
+                rows = sum(1 for line in sub.splitlines() if line.startswith("| ") and not line.startswith("| ---")) - 1
+                if section.startswith(("Newly failing", "Resolved")) and rows > 0:
+                    counts[section] = counts.get(section, 0) + rows
         if kept_subs:
             kept_blocks.append(f"### {heading_match.group(1)}\n\n" + "\n\n".join(kept_subs))
 
@@ -6167,8 +6203,32 @@ def _condense_shift_summary_for_chat(markdown: str) -> str:
             f"or Clang warnings between {window} across any imported architecture."
         )
         return f"{preamble}{message}" if preamble else message
-    result = f"{preamble}{title_line}\n\n" + "\n\n".join(kept_blocks)
+    overview = ""
+    if counts:
+        # one line a reader can take in before the per-architecture tables
+        overview = "**In short:** " + "; ".join(f"{section.lower()}: **{n:,}**" for section, n in counts.items()) + "\n\n"
+    result = f"{preamble}{title_line}\n\n{overview}" + "\n\n".join(kept_blocks)
     return f"{result}\n\n{footer}" if footer else result
+
+
+_CHAT_DIGEST_ROWS = 15
+
+
+def _cap_digest_table_rows(section_text: str) -> str:
+    """At most _CHAT_DIGEST_ROWS data rows per table in a chat answer: a window like
+    10-14-1100 -> 10-14-2300 has 940 newly failing RelVals (a 360 KB digest)."""
+    out, data_rows, hidden = [], 0, 0
+    for line in section_text.splitlines():
+        is_row = line.startswith("| ") and not line.startswith("| ---")
+        if is_row and data_rows > _CHAT_DIGEST_ROWS:  # header counts as the first row
+            hidden += 1
+            continue
+        if is_row:
+            data_rows += 1
+        out.append(line)
+    if hidden:
+        out.append(f"\n_... and {hidden:,} more row(s); the Shift Console lists them all._")
+    return "\n".join(out)
 
 
 def _shift_summary_answer(arch: str | None, days: int | None = None) -> str:
@@ -7548,6 +7608,55 @@ def _known_error_concept_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+_BASIC_TERMS = (
+    (r"ib|ibs|integration\s+builds?",
+     "An **Integration Build (IB)** is an automatic build of a CMSSW release branch, made several times a day "
+     "(typically 11:00 and 23:00), e.g. `CMSSW_20_1_X_2026-10-14-2300` = release series `CMSSW_20_1_X`, built "
+     "2026-10-14 at 23:00. Each IB is built and tested separately on every architecture (e.g. `el9_amd64_gcc14`): "
+     "a build status, RelVal workflows, unit tests and AddOn tests. Sub-IBs (ASAN, CLANG, ...) are other build "
+     "flavours of the same IB -- ask \"what is a sub-IB?\"."),
+    (r"relvals?|relval\s+workflows?|workflows?",
+     "A **RelVal** (release validation) **workflow** is a numbered chain of cmsRun steps (e.g. `1349.0`, steps "
+     "GEN-SIM, DIGI, RECO, ...) run on every IB to check the release still produces sensible results. On the IB "
+     "dashboard each workflow is FAILED if any step failed, DAS error if its input files could not be found, or "
+     "PASSED. Known errors (e.g. GridPacks only built for x86_64) are excluded from the failing count."),
+    (r"unit\s*tests?",
+     "**Unit tests** are the tests each CMSSW package ships (`scram build runtests`); the IB results are per "
+     "package (e.g. `FWCore/Framework`): failed if any of its tests failed, with the number of errors."),
+    (r"das(?:\s+errors?)?",
+     "A **DAS error** means a RelVal step could not get its input files from DAS (the CMS Data Aggregation "
+     "System, which finds where a dataset's files are), so the workflow never processed anything. That points to "
+     "the input dataset or infrastructure, not to broken code, and it is not counted as a failing RelVal."),
+    (r"known\s+errors?",
+     "A **known error** is a RelVal failure the IB results mark as expected for a known reason (e.g. \"GridPacks "
+     "were built for x86_64\" on an aarch64 machine). The dashboard and this bot exclude them from failing counts "
+     "but still list them."),
+    (r"shift\s+(?:summary|digest)|shift\s+console",
+     "The **shift summary** (digest) compares two builds of a release series -- by default the newest IB with the "
+     "previous one -- and lists what is newly failing and what was resolved: RelVals, unit tests, builds, AddOn "
+     "tests and Clang warnings, per architecture and build type. The Shift Console shows the same digest with "
+     "tiles and tables; ask \"give me a shift summary\"."),
+    (r"addon\s+tests?",
+     "**AddOn tests** are extra integration tests run on an IB after the build (`addOnTests.py`), reported as one "
+     "status per architecture."),
+)
+
+
+def _basic_term_answer(question: str) -> str | None:
+    """ "What is an IB?" -- found live 2026-10-15 getting the "couldn't match that" menu.
+    Fixed definitions of the terms the answers use; nothing is looked up."""
+    text = question.strip().rstrip("?!. ").lower()
+    m = re.fullmatch(r"(?:what(?:'s|\s+is|\s+are|\s+does)|define|explain|meaning\s+of)\s+(?:an?\s+|the\s+)?(.+?)"
+                     r"(?:\s+mean)?(?:\s+in\s+cmssw)?", text)
+    if not m:
+        return None
+    term = m.group(1).strip()
+    for pattern, definition in _BASIC_TERMS:
+        if re.fullmatch(pattern, term):
+            return definition
+    return None
+
+
 def _ib_variant_glossary_answer(question: str) -> str | None:
     if not _IB_VARIANT_QUESTION_RE.search(question):
         return None
@@ -7835,6 +7944,9 @@ _WORKFLOW_FOLLOW_UP_RE = re.compile(
 _CAPABILITY_FOLLOW_UP_KEYWORD = {
     "relval": "relval failures", "unittest": "unit tests", "build": "build warnings",
     "clang": "clang warnings", "ib_summary": "summary", "failure_overview": "failures",
+    # "give me a shift summary" then "what about el9_aarch64_gcc14 only" (found live
+    # 2026-10-15 returning GitHub issues that mention aarch64)
+    "shift_summary": "shift summary",
 }
 
 
@@ -8649,6 +8761,10 @@ def chat(req: ChatRequest):
     known_error_answer = _known_error_concept_answer(question)
     if known_error_answer:
         return _chat_response(sid, original_question, known_error_answer, "deterministic:known_error_concept")
+
+    basic_term = _basic_term_answer(original_question)
+    if basic_term:
+        return _chat_response(sid, original_question, basic_term, "deterministic:glossary")
 
     glossary_answer = _ib_variant_glossary_answer(question)
     if glossary_answer:
