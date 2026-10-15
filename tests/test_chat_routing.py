@@ -1056,7 +1056,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNotNone(result)
         answer, _ = result
         self.assertIn("136.899", answer)
-        get_failing_relvals.assert_called_once_with(tag, arch=None, limit=100)
+        get_failing_relvals.assert_called_once_with(tag, arch=None, limit=None)
 
     @patch("server.api_server.get_relval_recurrence")
     def test_relval_capability_answers_where_is_workflow_failing_with_no_tag(self, get_relval_recurrence):
@@ -1112,7 +1112,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNotNone(result)
         answer, _ = result
         self.assertIn("136.899", answer)
-        get_failing_relvals.assert_called_once_with(tag, arch=None, limit=100)
+        get_failing_relvals.assert_called_once_with(tag, arch=None, limit=None)
 
     @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_failing_relvals")
@@ -1137,7 +1137,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNotNone(result)
         answer, _ = result
         self.assertIn("140.0", answer)
-        self.assertIn("failing RelVals for", answer)  # the list heading, not the count-table heading
+        self.assertIn("failing RelVal(s)** for", answer)  # the list heading, not the count-table heading
 
     @patch("server.api_server.get_exit_code_names", return_value={})
     @patch("server.api_server.get_failing_relvals")
@@ -1175,7 +1175,7 @@ class ChatRoutingTests(unittest.TestCase):
         answer = _failed_relval_list_answer("what relvals are failing in CMSSW_20_1_X_2026-09-16-1100", context)
 
         self.assertNotIn("None", answer)
-        self.assertIn("and its sub-IBs are:", answer)
+        self.assertIn("and its sub-IBs:", answer)
 
     @patch("server.api_server.find_prs_for_error", return_value=[])
     @patch("server.api_server.get_failing_relvals")
@@ -2651,9 +2651,9 @@ class ChatRoutingTests(unittest.TestCase):
         answer = _workflow_artifact_answer("can you specify the PR/issues for 37834.0")
 
         self.assertIn("PR #51667", answer)
-        self.assertIn("exact match in title", answer)
-        self.assertEqual(session.run.call_args.kwargs["workflow_id"], "37834.0")
-        get_driver.return_value.close.assert_called_once()
+        self.assertIn("in its title", answer)
+        self.assertEqual(session.run.call_args.kwargs["lid"], "37834.0")
+        get_driver.return_value.close.assert_called()
 
     @patch("server.api_server.get_driver")
     def test_relval_exception_answer_never_traverses_has_exception(self, get_driver):
@@ -3478,7 +3478,7 @@ class ChatRoutingTests(unittest.TestCase):
 
         self.assertEqual(result.route, "llm_ungrounded_fallback")
         self.assertNotIn("42", result.answer)
-        self.assertIn("could not be safely summarized", result.answer)
+        self.assertIn("couldn't turn them into a verified answer", result.answer)
         self.assertIn("failing_count", result.answer)
 
     @patch("server.api_server._retriever", None)
