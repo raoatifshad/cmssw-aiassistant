@@ -7837,95 +7837,144 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
     first, last = min(r["when"] for r in rows)[:10], max(r["when"] for r in rows)[:10]
     names = get_exit_code_names()
 
-    lines = [f"Workflow `{workflow_id}` (`{current_name}`){where}: **{len(problems)} of {len(rows)}** imported "
-             f"run(s) did not pass, in builds from {first} to {last}."]
-    if counts["failed"]:
-        lines.append(f"- 🔴 **Failed** in {counts['failed']} run(s).")
+    def series_key(name: str) -> tuple:
+        numbers = re.match(r"CMSSW_(\d+)_(\d+)(.*)", name)
+        return (int(numbers.group(1)), int(numbers.group(2)), numbers.group(3)) if numbers else (0, 0, name)
+
+    def variant_key(variant: str) -> tuple:
+        return (variant != "primary", variant)
+
+    # Per track (release, build type, architecture), judged by that track's newest run:
+    # still not passing (and since which build) or passing again. Found live 2026-10-15:
+    # 1349.0 failed only in the 10-09..10-11 builds and passed in every 20_1 run since,
+    # but the answer read as if it were still failing -- so the answer now leads with
+    # where it fails NOW, and failures that are over are one summary line.
+    tracks: dict[tuple, list[dict]] = {}
+    for r in rows:
+        tracks.setdefault((r["series"], r["variant"], r["arch"]), []).append(r)
+    still_bad: list[tuple] = []   # (series, variant, arch, since_tag, kind)
+    recovered: list[tuple] = []   # (series, variant, arch)
+    for (series, variant, track_arch), track in tracks.items():
+        track.sort(key=lambda r: _ib_sort_key(r["tag"]))
+        if all(r["kind"] == "passed" for r in track):
+            continue
+        if track[-1]["kind"] == "passed":
+            recovered.append((series, variant, track_arch))
+            continue
+        start = len(track) - 1
+        while start > 0 and track[start - 1]["kind"] != "passed":
+            start -= 1
+        still_bad.append((series, variant, track_arch, track[start]["tag"], track[-1]["kind"]))
+
+    kind_label = {"failed": "failing", "das": "DAS error", "known": "known error"}
+
+    def group_places(entries: list[tuple]) -> list[tuple]:
+        """[((series, variant), [(arch, since, kind)])] in release / build type order."""
+        groups: dict[tuple, list[tuple]] = {}
+        for series, variant, track_arch, since, kind in entries:
+            groups.setdefault((series, variant), []).append((track_arch, since, kind))
+        return sorted(groups.items(), key=lambda item: (series_key(item[0][0]), variant_key(item[0][1])))
+
+    # known errors (e.g. GridPacks only built for x86_64) are kept apart from real
+    # failures: the dashboard excludes them, so they never make a workflow "failing"
+    real_places = group_places([x for x in still_bad if x[4] != "known"])
+    known_places = group_places([x for x in still_bad if x[4] == "known"])
+
+    def place_text(series: str, variant: str, entries: list[tuple]) -> str:
+        archs_text = ", ".join(f"`{a}`" for a, _, _ in sorted(entries))
+        since = min((since for _, since, _ in entries), key=_ib_sort_key)
+        kinds = sorted({kind_label[kind] for _, _, kind in entries})
+        return f"`{series}` {variant} on {archs_text} ({'/'.join(kinds)} since `{since}`)"
+
+    def places(items: list[tuple]) -> str:
+        return "; ".join(place_text(series, variant, entries) for (series, variant), entries in items)
+
+    def plural(n: int, word: str) -> str:
+        return f"{n} {word}" + ("" if n == 1 else "s")
+
+    def recovered_text() -> str:
+        """Failures that are over, by release: build types and the builds they failed in."""
+        by_series: dict[str, set] = {}
+        for series, variant, _ in recovered:
+            by_series.setdefault(series, set()).add(variant)
+        recovered_keys = set(recovered)
+        whens = sorted(r["when"] for r in problems if (r["series"], r["variant"], r["arch"]) in recovered_keys)
+        parts = []
+        for series in sorted(by_series, key=series_key):
+            variants = sorted(by_series[series], key=variant_key)
+            shown = ", ".join(variants[:12]) + (f" +{len(variants) - 12} more" if len(variants) > 12 else "")
+            parts.append(f"`{series}` {shown}")
+        span = f"builds {whens[0]} to {whens[-1]}" if whens[0] != whens[-1] else f"build {whens[0]}"
+        return f"{'; '.join(parts)} ({span})"
+
+    INLINE = 4  # places named in the sentence itself; more go in a table
+    first_last = f"builds {first} to {last}" if first != last else f"builds of {first}"
+    head = f"Workflow `{workflow_id}` (`{current_name}`){where}"
+    lines: list[str] = []
+    table_items: list[tuple] = []
+    if not problems:
+        lines.append(f"{head} is **not failing**: it passed in all {len(rows)} imported run(s) ({first_last}).")
+    elif not counts["passed"]:
+        variants = sorted({r["variant"] for r in problems}, key=variant_key)
+        archs = sorted({r["arch"] for r in problems})
+        series_names = sorted({r["series"] for r in problems}, key=series_key)
+        lines.append(f"{head} is **failing everywhere**: it did not pass in any of its {len(rows)} imported run(s) "
+                     f"({first_last}) -- every run of {', '.join(f'`{x}`' for x in series_names)}, in "
+                     f"{len(variants)} build type(s) ({', '.join(variants)}) on {len(archs)} architecture(s) "
+                     f"({', '.join(f'`{a}`' for a in archs)}).")
+    else:
+        if real_places:
+            listed = places(real_places) if len(real_places) <= INLINE else "listed below"
+            lines.append(f"{head} is **now failing in {plural(len(real_places), 'place')}** "
+                         f"(judged by each release / build type's newest run): {listed}.")
+            if len(real_places) > INLINE:
+                table_items += real_places
+        elif known_places:
+            lines.append(f"{head} is **not failing now**, apart from known errors.")
+        else:
+            last_bad = max(problems, key=lambda r: _ib_sort_key(r["tag"]))
+            lines.append(f"{head} is **not failing now**: the newest run passed everywhere. "
+                         f"It last failed in `{last_bad['tag']}` (`{last_bad['arch']}`).")
+        if known_places:
+            listed = places(known_places) if len(known_places) <= INLINE else "listed below"
+            lines.append(f"Known error, excluded from failure counts, in {plural(len(known_places), 'place')}: {listed}.")
+            if len(known_places) > INLINE:
+                table_items += known_places
+        if recovered:
+            lines.append(f"Earlier failures, passing since: {recovered_text()}.")
+
+    run_counts = [f"🔴 {counts['failed']} failed"] if counts["failed"] else []
+    run_counts += [f"🟠 {counts['das']} DAS error"] if counts["das"] else []
+    run_counts += [f"🟠 {counts['known']} known error"] if counts["known"] else []
+    run_counts += [f"🟢 {counts['passed']} passed"] if counts["passed"] else []
+    lines += ["", f"Runs: {' · '.join(run_counts)} ({len(rows)} in {first_last})."]
     if counts["das"]:
-        lines.append(f"- 🟠 **DAS error** in {counts['das']} run(s): {_DAS_ERROR_EXPLANATION}")
+        lines.append(f"- **DAS error**: {_DAS_ERROR_EXPLANATION}")
     if counts["known"]:
         reasons = sorted({r["known_error_message"] for r in rows if r["kind"] == "known" and r["known_error_message"]})
         reason_text = f" ({'; '.join(reasons[:2])})" if reasons else ""
-        lines.append(f"- 🟠 **Known error** in {counts['known']} run(s){reason_text}, excluded from failure counts.")
-    if counts["passed"]:
-        lines.append(f"- 🟢 **Passed** in {counts['passed']} run(s).")
+        lines.append(f"- **Known error**{reason_text}: excluded from failure counts, as on the IB dashboard.")
 
-    if problems:
-        # Is it still failing? Judged per track (release, build type, architecture) by
-        # that track's newest run -- found live 2026-10-15: 1349.0 failed only in the
-        # 10-09..10-11 builds and passed in every 20_1 run since, but the answer read as
-        # if it were still failing.
-        tracks: dict[tuple, list[dict]] = {}
-        for r in rows:
-            tracks.setdefault((r["series"], r["variant"], r["arch"]), []).append(r)
-        still_bad, recovered = [], []
-        for key, track in tracks.items():
-            track.sort(key=lambda r: _ib_sort_key(r["tag"]))
-            if all(r["kind"] == "passed" for r in track):
-                continue
-            if track[-1]["kind"] == "passed":
-                recovered.append(key)
-                continue
-            streak_start = len(track) - 1
-            while streak_start > 0 and track[streak_start - 1]["kind"] != "passed":
-                streak_start -= 1
-            still_bad.append((key, track[streak_start]["tag"], track[-1]["kind"]))
-        failed_builds = sorted({r["when"] for r in problems})
-        builds_text = (", ".join(failed_builds) if len(failed_builds) <= 8
-                       else f"{len(failed_builds)} builds, {failed_builds[0]} to {failed_builds[-1]}")
-        lines.append(f"\nBuilds where it did not pass: {builds_text}.")
-        if not counts["passed"]:
-            lines.append("**Now: still not passing anywhere** -- it has not passed in any imported run.")
-        elif not still_bad:
-            last = max(problems, key=lambda r: _ib_sort_key(r["tag"]))
-            lines.append(f"**Now: passing again everywhere** -- the newest run of every release/build type/architecture "
-                         f"passed; last failure `{last['tag']}` (`{last['arch']}`).")
-        else:
-            kind_label = {"failed": "failing", "das": "DAS error", "known": "known error"}
-            shown = "; ".join(f"`{series}` {variant} `{a}` ({kind_label[kind]} since `{since}`)"
-                              for (series, variant, a), since, kind in sorted(still_bad)[:8])
-            more = f"; +{len(still_bad) - 8} more" if len(still_bad) > 8 else ""
-            lines.append(f"**Now: still not passing in {len(still_bad)}** release/build type/architecture "
-                         f"track(s), judged by each one's newest run: {shown}{more}.")
-            if recovered:
-                lines.append(f"Passing again in the other {len(recovered)} track(s) where it failed earlier.")
+    if table_items:
+        lines += ["", "| Release | Build type | Architectures | Status | Since |", "| --- | --- | --- | --- | --- |"]
+        for (series, variant), entries in table_items[:20]:
+            since = min((since for _, since, _ in entries), key=_ib_sort_key)
+            kinds = "/".join(sorted({kind_label[kind] for _, _, kind in entries}))
+            archs_text = ", ".join(f"`{a}`" for a, _, _ in sorted(entries))
+            lines.append(f"| `{series}` | {variant} | {archs_text} | {kinds} | `{since}` |")
+        if len(table_items) > 20:
+            lines.append(f"| ... | {len(table_items) - 20} more | | | |")
 
+    if problems and counts["passed"]:
+        clean_series = sorted({r["series"] for r in rows} - {r["series"] for r in problems}, key=series_key)
+        if clean_series:
+            span = (f"`{clean_series[0]}`" if len(clean_series) == 1
+                    else f"`{clean_series[0]}` to `{clean_series[-1]}`")
+            lines.append(f"\nNever failed in {len(clean_series)} other release series ({span}).")
     if problems:
-        series_names = sorted({r["series"] for r in problems})
-        variants = sorted({r["variant"] for r in problems}, key=lambda v: (v != "primary", v))
-        archs = sorted({r["arch"] for r in problems})
-        if not counts["passed"]:
-            lines += ["", f"It did not pass **anywhere**: every imported run of {', '.join(f'`{x}`' for x in series_names)}, "
-                          f"in {len(variants)} build type(s) ({', '.join(variants[:30])}"
-                          f"{', ...' if len(variants) > 30 else ''}) and on {len(archs)} architecture(s) "
-                          f"({', '.join(f'`{a}`' for a in archs)})."]
-        else:
-            groups: dict[tuple, list[dict]] = {}
-            for r in rows:
-                groups.setdefault((r["series"], r["variant"]), []).append(r)
-            bad = sorted(((key, g) for key, g in groups.items() if any(r["kind"] != "passed" for r in g)),
-                         key=lambda item: -sum(r["kind"] != "passed" for r in item[1]))
-            lines += ["", "Where it did not pass:", "",
-                      "| Release | Build type | Architectures | Not passed / runs | Most recent |",
-                      "| --- | --- | --- | ---: | --- |"]
-            for (series, variant), group in bad[:15]:
-                bad_rows = [r for r in group if r["kind"] != "passed"]
-                recent = max(bad_rows, key=lambda r: _ib_sort_key(r["tag"]))
-                bad_archs = ", ".join(f"`{a}`" for a in sorted({r["arch"] for r in bad_rows}))
-                lines.append(f"| `{series}` | {variant} | {bad_archs} | "
-                             f"{len(bad_rows)} / {len(group)} | `{recent['tag']}` |")
-            if len(bad) > 15:
-                lines.append(f"| ... | {len(bad) - 15} more | | | |")
-            clean = sorted({f"`{key[0]}` {key[1]}" for key, g in groups.items() if all(r["kind"] == "passed" for r in g)})
-            if clean:
-                lines.append(f"\nPassed in every run of: {', '.join(clean[:10])}{', ...' if len(clean) > 10 else ''}.")
         codes = sorted({r["exitcode"] for r in problems if r["exitcode"]})
         if codes:
             lines.append("\nExit code(s): " + ", ".join(_format_exit_code(code, names) for code in codes) + ".")
-        recent = max(problems, key=lambda r: _ib_sort_key(r["tag"]))
-        lines.append(f"Most recent: `{recent['tag']}` ({recent['variant']}, `{recent['arch']}`).")
-    else:
-        lines.append(f"\nIt is not failing in any imported build{where}.")
 
     if step_details:
         by_detail: dict[str, int] = {}
@@ -7938,9 +7987,6 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
         lines.append("\nImported exception text:")
         lines += [f"- **[{e['category']}]** {e['message'].strip()} ({e['n']} record(s))" for e in exceptions]
     if other_rows:
-        def series_key(name: str) -> tuple:
-            numbers = re.match(r"CMSSW_(\d+)_(\d+)(.*)", name)
-            return (int(numbers.group(1)), int(numbers.group(2)), numbers.group(3)) if numbers else (0, 0, name)
         other_series = sorted({re.sub(r"_X_.*$", "", r["tag"]) for r in other_rows}, key=series_key)
         other_bad = sum(1 for r in other_rows if r["status"] != "PASSED")
         lines.append(f"\nNot counted above: {len(other_rows)} run(s) in {', '.join(f'`{x}`' for x in other_series[:6])} "
