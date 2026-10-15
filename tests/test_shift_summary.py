@@ -193,6 +193,59 @@ def _failing_row(workflow_id="140.51", name="RunMuonEG2022C", variant=None, erro
 
 
 class GenerateShiftSummaryTests(unittest.TestCase):
+    def test_recurrence_counts_only_the_same_variant_and_arch(self):
+        """Found live 2026-10-15: CLANG workflow 1.0 newly failed with a new LogicError
+        (exit 18944) and was shown as "Failed in 7 prior build(s) this series" -- those
+        were other variants (MULTIARCHS, NONLTO, primary) failing with exit 256."""
+        from server.api_server import _workflow_evidence_cells
+        recurrence = {
+            "total_appearances": 437, "failed_appearances": 31, "failed_tags": [],
+            "failure_history": [
+                {"tag": "CMSSW_20_1_CLANG_X_2026-10-14-2300", "arch": "el9_amd64_gcc14", "variant": "CLANG", "exitcode": 18944},
+                {"tag": "CMSSW_20_1_MULTIARCHS_X_2026-10-11-0000", "arch": "el9_amd64_gcc14", "variant": "MULTIARCHS", "exitcode": 256},
+                {"tag": "CMSSW_20_1_X_2026-10-10-1100", "arch": "el9_amd64_gcc14", "variant": "primary", "exitcode": 256},
+                {"tag": "CMSSW_20_1_CLANG_X_2026-10-09-2300", "arch": "el8_amd64_gcc14", "variant": "CLANG", "exitcode": 256},
+                {"tag": "CMSSW_20_1_CLANG_X_2026-10-09-2300", "arch": "el9_amd64_gcc14", "variant": "CLANG", "exitcode": 256},
+            ],
+        }
+        row = {"workflow_id": "1.0", "variant": "CLANG", "exitcode": 18944,
+               "ib_tag": "CMSSW_20_1_CLANG_X_2026-10-14-2300"}
+        with patch("server.api_server.get_relval_exception_evidence", return_value=[]):
+            cell, _ = _workflow_evidence_cells("1.0", row, "CMSSW_20_1_X_2026-10-14-2300", "el9_amd64_gcc14", recurrence)
+        self.assertEqual(cell, "Failed in 1 prior CLANG build(s) this series on el9_amd64_gcc14 "
+                               "(most recent CMSSW_20_1_CLANG_X_2026-10-09-2300), 0 with the same exit code; 31/437 overall.")
+
+        recurrence["failure_history"] = recurrence["failure_history"][:3]
+        with patch("server.api_server.get_relval_exception_evidence", return_value=[]):
+            cell, _ = _workflow_evidence_cells("1.0", row, "CMSSW_20_1_X_2026-10-14-2300", "el9_amd64_gcc14", recurrence)
+        self.assertEqual(cell, "First failure in CLANG builds this series on el9_amd64_gcc14; 31/437 overall.")
+
+    def test_workflow_id_only_match_is_labelled_as_a_mention(self):
+        from server.api_server import _workflow_evidence_cells
+        evidence = [
+            {"category": None, "exception": "boom", "matched_by": "workflow_id", "module": None,
+             "matches": [{"kind": "PR", "number": 51225, "state": "closed", "merged_at": "2026-06-17"}]},
+            {"category": None, "exception": "bang", "matched_by": "module", "module": "EvaluateMuonMVAID",
+             "matches": [{"kind": "Issue", "number": 7, "state": "open", "merged_at": None}]},
+        ]
+        with patch("server.api_server.get_relval_exception_evidence", return_value=evidence):
+            _, pr_cell = _workflow_evidence_cells(
+                "10001.0", {"ib_tag": "T_X_1"}, "T_X_1", "el9_amd64_gcc14", {"total_appearances": 0})
+        # no badge-shaped "[cmssw PR #N](url) (state)" mention, so no PR badge on the card
+        self.assertNotIn("[cmssw", pr_cell)
+        self.assertIn("Names workflow 10001.0 only, not this error: "
+                      "[PR #51225](https://github.com/cms-sw/cmssw/pull/51225)", pr_cell)
+        self.assertIn("Names module EvaluateMuonMVAID only, not this error: "
+                      "[Issue #7](https://github.com/cms-sw/cmssw/issues/7)", pr_cell)
+
+        evidence.insert(0, {"category": "LogicError", "exception": "boom", "matched_by": "exception", "module": None,
+                            "matches": [{"kind": "PR", "number": 9, "state": "open", "merged_at": None}]})
+        with patch("server.api_server.get_relval_exception_evidence", return_value=evidence):
+            _, pr_cell = _workflow_evidence_cells(
+                "10001.0", {"ib_tag": "T_X_1"}, "T_X_1", "el9_amd64_gcc14", {"total_appearances": 0})
+        self.assertTrue(pr_cell.startswith("[LogicError] [cmssw PR #9](https://github.com/cms-sw/cmssw/pull/9) (open) -- "))
+        self.assertIn("Also names workflow 10001.0 only, not this error: PR #51225", pr_cell)
+
     @patch("server.api_server.get_unittest_names", return_value=[])
     @patch("server.api_server.get_relval_workflow_ids", return_value=[])
     @patch("server.api_server.search_concepts", return_value=[])
@@ -240,6 +293,11 @@ class GenerateShiftSummaryTests(unittest.TestCase):
             "failed_tags": [
                 "CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-18-2300", "CMSSW_19_0_X_2026-08-01-0000",
             ],
+            "failure_history": [
+                {"tag": "CMSSW_20_1_X_2026-08-19-2300", "arch": "el9_amd64_gcc14", "variant": "primary", "exitcode": 16640},
+                {"tag": "CMSSW_20_1_X_2026-08-18-2300", "arch": "el9_amd64_gcc14", "variant": "primary", "exitcode": 16640},
+                {"tag": "CMSSW_19_0_X_2026-08-01-0000", "arch": "el9_amd64_gcc14", "variant": "primary", "exitcode": 16640},
+            ],
         }
         find_prs.return_value = [
             {
@@ -262,7 +320,8 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         self.assertIn("relevance only, do not prove a PR or Issue caused or fixed a failure", markdown)
         # the out-of-series tag must not be counted as an in-series recurrence, and the
         # build being reported (08-19-2300) is not a "prior" build of itself
-        self.assertIn("Failed in 1 prior build(s) this series (most recent CMSSW_20_1_X_2026-08-18-2300)", markdown)
+        self.assertIn("Failed in 1 prior primary build(s) this series on el9_amd64_gcc14 "
+                      "(most recent CMSSW_20_1_X_2026-08-18-2300), 1 with the same exit code; 3/5 overall.", markdown)
         # Regression (found live 2026-09-18, workflow 537.0 vs closed Issue #49849):
         # the evidence lookup must be scoped to THIS row's own ib_tag -- the build
         # that's actually newly failing -- not left unscoped to search the workflow's

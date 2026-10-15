@@ -649,3 +649,37 @@ class RelvalEvidencePrefetchTests(unittest.TestCase):
         self.assertEqual(first[0]["matches"][0]["matched_terms"], ["1.0", "boom one"])
         self.assertEqual(first[0]["category"], "LogicError")  # matched via its own exception text
         self.assertEqual([m["number"] for m in second[0]["matches"]], [30])  # exact text beats id-only #10
+
+
+class WorkflowIdPatternTests(unittest.TestCase):
+    """A bare workflow_id only counts as PR/Issue evidence as a whole token after a word
+    saying it is a workflow. Found live 2026-10-15: "1.0" matched "tags/v3.1.0" (PR #52092)
+    and "10.0" matched "Max event: 10.0047" (PR #51932)."""
+
+    def matches(self, workflow_id, text):
+        import re as re_
+        import tools
+        # Neo4j's =~ is a full-string match, like re.fullmatch
+        return re_.fullmatch(tools._workflow_id_pattern(workflow_id), text.lower()) is not None
+
+    def test_version_numbers_and_timings_do_not_match(self):
+        self.assertFalse(self.matches("1.0", "git checkout -b v3.1.0 tags/v3.1.0"))
+        self.assertFalse(self.matches("10.0", "TimeReport  - Max event:   10.0047"))
+        self.assertFalse(self.matches("1.0", "bumped to version 1.0 today"))  # no workflow word
+        self.assertFalse(self.matches("1.0", "workflow 11.0 fails"))
+        self.assertFalse(self.matches("1.0", "workflow 1.01 fails"))
+
+    def test_real_workflow_mentions_match(self):
+        self.assertTrue(self.matches("1.0", "Workflow 1.0 fails with a LogicError"))
+        self.assertTrue(self.matches("10.0", "wfs 136.731, 10.0 and 1000.0 crash"))
+        self.assertTrue(self.matches("10001.0", "runTheMatrix.py -l 10001.0,1.0 -j 8"))
+        self.assertTrue(self.matches("1.0", "affected relvals:\n- 1.0."))
+        self.assertTrue(self.matches("140.051", "see wf `140.051` step 3"))
+
+    def test_only_workflow_id_terms_get_a_pattern(self):
+        import tools
+        params = tools._artifact_query_params({"boom", "1.0"}, {"1.0"})
+        self.assertEqual(params["terms"], ["1.0", "boom"])
+        self.assertIsNotNone(params["patterns"][0])
+        self.assertIsNone(params["patterns"][1])
+

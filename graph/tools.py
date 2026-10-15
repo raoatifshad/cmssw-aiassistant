@@ -336,7 +336,7 @@ def get_relval_recurrence(workflow_id: str) -> dict:
             rows = [dict(r) for r in s.run(
                 "MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal {workflow_id:$workflow_id}) "
                 "RETURN relval.name AS name, relval.status AS status, "
-                "coalesce(relval.known_error, false) AS known_error, "
+                "coalesce(relval.known_error, false) AS known_error, relval.exitcode AS exitcode, "
                 "ib.tag AS tag, ib.arch AS arch, coalesce(ib.variant, 'primary') AS variant",
                 {"workflow_id": workflow_id},
             )]
@@ -359,6 +359,12 @@ def get_relval_recurrence(workflow_id: str) -> dict:
             {"tag": r["tag"], "arch": r["arch"], "variant": r["variant"]} for r in failed_records
         ],
         "failed_tags": [r["tag"] for r in failed_records],
+        # every genuine failure (uncapped), with exit code: the shift digest counts prior
+        # failures within one (variant, arch) track, which the top-10 above can miss
+        "failure_history": [
+            {"tag": r["tag"], "arch": r["arch"], "variant": r["variant"], "exitcode": r.get("exitcode")}
+            for r in sorted(genuine_failures, key=lambda r: _ib_sort_key(r["tag"]), reverse=True)
+        ],
     }
 
 
@@ -1394,8 +1400,8 @@ def get_relval_exception_evidence(workflow_id: str, ib_tag: str | None = None, l
 
             def candidates_for(terms: set, limit_: int) -> list[dict]:
                 return [dict(record) for record in session.run(
-                    _ARTIFACT_EVIDENCE_QUERY + " LIMIT $limit", terms=sorted(terms),
-                    lterms=[term.lower() for term in sorted(terms)], limit=limit_,
+                    _ARTIFACT_EVIDENCE_QUERY + " LIMIT $limit",
+                    **_artifact_query_params(terms, {workflow_id}), limit=limit_,
                 )]
 
             return _rank_relval_evidence(workflow_id, rows, candidates_for, limit)
@@ -1435,7 +1441,10 @@ _ARTIFACT_EVIDENCE_QUERY = (
     # messages up to 1000 chars) that is 6 s instead of 81 s, same matches (2026-10-15)
     "WITH item, [toLower(coalesce(item.title, '')), toLower(coalesce(item.body, ''))] "
     "+ collect(toLower(coalesce(comment.body, ''))) AS texts "
-    "WITH item, [i IN range(0, size($terms) - 1) WHERE any(text IN texts WHERE text CONTAINS $lterms[i]) "
+    # $patterns[i] is set only for a bare workflow_id term (see _workflow_id_pattern): the
+    # cheap CONTAINS goes first, the regex runs only on texts that already contain the id.
+    "WITH item, [i IN range(0, size($terms) - 1) WHERE any(text IN texts WHERE text CONTAINS $lterms[i] "
+    "AND ($patterns[i] IS NULL OR text =~ $patterns[i])) "
     "| $terms[i]] AS matched_terms "
     "WHERE size(matched_terms) > 0 "
     "RETURN CASE WHEN item:Issue THEN 'Issue' ELSE 'PR' END AS kind, "
@@ -1445,6 +1454,27 @@ _ARTIFACT_EVIDENCE_QUERY = (
     "ORDER BY number DESC"
 )
 _EVIDENCE_CACHE: dict[tuple, tuple[float, list]] = {}
+
+
+def _workflow_id_pattern(workflow_id: str) -> str:
+    """Regex (for already-lowercased text) that a bare workflow_id must match to count:
+    the id as a whole token, within 60 characters after a word that says it is a
+    workflow ("workflow", "wf", "relval", "runTheMatrix", "-l"). A plain substring match
+    made short ids hit unrelated text: found live 2026-10-15, "1.0" matched PR #52092's
+    "git checkout tags/v3.1.0", "10.0" matched PR #51932's "Max event: 10.0047"."""
+    return (
+        r"(?s).*(?:\b(?:workflows?|wfs?|relvals?|runthematrix(?:\.py)?)\b|(?<!\w)-l\s)"
+        r".{0,60}?(?<![\w.])" + re.escape(workflow_id.lower()) + r"(?!\w|\.\d).*"
+    )
+
+
+def _artifact_query_params(terms, workflow_ids) -> dict:
+    terms = sorted(terms)
+    return {
+        "terms": terms,
+        "lterms": [term.lower() for term in terms],
+        "patterns": [_workflow_id_pattern(term) if term in workflow_ids else None for term in terms],
+    }
 _EVIDENCE_CACHE_SECONDS = 300
 
 
@@ -1508,7 +1538,12 @@ def _rank_relval_evidence(workflow_id: str, rows: list[dict], candidates_for, li
         # "539.0" as an affected workflow; the XMLDocument label had nothing to do
         # with why that match was found).
         category = row.get("category") if specificity(best) == 3 else None
-        results.append({"category": category, "exception": exception, "matches": [best]})
+        # what the match was found by, so a caller can say "mentions workflow 1.0" instead
+        # of presenting a workflow_id/module-only hit as if it were about this exception
+        matched_by = {3: "exception", 2: "workflow_id", 1: "module"}[specificity(best)]
+        results.append({"category": category, "exception": exception, "matches": [best],
+                        "matched_by": matched_by,
+                        "module": next((t for t in best["matched_terms"] if t not in (exception, workflow_id)), None)})
     return results
 
 
@@ -1529,7 +1564,8 @@ def prefetch_relval_exception_evidence(requests: list[tuple[str, str | None]], l
             all_terms = sorted({term for (workflow_id, _), rows in rows_by_request.items()
                                 for row in rows for term in _relval_evidence_terms(workflow_id, row)})
             items = [dict(record) for record in session.run(
-                _ARTIFACT_EVIDENCE_QUERY, terms=all_terms, lterms=[term.lower() for term in all_terms],
+                _ARTIFACT_EVIDENCE_QUERY,
+                **_artifact_query_params(all_terms, {workflow_id for workflow_id, _ in requests}),
             )] if all_terms else []
     finally:
         driver.close()
