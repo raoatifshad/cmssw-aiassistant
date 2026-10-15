@@ -139,7 +139,7 @@ class RequestContext:
             # are failure questions too -- found live 2026-10-06 (held-out tester
             # set) never reaching the failure overview.
             has_failure_request=bool(re.search(
-                r"\b(?:fail(?:ing|ed|ures?)|errors?|red|green|clean|broken|breaks?|problems?|unhealthy|health)\b|"
+                r"\b(?:fail(?:s|ing|ed|ures?)?|errors?|red|green|clean|broken|breaks?|problems?|unhealthy|health)\b|"
                 r"\ball\s+(?:good|ok|fine)\b|\beverything\s+(?:ok|fine|good|passing)\b|"
                 r"\bhow\s+(?:bad|healthy|good)\b|\bwhat(?:'s|\s+is)\s+wrong\b|"
                 r"\bstatus\s+of\s+(?:the\s+)?(?:today'?s\s+|latest\s+|last\s+|current\s+)?ibs?\b",
