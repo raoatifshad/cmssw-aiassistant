@@ -887,6 +887,10 @@ def _normalize_deterministic_question(question: str) -> str:
     """Normalize high-confidence phrasing variants before deterministic routing."""
     normalized = question
     for pattern, replacement in (
+        # failing counts already exclude known errors: drop the qualifier so the question routes
+        # deterministically (stress test 2026-10-15: ~30 s through the LLM path)
+        (r",?\s*\b(?:excluding|except(?:\s+for)?|besides|without|other\s+than|not\s+counting)\s+(?:the\s+)?"
+         r"known[\s-]*(?:issues?|errors?|failures?)(?:\s+ones)?\b", ""),
         # "what packages need fixing in <tag>" = its failed unit-test packages (found live
         # 2026-10-15 replaying real sessions: "No imported local evidence")
         (r"\bpackages?\s+(?:that\s+)?(?:needs?|require|requires)\s+(?:fixing|to\s+be\s+fixed|a\s+fix|attention)\b",
@@ -7928,6 +7932,46 @@ _BASIC_TERMS = (
 )
 
 
+_NOT_FAILING_RE = re.compile(
+    r"\b(?:not|n't|never)\s+(?:failing|failed|fail)\b|\bdid\s+not\s+fail\b|\bdidn't\s+fail\b|"
+    r"\b(?:passing|passed|successful|succeeded|green)\s+(?:relvals?|workflows?|unit[\s-]*tests?|packages?)\b|"
+    r"\b(?:relvals?|workflows?|unit[\s-]*tests?|packages?)\s+(?:that\s+)?(?:are\s+|were\s+)?(?:passing|passed)\b",
+    re.IGNORECASE)
+
+
+def _not_failing_answer(question: str) -> str | None:
+    """ "Which workflows are NOT failing in <tag>?" -- passed counts per build/arch from the
+    graph. Found 2026-10-15 in the stress test: these went through the LLM path (25-60 s,
+    some timed out under 8 concurrent users) to produce lists of thousands of names."""
+    tag_match = IB_TAG_RE.search(question)
+    if not tag_match or not _NOT_FAILING_RE.search(question):
+        return None
+    unit = bool(re.search(r"\bunit[\s-]*tests?\b|\bpackages?\b", question, re.IGNORECASE))
+    rel = "RAN_UNITTEST" if unit else "RAN_RELVAL"
+    tag = tag_match.group(1)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                f"MATCH (ib:IB) WHERE (ib.tag = $t OR ib.parent_tag = $t) MATCH (ib)-[:{rel}]->(x) "
+                "RETURN ib.tag AS tag, ib.arch AS arch, count(x) AS total, "
+                "sum(CASE WHEN x.status = 'PASSED' THEN 1 ELSE 0 END) AS passed "
+                "ORDER BY tag, arch", t=tag)]
+    finally:
+        driver.close()
+    what = "unit-test packages" if unit else "RelVal workflows"
+    if not rows:
+        return f"No {what} results are imported for `{tag}` yet."
+    total, passed = sum(r["total"] for r in rows), sum(r["passed"] for r in rows)
+    lines = [f"**{passed:,} of {total:,}** {what} passed in `{tag}` and its sub-IBs:", "",
+             "| IB | Architecture | Passed | Total |", "| --- | --- | ---: | ---: |"]
+    lines += [f"| `{r['tag']}` | `{r['arch']}` | {r['passed']:,} | {r['total']:,} |" for r in rows]
+    example = "is workflow 1.0 passing" if not unit else "unit tests for " + tag
+    lines.append(f"\nListing every passing one isn't useful at this size -- ask about one (e.g. \"{example}\") or "
+                 f"for the failing ones (\"failed {'unit tests' if unit else 'RelVals'} for {tag}\").")
+    return "\n".join(lines)
+
+
 def _basic_term_answer(question: str) -> str | None:
     """ "What is an IB?" -- found live 2026-10-15 getting the "couldn't match that" menu.
     Fixed definitions of the terms the answers use; nothing is looked up."""
@@ -9050,6 +9094,10 @@ def chat(req: ChatRequest):
     known_error_answer = _known_error_concept_answer(question)
     if known_error_answer:
         return _chat_response(sid, original_question, known_error_answer, "deterministic:known_error_concept")
+
+    not_failing = _not_failing_answer(question)
+    if not_failing:
+        return _chat_response(sid, original_question, not_failing, "deterministic:not_failing")
 
     issue_answer = _issue_number_answer(original_question)
     if issue_answer:
