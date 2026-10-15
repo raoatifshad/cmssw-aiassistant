@@ -9,8 +9,10 @@ Two kinds, same rationale as the old SQL system:
   - Named tools for common questions (fast, predictable)
   - A general query_graph tool for everything else (the model writes Cypher)
 """
+import copy
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -82,8 +84,9 @@ NODES:
     (:ProblemSignature {signature_id, kind, category, signature, summary, first_seen_tag,
         first_seen_when, last_seen_tag, last_seen_when})
         — the same normalized problem across all IBs (when = 'YYYY-MM-DD-HHMM' from the tag).
-    (:ProblemFirstSeen {key, suite, owner, signature_id, first_seen_tag, first_seen_when, arch})
-        — first IB in which a serious problem or generic error line appeared for one test.
+    (:ProblemFirstSeen {key, suite, series, owner, signature_id, first_seen_tag, first_seen_when, arch})
+        — first IB in which a serious problem or generic error line appeared for one test, per
+        release series (e.g. CMSSW_20_1; sub-IBs share their series).
 
 EDGES:
   (IB)-[:REPORTED]->(Warning)
@@ -669,7 +672,7 @@ def get_failing_unittests(
         return _run_query(
             "MATCH (ib:IB {tag:$t})-[:RAN_UNITTEST]->(ut:UnitTest {status:'FAILED'}) "
             "WHERE $arch IS NULL OR ib.arch = $arch "
-            "RETURN ut.name AS name, ut.errors AS errors "
+            "RETURN ut.name AS name, ut.errors AS errors, ut.ok AS ok "
             "LIMIT $lim",
             {"t": ib_tag, "arch": arch, "lim": limit},
         )
@@ -685,13 +688,96 @@ def get_failing_unittests(
                 "  ORDER BY ut.name "
                 "  LIMIT $lim "
                 "} "
-                "RETURN ib.tag AS ib_tag, ib.variant AS variant, ut.name AS name, ut.errors AS errors "
+                "RETURN ib.tag AS ib_tag, ib.variant AS variant, ut.name AS name, ut.errors AS errors, ut.ok AS ok "
                 "ORDER BY ib.tag, ut.name",
                 {"t": ib_tag, "arch": arch, "lim": limit},
             )]
     finally:
         driver.close()
     return rows
+
+
+_UNIT_PROBLEM_KIND_RANK = {kind: rank for rank, kind in enumerate((
+    "fatal_exception", "uncaught_exception", "crash", "sanitizer", "ubsan", "assertion",
+    "python_traceback", "infrastructure_error", "message_logger", "generic_error_line"))}
+_UNIT_PROBLEM_SEVERITY_RANK = {"fatal": 0, "error": 1, "system": 2, "warning": 3}
+
+
+def get_unittest_log_details(builds: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+    """For each (IB tag, arch) -- a sub-IB by its own tag -- what the imported raw
+    unit-test logs say: `imported` (any unit TestLogRun), `failed_tests` (full
+    "Pkg/Sub/test" names, union over every unit run of that build: CPU and each GPU
+    type) and `problems` ({test: (kind, message)}): for each failed test the most
+    serious LogProblem with in_failed=true that names it as an owner whose own
+    status is not "passed" -- never another test's error. Empty `problems` when the
+    log has nothing for a failed test (e.g. CMSSW_20_1_ASAN_X_2026-10-05-2300
+    Alignment/OfflineValidation: PrimaryVertex and testPVPlotting failed, no problem)."""
+    keys = sorted({f"{tag}:{arch}" for tag, arch in builds if tag and arch})
+    out = {(tag, arch): dict(imported=False, failed_tests=[], problems={}) for tag, arch in builds}
+    if not keys:
+        return out
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            for row in session.run(
+                "MATCH (r:TestLogRun {suite:'unit'}) WHERE r.ib_key IN $keys "
+                "RETURN r.ib_tag AS tag, r.arch AS arch, r.failed_tests AS failed ORDER BY r.key",
+                keys=keys,
+            ):
+                entry = out.setdefault((row["tag"], row["arch"]), dict(imported=False, failed_tests=[], problems={}))
+                entry["imported"] = True
+                entry["failed_tests"] = list(dict.fromkeys(entry["failed_tests"] + list(row["failed"] or [])))
+            best: dict[tuple, tuple] = {}
+            for row in session.run(
+                "MATCH (r:TestLogRun {suite:'unit'})-[:HAS_PROBLEM]->(p:LogProblem) "
+                "WHERE r.ib_key IN $keys AND p.in_failed AND size(r.failed_tests) > 0 "
+                "AND any(o IN p.owners WHERE o IN r.failed_tests) "
+                "RETURN r.ib_tag AS tag, r.arch AS arch, r.failed_tests AS failed, p.owners AS owners, "
+                "p.owner_statuses AS statuses, coalesce(p.serious, false) AS serious, p.kind AS kind, "
+                "p.severity AS severity, coalesce(p.count, 0) AS count, p.message AS message, p.summary AS summary",
+                keys=keys,
+            ):
+                text = row["message"] or row["summary"]
+                if not text:
+                    continue
+                rank = (not row["serious"], _UNIT_PROBLEM_KIND_RANK.get(row["kind"], 99),
+                        _UNIT_PROBLEM_SEVERITY_RANK.get(row["severity"], 9), -row["count"])
+                statuses = row["statuses"] or []
+                for i, owner in enumerate(row["owners"] or []):
+                    if owner not in row["failed"] or (i < len(statuses) and statuses[i] == "passed"):
+                        continue
+                    key = (row["tag"], row["arch"], owner)
+                    if key not in best or rank < best[key][0]:
+                        best[key] = (rank, row["kind"], text)
+    finally:
+        driver.close()
+    for (tag, arch, owner), (_, kind, text) in best.items():
+        out.setdefault((tag, arch), dict(imported=True, failed_tests=[], problems={}))["problems"][owner] = (kind, text)
+    return out
+
+
+def get_unittest_recurrence(packages: list[str], arch: str) -> dict[tuple[str, str], list[tuple[str, str]]]:
+    """Every imported result of these unit-test packages on one architecture, keyed
+    by (package, variant) -- variant "" for the primary IB -- as [(tag, status)]
+    newest first. Same idea as get_relval_recurrence, matched on package + variant +
+    arch (a package failing on ASAN says nothing about the primary build)."""
+    if not packages:
+        return {}
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (u:UnitTest) WHERE u.arch = $arch AND u.name IN $packages "
+                "MATCH (ib:IB {ib_key: u.ib_key}) "
+                "RETURN u.name AS name, coalesce(ib.variant, '') AS variant, ib.tag AS tag, u.status AS status",
+                arch=arch, packages=sorted(set(packages)),
+            )]
+    finally:
+        driver.close()
+    out: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for row in sorted(rows, key=lambda r: r["tag"].rsplit("_X_", 1)[-1], reverse=True):
+        out.setdefault((row["name"], row["variant"]), []).append((row["tag"], row["status"]))
+    return out
 
 
 def get_relval_workflow_ids(ib_tag: str, arch: str | None = None) -> list[dict]:
@@ -1149,7 +1235,7 @@ def find_prs_for_error(error: str, ib_tag: str | None = None, limit: int = 20) -
         "OR toLower(w.file) CONTAINS toLower($error) "
         "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
         "RETURN p.repo AS repo, p.number AS pr_number, p.title AS title, "
-        "a.name AS author, p.merged_at AS merged_at, count(DISTINCT w) AS matched_warnings, "
+        "a.name AS author, p.merged_at AS merged_at, p.github_state AS state, count(DISTINCT w) AS matched_warnings, "
         "sum(w.count) AS matched_occurrences, "
         "collect(DISTINCT w.file)[0..5] AS matched_files, "
         "0 AS matched_unit_tests, 0 AS matched_unit_test_errors, [] AS matched_unit_test_packages, "
@@ -1162,7 +1248,7 @@ def find_prs_for_error(error: str, ib_tag: str | None = None, limit: int = 20) -
         "MATCH (p:PR) WHERE toLower(p.title) CONTAINS toLower($error) "
         "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
         "RETURN p.repo AS repo, p.number AS pr_number, p.title AS title, "
-        "a.name AS author, p.merged_at AS merged_at, 0 AS matched_warnings, "
+        "a.name AS author, p.merged_at AS merged_at, p.github_state AS state, 0 AS matched_warnings, "
         "0 AS matched_occurrences, [] AS matched_files, 0 AS matched_unit_tests, "
         "0 AS matched_unit_test_errors, [] AS matched_unit_test_packages, [] AS matched_unit_test_ibs, "
         "'pr_title' AS evidence "
@@ -1173,7 +1259,7 @@ def find_prs_for_error(error: str, ib_tag: str | None = None, limit: int = 20) -
         "MATCH (p:PR) WHERE toLower(coalesce(p.body, '')) CONTAINS toLower($error) "
         "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
         "RETURN p.repo AS repo, p.number AS pr_number, p.title AS title, "
-        "a.name AS author, p.merged_at AS merged_at, 0 AS matched_warnings, "
+        "a.name AS author, p.merged_at AS merged_at, p.github_state AS state, 0 AS matched_warnings, "
         "0 AS matched_occurrences, [] AS matched_files, 0 AS matched_unit_tests, "
         "0 AS matched_unit_test_errors, [] AS matched_unit_test_packages, [] AS matched_unit_test_ibs, "
         "'pr_description' AS evidence LIMIT $limit",
@@ -1184,7 +1270,7 @@ def find_prs_for_error(error: str, ib_tag: str | None = None, limit: int = 20) -
         "WHERE toLower(sf.path) CONTAINS toLower($error) "
         "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
         "RETURN p.repo AS repo, p.number AS pr_number, p.title AS title, "
-        "a.name AS author, p.merged_at AS merged_at, 0 AS matched_warnings, "
+        "a.name AS author, p.merged_at AS merged_at, p.github_state AS state, 0 AS matched_warnings, "
         "0 AS matched_occurrences, collect(DISTINCT sf.path)[0..5] AS matched_files, "
         "0 AS matched_unit_tests, 0 AS matched_unit_test_errors, "
         "[] AS matched_unit_test_packages, [] AS matched_unit_test_ibs, "
@@ -1201,7 +1287,7 @@ def find_prs_for_error(error: str, ib_tag: str | None = None, limit: int = 20) -
         "WITH DISTINCT p, ut, pkg, ib "
         "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
         "RETURN p.repo AS repo, p.number AS pr_number, p.title AS title, "
-        "a.name AS author, p.merged_at AS merged_at, 0 AS matched_warnings, "
+        "a.name AS author, p.merged_at AS merged_at, p.github_state AS state, 0 AS matched_warnings, "
         "0 AS matched_occurrences, [] AS matched_files, count(ut) AS matched_unit_tests, "
         "sum(ut.errors) AS matched_unit_test_errors, "
         "collect(DISTINCT pkg.name)[0..5] AS matched_unit_test_packages, "
@@ -1222,7 +1308,7 @@ def find_prs_for_error(error: str, ib_tag: str | None = None, limit: int = 20) -
         "WITH DISTINCT p "
         "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
         "RETURN p.repo AS repo, p.number AS pr_number, p.title AS title, "
-        "a.name AS author, p.merged_at AS merged_at, 0 AS matched_warnings, "
+        "a.name AS author, p.merged_at AS merged_at, p.github_state AS state, 0 AS matched_warnings, "
         "0 AS matched_occurrences, [] AS matched_files, 0 AS matched_unit_tests, "
         "0 AS matched_unit_test_errors, [] AS matched_unit_test_packages, [] AS matched_unit_test_ibs, "
         "'pr_comment' AS evidence LIMIT $limit",
@@ -1298,97 +1384,170 @@ def get_relval_exception_evidence(workflow_id: str, ib_tag: str | None = None, l
     # e.g. "LogicError: A muon..." - that prefix is never how the message is actually
     # quoted verbatim in a GitHub Issue's "Exception Message:" section, so text-with-
     # prefix silently never matches anything; message-alone does).
-    exception_query = (
-        "MATCH (exception:RelValException {workflow_id:$workflow_id}) "
-        "WHERE $ib_tag IS NULL OR exception.ib_tag = $ib_tag "
-        "RETURN exception.message AS exception, exception.category AS category, exception.context AS context "
-        "ORDER BY exception LIMIT 20"
-    )
-    artifact_query = (
-        "MATCH (item) WHERE item.repo = 'cmssw' AND (item:Issue OR item:PR) "
-        # cmsbuild is cms-bot: it posts a "Failed Tests" comment on every PR dumping the
-        # full exception traceback of *any currently-broken baseline test* as routine CI
-        # status, regardless of whether that PR relates to the failure at all (verified
-        # live: PR #51375, "MatrixUtil: ibeos-lfn-sort", matched workflow 140.051's
-        # LogicError purely because cms-bot's boilerplate comment happened to quote it).
-        # Excluding bot comments here keeps this a genuine-discussion signal.
-        "OPTIONAL MATCH (item)-[:HAS_COMMENT]->(comment:GitHubComment) WHERE comment.author <> 'cmsbuild' "
-        "WITH item, collect(coalesce(comment.body, '')) AS comment_bodies "
-        "WITH item, [term IN $terms WHERE "
-        "toLower(coalesce(item.title, '')) CONTAINS toLower(term) "
-        "OR toLower(coalesce(item.body, '')) CONTAINS toLower(term) "
-        "OR any(comment_body IN comment_bodies WHERE toLower(comment_body) CONTAINS toLower(term))] AS matched_terms "
-        "WHERE size(matched_terms) > 0 "
-        "RETURN CASE WHEN item:Issue THEN 'Issue' ELSE 'PR' END AS kind, "
-        "item.number AS number, item.title AS title, "
-        "coalesce(item.state, item.github_state, 'unknown') AS state, "
-        "item.merged_at AS merged_at, matched_terms AS matched_terms "
-        "ORDER BY number DESC LIMIT $limit"
-    )
+    cached = _EVIDENCE_CACHE.get((workflow_id, ib_tag, limit))
+    if cached and time.monotonic() - cached[0] < _EVIDENCE_CACHE_SECONDS:
+        return copy.deepcopy(cached[1])
     driver = get_driver()
     try:
         with driver.session() as session:
-            exceptions = [dict(record) for record in session.run(
-                exception_query, workflow_id=workflow_id, ib_tag=ib_tag,
-            )]
-            seen = set()
-            deduped = []
-            for row in exceptions:
-                key = (row.get("category"), row["exception"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                deduped.append(row)
-            exceptions = deduped[:3]
+            rows = _relval_exception_rows(session, workflow_id, ib_tag)
 
-            results = []
-            for row in exceptions:
-                exception = row["exception"]
-                module_match = re.search(r"Calling method for module\s+([\w:]+)/", row.get("context") or "")
-                module = module_match.group(1) if module_match else None
-                terms = {value for value in (workflow_id, exception, module) if value}
-                if not terms:
-                    continue
-                candidates = [dict(record) for record in session.run(
-                    artifact_query, terms=list(terms), limit=limit,
+            def candidates_for(terms: set, limit_: int) -> list[dict]:
+                return [dict(record) for record in session.run(
+                    _ARTIFACT_EVIDENCE_QUERY + " LIMIT $limit", terms=sorted(terms),
+                    lterms=[term.lower() for term in sorted(terms)], limit=limit_,
                 )]
-                matches = [match for match in candidates if terms & set(match["matched_terms"])]
-                if not matches:
-                    continue
 
-                # The exact exception message is the most reliable signal - it's a long,
-                # distinctive sentence essentially never quoted for an unrelated reason.
-                # A bare workflow_id mention ranks below it: even human-authored (not
-                # cms-bot noise, already excluded above), a developer can still cite a
-                # workflow number as an arbitrary example when testing something
-                # unrelated (verified live: PR #51375's author used "140.051" purely as
-                # a convenient test case for an --ibeos/LFN-sorting change, unrelated to
-                # this exception). Module name alone is the weakest/most generic.
-                def specificity(match: dict) -> int:
-                    matched = set(match["matched_terms"])
-                    if exception in matched:
-                        return 3
-                    if workflow_id in matched:
-                        return 2
-                    return 1
-
-                best = max(matches, key=specificity)
-                # Only attach the [category] label when the match was actually found via
-                # this exact exception's text - otherwise it's decorative, not descriptive:
-                # a workflow_id/module-only match can come from a *different* exception
-                # occurrence of the same workflow_id (RelValException has no timestamp
-                # ordering guarantee), so labeling it with an unrelated category is
-                # actively misleading (verified live: workflow 539.0's only stored
-                # exception is "XMLDocument: Invalid document structure", but it matched
-                # Issue #45872 - a SIGSEGV bug - purely via a developer's comment naming
-                # "539.0" as an affected workflow; the XMLDocument label had nothing to do
-                # with why that match was found).
-                category = row.get("category") if specificity(best) == 3 else None
-                results.append({"category": category, "exception": exception, "matches": [best]})
+            return _rank_relval_evidence(workflow_id, rows, candidates_for, limit)
     finally:
         driver.close()
+
+
+# context (which run/lumi/event it happened on) differs per occurrence even when the
+# exception signature itself is identical, so DISTINCT on all three columns doesn't
+# collapse repeat occurrences of the same failure - fetch a wider raw sample and dedupe
+# on (category, exception) alone below, so a workflow with one dominant failure mode
+# doesn't drown out a second, genuinely different one within a small LIMIT.
+# exception.message (e.g. "A muon candidate track has more than 5 stations...") is
+# used as the search term, not exception.text (which prefixes it with "<category>: ",
+# e.g. "LogicError: A muon..." - that prefix is never how the message is actually
+# quoted verbatim in a GitHub Issue's "Exception Message:" section, so text-with-
+# prefix silently never matches anything; message-alone does).
+_RELVAL_EXCEPTION_QUERY = (
+    "MATCH (exception:RelValException {workflow_id:$workflow_id}) "
+    "WHERE $ib_tag IS NULL OR exception.ib_tag = $ib_tag "
+    "RETURN exception.message AS exception, exception.category AS category, exception.context AS context "
+    "ORDER BY exception LIMIT 20"
+)
+# Every cmssw Issue/PR mentioning any of $terms (title, body or a non-bot comment), with
+# the terms each one matched, newest first. A full scan of Issues, PRs and ~800k comments
+# (~1-2 s), so a digest runs it once for all its workflows (prefetch_relval_exception_evidence).
+_ARTIFACT_EVIDENCE_QUERY = (
+    "MATCH (item) WHERE item.repo = 'cmssw' AND (item:Issue OR item:PR) "
+    # cmsbuild is cms-bot: it posts a "Failed Tests" comment on every PR dumping the
+    # full exception traceback of *any currently-broken baseline test* as routine CI
+    # status, regardless of whether that PR relates to the failure at all (verified
+    # live: PR #51375, "MatrixUtil: ibeos-lfn-sort", matched workflow 140.051's
+    # LogicError purely because cms-bot's boilerplate comment happened to quote it).
+    # Excluding bot comments here keeps this a genuine-discussion signal.
+    "OPTIONAL MATCH (item)-[:HAS_COMMENT]->(comment:GitHubComment) WHERE comment.author <> 'cmsbuild' "
+    # each text lowercased once, not once per term: with a digest's ~230 terms (exception
+    # messages up to 1000 chars) that is 6 s instead of 81 s, same matches (2026-10-15)
+    "WITH item, [toLower(coalesce(item.title, '')), toLower(coalesce(item.body, ''))] "
+    "+ collect(toLower(coalesce(comment.body, ''))) AS texts "
+    "WITH item, [i IN range(0, size($terms) - 1) WHERE any(text IN texts WHERE text CONTAINS $lterms[i]) "
+    "| $terms[i]] AS matched_terms "
+    "WHERE size(matched_terms) > 0 "
+    "RETURN CASE WHEN item:Issue THEN 'Issue' ELSE 'PR' END AS kind, "
+    "item.number AS number, item.title AS title, "
+    "coalesce(item.state, item.github_state, 'unknown') AS state, "
+    "item.merged_at AS merged_at, matched_terms AS matched_terms "
+    "ORDER BY number DESC"
+)
+_EVIDENCE_CACHE: dict[tuple, tuple[float, list]] = {}
+_EVIDENCE_CACHE_SECONDS = 300
+
+
+def _relval_exception_rows(session, workflow_id: str, ib_tag: str | None) -> list[dict]:
+    """Up to 3 distinct (category, message) exceptions of a workflow in one build."""
+    seen = set()
+    deduped = []
+    for row in session.run(_RELVAL_EXCEPTION_QUERY, workflow_id=workflow_id, ib_tag=ib_tag):
+        row = dict(row)
+        key = (row.get("category"), row["exception"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped[:3]
+
+
+def _relval_evidence_terms(workflow_id: str, row: dict) -> set:
+    module_match = re.search(r"Calling method for module\s+([\w:]+)/", row.get("context") or "")
+    module = module_match.group(1) if module_match else None
+    return {value for value in (workflow_id, row["exception"], module) if value}
+
+
+def _rank_relval_evidence(workflow_id: str, rows: list[dict], candidates_for, limit: int) -> list[dict]:
+    results = []
+    for row in rows:
+        exception = row["exception"]
+        terms = _relval_evidence_terms(workflow_id, row)
+        if not terms:
+            continue
+        candidates = candidates_for(terms, limit)
+        matches = [match for match in candidates if terms & set(match["matched_terms"])]
+        if not matches:
+            continue
+
+        # The exact exception message is the most reliable signal - it's a long,
+        # distinctive sentence essentially never quoted for an unrelated reason.
+        # A bare workflow_id mention ranks below it: even human-authored (not
+        # cms-bot noise, already excluded above), a developer can still cite a
+        # workflow number as an arbitrary example when testing something
+        # unrelated (verified live: PR #51375's author used "140.051" purely as
+        # a convenient test case for an --ibeos/LFN-sorting change, unrelated to
+        # this exception). Module name alone is the weakest/most generic.
+        def specificity(match: dict) -> int:
+            matched = set(match["matched_terms"])
+            if exception in matched:
+                return 3
+            if workflow_id in matched:
+                return 2
+            return 1
+
+        best = max(matches, key=specificity)
+        # Only attach the [category] label when the match was actually found via
+        # this exact exception's text - otherwise it's decorative, not descriptive:
+        # a workflow_id/module-only match can come from a *different* exception
+        # occurrence of the same workflow_id (RelValException has no timestamp
+        # ordering guarantee), so labeling it with an unrelated category is
+        # actively misleading (verified live: workflow 539.0's only stored
+        # exception is "XMLDocument: Invalid document structure", but it matched
+        # Issue #45872 - a SIGSEGV bug - purely via a developer's comment naming
+        # "539.0" as an affected workflow; the XMLDocument label had nothing to do
+        # with why that match was found).
+        category = row.get("category") if specificity(best) == 3 else None
+        results.append({"category": category, "exception": exception, "matches": [best]})
     return results
 
+
+def prefetch_relval_exception_evidence(requests: list[tuple[str, str | None]], limit: int = 5) -> None:
+    """get_relval_exception_evidence for many (workflow_id, ib_tag) at once, with ONE
+    artifact scan for all their search terms instead of one per workflow; results go to
+    a short-lived cache that get_relval_exception_evidence reads. Same answers: each
+    workflow gets the newest `limit` items matching any of its own terms, with only its
+    own terms as matched_terms. Found 2026-10-15: a digest with 62 newly failing RelVals
+    took 78-120 s (about 1.1 s per scan), longer than the Shift Console waits."""
+    requests = list(dict.fromkeys(requests))
+    if not requests:
+        return
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows_by_request = {req: _relval_exception_rows(session, req[0], req[1]) for req in requests}
+            all_terms = sorted({term for (workflow_id, _), rows in rows_by_request.items()
+                                for row in rows for term in _relval_evidence_terms(workflow_id, row)})
+            items = [dict(record) for record in session.run(
+                _ARTIFACT_EVIDENCE_QUERY, terms=all_terms, lterms=[term.lower() for term in all_terms],
+            )] if all_terms else []
+    finally:
+        driver.close()
+
+    def candidates_for(terms: set, limit_: int) -> list[dict]:
+        out = []
+        for item in items:  # newest first, like the per-workflow query
+            own = [term for term in item["matched_terms"] if term in terms]
+            if own:
+                out.append(dict(item, matched_terms=own))
+                if len(out) == limit_:
+                    break
+        return out
+
+    now = time.monotonic()
+    for (workflow_id, ib_tag), rows in rows_by_request.items():
+        _EVIDENCE_CACHE[(workflow_id, ib_tag, limit)] = (
+            now, _rank_relval_evidence(workflow_id, rows, candidates_for, limit))
 
 def shared_header_packages(file_path: str) -> list[dict]:
     """Which packages are all affected by warnings in the same shared header?
@@ -1457,7 +1616,7 @@ def log_search_terms(text: str, limit: int = 12) -> list[str]:
     """The distinctive words of a pasted error: identifiers (CamelCase, with
     digits, '::' or '_'), quoted names and file names -- not English words,
     IB tags, dates or numbers, which say nothing about which problem it is."""
-    text = _LOG_ARCH_RE.sub(" ", _LOG_IB_TAG_RE.sub(" ", text))
+    text = re.sub(r"\b0x[0-9a-fA-F]+\b", " ", _LOG_ARCH_RE.sub(" ", _LOG_IB_TAG_RE.sub(" ", text)))  # addresses
     terms: list[str] = []
     for token in re.findall(r"[A-Za-z_][A-Za-z0-9_.]*[A-Za-z0-9]", text):
         token = token.strip(".")
@@ -1768,6 +1927,196 @@ def test_log_coverage() -> dict:
         "RETURN min(w) AS first, max(w) AS last, count(r) AS runs"
     )
     return rows[0] if rows else {"first": None, "last": None, "runs": 0}
+
+
+_IB_PARTS_RE = re.compile(r"^(CMSSW_\d+_\d+)(?:_(.+))?_X_(\d{4}-\d{2}-\d{2}-\d{4})$")
+TEST_LOG_CHANGES_CAVEAT = (
+    "Problems found in the raw logs of tests and RelVal steps the dashboard reports as PASSED. "
+    "A problem listed here is evidence to look at, not a test failure: some tests raise errors on "
+    "purpose (see intentional_hint), and nothing is marked expected automatically.")
+
+
+def _test_log_owner_ran(owner: str, suite: str, ran: set[str]) -> bool:
+    """Whether a problem's owner (test, addOn test:stepN, or workflow:stepN) ran in a run."""
+    if owner.startswith("/(outside any test)"):
+        return True
+    if suite == "relval":
+        owner = owner.split(":step", 1)[0]
+    return owner in ran
+
+
+def get_test_log_changes(to_tag: str, from_tag: str, arch: str | None = None) -> dict:
+    """Serious problems inside PASSED tests/RelVal steps (raw IB test logs) that are
+    new, gone or still present between two builds of a release series: the primary
+    IB and every sub-IB of the same timestamp (ASAN, DBG, ...), per architecture,
+    suite (unit/addon/relval) and GPU/other run variant. Each such track is compared
+    with the same track at from_tag, or -- when that build has no imported log of it
+    -- with the track's own previous imported build (baseline_note says so), the
+    same policy as the shift digest. A track without any earlier build is not
+    compared at all (listed in no_baseline): every problem would look new.
+    Only serious kinds (exceptions, sanitizers, crashes, assertions, tracebacks,
+    infrastructure errors); MessageLogger warnings and generic error lines are not
+    reported. A problem is identified by (test, signature) inside one track."""
+    to_parts, from_parts = _IB_PARTS_RE.match(to_tag or ""), _IB_PARTS_RE.match(from_tag or "")
+    if not to_parts or not from_parts:
+        raise ValueError("from and to must be IB tags like CMSSW_20_1_X_2026-10-12-1100")
+    release, _, to_when = to_parts.groups()
+    from_release, _, from_when = from_parts.groups()
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            run_rows = [dict(r) for r in session.run(
+                "MATCH (r:TestLogRun) WHERE r.ib_tag STARTS WITH $prefix AND r.ib_tag ENDS WITH $when "
+                "AND ($arch IS NULL OR r.arch = $arch) "
+                "RETURN r.key AS key, r.ib_tag AS tag, r.arch AS arch, r.suite AS suite, "
+                "coalesce(r.run_variant, '') AS run_variant, "
+                "r.passed_tests + r.failed_tests + r.other_tests AS ran",
+                prefix=release + "_", when=to_when, arch=arch)]
+            to_runs = {}
+            for row in run_rows:
+                parts = _IB_PARTS_RE.match(row["tag"])
+                if parts and parts.group(1) == release and parts.group(3) == to_when:
+                    to_runs[row["key"]] = dict(row, flavor=parts.group(2) or "")
+            tracks = [dict(id=key, arch=r["arch"], suite=r["suite"], variant=r["run_variant"],
+                           prefix=f"{from_release}_{r['flavor'] + '_' if r['flavor'] else ''}X_")
+                      for key, r in to_runs.items()]
+            base_rows = [dict(r) for r in session.run(
+                "UNWIND $tracks AS t MATCH (r:TestLogRun {arch:t.arch, suite:t.suite, run_variant:t.variant}) "
+                "WHERE r.ib_tag STARTS WITH t.prefix AND size(r.ib_tag) = size(t.prefix) + 15 "
+                "AND substring(r.ib_tag, size(r.ib_tag) - 15) < $to_when "
+                "RETURN t.id AS track, r.key AS key, r.ib_tag AS tag, "
+                "r.passed_tests + r.failed_tests + r.other_tests AS ran",
+                tracks=tracks, to_when=to_when)] if tracks else []
+            # the same track at from_tag if imported, else its own newest earlier build
+            baselines: dict[str, dict] = {}
+            for row in sorted(base_rows, key=lambda r: (r["tag"].endswith(from_when), r["tag"])):
+                baselines[row["track"]] = row
+            keys = list(to_runs) + [b["key"] for b in baselines.values()]
+            problem_rows = [dict(r) for r in session.run(
+                "MATCH (r:TestLogRun)-[:HAS_PROBLEM]->(p:LogProblem) WHERE r.key IN $keys AND p.serious "
+                "RETURN r.key AS run, p.signature_id AS sid, p.kind AS kind, p.category AS category, "
+                "p.summary AS summary, p.message AS message, p.origin AS origin, "
+                "p.intentional_hint AS intentional_hint, p.owners AS owners, p.owner_statuses AS statuses, "
+                "left(p.evidence, 3000) AS evidence, p.server_path AS server_path, "
+                "p.example_member AS member, p.example_line AS line",
+                keys=keys)] if keys else []
+    finally:
+        driver.close()
+
+    by_run: dict[str, list[dict]] = {}
+    for row in problem_rows:
+        by_run.setdefault(row["run"], []).append(row)
+
+    def passed_pairs(run_key: str) -> dict[tuple, dict]:
+        pairs = {}
+        for row in by_run.get(run_key, []):
+            for owner, status in zip(row["owners"] or [], row["statuses"] or []):
+                if status == "passed":
+                    pairs[(owner, row["sid"])] = row
+        return pairs
+
+    archs: dict[str, dict] = {}
+    new_pairs: list[tuple] = []
+    for key, run in sorted(to_runs.items(), key=lambda kv: (kv[1]["arch"], kv[1]["flavor"], kv[1]["suite"],
+                                                            kv[1]["run_variant"])):
+        entry = archs.setdefault(run["arch"], dict(arch=run["arch"], tracks=[], new={}, gone={},
+                                                   still_present=0, no_baseline=[]))
+        base = baselines.get(key)
+        track = dict(variant=run["flavor"] or "primary", run_variant=run["run_variant"], suite=run["suite"],
+                     tag=run["tag"], baseline_tag=base["tag"] if base else None, baseline_note=None)
+        entry["tracks"].append(track)
+        place = dict(variant=track["variant"], run_variant=run["run_variant"], suite=run["suite"], tag=run["tag"])
+        if base is None:
+            track["baseline_note"] = "no earlier imported build of this track: not compared"
+            entry["no_baseline"].append(place)
+            continue
+        if not base["tag"].endswith(from_when):
+            track["baseline_note"] = (f"no imported log at {from_when}: compared with its own previous "
+                                      f"build {base['tag']}")
+        now, before = passed_pairs(key), passed_pairs(base["key"])
+        ran_now = set(run["ran"] or [])
+        for pair, row in now.items():
+            if pair in before:
+                entry["still_present"] += 1
+                continue
+            group = entry["new"].setdefault(row["sid"], dict(
+                signature_id=row["sid"], kind=row["kind"], category=row["category"], summary=row["summary"],
+                message=row["message"], origin=row["origin"], intentional_hint=row["intentional_hint"],
+                evidence=row["evidence"], log=dict(server_path=row["server_path"], member=row["member"],
+                                                   line=row["line"]), tests=[]))
+            test = dict(place, name=pair[0], baseline_tag=base["tag"],
+                        ran_in_baseline=_test_log_owner_ran(pair[0], run["suite"], set(base["ran"] or [])))
+            group["tests"].append(test)
+            # same key as ingest_test_logs.first_seen_key: per release series
+            new_pairs.append((f"{run['suite']}|{release}|{pair[0]}|{row['sid']}", test))
+        for pair, row in before.items():
+            if pair in now or not _test_log_owner_ran(pair[0], run["suite"], ran_now):
+                continue  # still there, or the test didn't run this time: nothing to say
+            group = entry["gone"].setdefault(row["sid"], dict(
+                signature_id=row["sid"], kind=row["kind"], category=row["category"], summary=row["summary"],
+                tests=[]))
+            group["tests"].append(dict(place, name=pair[0], baseline_tag=base["tag"]))
+
+    if new_pairs:  # when each (test, problem) was first seen, and when the problem itself was
+        firsts = {r["key"]: r["tag"] for r in _run_query_all(
+            "MATCH (f:ProblemFirstSeen) WHERE f.key IN $keys RETURN f.key AS key, f.first_seen_tag AS tag",
+            {"keys": sorted({k for k, _ in new_pairs})})}
+        for k, test in new_pairs:
+            first = firsts.get(k)
+            test["first_seen_tag"] = first
+            # seen for this test before the baseline, absent in it: it came back
+            test["returned"] = bool(first and _ib_when(first) < _ib_when(test["baseline_tag"]))
+    sids = sorted({sid for e in archs.values() for sid in e["new"]})
+    sig_first = {r["sid"]: r for r in _run_query_all(
+        "MATCH (s:ProblemSignature) WHERE s.signature_id IN $sids "
+        "RETURN s.signature_id AS sid, s.first_seen_tag AS first, s.last_seen_tag AS last",
+        {"sids": sids})} if sids else {}
+
+    def ordered(groups) -> list[dict]:
+        return sorted(groups, key=lambda g: (-len(g["tests"]), g["kind"], g["summary"] or ""))
+
+    out_archs = []
+    totals = dict(new_problems=0, new_tests=0, returned_problems=0, returned_tests=0,
+                  gone_problems=0, gone_tests=0, still_present=0)
+    for name in sorted(archs):
+        entry = archs[name]
+        # "new" = first time ever for that test; "returned" = seen for that test before the
+        # baseline but not in it (intermittent): a shifter must be able to tell them apart
+        new, returned = [], []
+        for group in entry["new"].values():
+            group["first_seen_tag"] = (sig_first.get(group["signature_id"]) or {}).get("first")
+            for target, flag in ((new, False), (returned, True)):
+                tests = [t for t in group["tests"] if bool(t.get("returned")) == flag]
+                if tests:
+                    target.append(dict(group, tests=tests))
+        new, returned, gone = ordered(new), ordered(returned), ordered(entry["gone"].values())
+        for label, groups in (("new", new), ("returned", returned), ("gone", gone)):
+            totals[f"{label}_problems"] += len(groups)
+            totals[f"{label}_tests"] += sum(len(g["tests"]) for g in groups)
+        totals["still_present"] += entry["still_present"]
+        out_archs.append(dict(entry, new=new, returned=returned, gone=gone))
+    coverage = test_log_coverage()
+    return dict(
+        to=to_tag, **{"from": from_tag}, arch=arch,
+        coverage=dict(to_imported=bool(to_runs), runs=len(to_runs), newest_imported=coverage.get("last"),
+                      message=None if to_runs else (
+                          f"No test logs imported yet for {to_tag}"
+                          + (f" on {arch}" if arch else "")
+                          + f" (newest imported build: {coverage.get('last') or 'none'})."
+                            " This is not the same as zero problems.")),
+        totals=totals, architectures=out_archs, caveat=TEST_LOG_CHANGES_CAVEAT,
+    )
+
+
+def _run_query_all(cypher: str, params: dict | None = None) -> list[dict]:
+    """_run_query without the MAX_ROWS cap, for internal lookups by key lists."""
+    _enforce_read_only(cypher)
+    driver = get_driver()
+    try:
+        with driver.session() as s:
+            return [dict(r) for r in s.run(cypher, params or {})]
+    finally:
+        driver.close()
 
 
 def query_graph(cypher: str) -> dict:

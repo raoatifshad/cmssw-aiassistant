@@ -23,6 +23,12 @@ Structural checks, per architecture and per newly-failing/resolved category
    architecture+category in the same digest -- a real self-contradiction,
    not a display quirk.
 3. Every data row has the same cell count as its table's header.
+4. "Newly failing Unit Tests" has exactly the header
+   | Name | Errors | Tests | Failed tests | Exception | Recurrence |
+   and on every row: Tests is "<N> failed / <M>" (or empty when the dashboard has no
+   ok count), Failed tests is either test names or exactly one of the two fixed strings
+   (then Exception is empty), Recurrence is non-empty in the RelVal wording.
+   ("Resolved Unit Tests" stays | Name | Errors |.) Cells may carry an escaped "\|".
 
 Usage:
     venv/bin/python scripts/validate_shift_summary.py [--base-url http://localhost:8002]
@@ -47,10 +53,45 @@ SEPARATOR_CELL_RE = re.compile(r"^:?-{2,}:?$")
 
 
 def split_table_row(row: str) -> list[str]:
+    """Same as the frontend's splitTableRow: split on unescaped "|" only, then unescape."""
     row = row.strip()
     row = re.sub(r"^\|", "", row)
-    row = re.sub(r"\|$", "", row)
-    return [cell.strip() for cell in row.split("|")]
+    row = re.sub(r"(?<!\\)\|$", "", row)
+    return [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", row)]
+
+
+UNITTEST_NEWLY_HEADER = ["Name", "Errors", "Tests", "Failed tests", "Exception", "Recurrence"]
+UNITTEST_FIXED_FAILED = ("no logs imported for this build yet", "not found in the imported log")
+TESTS_CELL_RE = re.compile(r"^\d+ failed / \d+$")
+RECURRENCE_CELL_RE = re.compile(
+    r"^(?:Failed in \d+ prior build\(s\) this series \(most recent CMSSW_\S+\)|First failure in this series); "
+    r"\d+/\d+ overall\.$")
+
+
+def check_unittest_table(section, label: str, arch_name: str) -> list[str]:
+    """Rule 4: the Newly failing Unit Tests columns the frontend's unit-test cards read."""
+    violations = []
+    header = section.table.header
+    if header != UNITTEST_NEWLY_HEADER:
+        return [f"[{label}] {arch_name}/{section.heading}: header {header} != {UNITTEST_NEWLY_HEADER}"]
+    for row in section.table.rows:
+        if len(row) != len(header):
+            continue  # reported by rule 3
+        cells = dict(zip(header, row))
+        where = f"[{label}] {arch_name}/{section.heading} {cells['Name']!r}"
+        if cells["Tests"] and not TESTS_CELL_RE.match(cells["Tests"]):
+            violations.append(f"{where}: Tests {cells['Tests']!r} is not '<N> failed / <M>'")
+        failed = cells["Failed tests"]
+        if not failed:
+            violations.append(f"{where}: empty Failed tests (must be names or a fixed string)")
+        elif failed in UNITTEST_FIXED_FAILED:
+            if cells["Exception"]:
+                violations.append(f"{where}: Exception {cells['Exception'][:60]!r} without failed tests")
+        elif any(fixed in failed for fixed in UNITTEST_FIXED_FAILED):
+            violations.append(f"{where}: a fixed string mixed with test names: {failed!r}")
+        if not RECURRENCE_CELL_RE.match(cells["Recurrence"]):
+            violations.append(f"{where}: Recurrence {cells['Recurrence']!r} not in the RelVal wording")
+    return violations
 
 
 def is_separator_row(cells: list[str]) -> bool:
@@ -179,6 +220,8 @@ def check_digest(markdown: str, label: str) -> list[str]:
                                 f"empty Variant cell"
                             )
 
+            if newly_heading.lower().startswith("newly failing unit tests") and newly and newly.table:
+                violations.extend(check_unittest_table(newly, label, arch.name))
             if newly and newly.table and resolved and resolved.table:
                 newly_ids = {row_identity(newly.table.header, row, needs_variant) for row in newly.table.rows}
                 resolved_ids = {row_identity(resolved.table.header, row, needs_variant) for row in resolved.table.rows}

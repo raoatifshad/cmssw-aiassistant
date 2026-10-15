@@ -1,4 +1,5 @@
 import re
+import re
 import unittest
 from unittest.mock import patch
 
@@ -9,11 +10,26 @@ from server.api_server import (
     _diff_failing_unittests,
     _plain_shift_table,
     _split_relval_diff,
+    _relval_exit_code_cell,
     _split_unittest_diff,
     _status_diff_rows,
     _unittest_shift_table,
     generate_shift_summary,
 )
+
+
+
+_PREFETCH_PATCH = patch("server.api_server.prefetch_relval_exception_evidence")
+
+
+def setUpModule():
+    # generate_shift_summary prefetches RelVal evidence with one shared scan; these tests
+    # mock get_relval_exception_evidence itself, so the prefetch must not reach a database
+    _PREFETCH_PATCH.start()
+
+
+def tearDownModule():
+    _PREFETCH_PATCH.stop()
 
 
 class DiffFailingRelvalsTests(unittest.TestCase):
@@ -52,6 +68,24 @@ class SplitRelvalDiffTests(unittest.TestCase):
 
         self.assertEqual([row["workflow_id"] for row in newly_failing], ["2.0"])
         self.assertEqual([row["workflow_id"] for row in resolved], ["1.0"])
+
+    def test_changed_exit_code_is_one_newly_failing_row_with_the_old_failure(self):
+        # Found live 2026-10-15: 1001.2 (ASAN) exit 256 -> 62720 was listed both as
+        # newly failing and as resolved, which read as a self-contradiction.
+        before = [{"workflow_id": "1001.2", "name": "A", "errors": 0, "exitcode": 256, "step": "step2"}]
+        after = [{"workflow_id": "1001.2", "name": "A", "errors": 0, "exitcode": 62720, "step": "step2"},
+                 {"workflow_id": "2.0", "name": "B", "errors": 1, "exitcode": 1}]
+        newly_failing, resolved = _split_relval_diff(_diff_failing_relvals(before, after))
+        self.assertEqual(resolved, [])
+        self.assertEqual([row["workflow_id"] for row in newly_failing], ["1001.2", "2.0"])
+        self.assertEqual(newly_failing[0]["previous_failure"], {"step": "step2", "exitcode": 256})
+        self.assertNotIn("previous_failure", newly_failing[1])
+        self.assertEqual(_relval_exit_code_cell(newly_failing[0], {62720: "SIGSEGV"}), "62720 (SIGSEGV); was 256")
+
+    def test_changed_step_with_same_exit_code_says_so(self):
+        row = {"workflow_id": "1.0", "exitcode": 65, "step": "step3",
+               "previous_failure": {"step": "step2", "exitcode": 65}}
+        self.assertEqual(_relval_exit_code_cell(row, {}), "65; was same exit code at step2")
 
     def test_changed_detail_still_failing_appears_in_neither_list(self):
         before = [{"workflow_id": "1.0", "name": "A", "errors": 1, "exitcode": 1}]
@@ -226,8 +260,9 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         self.assertIn("cmssw PR #45213", markdown)
         self.assertIn("(https://github.com/cms-sw/cmssw/pull/45213)", markdown)
         self.assertIn("relevance only, do not prove a PR or Issue caused or fixed a failure", markdown)
-        # the out-of-series tag must not be counted as an in-series recurrence
-        self.assertIn("Failed in 2 prior build(s) this series", markdown)
+        # the out-of-series tag must not be counted as an in-series recurrence, and the
+        # build being reported (08-19-2300) is not a "prior" build of itself
+        self.assertIn("Failed in 1 prior build(s) this series (most recent CMSSW_20_1_X_2026-08-18-2300)", markdown)
         # Regression (found live 2026-09-18, workflow 537.0 vs closed Issue #49849):
         # the evidence lookup must be scoped to THIS row's own ib_tag -- the build
         # that's actually newly failing -- not left unscoped to search the workflow's
@@ -374,6 +409,8 @@ class GenerateShiftSummaryTests(unittest.TestCase):
                 if "caused" in line:
                     self.assertIn("not prove", line)
 
+    @patch("server.api_server.get_unittest_recurrence", return_value={})
+    @patch("server.api_server.get_unittest_log_details", return_value={})
     @patch("server.api_server.get_unittest_names")
     @patch("server.api_server.get_relval_workflow_ids", return_value=[])
     @patch("server.api_server.search_concepts", return_value=[])
@@ -387,7 +424,7 @@ class GenerateShiftSummaryTests(unittest.TestCase):
     @patch("server.api_server._build_and_addon_status", return_value={})
     def test_unit_test_sections_show_newly_failing_and_resolved_rows(
         self, build_and_addon_status, get_failing_unittests, get_exit_code_names, arch, get_failing, diff_w,
-        recurrence, find_prs, search_c, get_relval_ids, get_ut_names
+        recurrence, find_prs, search_c, get_relval_ids, get_ut_names, _log_details, _ut_recurrence
     ):
         get_failing_unittests.side_effect = lambda tag, arch=None, limit=None, include_sub_ibs=False: (
             [{"name": "OldFlakyTest", "errors": 1}] if tag == "CMSSW_20_1_X_2026-08-19-1100"
@@ -399,8 +436,10 @@ class GenerateShiftSummaryTests(unittest.TestCase):
         markdown = generate_shift_summary("CMSSW_20_1_X_2026-08-19-2300", "CMSSW_20_1_X_2026-08-19-1100")
 
         self.assertIn("#### Newly failing Unit Tests", markdown)
-        self.assertIn("| test_something_LST | Segmentation fault |", markdown)
-        self.assertIn("#### Resolved Unit Tests", markdown)
+        self.assertIn("| Name | Errors | Tests | Failed tests | Exception | Recurrence |", markdown)
+        self.assertIn("| test_something_LST | Segmentation fault |  | no logs imported for this build yet |  | "
+                      "First failure in this series; 0/0 overall. |", markdown)
+        self.assertIn("#### Resolved Unit Tests\n| Name | Errors |", markdown)
         self.assertIn("| OldFlakyTest | 1 |", markdown)
 
     @patch("server.api_server.get_unittest_names", return_value=[])
@@ -545,3 +584,51 @@ class GenerateShiftSummaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NewlyFailingUnittestTableTests(unittest.TestCase):
+    """The unit-test columns the Shift Console's unit-test cards read (2026-10-15)."""
+    TAG = "CMSSW_20_1_ASAN_X_2026-10-05-2300"
+
+    def _table(self, rows, details, history):
+        from server.api_server import _newly_failing_unittest_table
+        with patch("server.api_server.get_unittest_log_details", return_value=details), \
+                patch("server.api_server.get_unittest_recurrence", return_value=history):
+            return _newly_failing_unittest_table(rows, "el9_amd64_gcc14", "CMSSW_20_1_X_2026-10-05-2300")
+
+    def test_failed_tests_without_an_error_in_the_log_get_no_exception(self):
+        # live case: PrimaryVertex and testPVPlotting failed, the log has no error for them
+        rows = [{"ib_tag": self.TAG, "variant": "ASAN", "name": "Alignment/OfflineValidation", "errors": 2, "ok": 24}]
+        details = {(self.TAG, "el9_amd64_gcc14"): dict(imported=True, problems={
+            "DQMServices/Demo/TestDQMCompareHistogram": ("python_traceback", "OSError: Failed to open file")},
+            failed_tests=["Alignment/OfflineValidation/PrimaryVertex", "Alignment/OfflineValidation/testPVPlotting",
+                          "DQMServices/Demo/TestDQMCompareHistogram"])}
+        history = {("Alignment/OfflineValidation", "ASAN"): [
+            (self.TAG, "FAILED"), ("CMSSW_20_1_ASAN_X_2026-10-02-2300", "FAILED"),
+            ("CMSSW_19_0_ASAN_X_2026-09-01-2300", "FAILED"), ("CMSSW_20_1_ASAN_X_2026-09-28-2300", "PASSED")]}
+        row = self._table(rows, details, history)[2]
+        self.assertEqual(row, "| Alignment/OfflineValidation (ASAN) | 2 | 2 failed / 26 | PrimaryVertex<br>testPVPlotting |  | "
+                              "Failed in 1 prior build(s) this series (most recent CMSSW_20_1_ASAN_X_2026-10-02-2300); "
+                              "3/4 overall. |")
+
+    def test_fixed_strings_caps_and_escaping(self):
+        rows = [{"ib_tag": self.TAG, "variant": None, "name": "A/B", "errors": 10, "ok": None},
+                {"ib_tag": "CMSSW_20_1_X_2026-10-05-2300", "variant": None, "name": "C/D", "errors": 1, "ok": 3}]
+        tests = [f"A/B/t{i}" for i in range(10)]
+        details = {
+            (self.TAG, "el9_amd64_gcc14"): dict(imported=True, failed_tests=tests, problems={
+                t: ("fatal_exception", "x | y\n" + "z" * 400) for t in tests}),
+            ("CMSSW_20_1_X_2026-10-05-2300", "el9_amd64_gcc14"): dict(imported=True, failed_tests=["E/F/t"], problems={}),
+        }
+        lines = self._table(rows, details, {})
+        cells = [c.strip() for c in re.split(r"(?<!\\)\|", lines[2])[1:-1]]
+        self.assertEqual(cells[2], "")  # no ok count: Tests left empty
+        self.assertEqual(cells[3], "<br>".join([f"t{i}" for i in range(8)] + ["+2 more"]))
+        exceptions = cells[4].split("<br>")
+        self.assertEqual(len(exceptions), 4)
+        self.assertEqual(exceptions[-1], "+7 more")
+        self.assertTrue(exceptions[0].startswith("t0: x \\| y z"))
+        self.assertTrue(exceptions[0].endswith("…"))
+        self.assertLessEqual(len(exceptions[0].replace("\\|", "|")), 300)
+        self.assertIn("| C/D | 1 | 1 failed / 4 | not found in the imported log |  | First failure in this series; 0/0 overall. |",
+                      lines[3])

@@ -75,6 +75,12 @@ venv/bin/python scripts/validate_bot.py --base-url http://localhost:8002  # non-
 # newly-failing and resolved). Needs DEV_SHIFTER_LOGIN=true (or --username
 # set to a real logged-in identity).
 venv/bin/python scripts/validate_shift_summary.py
+
+# live check of the imported IB test logs, run after each fetch + import:
+# graph integrity, /api/test-log-problems contract over consecutive builds,
+# chat finds pasted stored problems (FAIL = exit 1); freshness, noisy "new",
+# fragmented signatures, junk categories (WARN); plus what a shifter sees.
+venv/bin/python scripts/validate_test_log_data.py --base-url http://localhost:8002 --username testshifter
 ```
 
 Tests mock the Neo4j driver / LLM client rather than requiring a live
@@ -167,6 +173,26 @@ additionally deletes graph records whose backing source file is gone
   changing detection or normalization, bump `SCANNER_VERSION`, and measure
   "new" generic lines over a week of data -- run-specific text (timestamps,
   hosts, paths) leaking into a signature makes every build look "new".
+  The zips are deleted after scanning, so old results can't be re-scanned:
+  the importer re-signs every stored problem with `current_signature`
+  (scanner) instead, and a normalization change only takes effect after
+  `ingest_test_logs.py --force`. Found live (v5): Madgraph `threadN/` worker
+  dirs, a `%MSG` glued onto UBSan lines, and fatal messages cut at 300 *raw*
+  chars (release path length moves the cut) each split one problem into
+  several signatures, showing it as new + gone in the same window.
+  `ProblemFirstSeen` is keyed per release series (`suite|CMSSW_20_1|owner|sid`).
+  Shift Console side: `GET /api/test-log-problems?from=&to=[&arch=]`
+  (`get_test_log_changes`, `graph/tools.py`) returns JSON, deliberately not a
+  `/api/shift-summary` section (that markdown contract is shared with the
+  frontend parser). Serious problems in PASSED tests/steps only, per
+  (sub-IB variant, arch, suite, run variant) track, each compared with the
+  same track at `from` or its own previous build (`baseline_note`), split
+  into `new` (first time ever for that test, via `ProblemFirstSeen`),
+  `returned` (seen before, absent in the baseline: intermittent -- the
+  Madgraph `IndexError` RelVals flap like this), `gone` (test ran again
+  without it) and a `still_present` count. `coverage.to_imported=false`
+  means no logs yet, never "zero problems". Tests:
+  `tests/test_test_log_changes.py`.
 - `--github-issues` — optional raw CMSSW GitHub Issues export
   (dir or `.tar`/`.tar.gz`), imports PR/Issue bodies, labels, comments, and
   explicit `#number`/URL cross-references. Never calls GitHub live.

@@ -358,5 +358,55 @@ class PastedErrorRoutingTests(unittest.TestCase):
         self.assertIn("getNewCorners", result.answer)
 
 
+    @patch("server.api_server._pasted_names_github_answer", return_value=None)
+    @patch("server.api_server._pasted_error_evidence_answer", return_value=None)
+    @patch("server.api_server._test_log_problem_answer", return_value="**Found in the imported IB test logs** zombiekiller")
+    @patch("server.api_server.get_driver")
+    def test_shell_report_of_a_killed_test_is_searched_in_the_logs(self, get_driver, log_answer, _gh, _names):
+        # Found live 2026-10-15: this line was answered with an IB summary because the
+        # paste gate only knew CMSSW/sanitizer/traceback shapes, not the shell's report.
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.__iter__.return_value = iter([])
+        session.run.return_value.single.return_value = None
+        paste = ("In CMSSW_20_1_X_2026-10-12-1100 this test passed but its log shows:\n"
+                 "/data/cmsbld/jenkins/workspace/ib-run-qa/CMSSW_20_1_X_2026-10-12-1100/src/FWCore/Services/test/"
+                 "test_zombiekiller.sh: line 10: 2006489 Aborted                 (core dumped) ! ( cmsRun $F2 )")
+        result = chat(ChatRequest(session_id="paste-shell-abort", question=paste))
+        log_answer.assert_called_once_with(paste)
+        self.assertIn("Found in the imported IB test logs", result.answer)
+
+
+class PasteGateTests(unittest.TestCase):
+    def test_shell_crash_lines_are_pastes_but_ordinary_questions_are_not(self):
+        from server.api_server import _LOG_PROBLEM_PASTE_RE
+        for text in ("x.sh: line 10: 2006489 Aborted                 (core dumped) ! ( cmsRun $F2 )",
+                     "run.sh: line 7: 12345 Segmentation fault      cmsRun cfg.py",
+                     "output\nSegmentation fault (core dumped)\n", "Aborted (core dumped)",
+                     "Floating point exception (core dumped)"):
+            self.assertTrue(_LOG_PROBLEM_PASTE_RE.search(text), text)
+        for text in ("why do my tests get Killed sometimes", "line 5 is aborted",
+                     "what does segmentation fault mean in unit tests", "segmentation fault",
+                     "why was the job aborted (core dumped) yesterday"):
+            self.assertFalse(_LOG_PROBLEM_PASTE_RE.search(text), text)
+
+
+class PrStatusTests(unittest.TestCase):
+    def test_merge_date_wins_then_the_export_state(self):
+        from server.api_server import _pr_status
+        self.assertEqual(_pr_status("2026-10-11T06:56:00Z", "open"), "merged 2026-10-11")
+        self.assertEqual(_pr_status(None, "open"), "open, not merged (per GitHub export)")
+        self.assertEqual(_pr_status(None, "closed"), "closed, no merge recorded")
+        self.assertEqual(_pr_status(None, None), "not merged")
+
+    @patch("server.api_server.search_issues_by_text", return_value={"issues": []})
+    @patch("server.api_server.find_prs_for_error")
+    def test_pasted_names_answer_says_a_pr_is_still_open(self, find_prs, _issues):
+        find_prs.side_effect = lambda name, limit: [
+            dict(pr_number=52200, title="fix PFN inference", merged_at=None, state="open")]
+        answer = _pasted_names_github_answer(parse_pasted_error(TRACKSTER_PASTE))
+        self.assertIn("PR #52200", answer)
+        self.assertIn("open, not merged", answer)
+
+
 if __name__ == "__main__":
     unittest.main()

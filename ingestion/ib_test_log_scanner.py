@@ -19,7 +19,8 @@ Problem kinds, most to least serious:
     sanitizer            ==PID==ERROR: AddressSanitizer|LeakSanitizer|... + stack
     ubsan                <file>:<line>: runtime error: ...
     crash                CMSSW "A fatal system signal has occurred", or a shell
-                         "line N: PID Segmentation fault|Aborted|..." report
+                         "line N: PID Segmentation fault|Aborted|..." report, or
+                         that report alone on its line ("Aborted (core dumped)")
     assertion            glibc "Assertion `...' failed"
     uncaught_exception   terminate called after throwing an instance of '...'
     python_traceback     Traceback (most recent call last): ... <Type>: <msg>
@@ -59,7 +60,7 @@ import re
 import zipfile
 from collections import deque
 
-SCANNER_VERSION = 3       # bump when detection changes, so stored results say what produced them
+SCANNER_VERSION = 6       # bump when detection changes, so stored results say what produced them
 MAX_BLOCK_LINES = 60      # lines of evidence kept per problem
 MAX_LINE_CHARS = 500      # characters kept per evidence line
 MAX_FRAMES = 20           # stack frames kept per sanitizer report
@@ -94,7 +95,26 @@ UBSAN_RE = re.compile(r"(?P<loc>\S+:\d+(?::\d+)?): runtime error: (?P<what>.*)$"
 SIGNAL_RE = re.compile(r"A fatal system signal has occurred: (?P<what>.+)$")
 SHELL_KILL_RE = re.compile(
     r"line \d+:\s+\d+ (?P<what>Segmentation fault|Aborted|Bus error|Killed|Floating point exception|Illegal instruction)")
-PLAIN_SEGV_RE = re.compile(r"^(?P<what>Segmentation fault|Bus error)(?: \(core dumped\))?\s*$")
+# the shell's report alone on a line (no "line N: PID" prefix), e.g. from a wrapper;
+# only when the line holds nothing else, so prose mentioning "aborted" is not a crash
+PLAIN_SIGNAL_RE = re.compile(
+    r"^(?P<what>Segmentation fault|Bus error|Aborted|Floating point exception|Illegal instruction)"
+    r"(?: \(core dumped\))?\s*$")
+# CMSSW's names for the signals it reports ("A fatal system signal has occurred: <name>")
+CMSSW_SIGNAL_NAMES = ("segmentation violation", "abort signal", "bus error", "illegal instruction",
+                      "floating point exception", "external termination request", "keyboard interrupt")
+
+
+def signal_name(what: str) -> str:
+    """The signal name from a "fatal system signal" line. Output of two threads can be
+    glued onto it (": index abort signal-916979453", "abort signalabort signal"), which
+    made each such crash a signature of its own; the known name is taken out of it."""
+    lowered = (what or "").lower()
+    for name in CMSSW_SIGNAL_NAMES:
+        if name in lowered:
+            return name
+    words = re.match(r"[A-Za-z][A-Za-z ]*[A-Za-z]", (what or "").strip(" :"))
+    return words.group(0) if words else (what or "").strip()
 ASSERTION_RE = re.compile(r"Assertion [`'\"](?P<expr>.+)[`'\"] failed")
 TERMINATE_RE = re.compile(r"terminate called after throwing an instance of '(?P<type>[^']+)'")
 TRACEBACK_RE = re.compile(r"^Traceback \(most recent call last\):")
@@ -107,6 +127,10 @@ GENERIC_ERROR_RE = re.compile(r"\b(?:error|ERROR|Error|exception|Exception|EXCEP
 # Minified JavaScript is web-page content, not a log message: test_StorageFactory_Http
 # prints a downloaded page whose code ("throw Error(...)") changes every day.
 MINIFIED_CODE_RE = re.compile(r"\bfunction\s*\(")
+# The HLT TrigReport summary's column header ("... Passed  Failed  Error Name") names
+# columns, it reports nothing: every HLT addOn test prints it, so it looked like a
+# "new" generic line in every newly scanned series.
+COLUMN_HEADER_RE = re.compile(r"^TrigReport\b.*\bFailed\s+Error\s+Name\s*$")
 
 
 def _is_minified_code(line: str) -> bool:
@@ -132,6 +156,10 @@ _NORMALIZERS = [
     (re.compile(r"/cvmfs/[^/\s]+/(?:sw/[^/\s]+/)?(?:nweek-\d+/)?[a-z0-9]+_[a-z0-9]+_[a-z0-9]+/"), "$SW/"),
     (re.compile(r"\bCMSSW_\d+_\d+_[A-Za-z0-9_]*?X_\d{4}-\d\d-\d\d-\d{4}\b"), "<IB>"),
     (re.compile(r"/pyRelval/[^/\s]+/"), "/pyRelval/<WF>/"),
+    # Madgraph runs in one of several worker dirs: .../pyRelval/<WF>/thread0/lheevent/...
+    (re.compile(r"(?<=/)thread\d+(?=/)"), "thread<N>"),
+    # interleaved output glues a MessageLogger "%MSG" onto the next line: "%MSGsrc/X.h:12:3: runtime error"
+    (re.compile(r"%MSG(?=[\w/$])"), ""),
     (re.compile(r"\d{1,2}-[A-Z][a-z]{2}-\d{4} \d\d:\d\d:\d\d(?:\.\d+)? ?[A-Z]{0,5}"), "<TIME>"),
     (re.compile(r"[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d\d:\d\d:\d\d [A-Z]{0,5} ?\d{4}"), "<TIME>"),
     (re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d)?"), "<TIME>"),
@@ -159,6 +187,34 @@ _PUNCT_SPACE_RE = re.compile(r"\s*([:\[\]()=,;])\s*")
 
 def make_signature(kind: str, category: str | None, detail: str) -> str:
     return f"{kind}|{category or ''}|{normalize_text(detail)}"
+
+
+def fatal_signature_detail(message: str) -> str:
+    """The part of a fatal exception message that identifies it. The stored message is
+    the first 300 raw characters; a raw cut lands at a different place in each run
+    (release paths differ in length), so the partly cut last word is dropped and the
+    cut is made again after normalization -- otherwise one exception gets a new
+    signature in every build ("At:$RELEASE/src/F" vs "At:$RELEASE")."""
+    message = (message or "")[:300]
+    if len(message) >= 300:
+        message = message.rsplit(None, 1)[0]
+    return normalize_text(message)[:200]
+
+
+def current_signature(problem: dict) -> str:
+    """A stored problem's signature recomputed with the current normalization, so
+    results scanned by an older SCANNER_VERSION (whose zips are long deleted) still
+    compare equal to new ones. Idempotent: normalizing a normalized text changes nothing.
+    MessageLogger signatures have no detail, and their category can itself contain "|"
+    ("HGCalGeomT3|4"), so they are left as they are."""
+    if problem["signature"].startswith("message_logger|"):
+        return problem["signature"]
+    kind, category, detail = problem["signature"].split("|", 2)
+    if kind == "fatal_exception":
+        return make_signature(kind, category or None, fatal_signature_detail(problem.get("message")))
+    if kind == "crash" and SIGNAL_RE.search(problem.get("message") or ""):
+        category = signal_name(category)
+    return make_signature(kind, category or None, detail)
 
 
 def signature_id(signature: str) -> str:
@@ -250,7 +306,7 @@ class _FatalBlock(_Block):
         message = " ".join(self.meta["message"])
         return dict(kind="fatal_exception", category=cat, origin="cmssw", message=message[:300],
                     summary=f"Fatal exception '{cat}': {message[:150]}",
-                    signature=make_signature("fatal_exception", cat, message[:200]))
+                    signature=make_signature("fatal_exception", cat, fatal_signature_detail(message)))
 
 
 class _MessageBlock(_Block):
@@ -367,11 +423,11 @@ def _single_line_issue(line: str, stripped: str) -> tuple[dict, int] | None:
         return None
     m = SIGNAL_RE.search(stripped)
     if m:
-        what = m.group("what")
+        what = signal_name(m.group("what"))
         return dict(kind="crash", category=what, origin="cmssw", message=stripped[:300],
                     summary=f"cmsRun crash: fatal system signal ({what})",
                     signature=make_signature("crash", what, "")), 40
-    m = SHELL_KILL_RE.search(stripped) or PLAIN_SEGV_RE.match(stripped)
+    m = SHELL_KILL_RE.search(stripped) or PLAIN_SIGNAL_RE.match(stripped)
     if m and "Found custom handler" not in stripped:
         what = m.group("what")
         script = re.search(r"(\S+\.(?:sh|py)): line", stripped)
@@ -482,7 +538,8 @@ def iter_issues(lines):
         for block in open_blocks[opened_before:]:
             block.before = list(recent)
 
-        if not started and not covered and GENERIC_ERROR_RE.search(stripped) and not _is_minified_code(stripped):
+        if (not started and not covered and GENERIC_ERROR_RE.search(stripped)
+                and not _is_minified_code(stripped) and not COLUMN_HEADER_RE.match(stripped)):
             yield dict(kind="generic_error_line", category=None, origin="unclassified",
                        message=stripped[:300], summary=stripped[:150],
                        signature=make_signature("generic_error_line", None, stripped[:200]),
@@ -533,6 +590,7 @@ _NAME_STOPWORDS = {
     "following", "classes", "calling", "method", "module", "prefetching", "begin", "fatal", "error",
     "errors", "found", "unable", "cmsrun", "cmssw", "summary", "addresssanitizer", "readof", "writeof",
 }
+HEX_LITERAL_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
 MAX_NAMES = 40
 MAX_CONTEXTS = 20
 MAX_DETAIL_OCCURRENCES = 200  # occurrences per record whose details are merged (a debug log repeats one line 1M times)
@@ -562,7 +620,9 @@ def problem_details(lines, category: str | None = None) -> dict:
                  + executables):
         if name != category:
             names.append(name)
-    plain = _ARCH_RE.sub(" ", _IB_RE.sub(" ", PATH_NAME_RE.sub(" ", context + "\n" + body)))
+    # memory addresses ("0x50d0005dfb30") change every run; tokenized they became
+    # names like "x50d0005dfb30" that a paste then "shared" by chance (found 2026-10-15)
+    plain = HEX_LITERAL_RE.sub(" ", _ARCH_RE.sub(" ", _IB_RE.sub(" ", PATH_NAME_RE.sub(" ", context + "\n" + body))))
     for token in _IDENTIFIER_RE.findall(plain):
         if not _identifier_like(token) or token == category:
             continue

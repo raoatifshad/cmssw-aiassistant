@@ -181,6 +181,38 @@ class OtherDetectorTests(unittest.TestCase):
         self.assertEqual(issues[0]["kind"], "crash")
         self.assertEqual(issues[0]["summary"], "Process aborted in test_zombiekiller.sh")
 
+    def test_bare_shell_signal_report_is_a_crash(self):
+        # the report alone on its line (no "line N: PID"), as a wrapper prints it
+        for line, what in (("Aborted (core dumped)", "Aborted"), ("Aborted", "Aborted"),
+                           ("Floating point exception (core dumped)", "Floating point exception"),
+                           ("Illegal instruction (core dumped)", "Illegal instruction"),
+                           ("Segmentation fault (core dumped)", "Segmentation fault")):
+            issues = scanner.scan_lines([line + "\n"])
+            self.assertEqual([(i["kind"], i["category"]) for i in issues], [("crash", what)], line)
+        self.assertEqual(scanner.scan_lines(["Aborted (core dumped)\n"])[0]["summary"], "Process aborted")
+
+    def test_prose_mentioning_an_abort_is_not_a_crash(self):
+        for line in ("Job Aborted by the user", "the test was Aborted (core dumped) earlier, retrying",
+                     "Event processing Aborted because of a skipped event"):
+            self.assertNotIn("crash", [i["kind"] for i in scanner.scan_lines([line + "\n"])], line)
+
+    def test_glued_thread_output_does_not_change_the_signal_name(self):
+        # found in the imported data: output of two threads glued onto the signal line
+        lines = ["A fatal system signal has occurred: abort signal\n",
+                 "A fatal system signal has occurred: : index abort signal-916979453\n",
+                 "A fatal system signal has occurred: abort signalabort signal\n",
+                 "A fatal system signal has occurred: : abort signal\n"]
+        issues = [scanner.scan_lines([line])[0] for line in lines]
+        self.assertEqual({i["category"] for i in issues}, {"abort signal"})
+        self.assertEqual(len({i["signature"] for i in issues}), 1)
+        self.assertEqual(issues[1]["summary"], "cmsRun crash: fatal system signal (abort signal)")
+
+    def test_old_glued_signal_signature_is_resigned(self):
+        old = dict(kind="crash", category=": index abort signal-916979453",
+                   message="A fatal system signal has occurred: : index abort signal-916979453",
+                   signature="crash|: index abort signal-916979453|")
+        self.assertEqual(scanner.current_signature(old), "crash|abort signal|")
+
     def test_python_traceback_outside_cmssw_is_unclassified(self):
         text = (
             "Traceback (most recent call last):\n"
@@ -201,11 +233,49 @@ class OtherDetectorTests(unittest.TestCase):
         self.assertEqual((issues[0]["kind"], issues[0]["origin"]), ("infrastructure_error", "infrastructure"))
 
     def test_generic_error_lines_are_kept_but_labelled_generic(self):
-        issues = scanner.scan_lines(["TrigReport Trig Bit#   Visited  Passed  Failed  Error Name\n"])
+        issues = scanner.scan_lines(["Error in opening file /tmp/x.root\n"])
         self.assertEqual([i["kind"] for i in issues], ["generic_error_line"])
+
+    def test_trigreport_column_header_is_not_a_problem(self):
+        # the header of every HLT TrigReport table, seen as "new" in each newly scanned series
+        issues = scanner.scan_lines([
+            "TrigReport  Trig Bit#   Executed     Passed     Failed      Error Name\n",
+            "TrigReport    Visited        Run     Passed     Failed      Error Name\n",
+            "TrigReport     1    0        100        100          0           0 HLTriggerFirstPath\n"])
+        self.assertEqual(issues, [])
 
 
 class NormalizationTests(unittest.TestCase):
+    def test_madgraph_worker_dir_is_not_part_of_the_signature(self):
+        a = scanner.normalize_text("/pyRelval/519.0_X/thread0/lheevent/bin/internal/lhe_parser.py")
+        b = scanner.normalize_text("/pyRelval/525.0_Y/thread3/lheevent/bin/internal/lhe_parser.py")
+        self.assertEqual(a, b)
+
+    def test_a_messagelogger_marker_glued_onto_a_ubsan_line_is_dropped(self):
+        issues = scanner.scan_lines([
+            "%MSGsrc/DataFormats/GEMDigi/interface/GEMOptoHybrid.h:151:38: runtime error: shift exponent 3927 "
+            "is too large for 32-bit type 'int'\n",
+            "src/DataFormats/GEMDigi/interface/GEMOptoHybrid.h:151:38: runtime error: shift exponent 2556 "
+            "is too large for 32-bit type 'int'\n"])
+        self.assertEqual(len({i["signature"] for i in issues}), 1)
+
+    def test_fatal_exception_signature_does_not_depend_on_release_path_length(self):
+        def message(path):
+            return ("Module intProducer has the Test variant set explicitly to other, but its accelerator is "
+                    "not available for the job At: " + path + "/src/FWCore/Integration/plugins/Thing.cc "
+                    + "x" * 200)
+        short = scanner.fatal_signature_detail(message("/cvmfs/cms-ib.cern.ch/sw/x/cms/cmssw/CMSSW_20_1_X_2026-10-09-1100"))
+        long = scanner.fatal_signature_detail(message(
+            "/data/cmsbld/jenkins/workspace/ib-run-qa-long-name/CMSSW_20_1_X_2026-10-09-2300"))
+        self.assertEqual(short, long)
+
+    def test_current_signature_is_idempotent_and_keeps_messagelogger_categories(self):
+        ml = dict(signature="message_logger|warning:HGCalGeomT3|4|")
+        self.assertEqual(scanner.current_signature(ml), ml["signature"])
+        tb = dict(signature="python_traceback|IndexError|IndexError:x @ $RELEASE/pyRelval/<WF>/thread2/a.py")
+        once = scanner.current_signature(tb)
+        self.assertEqual(scanner.current_signature(dict(signature=once)), once)
+
     def test_release_paths_timestamps_and_numbers_are_stripped(self):
         a = scanner.normalize_text(
             "/data/cmsbld/jenkins/workspace/ib-run-qa/CMSSW_20_1_ASAN_X_2026-10-05-2300/src/X.py line 12 "

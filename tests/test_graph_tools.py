@@ -604,3 +604,48 @@ class SearchShifterDocsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelvalEvidencePrefetchTests(unittest.TestCase):
+    """prefetch_relval_exception_evidence: one artifact scan for many workflows, same
+    answers as one query per workflow (found 2026-10-15: 62 scans made a digest take 78-120 s)."""
+
+    def tearDown(self):
+        import tools
+        tools._EVIDENCE_CACHE.clear()
+
+    @patch("tools.get_driver")
+    def test_each_workflow_gets_only_its_own_terms_newest_first(self, get_driver):
+        import tools
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        exceptions = {
+            ("1.0", "T"): [{"exception": "boom one", "category": "LogicError", "context": ""}],
+            ("2.0", "T"): [{"exception": "boom two", "category": "ProductNotFound", "context": ""}],
+        }
+        scans = []
+
+        def run(query, **params):
+            if "RelValException" in query:
+                return exceptions[(params["workflow_id"], params["ib_tag"])]
+            scans.append(sorted(params["terms"]))
+            return [  # newest first, the union over both workflows' terms
+                {"kind": "PR", "number": 30, "title": "c", "state": "open", "merged_at": None,
+                 "matched_terms": ["boom two"]},
+                {"kind": "Issue", "number": 20, "title": "b", "state": "open", "merged_at": None,
+                 "matched_terms": ["1.0", "boom one"]},
+                {"kind": "Issue", "number": 10, "title": "a", "state": "closed", "merged_at": None,
+                 "matched_terms": ["2.0"]},
+            ]
+        session.run.side_effect = run
+
+        tools.prefetch_relval_exception_evidence([("1.0", "T"), ("2.0", "T")], limit=5)
+        self.assertEqual(scans, [["1.0", "2.0", "boom one", "boom two"]])  # one scan for both
+
+        get_driver.reset_mock()
+        first = tools.get_relval_exception_evidence("1.0", "T", 5)
+        second = tools.get_relval_exception_evidence("2.0", "T", 5)
+        get_driver.assert_not_called()  # served from the prefetch
+        self.assertEqual([m["number"] for m in first[0]["matches"]], [20])
+        self.assertEqual(first[0]["matches"][0]["matched_terms"], ["1.0", "boom one"])
+        self.assertEqual(first[0]["category"], "LogicError")  # matched via its own exception text
+        self.assertEqual([m["number"] for m in second[0]["matches"]], [30])  # exact text beats id-only #10
