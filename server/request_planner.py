@@ -54,6 +54,8 @@ SHIFT_SUMMARY_RE = re.compile(
     # "what's newly failing in the last 3 days" (found live 2026-10-15 getting the latest
     # IB's failure overview: "newly" never matched \bnew\b)
     r"\bnewly\s+(?:failing|failed|broken|broke)\b|"
+    # "summarize the week for CMSSW_20_1_X" (held-out pass 2026-10-15: LLM tool-name leak)
+    r"\bsummar(?:y|ise|ize)\b[^?!]{0,30}\b(?:the\s+|this\s+|last\s+|past\s+)?(?:week|\d+\s+days?)\b|"
     r"\b(?:fail(?:ing|ed|ures?)?|broken|broke|regress\w*)\b[^?!]{0,30}\b(?:in|over|during)\s+the\s+(?:last|past)\s+\d+\s+days?\b",
     re.IGNORECASE,
 )
@@ -252,7 +254,7 @@ def validate_llm_plan(raw: object, capabilities: Iterable[Capability], allowed_t
     for tool_call in tool_calls:
         if not isinstance(tool_call, dict):
             return None
-        name = tool_call.get("name")
+        name = str(tool_call.get("name") or "").split("<|", 1)[0].strip()  # harmony token leak
         arguments = tool_call.get("arguments")
         if name not in allowed_tools or not isinstance(arguments, dict):
             return None

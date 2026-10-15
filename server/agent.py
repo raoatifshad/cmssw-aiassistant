@@ -246,6 +246,13 @@ def _function_to_openai_schema(name: str, fn) -> dict:
     }
 
 
+def clean_tool_name(name: str) -> str:
+    """The model sometimes emits a harmony control token glued to the function name
+    ("get_database_overview<|channel|>commentary", found live 2026-10-15), which made a
+    real tool "unknown". Keep only the identifier before any "<|" token."""
+    return (name or "").split("<|", 1)[0].strip()
+
+
 class KGChatSession:
     def __init__(self, openai_client, model: str, tools_registry: dict,
                  system_prompt: str,
@@ -285,6 +292,7 @@ class KGChatSession:
         ])
 
     def _execute_tool(self, name: str, args: dict) -> str:
+        name = clean_tool_name(name)
         fn = self.tools_registry.get(name)
         if not fn:
             return json.dumps({"error": f"unknown tool: {name}"})
@@ -367,7 +375,7 @@ class KGChatSession:
                 args = json.loads(tc.function.arguments or "{}")
                 content = self._execute_tool(tc.function.name, args)
                 if self.on_tool_call:
-                    self.on_tool_call(tc.function.name, args, content)
+                    self.on_tool_call(clean_tool_name(tc.function.name), args, content)
                 self.messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": content}
                 )
