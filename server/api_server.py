@@ -1193,8 +1193,8 @@ def _relval_das_error_lines(labelled_records: list[tuple[str, dict]], cap: int =
         driver.close()
     if not lines:
         return []
-    return ["", "DAS errors (input files not found in DAS, so the workflow never ran; "
-                "excluded from the failing count):", *lines]
+    return ["", "DAS errors (input files not found in DAS, so the workflow never ran; the IB dashboard counts "
+                "these as failed, listed separately here):", *lines]
 
 
 def _relval_archs_without_results(tags: set[str], arch: str | None = None) -> list[tuple[str, str]]:
@@ -1230,7 +1230,7 @@ def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: li
     known_error_note = f", {known_error:,} known error" if known_error else ""
     das_error = sum(record.get("das_error_relvals") or 0 for record in records)
     if das_error:
-        known_error_note += f", {das_error:,} DAS error (input files not found, nothing ran)"
+        known_error_note += f", {das_error:,} DAS error (input files not found, nothing ran; the IB dashboard counts these as failed)"
     # Status emoji mirror the real CMSDT dashboard's own red/orange/green
     # convention (confirmed against a real dashboard screenshot, 2026-09-21)
     # so a shifter can tell build health apart at a glance in a plain-text
@@ -6611,7 +6611,7 @@ def _failure_overview_answer(tag: str, arch: str | None, item_cap: int = 12) -> 
         lines.append(f"  - Plus {known_total} known-error RelVal(s), excluded from the count (as on the IB dashboard).")
     if das_total:
         lines.append(f"  - Plus {das_total} DAS-error RelVal(s): the input files could not be found in DAS, so they never "
-                     "ran; excluded from the count.")
+                     "ran (the IB dashboard counts these as failed; listed separately here).")
     if unittest_rows:
         total = sum(len(r["failed_unittests"]) for r in unittest_rows)
         lines.append(f"\n**Unit tests** -- {total} failing:")
@@ -7911,7 +7911,8 @@ _BASIC_TERMS = (
     (r"das(?:\s+errors?)?",
      "A **DAS error** means a RelVal step could not get its input files from DAS (the CMS Data Aggregation "
      "System, which finds where a dataset's files are), so the workflow never processed anything. That points to "
-     "the input dataset or infrastructure, not to broken code, and it is not counted as a failing RelVal."),
+     "the input dataset or infrastructure, not to broken code. The IB dashboard counts it as a failed RelVal; this "
+     "bot lists DAS errors separately from real failures."),
     (r"known\s+errors?",
      "A **known error** is a RelVal failure the IB results mark as expected for a known reason (e.g. \"GridPacks "
      "were built for x86_64\" on an aarch64 machine). The dashboard and this bot exclude them from failing counts "
@@ -8530,7 +8531,8 @@ def _workflow_why_failing_answer(question: str, session_id: str) -> str | None:
 _DAS_ERROR_EXPLANATION = (
     "the step could not get its input files from DAS (the CMS dataset lookup service), so the "
     "workflow never processed anything. That points to the input dataset or the infrastructure, not "
-    "to broken code, and the IB dashboard does not count it as a failing RelVal."
+    "to broken code. The IB dashboard counts it as a failed RelVal; it is listed separately here because the "
+    "workflow never actually ran."
 )
 # "where is X failing", "which builds/IBs does X fail in", "is X failing (anywhere)",
 # "X failing?", or the bare ID ("38551.85", "wf 38551.85"): one workflow across every

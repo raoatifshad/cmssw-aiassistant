@@ -35,7 +35,7 @@ NODES:
     (:RelVal {key, ib_key, ib_tag, arch, workflow_id, name, status, errors, warnings, exitcode})
         — status is 'FAILED', 'PASSED' or 'DAS_ERROR' (a step could not get its input
         files from DAS, so nothing ran: an input-data problem, not a code failure, and
-        not counted as failing)
+        kept apart from FAILED here; the IB dashboard itself counts it as failed)
     (:RelValException {key, ib_key, ib_tag, arch, workflow_id, step, category, message, context, text, source_url})
     (:ExitCode {code, name}) — static CMSSW exit-code table, e.g. 16640 -> 'OtherCMS'; not IB-scoped
     (:Concept {concept_id, question, definition, source_feedback_id, verification_method,
