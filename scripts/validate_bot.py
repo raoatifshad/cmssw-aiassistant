@@ -91,6 +91,15 @@ _RELVAL_SCOPE_ALT_OK = _NO_RELVAL_DATA_YET + _RELVAL_ARCH_CHOICE_PENDING
 
 def build_scenarios(tag: str, arch: str) -> list[Scenario]:
     return [
+        # Found live 2026-10-15: "where is 38551.85 failing?" got the latest IB's failure
+        # overview, a bare "38551.85" the "couldn't match that" menu. Workflow 1.0 runs in
+        # every release series, so this holds whatever the graph's current data is.
+        Scenario("where is a workflow failing, no tag", [
+            Turn("where is workflow 1.0 failing?", expect_contains=["Workflow `1.0`", "imported run(s) did not pass"]),
+        ]),
+        Scenario("bare workflow ID", [
+            Turn("1.0", expect_contains=["Workflow `1.0`", "imported run(s) did not pass"]),
+        ]),
         Scenario("relval failure count", [
             Turn(
                 f"how many relvals are failing in {tag}",

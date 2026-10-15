@@ -242,6 +242,21 @@ def _reconcile_missing_sources(driver, prefix: str, active_sources: set[str]):
         print(f"  removed missing source: {source_id}")
 
 
+def relval_status(steps: list[dict]) -> str:
+    """FAILED if any step failed, else DAS_ERROR if a step could not get its input
+    files from DAS (the job never processed anything), else PASSED. Found
+    2026-10-15: DAS_ERROR was stored as PASSED (only "FAILED" was checked), so
+    workflow 38551.85 -- DAS_ERROR at step1 in all 250 imported runs -- read as
+    passing everywhere. DAS_ERROR is kept apart from FAILED: it is an input-data
+    problem, not a code failure, and is not in the dashboard's failing count."""
+    statuses = {step.get("status") for step in steps}
+    if "FAILED" in statuses:
+        return "FAILED"
+    if "DAS_ERROR" in statuses:
+        return "DAS_ERROR"
+    return "PASSED"
+
+
 def _ingest_relval_file(driver, path: Path, arch: str, force: bool) -> tuple[int, str]:
     tag = f"{path.stem}_{path.parent.name}"
     source_id = f"relvals:{tag}:{arch}:{path.resolve()}"
@@ -270,7 +285,7 @@ def _ingest_relval_file(driver, path: Path, arch: str, force: bool) -> tuple[int
                 key=f"{current_ib_key}:{workflow_id}",
                 workflow_id=workflow_id,
                 name=entry.get("name", ""),
-                status="FAILED" if any(step.get("status") == "FAILED" for step in steps) else "PASSED",
+                status=relval_status(steps),
                 exitcode=entry.get("exitcode"),
                 errors=sum(step.get("errors", 0) for step in steps),
                 warnings=sum(step.get("warnings", 0) for step in steps),

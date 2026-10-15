@@ -883,7 +883,8 @@ def _relval_scope_records(tag: str, include_sub_ibs: bool) -> list[dict]:
     see get_failing_relvals); they're counted separately in known_error_relvals/
     known_error_errors instead of being folded into either failed_relvals or
     passed_relvals, so relval_total == failed_relvals + passed_relvals +
-    known_error_relvals always holds and a caller can still mention them if useful."""
+    known_error_relvals + das_error_relvals always holds and a caller can still mention
+    them if useful. das_error_relvals: a step could not get its input files from DAS."""
     query = """
         MATCH (ib:IB)
         WHERE ib.tag = $tag OR ($include_sub_ibs AND ib.parent_tag = $tag)
@@ -895,6 +896,7 @@ def _relval_scope_records(tag: str, include_sub_ibs: bool) -> list[dict]:
             sum(CASE WHEN relval.status = 'PASSED' THEN 1 ELSE 0 END) AS passed_relvals,
             sum(CASE WHEN relval.status = 'FAILED' AND coalesce(relval.known_error, false) = true
                      THEN 1 ELSE 0 END) AS known_error_relvals,
+            sum(CASE WHEN relval.status = 'DAS_ERROR' THEN 1 ELSE 0 END) AS das_error_relvals,
             coalesce(sum(coalesce(relval.errors, 0)), 0) AS error_count,
             sum(CASE WHEN relval.status = 'FAILED' AND coalesce(relval.known_error, false) = false
                      THEN coalesce(relval.errors, 0) ELSE 0 END) AS failed_errors,
@@ -904,13 +906,14 @@ def _relval_scope_records(tag: str, include_sub_ibs: bool) -> list[dict]:
         WHERE relval_total > 0
         RETURN ib.tag AS tag, ib.arch AS arch, ib.variant AS variant,
             coalesce(ib.is_relval_default, false) AS is_relval_default,
-            // failed_relvals + passed_relvals + known_error_relvals == relval_total, always -
+            // failed_relvals + passed_relvals + known_error_relvals + das_error_relvals ==
+            // relval_total, always (DAS_ERROR: input files not found, nothing ran) -
             // known_error workflows are split out into their own bucket (they genuinely
             // failed, just not for reasons a shifter needs to act on - see
             // ingestion/build_graph.py's known_error note) rather than silently folded into
             // either failed_relvals (would overcount real problems) or passed_relvals
             // (would misreport a real failure as a pass).
-            relval_total, failed_relvals, passed_relvals, known_error_relvals,
+            relval_total, failed_relvals, passed_relvals, known_error_relvals, das_error_relvals,
             error_count, failed_errors, passed_errors, known_error_errors
         ORDER BY tag, arch
     """
@@ -1070,6 +1073,42 @@ def _relval_known_error_lines(labelled_records: list[tuple[str, dict]], per_mess
     return ["", "Known errors (red on the dashboard, but excluded from the failing count):", *lines]
 
 
+def _relval_das_error_lines(labelled_records: list[tuple[str, dict]], cap: int = 8) -> list[str]:
+    """Name the DAS-error workflows a RelVal table counts but excludes from "Failing":
+    step 1 could not get its input files from DAS, so nothing ran (found 2026-10-15:
+    38551.85 in every 20_0/20_1 build, stored as PASSED until build_graph.relval_status)."""
+    targets = [(label, r) for label, r in labelled_records if r.get("das_error_relvals")]
+    if not targets:
+        return []
+    lines: list[str] = []
+    try:
+        driver = get_driver()
+    except Exception as exc:
+        print(f"WARNING: could not list DAS-error RelVals: {exc}")
+        return []
+    try:
+        with driver.session() as session:
+            for label, record in targets:
+                workflow_ids = [row["workflow_id"] for row in session.run(
+                    "MATCH (ib:IB {tag:$tag, arch:$arch})-[:RAN_RELVAL]->(relval:RelVal {status:'DAS_ERROR'}) "
+                    "RETURN relval.workflow_id AS workflow_id ORDER BY toFloat(relval.workflow_id)",
+                    tag=record["tag"], arch=record["arch"],
+                )]
+                if workflow_ids:
+                    shown = ", ".join(f"`{wf}`" for wf in workflow_ids[:cap])
+                    more = f" (+{len(workflow_ids) - cap} more)" if len(workflow_ids) > cap else ""
+                    lines.append(f"- 🟠 **{label}**: {len(workflow_ids)} DAS error(s): {shown}{more}")
+    except Exception as exc:  # supplementary detail only
+        print(f"WARNING: could not list DAS-error RelVals: {exc}")
+        return []
+    finally:
+        driver.close()
+    if not lines:
+        return []
+    return ["", "DAS errors (input files not found in DAS, so the workflow never ran; "
+                "excluded from the failing count):", *lines]
+
+
 def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: list[str] | None = None) -> str:
     """Format a complete RelVal count without merging architecture-specific facts."""
     total = sum(record["relval_total"] or 0 for record in records)
@@ -1080,13 +1119,16 @@ def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: li
     # numbers from silently not adding up to `total` on the reader's own arithmetic.
     known_error = sum(record.get("known_error_relvals") or 0 for record in records)
     known_error_note = f", {known_error:,} known error" if known_error else ""
+    das_error = sum(record.get("das_error_relvals") or 0 for record in records)
+    if das_error:
+        known_error_note += f", {das_error:,} DAS error (input files not found, nothing ran)"
     # Status emoji mirror the real CMSDT dashboard's own red/orange/green
     # convention (confirmed against a real dashboard screenshot, 2026-09-21)
     # so a shifter can tell build health apart at a glance in a plain-text
     # chat reply, not just from the numbers -- red for a genuine failure,
     # orange for known_error-only (excluded from the failing count but still
     # worth a shifter's attention), green for clean.
-    headline_marker = "🔴" if failed else ("🟠" if known_error else "🟢")
+    headline_marker = "🔴" if failed else ("🟠" if known_error or das_error else "🟢")
     lines = [
         f"{headline_marker} {heading}: **{failed:,} failing RelVal(s)** across **{total:,}** RelVal record(s) "
         f"({passed:,} passed{known_error_note}).",
@@ -1096,7 +1138,7 @@ def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: li
     ]
     lines.extend(
         f"| `{record['tag']}` | `{record['arch']}` | "
-        f"{'🔴' if record['failed_relvals'] else ('🟠' if record.get('known_error_relvals') else '🟢')} "
+        f"{'🔴' if record['failed_relvals'] else ('🟠' if record.get('known_error_relvals') or record.get('das_error_relvals') else '🟢')} "
         f"{record['failed_relvals'] or 0:,} | {record.get('known_error_relvals') or 0:,} | "
         f"{record['passed_relvals'] or 0:,} | {record['relval_total'] or 0:,} |"
         for record in records
@@ -1118,6 +1160,7 @@ def _relval_scope_summary(records: list[dict], heading: str, sub_ib_variants: li
         lines.append("Failing workflows:")
         lines.extend(failing_lines)
     lines.extend(_relval_known_error_lines([(record["arch"], record) for record in records]))
+    lines.extend(_relval_das_error_lines([(record["arch"], record) for record in records]))
     note = _sub_ib_variant_note(records[0]["tag"], sub_ib_variants)
     if note:
         lines.append("")
@@ -1161,7 +1204,8 @@ def _relval_arch_scoped_ib_breakdown(tag: str, selected_arch: str, primary_recor
     exit_code_names: dict[int, str] | None = None
     failing_lines: list[str] = []
     for label, record in rows:
-        marker = "🔴" if record["failed_relvals"] else ("🟠" if record.get("known_error_relvals") else "🟢")
+        marker = "🔴" if record["failed_relvals"] else (
+            "🟠" if record.get("known_error_relvals") or record.get("das_error_relvals") else "🟢")
         lines.append(
             f"| {label} | {marker} {record['failed_relvals'] or 0:,} | {record.get('known_error_relvals') or 0:,} | "
             f"{record['passed_relvals'] or 0:,} | {record['relval_total'] or 0:,} |"
@@ -1174,6 +1218,7 @@ def _relval_arch_scoped_ib_breakdown(tag: str, selected_arch: str, primary_recor
         lines.append("Failing workflows:")
         lines.extend(failing_lines)
     lines.extend(_relval_known_error_lines(rows))
+    lines.extend(_relval_das_error_lines(rows))
     return "\n".join(lines)
 
 
@@ -3669,6 +3714,9 @@ def _workflow_recurrence_answer(workflow_id: str, recurrence: dict, session_id: 
     # below; same terse comma-addendum style as _ib_results_summary_answer's own
     # known-error note.
     known_error_note = f", {known_error:,} known error (excluded above)" if known_error else ""
+    das_error = recurrence.get("das_error_appearances") or 0
+    if das_error:
+        known_error_note += f", {das_error:,} DAS error (input files not found, nothing ran; excluded above)"
     lines = [
         f"Workflow `{workflow_id}` (`{recurrence['name']}`) has failed in **{failed} of {total}** "
         f"imported record(s) ({rate:.0%}{known_error_note}) across every architecture and IB seen so far."
@@ -7614,6 +7662,10 @@ def _workflow_why_failing_answer(question: str, session_id: str) -> str | None:
         driver.close()
 
     where = f" on `{arch}`" if arch else f" on {family} architectures" if family else ""
+    if not records and not tag_match:
+        # no tag named and the IB we picked has no record of it (e.g. the latest IB's
+        # RelVals aren't imported yet): every build it ran in says more than "no record"
+        return _workflow_across_builds_answer(workflow_id, question, session_id)
     if not records:
         return (
             f"Workflow `{workflow_id}` has no imported RelVal record in `{tag}`{scope_note} or its sub-IBs{where}. "
@@ -7624,12 +7676,16 @@ def _workflow_why_failing_answer(question: str, session_id: str) -> str | None:
     lines = [f"Workflow `{workflow_id}` (`{records[0]['name']}`) in `{tag}`{scope_note}{where}:", ""]
     lines += ["| IB variant | Architecture | Status | Exit code | Errors |", "| --- | --- | --- | --- | ---: |"]
     for r in records[:20]:
-        status = "known error" if r["status"] == "FAILED" and r["known_error"] else r["status"].lower()
+        status = ("known error" if r["status"] == "FAILED" and r["known_error"]
+                  else "DAS error" if r["status"] == "DAS_ERROR" else r["status"].lower())
         exit_code = _format_exit_code(r["exitcode"], names) if r["exitcode"] else "0"
         lines.append(f"| {r['variant']} | `{r['arch']}` | {status} | {exit_code} | {r['errors'] or 0} |")
     if len(records) > 20:
         lines.append(f"| ... | {len(records) - 20} more record(s) | | | |")
-    if not failed:
+    das = [r for r in records if r["status"] == "DAS_ERROR"]
+    if das:
+        lines.append(f"\n**DAS error** in {len(das)} record(s): {_DAS_ERROR_EXPLANATION}")
+    if not failed and not das:
         lines.append(f"\nIt **passed** in every record above -- it is not failing in this IB{where}.")
     known = sorted({r["known_error_message"] for r in failed if r["known_error"] and r["known_error_message"]})
     if known:
@@ -7656,6 +7712,185 @@ def _workflow_why_failing_answer(question: str, session_id: str) -> str | None:
         if recurrence.get("known_error_appearances"):
             history += f", plus {recurrence['known_error_appearances']} known-error record(s)"
         lines.append(history + ".")
+    return "\n".join(lines)
+
+
+_DAS_ERROR_EXPLANATION = (
+    "the step could not get its input files from DAS (the CMS dataset lookup service), so the "
+    "workflow never processed anything. That points to the input dataset or the infrastructure, not "
+    "to broken code, and the IB dashboard does not count it as a failing RelVal."
+)
+# "where is X failing", "which builds/IBs does X fail in", "is X failing (anywhere)",
+# "X failing?", or the bare ID ("38551.85", "wf 38551.85"): one workflow across every
+# imported build. Found live 2026-10-15: "where is 38551.85 failing?" got the latest
+# IB's failure overview (the latest tag was injected because no category was named),
+# and a bare "38551.85" got the "couldn't match that" menu.
+_WORKFLOW_WHERE_RE = re.compile(
+    r"\bwhere\b|\banywhere\b|\bwhich\s+(?:builds?|ibs?|releases?|archs?|architectures?|variants?|sub-?ibs?)\b|"
+    r"\bin\s+which\b|\bis\b[^?!]{0,40}\bfail|\bfail(?:s|ing|ed)?\s*\??\s*$",
+    re.IGNORECASE,
+)
+_BARE_WORKFLOW_RE = re.compile(
+    r"^\s*(?:(?:wf|workflow|relval)\s*#?\s*)?(\d{1,6}\.\d{1,6})\s*[?.!]*\s*$", re.IGNORECASE)
+
+
+def _workflow_where_failing_answer(question: str, session_id: str) -> str | None:
+    """One workflow's results across every imported build: where it fails, how
+    (failed / DAS error / known error), since when, and the step detail from the
+    test logs. Only for a question that names a workflow and no IB tag; "why is X
+    failing" and "status of X" stay with _workflow_why_failing_answer (one IB)."""
+    bare = _BARE_WORKFLOW_RE.match(question)
+    if bare:
+        workflow_id = bare.group(1)
+    else:
+        if IB_TAG_RE.search(question) or not _WORKFLOW_WHERE_RE.search(question):
+            return None
+        if re.search(r"\b(?:prs?|pull requests?|issues?|github|ticket|exceptions?|logs?|commands?|cmsdriver|"
+                     r"why|reason|cause[sd]?|history|how\s+often|before|recurr\w*)\b", question, re.IGNORECASE):
+            return None  # PR/Issue evidence, exception/log/command lookups, "why", history: other handlers
+        match = re.search(r"\b(?:wf|workflow|relval)s?\s*#?\s*(\d{1,6}\.\d{1,6})(?![\d.])", question, re.IGNORECASE) \
+            or re.search(r"(?<![\d.\w-])(\d{3,6}\.\d{1,6})(?![\d.])", question)
+        if not match:
+            return None
+        workflow_id = match.group(1)
+    return _workflow_across_builds_answer(workflow_id, question, session_id)
+
+
+def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: str) -> str:
+    """The cross-build answer itself; also the fallback for "why is X failing" with no
+    tag when the latest IB has no record of X yet (its RelVals land hours after the build)."""
+    arch = _requested_ib_arch(question)
+    family = None if arch else _arch_family(question)
+
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal {workflow_id:$wf}) "
+                "WHERE ($arch IS NULL OR ib.arch = $arch) AND ($family IS NULL OR ib.arch CONTAINS $family) "
+                "RETURN ib.tag AS tag, ib.arch AS arch, coalesce(ib.variant, 'primary') AS variant, "
+                "relval.name AS name, relval.status AS status, relval.exitcode AS exitcode, "
+                "coalesce(relval.known_error, false) AS known_error, relval.known_error_message AS known_error_message",
+                wf=workflow_id, arch=arch, family=family,
+            )]
+            step_details = [r["detail"] for r in session.run(
+                "MATCH (run:TestLogRun) WHERE run.suite = 'relval' AND ($arch IS NULL OR run.arch = $arch) "
+                "AND ($family IS NULL OR run.arch CONTAINS $family) "
+                "UNWIND [d IN coalesce(run.failed_details, []) WHERE d STARTS WITH $prefix] AS detail "
+                "RETURN detail",
+                prefix=f"{workflow_id}_", arch=arch, family=family,
+            )]
+            exceptions = [dict(r) for r in session.run(
+                "MATCH (e:RelValException {workflow_id:$wf}) "
+                "WHERE ($arch IS NULL OR e.arch = $arch) AND ($family IS NULL OR e.arch CONTAINS $family) "
+                "RETURN e.category AS category, left(coalesce(e.message, ''), 200) AS message, count(*) AS n "
+                "ORDER BY n DESC LIMIT 3",
+                wf=workflow_id, arch=arch, family=family,
+            )]
+    finally:
+        driver.close()
+
+    where = f" on `{arch}`" if arch else f" on {family} architectures" if family else ""
+    if not rows:
+        if arch or family:
+            return f"Workflow `{workflow_id}` has no imported RelVal result{where}."
+        return _workflow_prefix_choice_answer(session_id, f"{workflow_id.split('.')[0]}.", not_found_id=workflow_id)
+    _last_workflow_contexts[session_id] = workflow_id
+
+    # one workflow number can be reused for a different workflow in another era:
+    # describe the current one (same scoping as get_relval_recurrence)
+    current_name = max(rows, key=lambda r: _ib_sort_key(r["tag"]))["name"]
+    other_rows = [r for r in rows if r["name"] != current_name]
+    rows = [r for r in rows if r["name"] == current_name]
+
+    def kind(row: dict) -> str:
+        if row["status"] == "DAS_ERROR":
+            return "das"
+        if row["status"] == "FAILED":
+            return "known" if row["known_error"] else "failed"
+        return "passed"
+
+    for row in rows:
+        row["kind"] = kind(row)
+        row["when"] = row["tag"].rsplit("_X_", 1)[-1]
+        series = re.match(r"(CMSSW_\d+_\d+)", row["tag"])
+        row["series"] = series.group(1) if series else row["tag"]
+    counts = {k: sum(1 for r in rows if r["kind"] == k) for k in ("failed", "das", "known", "passed")}
+    problems = [r for r in rows if r["kind"] != "passed"]
+    first, last = min(r["when"] for r in rows)[:10], max(r["when"] for r in rows)[:10]
+    names = get_exit_code_names()
+
+    lines = [f"Workflow `{workflow_id}` (`{current_name}`){where}: **{len(problems)} of {len(rows)}** imported "
+             f"run(s) did not pass, in builds from {first} to {last}."]
+    if counts["failed"]:
+        lines.append(f"- 🔴 **Failed** in {counts['failed']} run(s).")
+    if counts["das"]:
+        lines.append(f"- 🟠 **DAS error** in {counts['das']} run(s): {_DAS_ERROR_EXPLANATION}")
+    if counts["known"]:
+        reasons = sorted({r["known_error_message"] for r in rows if r["kind"] == "known" and r["known_error_message"]})
+        reason_text = f" ({'; '.join(reasons[:2])})" if reasons else ""
+        lines.append(f"- 🟠 **Known error** in {counts['known']} run(s){reason_text}, excluded from failure counts.")
+    if counts["passed"]:
+        lines.append(f"- 🟢 **Passed** in {counts['passed']} run(s).")
+
+    if problems:
+        series_names = sorted({r["series"] for r in problems})
+        variants = sorted({r["variant"] for r in problems}, key=lambda v: (v != "primary", v))
+        archs = sorted({r["arch"] for r in problems})
+        if not counts["passed"]:
+            lines += ["", f"It did not pass **anywhere**: every imported run of {', '.join(f'`{x}`' for x in series_names)}, "
+                          f"in {len(variants)} build type(s) ({', '.join(variants[:12])}"
+                          f"{', ...' if len(variants) > 12 else ''}) and on {len(archs)} architecture(s) "
+                          f"({', '.join(f'`{a}`' for a in archs)})."]
+        else:
+            groups: dict[tuple, list[dict]] = {}
+            for r in rows:
+                groups.setdefault((r["series"], r["variant"]), []).append(r)
+            bad = sorted(((key, g) for key, g in groups.items() if any(r["kind"] != "passed" for r in g)),
+                         key=lambda item: -sum(r["kind"] != "passed" for r in item[1]))
+            lines += ["", "Where it did not pass:", "",
+                      "| Release | Build type | Architectures | Not passed / runs | Most recent |",
+                      "| --- | --- | --- | ---: | --- |"]
+            for (series, variant), group in bad[:15]:
+                bad_rows = [r for r in group if r["kind"] != "passed"]
+                recent = max(bad_rows, key=lambda r: _ib_sort_key(r["tag"]))
+                bad_archs = ", ".join(f"`{a}`" for a in sorted({r["arch"] for r in bad_rows}))
+                lines.append(f"| `{series}` | {variant} | {bad_archs} | "
+                             f"{len(bad_rows)} / {len(group)} | `{recent['tag']}` |")
+            if len(bad) > 15:
+                lines.append(f"| ... | {len(bad) - 15} more | | | |")
+            clean = sorted({f"`{key[0]}` {key[1]}" for key, g in groups.items() if all(r["kind"] == "passed" for r in g)})
+            if clean:
+                lines.append(f"\nPassed in every run of: {', '.join(clean[:10])}{', ...' if len(clean) > 10 else ''}.")
+        codes = sorted({r["exitcode"] for r in problems if r["exitcode"]})
+        if codes:
+            lines.append("\nExit code(s): " + ", ".join(_format_exit_code(code, names) for code in codes) + ".")
+        recent = max(problems, key=lambda r: _ib_sort_key(r["tag"]))
+        lines.append(f"Most recent: `{recent['tag']}` ({recent['variant']}, `{recent['arch']}`).")
+    else:
+        lines.append(f"\nIt is not failing in any imported build{where}.")
+
+    if step_details:
+        by_detail: dict[str, int] = {}
+        for detail in step_details:
+            text = detail.split(": ", 1)[-1].strip()
+            by_detail[text] = by_detail.get(text, 0) + 1
+        lines.append(f"\nFrom the raw test logs ({len(step_details)} failed run(s)):")
+        lines += [f"- `{text}` -- {n} run(s)" for text, n in sorted(by_detail.items(), key=lambda kv: -kv[1])[:3]]
+    if exceptions:
+        lines.append("\nImported exception text:")
+        lines += [f"- **[{e['category']}]** {e['message'].strip()} ({e['n']} record(s))" for e in exceptions]
+    if other_rows:
+        def series_key(name: str) -> tuple:
+            numbers = re.match(r"CMSSW_(\d+)_(\d+)(.*)", name)
+            return (int(numbers.group(1)), int(numbers.group(2)), numbers.group(3)) if numbers else (0, 0, name)
+        other_series = sorted({re.sub(r"_X_.*$", "", r["tag"]) for r in other_rows}, key=series_key)
+        other_bad = sum(1 for r in other_rows if r["status"] != "PASSED")
+        lines.append(f"\nNot counted above: {len(other_rows)} run(s) in {', '.join(f'`{x}`' for x in other_series[:6])} "
+                     f"where this number has a different workflow name ({other_bad} of them did not pass) -- "
+                     f"older release series can define the number differently.")
+    lines.append(f"\nThe dashboard data keeps about two weeks of builds. For one build's detail, ask "
+                 f"\"why is workflow {workflow_id} failing in <IB tag>\".")
     return "\n".join(lines)
 
 
@@ -7760,6 +7995,10 @@ def chat(req: ChatRequest):
     slot_answer = _ib_slot_availability_answer(question)
     if slot_answer:
         return _chat_response(sid, original_question, slot_answer, "deterministic:ib_slot")
+
+    workflow_where_answer = _workflow_where_failing_answer(question, sid)
+    if workflow_where_answer:
+        return _chat_response(sid, original_question, workflow_where_answer, "deterministic:workflow_where")
 
     workflow_why_answer = _workflow_why_failing_answer(question, sid)
     if workflow_why_answer:

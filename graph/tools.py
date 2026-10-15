@@ -33,6 +33,9 @@ NODES:
     (:Label {key, name})
   (:Author {name})
     (:RelVal {key, ib_key, ib_tag, arch, workflow_id, name, status, errors, warnings, exitcode})
+        — status is 'FAILED', 'PASSED' or 'DAS_ERROR' (a step could not get its input
+        files from DAS, so nothing ran: an input-data problem, not a code failure, and
+        not counted as failing)
     (:RelValException {key, ib_key, ib_tag, arch, workflow_id, step, category, message, context, text, source_url})
     (:ExitCode {code, name}) — static CMSSW exit-code table, e.g. 16640 -> 'OtherCMS'; not IB-scoped
     (:Concept {concept_id, question, definition, source_feedback_id, verification_method,
@@ -348,6 +351,7 @@ def get_relval_recurrence(workflow_id: str) -> dict:
     current = [r for r in rows if r["name"] == current_name]
     genuine_failures = [r for r in current if r["status"] == "FAILED" and not r["known_error"]]
     known_error_failures = [r for r in current if r["status"] == "FAILED" and r["known_error"]]
+    das_errors = [r for r in current if r["status"] == "DAS_ERROR"]
     failed_records = sorted(genuine_failures, key=lambda r: _ib_sort_key(r["tag"]), reverse=True)[:10]
     return {
         "workflow_id": workflow_id,
@@ -355,6 +359,7 @@ def get_relval_recurrence(workflow_id: str) -> dict:
         "total_appearances": len(current),
         "failed_appearances": len(genuine_failures),
         "known_error_appearances": len(known_error_failures),
+        "das_error_appearances": len(das_errors),
         "failed_records": [
             {"tag": r["tag"], "arch": r["arch"], "variant": r["variant"]} for r in failed_records
         ],
