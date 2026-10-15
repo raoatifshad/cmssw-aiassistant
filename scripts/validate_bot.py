@@ -157,7 +157,10 @@ def build_scenarios(tag: str, arch: str) -> list[Scenario]:
         ]),
         Scenario("scope-only follow-up repeats the previous question", [
             Turn(f"unit tests for {tag}", expect_contains=["unit-test results"]),
-            Turn("and on aarch64 only", expect_contains=["unit-test results", "aarch64"]),
+            # the latest IB often has no aarch64 build yet (10-15-0900 had only el9_amd64_gcc14):
+            # saying so is the correct answer, not a routing dead end
+            Turn("and on aarch64 only", expect_contains=["unit-test results", "aarch64"],
+                 alt_ok_contains=["has no imported `aarch64` build"]),
         ]),
         Scenario("exit code meaning in all three forms", [
             Turn("what does exit code 65 mean", expect_contains=["OtherCMS"]),
