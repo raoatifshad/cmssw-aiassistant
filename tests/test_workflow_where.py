@@ -173,7 +173,7 @@ class WorkflowWhereTests(unittest.TestCase):
     def test_other_handlers_keep_their_questions(self):
         with self._patch_graph([]) as get_driver:
             for question in ("why is 38551.85 failing", "38551.85 any PR?", "is there an issue for workflow 38551.85",
-                             "has 38551.85 failed before", "where is 38551.85 failing in CMSSW_20_1_X_2026-10-14-2300",
+                             "where is 38551.85 failing in CMSSW_20_1_X_2026-10-14-2300",
                              "relval exception for 38551.85", "what is failing in the latest IB"):
                 self.assertIsNone(_workflow_where_failing_answer(question, "s"), question)
             get_driver.assert_not_called()

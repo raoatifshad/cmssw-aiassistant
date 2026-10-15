@@ -50,7 +50,11 @@ SHIFT_SUMMARY_RE = re.compile(
     r"\bnew(?:ly)?\b[^?!]{0,20}\b(?:broken|broke|regress(?:ed|ions?)?)\b|"
     r"\b(?:broken|broke|regress(?:ed|ions?)?)\b[^?!]{0,30}\bsince\b|"
     r"\bsince\s+(?:(?:this|the)\s+morning|yesterday|(?:last|this)\s+night|today|the\s+last\s+(?:ib|build))\b|"
-    r"\bwhat'?s\s+new\b",
+    r"\bwhat'?s\s+new\b|"
+    # "what's newly failing in the last 3 days" (found live 2026-10-15 getting the latest
+    # IB's failure overview: "newly" never matched \bnew\b)
+    r"\bnewly\s+(?:failing|failed|broken|broke)\b|"
+    r"\b(?:fail(?:ing|ed|ures?)?|broken|broke|regress\w*)\b[^?!]{0,30}\b(?:in|over|during)\s+the\s+(?:last|past)\s+\d+\s+days?\b",
     re.IGNORECASE,
 )
 
