@@ -18,8 +18,10 @@
 # one fixed name would wipe all older exceptions on the first daily run. The old files are not
 # needed after import (the graph keeps the exceptions), so only the newest one is kept.
 #
-# Unattended login to cmssdt9-02 needs a Kerberos keytab (see KEYTAB below); without one the
-# test-log step is skipped once the current ticket expires, and says so in status.txt.
+# Login to cmssdt9-02 uses only a dedicated key (SSH_KEY below) whose entry in root's
+# authorized_keys is locked to a read-only forced command (scripts/cmssdt9-02/README.md): it can
+# list and download test-log zips and nothing else. Never Kerberos, a password or a keytab.
+# Without that key installed the test-log step is skipped, and status.txt says so.
 #
 # Install (runs at 07:30 every day):   scripts/daily_refresh.sh --install-cron
 # Try it now in the foreground:        scripts/daily_refresh.sh
@@ -32,8 +34,7 @@ CLANG_ROOT=/home/rao/CHAT-BOT-AI/CLANG-LOGS
 EXC_DIR=/home/rao/CHAT-BOT-AI/exceptions-json-file
 TESTLOGS=/home/rao/CHAT-BOT-AI/IB-TEST-LOGS
 LOG_DIR=/home/rao/CHAT-BOT-AI/daily-refresh-logs
-KEYTAB=${KEYTAB:-/home/rao/.keytab/mrao.keytab}
-PRINCIPAL=${PRINCIPAL:-mrao@CERN.CH}
+SSH_KEY=${SSH_KEY:-/home/rao/.ssh/ibtestlogs_ro}
 API=${API:-http://localhost:8002}
 MIN_FREE_GB=${MIN_FREE_GB:-60}          # never start copying test logs below this much free disk
 DISK_BUDGET_GB=${DISK_BUDGET_GB:-45}     # max unscanned zips on disk at once (a DBG RelVal zip is ~33 GB)
@@ -135,11 +136,12 @@ else status exceptions SKIPPED; fi
 
 # ---------------------------------------------------------------- 3. IB test logs
 if want testlogs; then
-    # a fresh ticket from the keytab, else renew the current one
-    if [ -r "$KEYTAB" ]; then kinit -kt "$KEYTAB" "$PRINCIPAL" 2>&1 && aklog 2>/dev/null; else kinit -R 2>/dev/null; fi
+    export IBTESTLOGS_SSH_KEY="$SSH_KEY"
     FREE_GB=$(df -BG --output=avail "$TESTLOGS" | tail -1 | tr -dc 0-9)
-    if ! timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 root@cmssdt9-02.cern.ch true 2>/dev/null; then
-        status testlogs "SKIPPED (no password-less login to cmssdt9-02: Kerberos ticket expired and no keytab at $KEYTAB)"
+    ping_reply=$( [ -r "$SSH_KEY" ] && timeout 60 ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o GSSAPIAuthentication=no \
+        -o PasswordAuthentication=no -o BatchMode=yes -o ConnectTimeout=20 root@cmssdt9-02.cern.ch ping 2>/dev/null )
+    if [ "$ping_reply" != "ok" ]; then
+        status testlogs "SKIPPED (the read-only key $SSH_KEY can't log in to cmssdt9-02 -- not installed there, or this PC's IP changed; see scripts/cmssdt9-02/README.md)"
         FAILED=$((FAILED + 1))
     elif [ "$FREE_GB" -lt "$MIN_FREE_GB" ]; then
         status testlogs "SKIPPED (only ${FREE_GB} GB free on /home, need ${MIN_FREE_GB})"
