@@ -14,7 +14,7 @@ from typing import Iterable
 
 IB_TAG_RE = re.compile(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b")
 ARCH_RE = re.compile(
-    r"\b(el\d+|fc\d+)[_\s-]+(amd64|aarch64|riscv64)[_\s-]+(gcc\d+)\b", re.IGNORECASE
+    r"\b(el\d+|fc\d+|slc\d+|cc\d+|cs\d+)[_\s-]+(amd64|aarch64|riscv64|ppc64le)[_\s-]+(gcc\d+)\b", re.IGNORECASE
 )
 PR_RE = re.compile(r"(?:\b(?:pr|mr|pull request|merge request)\s*#?|#)(\d+)\b", re.IGNORECASE)
 WORKFLOW_RE = re.compile(r"\bworkflow\s*#?(\d+(?:\.\d+)?)\b", re.IGNORECASE)
@@ -56,7 +56,15 @@ SHIFT_SUMMARY_RE = re.compile(
     r"\bnewly\s+(?:failing|failed|broken|broke)\b|"
     # "summarize the week for CMSSW_20_1_X" (held-out pass 2026-10-15: LLM tool-name leak)
     r"\bsummar(?:y|ise|ize)\b[^?!]{0,30}\b(?:the\s+|this\s+|last\s+|past\s+)?(?:week|\d+\s+days?)\b|"
-    r"\b(?:fail(?:ing|ed|ures?)?|broken|broke|regress\w*)\b[^?!]{0,30}\b(?:in|over|during)\s+the\s+(?:last|past)\s+\d+\s+days?\b",
+    r"\b(?:fail(?:ing|ed|ures?)?|broken|broke|regress\w*)\b[^?!]{0,30}\b(?:in|over|during)\s+the\s+(?:last|past)\s+\d+\s+days?\b|"
+    # shifter openers found 2026-10-16 ending in raw list_ib_tags dumps: "what broke between
+    # yesterday and today", "what should the shifter look at today", "give me the morning
+    # report", "I'm the shifter today, where do I start", "is the IB getting better or worse"
+    r"\b(?:broke|broken|changed|regress\w*)\b[^?!]{0,20}\bbetween\s+yesterday\s+and\s+today\b|"
+    r"\bshifters?\b[^?!]{0,40}\b(?:look\s+at|check|start|focus|worry|watch)\b[^?!]{0,20}\b(?:today|now|first|this\s+morning)\b|"
+    r"\b(?:where|how)\s+(?:do|should)\s+i\s+start\b|"
+    r"\bmorning\s+(?:report|summary|digest|check)\b|\b(?:daily|today'?s)\s+(?:report|summary|digest)\b|"
+    r"\b(?:getting|got)\s+(?:better|worse)\b|\bbetter\s+or\s+worse\b",
     re.IGNORECASE,
 )
 

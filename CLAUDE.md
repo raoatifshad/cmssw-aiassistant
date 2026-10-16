@@ -83,6 +83,15 @@ venv/bin/python scripts/validate_bot.py --base-url http://localhost:8002  # non-
 # set to a real logged-in identity).
 venv/bin/python scripts/validate_shift_summary.py
 
+# live question bank: ~200 questions CMSSW people ask (pasted RelVal exceptions and
+# test-log problems, unit tests, workflows, PRs/Issues, IB flavours, comparisons,
+# build/Clang, exit codes/terms, follow-ups, typos, misuse), each with checks on its
+# answer plus global ones (dead ends, literal None, raw <tags>, 500s, >15k chars, >30 s).
+# Its expected facts are pinned to the 2026-10-16 data: after a refresh run
+# --check-facts first -- it says which facts (and so which questions) went stale.
+venv/bin/python scripts/question_bank.py --base-url http://localhost:8002 [--only PX,UT] [--json out.json]
+venv/bin/python scripts/question_bank.py --check-facts
+
 # live check of the imported IB test logs, run after each fetch + import:
 # graph integrity, /api/test-log-problems contract over consecutive builds,
 # chat finds pasted stored problems (FAIL = exit 1); freshness, noisy "new",
