@@ -39,6 +39,12 @@ cd shifter-wiki && git fetch --prune origin master && git reset --hard origin/ma
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_shifter_docs.py \
   --wiki-root "$PWD/shifter-wiki" --cmsrepo "$PWD/cmsrepo" --reconcile
 
+# all of the above, unattended, every day at 07:30 (cron; logs + status.txt in
+# /home/rao/CHAT-BOT-AI/daily-refresh-logs/). Exceptions go to a dated file per run: importing
+# the same path again deletes what that path imported before. Needs a Kerberos keytab
+# (~/.keytab/mrao.keytab) for cmssdt9-02 once the login ticket expires.
+scripts/daily_refresh.sh [--install-cron|--uninstall-cron]   # STEPS="cmsrepo exceptions testlogs docs checks"
+
 # IB test logs from cmssdt9-02 (unit/addOn/RelVal zips; the server deletes
 # them after ~1 week, so run at least every few days). The user copies with
 # their own rsync (full command in README "IB test logs"), then:
