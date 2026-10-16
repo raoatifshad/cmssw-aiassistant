@@ -42,14 +42,17 @@ PRINCIPAL=mrao@CERN.CH
 API=${API:-http://localhost:8002}
 MIN_FREE_GB=${MIN_FREE_GB:-60}          # never start copying test logs below this much free disk
 DISK_BUDGET_GB=${DISK_BUDGET_GB:-45}     # max unscanned zips on disk at once (a DBG RelVal zip is ~33 GB)
-STEPS=${STEPS:-"cmsrepo exceptions testlogs docs checks"}
+STEPS=${STEPS:-"cmsrepo exceptions testlogs docs frontend checks"}
+FRONTEND=/home/rao/CERN/CERN-IB-WORK/cmssdt-18V/public   # Shift Console data: its own updateData.sh
 export NEO4J_URI=bolt://localhost:7688
 export PATH=/usr/sue/bin:/usr/local/bin:/usr/bin:/bin:$PATH
 
 if [ "${1:-}" = "--install-cron" ]; then
     line="30 7 * * * $REPO/scripts/daily_refresh.sh >/dev/null 2>&1"
-    ( crontab -l 2>/dev/null | grep -v 'scripts/daily_refresh.sh'; echo "$line" ) | crontab -
-    echo "installed: $line"; crontab -l | grep daily_refresh
+    # also 10 min after every boot, so a crash costs hours, not a day (flock: never two at once)
+    boot="@reboot sleep 600 && $REPO/scripts/daily_refresh.sh >/dev/null 2>&1"
+    ( crontab -l 2>/dev/null | grep -v 'scripts/daily_refresh.sh'; echo "$line"; echo "$boot" ) | crontab -
+    echo "installed:"; crontab -l | grep daily_refresh
     exit 0
 fi
 if [ "${1:-}" = "--uninstall-cron" ]; then
@@ -190,6 +193,23 @@ with d.session() as s:
 d.close()
 EOF
 )
+if want frontend; then
+    # updateData.sh deletes SDT/ and clones cms-sw.github.io again; keep the old copy until the
+    # new one is complete, so a failed clone never leaves the frontend without data
+    if [ -x "$FRONTEND/updateData.sh" ]; then
+        rm -rf "$FRONTEND/SDT.prev"
+        [ -d "$FRONTEND/SDT" ] && mv "$FRONTEND/SDT" "$FRONTEND/SDT.prev"
+        if timeout 1800 "$FRONTEND/updateData.sh" && [ -e "$FRONTEND/SDT/html/data/" ]; then
+            rm -rf "$FRONTEND/SDT.prev"
+            status frontend "OK ($(git -C "$FRONTEND/SDT/public/cms-sw.github.io" log -1 --format=%ci 2>/dev/null))"
+        else
+            rm -rf "$FRONTEND/SDT"
+            [ -d "$FRONTEND/SDT.prev" ] && mv "$FRONTEND/SDT.prev" "$FRONTEND/SDT"
+            status frontend "FAILED (clone failed; kept the previous data)"
+        fi
+    else status frontend "SKIPPED (no $FRONTEND/updateData.sh)"; fi
+else status frontend SKIPPED; fi
+
 if want checks; then
     if curl -sf -m 30 "$API/api/health" >/dev/null; then
         bot=$(timeout 30m venv/bin/python scripts/validate_bot.py --base-url "$API" 2>&1 | grep -E "turns passed" | tail -1)
