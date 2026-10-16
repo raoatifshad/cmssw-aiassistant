@@ -41,8 +41,8 @@ PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/i
 
 # all of the above, unattended, every day at 07:30 (cron; logs + status.txt in
 # /home/rao/CHAT-BOT-AI/daily-refresh-logs/). Exceptions go to a dated file per run: importing
-# the same path again deletes what that path imported before. Needs a Kerberos keytab
-# (~/.keytab/mrao.keytab) for cmssdt9-02 once the login ticket expires.
+# the same path again deletes what that path imported before. cmssdt9-02 is reached only
+# with a dedicated key locked to a read-only forced command (scripts/cmssdt9-02/README.md).
 scripts/daily_refresh.sh [--install-cron|--uninstall-cron]   # STEPS="cmsrepo exceptions testlogs docs checks"
 
 # IB test logs from cmssdt9-02 (unit/addOn/RelVal zips; the server deletes

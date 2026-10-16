@@ -70,6 +70,16 @@ DEFAULT_BASE = "/home/rao/CHAT-BOT-AI/IB-TEST-LOGS"
 ZIP_KINDS = {"pyRelValMatrixLogs.zip": "relval", "unitTestLogs.zip": "unit", "addOnTests.zip": "addon"}
 SSH_OPTS = ["-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/cm-ibtestlogs-%r@%h:%p",
             "-o", "ControlPersist=10m", "-o", "ServerAliveInterval=30"]
+# Unattended runs (scripts/daily_refresh.sh) log in with a dedicated key whose root
+# authorized_keys entry is locked to a read-only forced command
+# (scripts/cmssdt9-02/ibtestlogs-readonly.sh). With it set, only that key is offered --
+# never Kerberos or a password -- over its own connection, so such a run can never fall
+# back to a full root login.
+if os.environ.get("IBTESTLOGS_SSH_KEY"):
+    SSH_OPTS = ["-i", os.environ["IBTESTLOGS_SSH_KEY"], "-o", "IdentitiesOnly=yes", "-o", "GSSAPIAuthentication=no",
+                "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no", "-o", "BatchMode=yes",
+                "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/cm-ibtestlogs-ro-%r@%h:%p",
+                "-o", "ControlPersist=10m", "-o", "ServerAliveInterval=30"]
 EVIDENCE_LINES_QUIET = 8  # evidence lines kept for message_logger / generic records
 MARKER_WAIT_HOURS = 24  # unit/addOn zip without a .checked marker: scanned anyway after this
 BIG_ZIP_BYTES = 5e9  # DBG RelVal zips are ~33 GB; at most one of these is copied/scanned at a time
