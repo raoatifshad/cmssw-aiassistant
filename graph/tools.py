@@ -1940,21 +1940,41 @@ def _log_problem_details(chosen: list[str], match: dict) -> list[dict]:
         "ps[0].arch AS example_arch, ps[0].server_path AS example_path, ps[0].example_member AS example_member, "
         "ps[0].example_line AS example_line, "
         "[x IN ps | {tag:x.ib_tag, arch:x.arch, variant:coalesce(x.run_variant, ''), suite:x.suite}] AS places, "
-        "reduce(acc = [], x IN ps | acc + [i IN range(0, size(x.owners) - 1) | "
-        "x.suite + '|' + x.owners[i] + '|' + x.owner_statuses[i]]) AS owner_statuses, "
-        "head([x IN ps WHERE x.intentional_hint IS NOT NULL | x.intentional_hint]) AS intentional_hint, "
-        "reduce(acc = [], x IN ps | acc + coalesce(x.modules, [])) AS all_modules",
+        "head([x IN ps WHERE x.intentional_hint IS NOT NULL | x.intentional_hint]) AS intentional_hint",
         {"sids": chosen},
     )
+    # owners and modules are counted by the database: a common message ("%MSG-e ...") has
+    # ~1k problems with 600k owners, and concatenating those lists in Cypher took 40 s per paste
+    owner_rows = _run_query_all(  # one row per test: never cut at MAX_ROWS
+        "MATCH (p:LogProblem) WHERE p.signature_id IN $sids "
+        "UNWIND range(0, size(p.owners) - 1) AS i "
+        "RETURN p.signature_id AS sid, p.suite AS suite, p.owners[i] AS owner, p.owner_statuses[i] AS status, "
+        "count(*) AS n",
+        {"sids": chosen},
+    )
+    module_rows = _run_query_all(
+        "MATCH (p:LogProblem) WHERE p.signature_id IN $sids "
+        "WITH p ORDER BY p.ib_tag DESC UNWIND coalesce(p.modules, []) AS m "
+        "WITH p.signature_id AS sid, m, count(*) AS n ORDER BY n DESC "
+        "RETURN sid, collect(m)[0..10] AS modules",
+        {"sids": chosen},
+    )
+    owners_of: dict[str, list] = {}
+    for r in owner_rows:
+        owners_of.setdefault(r["sid"], []).append(r)
+    modules_of = {r["sid"]: r["modules"] for r in module_rows}
+    for row in rows:
+        row["owner_counts"] = owners_of.get(row["sid"], [])
+        row["all_modules"] = modules_of.get(row["sid"], [])
     results = []
     order = {sid: i for i, sid in enumerate(chosen)}
     for row in sorted(rows, key=lambda r: order.get(r["sid"], len(order))):
         places = row.pop("places")
         tests: dict[str, dict] = {}
-        for entry in row.pop("owner_statuses"):
-            suite, owner, status = entry.split("|", 2)
-            counts = tests.setdefault(owner, {"suite": suite, "passed": 0, "failed": 0, "other": 0})
-            counts[status if status in ("passed", "failed") else "other"] += 1
+        for entry in row.pop("owner_counts"):
+            status = entry["status"]
+            counts = tests.setdefault(entry["owner"], {"suite": entry["suite"], "passed": 0, "failed": 0, "other": 0})
+            counts[status if status in ("passed", "failed") else "other"] += entry["n"]
         tags = sorted({p["tag"] for p in places}, key=_ib_when)
         series_last: dict[tuple, str] = {}
         for p in places:
@@ -2182,11 +2202,31 @@ def _run_query_all(cypher: str, params: dict | None = None) -> list[dict]:
         driver.close()
 
 
+# other people's conversations, feedback and router logs are never answer evidence: found
+# 2026-10-16, a pasted "MATCH (n) RETURN n LIMIT 5" showed another session's ChatSession node
+_PRIVATE_LABELS = frozenset({"ChatSession", "ChatTurn", "ChatPlanDecision", "ChatPendingPlan", "UserFeedback",
+                             "RouterShadowLog"})
+_PRIVATE_LABEL_RE = re.compile(r":\s*`?(?:" + "|".join(sorted(_PRIVATE_LABELS)) + r")\b")
+
+
+def _holds_private_node(value) -> bool:
+    labels = getattr(value, "labels", None)
+    if labels is not None and set(labels) & _PRIVATE_LABELS:
+        return True
+    if isinstance(value, (list, tuple)):
+        return any(_holds_private_node(v) for v in value)
+    if isinstance(value, dict):
+        return any(_holds_private_node(v) for v in value.values())
+    return False
+
+
 def query_graph(cypher: str) -> dict:
     """Run a read-only Cypher query. Call get_graph_schema() first to see
     available node labels, properties, and edge types."""
+    if _PRIVATE_LABEL_RE.search(cypher):
+        return {"ok": False, "error": "Chat sessions, feedback and router logs are not queryable."}
     try:
-        rows = _run_query(cypher)
+        rows = [row for row in _run_query(cypher) if not _holds_private_node(row)]
         return {"ok": True, "rows": rows, "count": len(rows)}
     except ValueError as e:
         return {"ok": False, "error": str(e)}

@@ -4173,12 +4173,35 @@ class ChatRoutingTests(unittest.TestCase):
              {"variant": "ASAN", "arch": "el9_amd64_gcc14", "status": "PASSED", "errors": 0}],
             MagicMock(single=MagicMock(return_value={"total": 323, "failed": 62, "first_failed": "2026-09-29-2300"})),
         ]
-        answer = _package_status_answer("why is HeterogeneousCore/MPICore failing", "pkg-status")
+        answer = _package_status_answer("why is HeterogeneousCore/MPICore failing in CMSSW_20_1_X_2026-10-05-2300", "pkg-status")
         self.assertIn("failing in 1 of 2", answer)
         self.assertIn("62 of 323", answer)
         self.assertIn("Issue #50547", answer)
         self.assertIn("relevance only", answer)
         self.assertIsNone(_package_status_answer("any PR for HeterogeneousCore/MPICore", "pkg-status"))
+
+    @patch("server.api_server.get_driver")
+    def test_package_status_without_tag_uses_each_tracks_newest_build(self, get_driver):
+        # found 2026-10-16: the newest IB had unit tests for one architecture only, so
+        # "is MPICore still failing?" said "failing in 0 of 2"
+        from server.api_server import _package_status_answer
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        row = lambda tag, arch, status: {"tag": tag, "variant": "primary", "arch": arch, "status": status, "errors": 1}
+        session.run.return_value = [
+            row("CMSSW_20_1_X_2026-10-15-0900", "el9_amd64_gcc14", "PASSED"),
+            row("CMSSW_20_1_X_2026-10-14-2300", "el9_aarch64_gcc14", "FAILED"),
+            row("CMSSW_20_1_X_2026-10-14-1100", "el9_aarch64_gcc14", "FAILED"),
+            row("CMSSW_20_1_X_2026-10-13-2300", "el9_aarch64_gcc14", "PASSED"),
+            row("CMSSW_20_1_X_2026-10-12-2300", "el9_amd64_gcc14", "FAILED"),
+            row("CMSSW_20_0_X_2026-10-14-2300", "el8_amd64_gcc13", "FAILED"),
+        ]
+        answer = _package_status_answer("is SimG4Core/Geometry still failing?", "pkg-newest")
+        self.assertIn("Failing now in 1 of 2", answer)
+        self.assertIn("since `CMSSW_20_1_X_2026-10-14-1100`", answer)
+        self.assertIn("last failed in `CMSSW_20_1_X_2026-10-12-2300`", answer)
+        self.assertNotIn("CMSSW_20_0", answer)  # newest release series only
+        only = _package_status_answer("SimG4Core/Geometry failures on aarch64", "pkg-newest")
+        self.assertIn("Failing now in 1 of 1", only)
 
     @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-10-05-2300"}])
     @patch("server.api_server.get_driver")

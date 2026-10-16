@@ -99,6 +99,8 @@ def setup_schema(driver):
         "CREATE INDEX IF NOT EXISTS FOR (n:TestLogRun) ON (n.ib_key)",
         "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.source_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.ib_key)",
+        # test-log paste search groups matches by signature: a full scan of ~236k rows took 39s
+        "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.signature_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.kind, n.in_passed)",
         "CREATE INDEX IF NOT EXISTS FOR (n:ProblemFirstSeen) ON (n.first_seen_when)",
         "CREATE FULLTEXT INDEX logProblemText IF NOT EXISTS "

@@ -111,7 +111,7 @@ class _FakeSession:
 
 
 def _detail_rows(cypher, params=None):
-    if "IN $sids" not in cypher:
+    if "IN $sids" not in cypher or "UNWIND" in cypher:  # owner / module counts: none here
         return []
     return [dict(sid=sid, kind="fatal_exception", category="PluginNotFound", summary=sid, origin="cmssw",
                  evidence="", example_tag="CMSSW_20_1_X_2026-10-11-0000", example_arch="el9_amd64_gcc14",
@@ -121,7 +121,8 @@ def _detail_rows(cypher, params=None):
 
 class SearchMatchLevelTests(unittest.TestCase):
     def _search(self, text, signatures=(), hits=(), same_ib=(), name_hits=()):
-        with patch("tools.get_driver") as get_driver, patch("tools._run_query", side_effect=_detail_rows):
+        with patch("tools.get_driver") as get_driver, patch("tools._run_query", side_effect=_detail_rows), \
+                patch("tools._run_query_all", side_effect=_detail_rows):
             get_driver.return_value.session.return_value = _FakeSession(
                 set(signatures), list(hits), list(same_ib), name_hits)
             return {r["sid"]: (r["match"], r["shared_terms"]) for r in search_test_log_problems(text)}
