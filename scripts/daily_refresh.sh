@@ -23,6 +23,8 @@
 # test-log step is skipped (status.txt says so). The server keeps zips about a week, so one
 # manual run when you are back recovers the last 7 days. Only ssh to cmssdt9-02 is the fixed
 # listing and rsync downloads of ingestion/fetch_ib_test_logs.py.
+# If $KEYTAB exists (chmod 600, on this PC only), each run gets a fresh ticket from it instead,
+# so the step works for as long as you are away. Delete it when you are back.
 #
 # Install (runs at 07:30 every day):   scripts/daily_refresh.sh --install-cron
 # Try it now in the foreground:        scripts/daily_refresh.sh
@@ -35,6 +37,8 @@ CLANG_ROOT=/home/rao/CHAT-BOT-AI/CLANG-LOGS
 EXC_DIR=/home/rao/CHAT-BOT-AI/exceptions-json-file
 TESTLOGS=/home/rao/CHAT-BOT-AI/IB-TEST-LOGS
 LOG_DIR=/home/rao/CHAT-BOT-AI/daily-refresh-logs
+KEYTAB=/home/rao/.mrao.keytab
+PRINCIPAL=mrao@CERN.CH
 API=${API:-http://localhost:8002}
 MIN_FREE_GB=${MIN_FREE_GB:-60}          # never start copying test logs below this much free disk
 DISK_BUDGET_GB=${DISK_BUDGET_GB:-45}     # max unscanned zips on disk at once (a DBG RelVal zip is ~33 GB)
@@ -136,7 +140,11 @@ else status exceptions SKIPPED; fi
 
 # ---------------------------------------------------------------- 3. IB test logs
 if want testlogs; then
-    kinit -R 2>/dev/null                    # extend the ticket you left (max 5 days from kinit)
+    if [ -f "$KEYTAB" ]; then
+        kinit -kt "$KEYTAB" "$PRINCIPAL" 2>/dev/null || kinit -R 2>/dev/null
+    else
+        kinit -R 2>/dev/null                # extend the ticket you left (max 5 days from kinit)
+    fi
     renew_until=$(klist 2>/dev/null | awk '/renew until/ {print $3, $4; exit}')
     FREE_GB=$(df -BG --output=avail "$TESTLOGS" | tail -1 | tr -dc 0-9)
     if ! klist -s 2>/dev/null || ! timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 root@cmssdt9-02.cern.ch true 2>/dev/null; then
