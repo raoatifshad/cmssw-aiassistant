@@ -1,0 +1,36 @@
+"""Wrong/dead-end answers found by the unattended tester run of 2026-11-04 (fresh questions about
+that day's data: read in full and checked against the graph)."""
+import unittest
+from unittest.mock import MagicMock, patch
+
+from server import api_server
+from server.api_server import _today_falls_back_to_latest
+
+
+def _driver_with(*results):
+    """A get_driver() mock whose session.run returns each result in turn."""
+    session = MagicMock()
+    session.run.side_effect = list(results)
+    driver = MagicMock()
+    driver.session.return_value.__enter__.return_value = session
+    return driver, session
+
+
+class TodayFallbackTests(unittest.TestCase):
+    @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_17_1_X_2026-11-03-1100"}])
+    def test_today_without_a_build_is_the_newest_ib_of_the_named_series(self, latest):
+        question, note = _today_falls_back_to_latest("what's wrong with 17_1 today?")
+        self.assertIn("CMSSW_17_1_X_2026-11-03-1100", question)
+        self.assertNotIn("today", question)
+        self.assertEqual(latest.call_args.args[1], (17, 1))
+        self.assertIn("No IB from today", note)
+
+    @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-11-03-1100"}])
+    def test_a_named_date_or_hour_or_yesterday_stays_a_no(self, _):
+        self.assertIsNone(_today_falls_back_to_latest("what failed on 2026-11-04?"))
+        self.assertIsNone(_today_falls_back_to_latest("failures in the 11:00 IB today"))
+        self.assertIsNone(_today_falls_back_to_latest("what failed yesterday?"))
+
+
+if __name__ == "__main__":
+    unittest.main()
