@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from server import api_server
-from server.api_server import _render_metric_deltas, _today_falls_back_to_latest
+from server.api_server import _loose_arch_choice, _render_metric_deltas, _today_falls_back_to_latest
 
 
 def _driver_with(*results):
@@ -43,6 +43,18 @@ class MetricDeltaWordingTests(unittest.TestCase):
     def test_claim_kept_when_nothing_moved(self):
         text = "\n".join(_render_metric_deltas({"f": 1, "n": 954}, {"f": 1, "n": 954}, self.METRICS, "A", "B"))
         self.assertIn("No new failures/errors", text)
+
+
+class LooseArchChoiceTests(unittest.TestCase):
+    ARCHS = ["el9_amd64_gcc14", "el9_amd64_gcc15", "el9_amd64_gcc16"]
+
+    def test_compiler_picks_the_one_architecture(self):
+        self.assertEqual(_loose_arch_choice("and only gcc16?", self.ARCHS), "el9_amd64_gcc16")
+
+    def test_several_or_no_matches_stay_unresolved(self):
+        self.assertIsNone(_loose_arch_choice("only el9", self.ARCHS))
+        self.assertIsNone(_loose_arch_choice("only gcc12", self.ARCHS))
+        self.assertIsNone(_loose_arch_choice("which one is best?", self.ARCHS))
 
 
 if __name__ == "__main__":

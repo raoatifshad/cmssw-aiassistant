@@ -1564,6 +1564,8 @@ def _relval_failure_count_answer(question: str, session_id: str) -> str | None:
                 "root_tag": pending["root_tag"], "stage": "arch", "records": selected_records,
             }
             return _relval_arch_choice_answer(selected_tag, selected_records)
+        if pending["stage"] == "arch":
+            selected_arch = selected_arch or _loose_arch_choice(question, [record["arch"] for record in records])
         if pending["stage"] == "arch" and selected_arch:
             selected_records = [record for record in records if record["arch"] == selected_arch]
             if not selected_records:
@@ -1784,6 +1786,7 @@ def _unittest_summary_answer(
         if all_requested:
             _pending_unittest_scopes.pop(session_id, None)
             return _unittest_summary_from_records(tag, records)
+        selected_arch = selected_arch or _loose_arch_choice(question, [record["arch"] for record in records])
         if selected_arch:
             selected_records = [record for record in records if record["arch"] == selected_arch]
             if not selected_records:
@@ -9507,7 +9510,9 @@ def _arch_scope_matches(question: str, session_id: str) -> tuple[str, str, list[
     family = _arch_family(question)
     os_match = _OS_FAMILY_RE.search(question)
     os_prefix = os_match.group(1).lower() + "_" if os_match else None
-    if not family and not os_prefix:
+    compiler_match = _ARCH_COMPILER_RE.search(question)
+    compiler = compiler_match.group(1).lower() if compiler_match else None
+    if not family and not os_prefix and not compiler:
         return None
     tag_match = IB_TAG_RE.search(question)
     tag = tag_match.group(1) if tag_match else _latest_ib_contexts.get(session_id)
@@ -9525,8 +9530,9 @@ def _arch_scope_matches(question: str, session_id: str) -> tuple[str, str, list[
         print(f"WARNING: could not resolve architecture family: {exc}")
         return None
     matches = [arch for arch in available
-               if (not family or family in arch) and (not os_prefix or arch.startswith(os_prefix))]
-    words = " ".join(word for word in (os_prefix and os_prefix[:-1], family) if word)
+               if (not family or family in arch) and (not os_prefix or arch.startswith(os_prefix))
+               and (not compiler or compiler in arch)]
+    words = " ".join(word for word in (os_prefix and os_prefix[:-1], family, compiler) if word)
     return tag, words, matches, available
 
 
@@ -9604,6 +9610,24 @@ _WORKFLOW_WHY_RE = re.compile(
 _ARCH_FAMILY_RE = re.compile(r"\b(aarch64|arm(?:64)?|amd64|x86(?:_64)?|riscv64)\b", re.IGNORECASE)
 # an OS family named alone ("only el9", "slc7"), never part of a full architecture name
 _OS_FAMILY_RE = re.compile(r"(?<![\w])(el\d+|slc\d+|cc\d+|cs\d+)(?![\w])", re.IGNORECASE)
+
+
+# a compiler named alone ("only gcc16"), never part of a full architecture name
+_ARCH_COMPILER_RE = re.compile(r"(?<![\w])(gcc\d+)(?![\w])", re.IGNORECASE)
+
+
+def _loose_arch_choice(question: str, archs) -> str | None:
+    """The one architecture of `archs` a loose word in the answer to "which architecture?" can
+    mean: "and only gcc16?", "el9", "aarch64". None when it is none of them or more than one
+    (found 2026-11-04: "and only gcc16?" got the same "Choose one" prompt again)."""
+    words = [_arch_family(question)] + [m.group(1).lower() for m in (_ARCH_COMPILER_RE.search(question),) if m]
+    os_match = _OS_FAMILY_RE.search(question)
+    words = [w for w in words if w]
+    if not words and not os_match:
+        return None
+    matching = [a for a in archs if all(w in a for w in words)
+                and (not os_match or a.startswith(os_match.group(1).lower() + "_"))]
+    return matching[0] if len(set(matching)) == 1 else None
 
 
 def _arch_family(question: str) -> str | None:
@@ -10307,7 +10331,17 @@ def _variant_day_failure_answer(question: str, session_id: str) -> tuple[str, li
         return (f"No `{variant}` build is imported{when}. Ask \"what is the latest IB\" to see which builds are in.", [])
     tag = max(tags, key=_ib_sort_key)
     _latest_ib_contexts[session_id] = tag
-    result = _failure_overview_answer(tag, _requested_ib_arch(question))
+    arch = _requested_ib_arch(question)
+    if not arch and (_ARCH_COMPILER_RE.search(question) or _arch_family(question) or _OS_FAMILY_RE.search(question)):
+        # "asan failures in the latest ASAN IB gcc15" (found 2026-11-04: both architectures)
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                arch = _loose_arch_choice(question, [r["arch"] for r in session.run(
+                    "MATCH (ib:IB {tag:$tag}) RETURN DISTINCT ib.arch AS arch", tag=tag)])
+        finally:
+            driver.close()
+    result = _failure_overview_answer(tag, arch)
     if not result:
         return None
     answer, actions = result
