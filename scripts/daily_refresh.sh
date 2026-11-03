@@ -7,6 +7,7 @@
 #      deletes it) -> ingest_test_logs.py
 #   4. shifter documentation (cmssdt-wiki) -> ingest_shifter_docs.py
 #   5. health checks: API up, validate_bot.py, validate_test_log_data.py
+#   6. then starts scripts/daily_tester.sh in the background (TESTER=0 to skip)
 #
 # A failing step is logged and the next one still runs. Every run writes
 #   $LOG_DIR/<date>.log    the full output (kept 45 days)
@@ -26,7 +27,7 @@
 # If $KEYTAB exists (chmod 600, on this PC only), each run gets a fresh ticket from it instead,
 # so the step works for as long as you are away. Delete it when you are back.
 #
-# Install (runs at 07:30 every day):   scripts/daily_refresh.sh --install-cron
+# Install (runs at 00:30 and 12:30 every day):   scripts/daily_refresh.sh --install-cron
 # Try it now in the foreground:        scripts/daily_refresh.sh
 # Only some steps:                     STEPS="cmsrepo exceptions" scripts/daily_refresh.sh
 set -u
@@ -48,7 +49,7 @@ export NEO4J_URI=bolt://localhost:7688
 export PATH=/usr/sue/bin:/usr/local/bin:/usr/bin:/bin:$PATH
 
 if [ "${1:-}" = "--install-cron" ]; then
-    line="30 7 * * * $REPO/scripts/daily_refresh.sh >/dev/null 2>&1"
+    line="30 0,12 * * * $REPO/scripts/daily_refresh.sh >/dev/null 2>&1"
     # also 10 min after every boot, so a crash costs hours, not a day (flock: never two at once)
     boot="@reboot sleep 600 && $REPO/scripts/daily_refresh.sh >/dev/null 2>&1"
     ( crontab -l 2>/dev/null | grep -v 'scripts/daily_refresh.sh'; echo "$line"; echo "$boot" ) | crontab -
@@ -228,4 +229,9 @@ mv "$STATUS" "$LOG_DIR/status.txt"
 echo "$(date -Is) $([ $FAILED -eq 0 ] && echo OK || echo "$FAILED problem(s)") -- newest RelVals ${NEWEST_AFTER:-?} -- log $LOG" >> "$LOG_DIR/history.txt"
 find "$LOG_DIR" -name '20*.log' -mtime +45 -delete
 log "===== done, $FAILED problem(s)"
+# then the bot tester, detached so this refresh's lock is released (TESTER=0 to skip)
+if [ "${TESTER:-1}" = 1 ] && [ -x "$REPO/scripts/daily_tester.sh" ]; then
+    log "starting scripts/daily_tester.sh (reports in /home/rao/CHAT-BOT-AI/daily-test-reports)"
+    setsid nohup "$REPO/scripts/daily_tester.sh" >/dev/null 2>&1 < /dev/null &
+fi
 exit 0
