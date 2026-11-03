@@ -250,7 +250,9 @@ def build_scenarios(tag: str, arch: str) -> list[Scenario]:
                 "'PluginDescriptorTracksterInferenceAlgoFactory' has no known plugins\n"
                 "----- End Fatal Exception -------------------------------------------------",
                 expect_contains=["This exact error is not in the imported IB test logs", "edmWriteConfigs",
-                                 "specific names in your paste", "PR #52138", "Searched the test logs by:"],
+                                 "Searched the test logs by:"],
+                # (it also expected PR #52138 by the pasted names: that PR was deleted from the graph
+                # by the old cmsrepo --reconcile, see project memory "keep 90 days")
             ),
         ]),
         # Searched by the producer in the "[N]" context lines, not only the message: this
