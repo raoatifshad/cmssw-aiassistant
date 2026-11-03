@@ -6,10 +6,12 @@ each with checks on its answer, run against a live server.
     venv/bin/python scripts/question_bank.py [--base-url http://localhost:8002] [--only PX,UT|PX03]
     venv/bin/python scripts/question_bank.py --check-facts     # are the questions still valid?
 
-The expected facts (workflow 539.0's LogicError in CMSSW_20_1_CLANG_X_2026-10-14-2300, PR 52144's
-author, ...) were taken from the graph on 2026-10-16. RelVal and unit-test results leave the
-graph after about two weeks (the dashboard data is reconciled away), so run --check-facts after
-a refresh: it says which pinned facts no longer hold, i.e. which questions need new values.
+The expected facts (workflow 539.0's LogicError in CMSSW_20_1_CLANG_X_2026-10-14-2300, PR 52223's
+author, ...) were taken from the graph on 2026-10-16, and re-pinned on 2026-11-03 to IBs of
+2026-10-29 .. 2026-11-02 after the old --reconcile had deleted the 10-13/10-14 data. Since
+2026-11-03 the daily refresh keeps RelVal/unit-test results and PRs for 90 days, so these pins
+should hold until about 2027-01-27. Run --check-facts after a refresh: it says which pinned
+facts no longer hold, i.e. which questions need new values.
 Every answer is also checked for dead ends ("I couldn't match that", "No imported local
 evidence"), a literal None, "[object Object]", raw <tags> outside code, server errors, answers
 over 15,000 characters and answers slower than 30 s.
@@ -34,10 +36,11 @@ def fatal(cat, msg, ctx=("Processing  Event run: 1 lumi: 1 event: 1 stream: 0",
     return "\n".join(lines)
 
 
-T = "CMSSW_20_1_X_2026-10-14-2300"       # newest primary IB with full results (2026-10-16)
-TP = "CMSSW_20_1_X_2026-10-13-2300"
-CL = "CMSSW_20_1_CLANG_X_2026-10-14-2300"
-NEWEST = "CMSSW_20_1_X_2026-10-15-0900"  # partly imported on 2026-10-16
+T = "CMSSW_20_1_X_2026-11-01-2300"       # full results on 3 archs; SimG4Core/Geometry fails on aarch64
+TP = "CMSSW_20_1_X_2026-10-29-2300"      # RecoTracker/LSTCore fails on el9_amd64_gcc16
+CL = "CMSSW_20_1_CLANG_X_2026-11-02-2300"  # 539.0 TimeOut
+TM = "CMSSW_20_1_X_2026-11-02-1100"      # 31 merged cmssw PRs listed (52223 fwyzard first here); 537.0 step1
+NEWEST = "CMSSW_20_1_X_2026-11-02-2300"  # partly imported on 2026-11-03
 
 B = []
 def add(cat, turns, all=(), any=(), none=()):
@@ -143,7 +146,7 @@ add("PT", fatal("MakeDataException", "Error while making data \"ESTestDataA\" \"
 add("UT", f"which unit tests failed in {T}", all=[r"SimG4Core/Geometry"], any=[r"aarch64"])
 add("UT", "why is SimG4Core/Geometry failing on aarch64?", all=[r"SimG4Core/Geometry"])
 add("UT", "since when does SimG4Core/Geometry fail on el9_aarch64_gcc14?", all=[r"SimG4Core/Geometry"], any=[r"2026-10-0", r"since"])
-add("UT", "is HeterogeneousCore/MPICore still failing?", all=[r"MPICore"], any=[r"2026-10-12", r"not failing", r"passing", r"last"])
+add("UT", "is HeterogeneousCore/MPICore still failing?", all=[r"MPICore"], any=[r"riscv64", r"not failing", r"passing"])
 add("UT", "RecoTracker/LSTCore unit test failures on gcc16", all=[r"LSTCore"], any=[r"gcc16"])
 add("UT", f"which unit tests failed in {TP} on el9_amd64_gcc16", all=[r"LSTCore"])
 add("UT", "IOPool/Tests failures in the ASAN IB", all=[r"IOPool"], any=[r"ASAN"])
@@ -163,7 +166,7 @@ add("WF", "what does workflow 25.0 do", all=[r"25\.0"])
 add("WF", "which workflows fail on fc42_riscv64_gcc15?", any=[r"riscv64"])
 add("WF", f"failed relvals in {T} on el8_amd64_gcc14", any=[r"el8_amd64_gcc14"])
 add("WF", f"why does 136.731 fail in {CL}", all=[r"136\.731"])
-add("WF", f"show the exception for 539.0 in {CL}", all=[r"539\.0"], any=[r"LogicError", r"Attempt to open output"])
+add("WF", f"show the exception for 537.0 in {TM}", all=[r"537\.0"], any=[r"ThePEG"])
 add("WF", "which step fails for 1349.0", all=[r"1349\.0"], any=[r"step"])
 add("WF", "relval 38434.772 in CMSSW_20_1_X_2026-10-10-1100", all=[r"38434\.772"], any=[r"TrackstersProducer", r"PluginNotFound", r"fail"])
 add("WF", "history of workflow 1370.18", all=[r"1370\.18"])
@@ -174,19 +177,19 @@ add("WF", "relvals failing with exit code 65 in the latest IB", any=[r"no (RelVa
 add("WF", "is 99999.99 a real workflow?", any=[r"no (record|result)", r"not (found|imported|reported)", r"no RelVal", r"never"])
 
 # ---------------------------------------------------------------- PR: pull requests
-add("PR", "what does PR 52165 do", all=[r"52165"], any=[r"RefCoreStreamerGuard", r"product getter"])
-add("PR", "who authored PR 52144", all=[r"fwyzard"])
-add("PR", "which IB first has PR 52144?", all=[r"52144"], any=[r"2026-10-14-2300"])
-add("PR", "is PR 52186 in an IB yet?", all=[r"52186"], any=[r"not .*IB", r"no IB", r"not yet", r"hasn't", r"not been"])
-add("PR", f"PRs merged in {T}", all=[r"52144", r"52185"])
+add("PR", "what does PR 52223 do", all=[r"52223"], any=[r"edm::expected"])
+add("PR", "who authored PR 52223", all=[r"fwyzard"])
+add("PR", "which IB first has PR 52223?", all=[r"52223"], any=[r"first in `CMSSW_20_1_X_2026-11-02-1100`"])
+add("PR", "is PR 52223 in an IB yet?", all=[r"52223"], any=[r"CMSSW_20_1_X_2026-11-02-1100"])
+add("PR", f"PRs merged in {TM}", all=[r"52324", r"52223"])
 add("PR", f"what PRs went into {NEWEST}", any=[r"52165", r"52111", r"not imported", r"merged"])
-add("PR", "was the ROOT 6.40.05 update merged?", any=[r"10923", r"6\.40\.05"])
+add("PR", "was the Geant4 11.4.3 update merged?", all=[r"10960"], any=[r"11\.4\.3"])
 add("PR", "cmsdist PR 10924", any=[r"TBB", r"10924"])
 add("PR", "PRs by mmusich merged recently", any=[r"52186", r"mmusich"])
 add("PR", "any PR about MahiFit?", any=[r"52173", r"MahiFit"])
-add("PR", "which PR added LST+mkFit Phase-2 workflows", any=[r"52108"])
-add("PR", "could PR 52144 have broken the CLANG IB?", all=[r"52144"], any=[r"not proof", r"relevance", r"doesn't prove", r"can't prove", r"cannot", r"no evidence", r"not.*caus"])
-add("PR", "what changed between 10-14-1100 and 10-14-2300 in terms of PRs", any=[r"52144", r"PR"])
+add("PR", "which PR implemented edm::expected", any=[r"52223"])
+add("PR", "could PR 52223 have broken the CLANG IB?", all=[r"52223"], any=[r"not proof", r"relevance", r"doesn't prove", r"can't prove", r"cannot", r"no evidence", r"not.*caus"])
+add("PR", "what changed between 11-01-2300 and 11-02-1100 in terms of PRs", any=[r"52223", r"52324", r"PR"])
 add("PR", "PR 1", any=[r"PR", r"#1\b"], none=[r"Traceback"])
 add("PR", "what does PR 99999999 do", any=[r"not (found|imported)", r"no PR", r"couldn't find", r"isn't"])
 
@@ -204,8 +207,8 @@ add("IS", "is MPICore failure tracked in an issue?", any=[r"MPI", r"Issue"])
 # ---------------------------------------------------------------- VA: IB variants / series
 for v in ["ASAN", "UBSAN", "ROOT6", "ROOT640", "DBG", "NONLTO", "DEVEL", "MULTIARCHS", "GEANT4", "G4ADEPT"]:
     add("VA", f"how is the {v} IB doing?", all=[v])
-add("VA", "latest 16_1 IB", all=[r"CMSSW_16_1_X_2026-10-15-1100"])
-add("VA", "latest CMSSW_17_0 IB", all=[r"CMSSW_17_0_X_2026-10-15-1100"])
+add("VA", "latest 16_1 IB", all=[r"CMSSW_16_1_X_20\d\d-\d\d-\d\d-\d{4}"], none=[r"CMSSW_20_1_X"])  # the series, not its date
+add("VA", "latest CMSSW_17_0 IB", all=[r"CMSSW_17_0_X_20\d\d-\d\d-\d\d-\d{4}"], none=[r"CMSSW_20_1_X"])
 add("VA", "what failed in the latest 20_0 IB?", all=[r"CMSSW_20_0"])
 add("VA", "is the EVTGEN3 IB still built?", any=[r"2026-09-20", r"EVTGEN3"])
 add("VA", "which IB flavours exist for 20_1?", any=[r"ASAN", r"UBSAN", r"CLANG"])
@@ -244,7 +247,7 @@ add("TL", "new problems in test logs since 2026-10-10", any=[r"new", r"test log"
 add("TL", "are there sanitizer errors in passed ASAN tests?", any=[r"Sanitizer", r"ASAN"])
 add("TL", "intermittent failures in relvals this week", any=[r"intermittent", r"returned", r"flap", r"IndexError"])
 add("TL", "do the test logs of the UBSAN IB show runtime errors?", any=[r"runtime error", r"UBSAN"])
-add("TL", "test logs for 2026-10-15", any=[r"not imported", r"no test logs", r"10-13", r"yet"])
+add("TL", "test logs for 2026-10-21", any=[r"No raw test logs are imported", r"not the same as zero"])  # outage gap
 add("TL", "crashes in unit tests that still passed", any=[r"crash", r"passed"])
 
 # ---------------------------------------------------------------- EX: exit codes / concepts
@@ -274,11 +277,11 @@ add("DOC", "where are IB logs stored?", any=[r"cmssdt|log"])
 
 # ---------------------------------------------------------------- MT: multi-turn
 add("MT", [f"how many relvals failed in {T}", "and in the CLANG one?"], all=[r"CLANG"])
-add("MT", [f"what failed in {CL}", "show only step1 failures"], any=[r"step1"])
+add("MT", [f"what failed in {TM}", "show only step1 failures"], all=[r"537\.0"], any=[r"step1"])
 add("MT", ["where is 140.051 failing", "since when?"], all=[r"140\.051"])
-add("MT", ["what does PR 52144 do", "who wrote it?"], all=[r"fwyzard"])
+add("MT", ["what does PR 52223 do", "who wrote it?"], all=[r"fwyzard"])
 add("MT", ["issue 51787", "is it still open?"], any=[r"open"])
-add("MT", [f"unit tests failed in {T}", "why?"], any=[r"SimG4Core"])
+add("MT", [f"unit tests failed in {T} on el9_aarch64_gcc14", "why?"], any=[r"SimG4Core"])  # T has 2 default archs
 add("MT", ["how is the ASAN IB doing", "what about UBSAN?"], all=[r"UBSAN"])
 add("MT", [fatal("LogicError", "Attempt to open output file before input file. Please report this to the core framework developers."),
            "which PR could have caused it?"], any=[r"PR", r"not proof|relevance|no PR"])
@@ -320,31 +323,38 @@ FACTS = [
      "MATCH (e:RelValException) WHERE e.message CONTAINS 'TrackstersProducer' RETURN count(e) > 0 AS ok"),
     ("140.051 has the muon-stations LogicError", "MATCH (e:RelValException {workflow_id:'140.051'}) "
      "WHERE e.message CONTAINS 'more than 5 stations' RETURN count(e) > 0 AS ok"),
-    ("SimG4Core/Geometry failed on el9_aarch64_gcc14 in CMSSW_20_1_X_2026-10-14-2300",
-     "MATCH (:IB {tag:'CMSSW_20_1_X_2026-10-14-2300', arch:'el9_aarch64_gcc14'})-[:RAN_UNITTEST]->"
+    ("SimG4Core/Geometry failed on el9_aarch64_gcc14 in CMSSW_20_1_X_2026-11-01-2300",
+     "MATCH (:IB {tag:'CMSSW_20_1_X_2026-11-01-2300', arch:'el9_aarch64_gcc14'})-[:RAN_UNITTEST]->"
      "(u:UnitTest {name:'SimG4Core/Geometry', status:'FAILED'}) RETURN count(u) > 0 AS ok"),
-    ("RecoTracker/LSTCore failed on el9_amd64_gcc16 in CMSSW_20_1_X_2026-10-13-2300",
-     "MATCH (:IB {tag:'CMSSW_20_1_X_2026-10-13-2300', arch:'el9_amd64_gcc16'})-[:RAN_UNITTEST]->"
+    ("RecoTracker/LSTCore failed on el9_amd64_gcc16 in CMSSW_20_1_X_2026-10-29-2300",
+     "MATCH (:IB {tag:'CMSSW_20_1_X_2026-10-29-2300', arch:'el9_amd64_gcc16'})-[:RAN_UNITTEST]->"
      "(u:UnitTest {name:'RecoTracker/LSTCore', status:'FAILED'}) RETURN count(u) > 0 AS ok"),
-    ("PR 52144 by fwyzard, first in CMSSW_20_1_X_2026-10-14-2300",
-     "MATCH (p:PR {number:52144, repo:'cmssw'})-[:AUTHORED_BY]->(:Author {name:'fwyzard'}) "
-     "MATCH (p)-[:MERGED_BEFORE]->(:IB {tag:'CMSSW_20_1_X_2026-10-14-2300'}) RETURN count(p) > 0 AS ok"),
-    ("PR 52186 (mmusich) is in no imported IB yet",
-     "MATCH (p:PR {number:52186, repo:'cmssw'}) RETURN NOT (p)-[:MERGED_BEFORE]->() AS ok"),
-    ("cmsdist PR 10923 updates ROOT to 6.40.05",
-     "MATCH (p:PR {number:10923, repo:'cmsdist'}) RETURN p.title CONTAINS '6.40.05' AS ok"),
-    ("PR 52108 adds LST+mkFit Phase-2 workflows",
-     "MATCH (p:PR {number:52108}) RETURN p.title CONTAINS 'LST+mkFit' AS ok"),
+    ("PR 52223 (edm::expected) by fwyzard, in CMSSW_20_1_X_2026-11-02-1100",
+     "MATCH (p:PR {number:52223, repo:'cmssw'})-[:AUTHORED_BY]->(:Author {name:'fwyzard'}) "
+     "MATCH (p)-[:MERGED_BEFORE]->(:IB {tag:'CMSSW_20_1_X_2026-11-02-1100'}) RETURN p.title CONTAINS 'edm::expected' AS ok"),
+    ("PRs 52324 and 52223 merged in CMSSW_20_1_X_2026-11-02-1100",
+     "MATCH (p:PR {repo:'cmssw'})-[:MERGED_BEFORE]->(:IB {tag:'CMSSW_20_1_X_2026-11-02-1100'}) "
+     "WHERE p.number IN [52324, 52223] RETURN count(DISTINCT p) = 2 AS ok"),
+    ("537.0 has a ThePEG exception in CMSSW_20_1_X_2026-11-02-1100",
+     "MATCH (e:RelValException {ib_tag:'CMSSW_20_1_X_2026-11-02-1100', workflow_id:'537.0'}) "
+     "WHERE e.message CONTAINS 'ThePEG' RETURN count(e) > 0 AS ok"),
+    ("539.0 timed out (31744) in CMSSW_20_1_CLANG_X_2026-11-02-2300",
+     "MATCH (:IB {tag:'CMSSW_20_1_CLANG_X_2026-11-02-2300'})-[:RAN_RELVAL]->(r:RelVal {workflow_id:'539.0'}) "
+     "RETURN count(r) > 0 AND all(x IN collect(r.exitcode) WHERE x = 31744) AS ok"),
+    ("no test logs for 2026-10-21 (outage gap)",
+     "MATCH (r:TestLogRun) WHERE r.ib_tag CONTAINS '_X_2026-10-21-' RETURN count(r) = 0 AS ok"),
+    ("cmsdist PR 10960 updates Geant4 to 11.4.3",
+     "MATCH (p:PR {number:10960, repo:'cmsdist'}) RETURN p.title CONTAINS '11.4.3' AS ok"),
     ("Issues 51787 (IOPool ASAN), 51757, 51822, 51793 are open",
      "MATCH (i:Issue) WHERE i.number IN [51787, 51757, 51822, 51793] AND i.state = 'open' RETURN count(i) = 4 AS ok"),
     ("1,009 open Issues", "MATCH (i:Issue {state:'open'}) RETURN count(i) = 1009 AS ok"),
-    ("newest 16_1 and 17_0 IBs are 2026-10-15-1100",
-     "MATCH (i:IB) WHERE i.tag IN ['CMSSW_16_1_X_2026-10-15-1100', 'CMSSW_17_0_X_2026-10-15-1100'] "
-     "RETURN count(DISTINCT i.tag) = 2 AS ok"),
+    ("16_1 and 17_0 IBs are imported",
+     "MATCH (i:IB) WHERE i.tag STARTS WITH 'CMSSW_16_1_X_' OR i.tag STARTS WITH 'CMSSW_17_0_X_' "
+     "RETURN count(DISTINCT left(i.tag, 13)) = 2 AS ok"),
     ("newest EVTGEN3 IB is 2026-09-20-2300", "MATCH (i:IB) WHERE i.tag STARTS WITH 'CMSSW_20_1_EVTGEN3_X_' "
      "RETURN max(i.tag) = 'CMSSW_20_1_EVTGEN3_X_2026-09-20-2300' AS ok"),
-    ("CLANG 10-14-2300 build failed", "MATCH (i:IB {tag:'CMSSW_20_1_CLANG_X_2026-10-14-2300'}) "
-     "RETURN i.build_status = 'error' AS ok"),
+    ("CLANG 11-02-2300 build passed", "MATCH (i:IB {tag:'CMSSW_20_1_CLANG_X_2026-11-02-2300'}) "
+     "RETURN i.build_status = 'passed' AS ok"),
     ("workflow 11834.0 never failed", "MATCH (r:RelVal {workflow_id:'11834.0'}) "
      "RETURN count(r) > 0 AND all(x IN collect(r.status) WHERE x <> 'FAILED') AS ok"),
     ("no RelVal has exit code 65", "MATCH (r:RelVal) WHERE r.exitcode = 65 RETURN count(r) = 0 AS ok"),
