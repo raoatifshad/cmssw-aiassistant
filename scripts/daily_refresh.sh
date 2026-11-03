@@ -115,7 +115,11 @@ EOF
 if want cmsrepo; then
     if run cmsrepo-git 20m bash -c "cd cmsrepo && git fetch --prune origin master && git reset --hard origin/master && git sparse-checkout reapply" \
        && run cmsrepo-import 3h env PYTHONPATH=ingestion venv/bin/python ingestion/build_graph.py \
-              --cmsrepo "$REPO/cmsrepo" --clang-root "$CLANG_ROOT" --reconcile; then
+              --cmsrepo "$REPO/cmsrepo" --clang-root "$CLANG_ROOT"; then
+        # no --reconcile (user, 2026-11-03: keep at least 90 days): cms-sw.github.io itself drops IB
+        # files after ~2 weeks, and --reconcile then deleted those IBs' RelVals, unit tests and
+        # even the PR nodes from the graph. Old data now stays until prune_old_data.py (90 days;
+        # PRs/Issues are never pruned). A changed file is still re-imported (hash check).
         status cmsrepo "OK (cmsrepo at $(git -C cmsrepo log -1 --format=%cd --date=format:'%F %H:%M'))"
     fi
 else status cmsrepo SKIPPED; fi
@@ -128,10 +132,10 @@ if want exceptions; then
         if venv/bin/python -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get('hits',{}).get('hits') else 1)" "$EXC_FILE.part"; then
             mv "$EXC_FILE.part" "$EXC_FILE"
             if run exceptions-import 2h env PYTHONPATH=ingestion venv/bin/python ingestion/build_graph.py \
-                   --cmsrepo cmsrepo --es-exceptions-json "$EXC_FILE" --reconcile; then
+                   --cmsrepo cmsrepo --es-exceptions-json "$EXC_FILE"; then
                 status exceptions "OK ($(basename "$EXC_FILE"), $(du -h "$EXC_FILE" | cut -f1))"
-                # once imported, the graph has the exceptions (--reconcile never removes exception
-                # imports); keep only the newest export, for a re-run or a look
+                # once imported, the graph has the exceptions; keep only the newest export, for a
+                # re-run or a look (no --reconcile here either: it also covers the cmsrepo sources)
                 find "$EXC_DIR" -name 'exceptions-*.json' ! -name "$(basename "$EXC_FILE")" -delete
             fi
         else

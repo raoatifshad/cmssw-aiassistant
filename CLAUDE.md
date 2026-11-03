@@ -39,6 +39,10 @@ cd shifter-wiki && git fetch --prune origin master && git reset --hard origin/ma
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_shifter_docs.py \
   --wiki-root "$PWD/shifter-wiki" --cmsrepo "$PWD/cmsrepo" --reconcile
 
+# NOTE: the unattended refresh imports cmsrepo WITHOUT --reconcile (user, 2026-11-03: keep >= 90 days).
+# cms-sw.github.io drops IB files after ~2 weeks and squashes its git history, so --reconcile on
+# cmsrepo deletes those IBs' RelVals/unit tests and PR nodes for good. Don't add it back; retention
+# is prune_old_data.py's job (90 days, PRs/Issues never pruned). Data before ~2026-10-26 is lost.
 # all of the above, unattended, every day at 00:30 and 12:30 (cron; logs + status.txt in
 # /home/rao/CHAT-BOT-AI/daily-refresh-logs/). Exceptions go to a dated file per run: importing
 # the same path again deletes what that path imported before. cmssdt9-02 is reached with
