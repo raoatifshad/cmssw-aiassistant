@@ -10089,6 +10089,24 @@ def _test_log_question_answer(question: str, session_id: str, original_question:
         if not flavour_whens:
             return f"No raw test logs are imported for any `{flavour}` build of `{series}_X`."
         whens = sorted(set(whens), reverse=True)
+    day = None if tag_match else re.search(r"\b(20\d\d-\d\d-\d\d)\b", question)
+    if day:
+        # "test logs for 2026-10-21" (found 2026-11-03: answered for the newest build): that
+        # day's builds only; a day without logs is said, never replaced by another day
+        on_day = [w for w in (flavour_whens if flavour else whens) if w.startswith(day.group(1))]
+        if not on_day:
+            pool = flavour_whens if flavour else whens
+            before = [w for w in pool if w < day.group(1)]
+            after = [w for w in pool if w > day.group(1)]
+            nearest = ([before[0][:10]] if before else []) + ([after[-1][:10]] if after else [])
+            return (f"No raw test logs are imported for {flavour + ' ' if flavour else ''}`{series}_X` builds of "
+                    f"{day.group(1)} -- that is not the same as zero problems (the logs of those days were not "
+                    "fetched before the server deleted them, or there were no builds)."
+                    + (" The nearest days with test logs: " + " and ".join(nearest) + "." if nearest else ""))
+        if flavour:
+            flavour_whens = on_day
+        else:
+            whens = on_day + [w for w in whens if w < on_day[-1]]
     to_when = tag_match.group(1).rsplit("_X_", 1)[-1] if tag_match else (flavour_whens[0] if flavour else whens[0])
     if flavour and to_when not in flavour_whens and not (tag_match and original_question and tag_match.group(1) in original_question):
         older_flavour = [w for w in flavour_whens if w < to_when]
