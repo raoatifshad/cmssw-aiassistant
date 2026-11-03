@@ -45,7 +45,7 @@ PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/i
 # your Kerberos ticket (renewed each run, max 5 days; or a fresh one from ~/.mrao.keytab if it
 # exists, kept on this PC only); nothing is stored or installed there.
 scripts/daily_refresh.sh [--install-cron|--uninstall-cron]   # STEPS="cmsrepo exceptions testlogs docs frontend checks"; also runs 10 min after each boot
-# after each refresh it starts scripts/daily_tester.sh (Claude Code headless, prompt scripts/tester_prompt.md,
+# after each refresh it starts scripts/daily_tester.sh -- NIGHT ONLY (20:00-06:00, so after the 00:30 run; FORCE=1 by hand) (Claude Code headless, prompt scripts/tester_prompt.md,
 # worktree ../../cmssdt-kg-vacation on auto/vacation-fixes; reports in /home/rao/CHAT-BOT-AI/daily-test-reports/; TESTER=0 skips)
 # progress page (read-only, started @reboot by cron): http://localhost:8090 -- copy/scan GB done/left,
 # import into Neo4j, test-log runs per IB date ("missing" days), tester runs. Never edit daily_refresh.sh
