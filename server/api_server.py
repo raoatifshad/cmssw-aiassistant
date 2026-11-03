@@ -5229,8 +5229,10 @@ def _render_metric_deltas(
     if unchanged_nonzero:
         if block:
             block.append("")
+        # only a claim about failures when nothing moved: "No new failures" under a table with
+        # "Failed RelVals 1 -> 2" (found 2026-11-04) just because RelVals run stayed 954
         block.append(
-            "No new failures/errors -- "
+            ("No new failures/errors -- " if not changed else "Unchanged: ")
             + "; ".join(f"{label} still {before[key]:,}" for label, key in unchanged_nonzero)
             + "."
         )
