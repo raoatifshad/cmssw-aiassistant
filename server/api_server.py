@@ -10433,9 +10433,25 @@ def _date_tag_context(question: str) -> tuple[str, str | None]:
         latest = _latest_ib_records()
         newest = latest[0]["tag"] if latest else None
         return question, (f"No IB built on {when} is imported" + (f" (the newest imported IB is `{newest}`)" if newest else "")
-                          + ". IBs are built around 11:00 and 23:00 CERN time and are imported by hand, so the newest "
+                          + ". IBs are built around 11:00 and 23:00 CERN time and the data is refreshed twice a day, so the newest "
                           "builds can be missing; ask about a specific tag or \"the latest IB\".")
     return f"{question} {max(tags, key=_ib_sort_key)}", None
+
+
+def _today_falls_back_to_latest(question: str) -> tuple[str, str] | None:
+    """(question naming the newest IB, note): "what's newly failing today?" before today's first
+    build is imported means "the newest IB", not "ask me again" (found 2026-11-04: from midnight
+    until the first import of the day every "today" question got "No IB built on ... is
+    imported"). Only for the relative word: a date or hour the user named stays a no."""
+    today = re.compile(r"\b(?:for\s+|from\s+|of\s+)?(?:today|this\s+morning|tonight)\b", re.IGNORECASE)
+    if not today.search(question) or re.search(r"\b20\d\d-\d\d-\d\d\b|\b\d{1,2}[:.h]00\b", question):
+        return None
+    latest = _latest_ib_records(None, _requested_release_series(question))
+    if not latest:
+        return None
+    tag = latest[0]["tag"]
+    return (f"{today.sub(' ', question).strip()} {tag}",
+            f"_No IB from today is imported yet, so this is for the newest one, `{tag}`._\n\n")
 
 
 _ABOUT_DATA_RE = re.compile(
@@ -11136,7 +11152,10 @@ def _chat(req: ChatRequest):
     question = _with_variant_ib_context(question)
     question, date_message = _date_tag_context(question)
     if date_message:
-        return _chat_response(sid, original_question, date_message, "deterministic:date_not_imported")
+        today_fallback = _today_falls_back_to_latest(question)
+        if not today_fallback:
+            return _chat_response(sid, original_question, date_message, "deterministic:date_not_imported")
+        question, _default_tag_notes[sid] = today_fallback
     question = _with_workflow_follow_up_context(question, sid)
     arch_unavailable = _arch_unavailable_answer(question, sid)
     if arch_unavailable:
