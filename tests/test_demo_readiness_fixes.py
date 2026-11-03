@@ -12,6 +12,7 @@ from server.api_server import (
     _latest_ib_answer,
     _newest_complete_primary_tag,
     _not_failing_answer,
+    _test_log_question_answer,
     _with_variant_ib_context,
     _pr_author_ranking_answer,
     _relval_by_exit_code_answer,
@@ -298,6 +299,18 @@ class VariantAndNotFailingTests(unittest.TestCase):
         answer = _not_failing_answer("which relvals are not failing on el8_amd64_gcc14?")
         self.assertIn("**952 of 954**", answer)
         self.assertEqual(session.run.call_args.kwargs["arch"], "el8_amd64_gcc14")
+
+
+class TestLogDateTests(unittest.TestCase):
+    @patch("server.api_server.get_driver")
+    def test_day_without_logs_is_said_with_nearest_days(self, get_driver):
+        # found 2026-11-03: "test logs for 2026-10-21" (outage gap) answered for the newest build
+        driver, _ = _driver_with([{"tag": t} for t in (
+            "CMSSW_20_1_X_2026-10-16-2300", "CMSSW_20_1_X_2026-10-27-1100", "CMSSW_20_1_X_2026-11-02-2300")])
+        get_driver.return_value = driver
+        answer = _test_log_question_answer("test logs for 2026-10-21", "demo-tl")
+        self.assertIn("No raw test logs are imported for `CMSSW_20_1_X` builds of 2026-10-21", answer)
+        self.assertIn("2026-10-16 and 2026-10-27", answer)
 
 
 if __name__ == "__main__":
