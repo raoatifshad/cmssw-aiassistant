@@ -47,6 +47,10 @@ PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/i
 scripts/daily_refresh.sh [--install-cron|--uninstall-cron]   # STEPS="cmsrepo exceptions testlogs docs frontend checks"; also runs 10 min after each boot
 # after each refresh it starts scripts/daily_tester.sh (Claude Code headless, prompt scripts/tester_prompt.md,
 # worktree ../../cmssdt-kg-vacation on auto/vacation-fixes; reports in /home/rao/CHAT-BOT-AI/daily-test-reports/; TESTER=0 skips)
+# progress page (read-only, started @reboot by cron): http://localhost:8090 -- copy/scan GB done/left,
+# import into Neo4j, test-log runs per IB date ("missing" days), tester runs. Never edit daily_refresh.sh
+# in place while a run is going (bash reads it by byte offset): write a new file and mv it over.
+venv/bin/python scripts/refresh_status_page.py [--port 8090]
 # (frontend = cmssdt-18V's public/updateData.sh; the previous SDT/ is kept until the new clone is complete)
 
 # IB test logs from cmssdt9-02 (unit/addOn/RelVal zips; the server deletes
