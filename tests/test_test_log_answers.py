@@ -205,6 +205,23 @@ class NotFoundAnswerTests(unittest.TestCase):
         self.assertIn("Searched the test logs by: whole error 0; `TracksterInferenceByPFN` 0; "
                       "producer `PluginNotFound|TICLCandidateProducer` 0; same IB 1", answer)
 
+    @patch("server.api_server.test_log_coverage", return_value={"first": "2026-10-01-1100", "last": "2026-11-02-2300", "runs": 2046})
+    @patch("server.api_server.search_test_log_problems_report")
+    def test_same_ib_match_for_a_paste_without_message_is_not_called_a_different_error(self, search, _cov):
+        # found 2026-11-03: the 3-line head of a Fatal Exception block (no "Exception Message:")
+        # got its own stored problem labelled "a different error"
+        search.return_value = _report(
+            [dict(SUBMITPVRBR_PROBLEM, match="same_ib", shared_terms=[],
+                  tests={"wf:step2": {"suite": "relval", "passed": 3, "failed": 0, "other": 0}})],
+            searched=[dict(by="same IB", key="FileInPathError in CMSSW_13_2_X_2026-11-02-2300", found=1)])
+        paste = ("In CMSSW_13_2_X_2026-11-02-2300 this test passed but its log shows:\n"
+                 "----- Begin Fatal Exception 03-Nov-2026 03:34:42 CET-----------------------\n"
+                 "An exception of category 'FileInPathError' occurred while\n"
+                 "   [0] Constructing the EventProcessor")
+        answer = _test_log_problem_answer(paste, "FileInPathError")
+        self.assertNotIn("a different error", answer)
+        self.assertIn("may or may not be the same error", answer)
+
     @patch("server.api_server.test_log_coverage", return_value={"first": "2026-10-01-1100", "last": "2026-10-12-1100", "runs": 2046})
     @patch("server.api_server.search_test_log_problems_report")
     def test_names_found_in_a_related_problem_are_not_listed_as_absent(self, search, _cov):

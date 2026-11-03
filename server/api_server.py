@@ -8017,6 +8017,12 @@ def _test_log_problem_answer(question: str, category: str | None = None) -> str 
         "same_ib": "**Other `{category}` problems in {tags}** (the IB in your paste) -- a different error, shown only "
                    "because it hit the same build:",
     }
+    if not (parsed.get("message") or "").strip():
+        # a paste cut before its "Exception Message:" has nothing to tell errors of one category
+        # apart -- it may well be the same one (found 2026-11-03: the very problem pasted was
+        # labelled "a different error")
+        headers["same_ib"] = ("**`{category}` problems in {tags}** (the IB in your paste) -- your paste has no "
+                              "exception message, so this may or may not be the same error; compare the evidence:")
     shown_header = None
     for index, problem in enumerate(problems, 1):
         how = problem.get("match", "exact")

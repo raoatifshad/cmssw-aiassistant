@@ -342,8 +342,12 @@ def check_chat(client: httpx.Client, session, samples: int, result: Result) -> N
         "RETURN kind, p.ib_tag AS tag, p.evidence AS evidence, p.owners AS owners LIMIT $n",
         n=samples).data()
     for row in rows:
-        # what a shifter would copy out of the log: the first lines of the evidence
-        row["line"] = "\n".join(row["evidence"].splitlines()[:3])[:600]
+        # what a shifter would copy out of the log: the first lines of the evidence, up to and
+        # including the exception message when there is one (3 lines cut a Fatal Exception
+        # block before its message, leaving only the category to match on)
+        lines = row["evidence"].splitlines()
+        upto = next((i + 2 for i, l in enumerate(lines) if l.strip().startswith("Exception Message")), 3)
+        row["line"] = "\n".join(lines[:max(3, upto)])[:600]
         question = f"In {row['tag']} this test passed but its log shows:\n{row['line']}"
         try:
             resp = client.post("/api/chat", json={"question": question,
