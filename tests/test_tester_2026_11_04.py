@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from server import api_server
-from server.api_server import _ib_failure_ranking_answer, _is_latest_ib_question, _loose_arch_choice, _render_metric_deltas, _today_falls_back_to_latest
+from server.api_server import _LOG_PROBLEM_PASTE_RE, _ib_failure_ranking_answer, _is_latest_ib_question, _loose_arch_choice, _render_metric_deltas, _today_falls_back_to_latest
 
 
 def _driver_with(*results):
@@ -81,6 +81,21 @@ class LatestSeriesTests(unittest.TestCase):
         self.assertTrue(_is_latest_ib_question("build errors in the latest 20_1"))
         self.assertTrue(_is_latest_ib_question("newest CMSSW_17_1_X, what failed"))
         self.assertFalse(_is_latest_ib_question("the latest PR about ROOT"))
+
+
+class ShortLogLineTests(unittest.TestCase):
+    def test_typed_log_lines_are_searched_in_the_test_logs(self):
+        for text in ("heap-use-after-free edm::storage::File::syswrite",
+                     "global-buffer-overflow in HGCalGeometry::getNewCorners, seen in ASAN logs. known?",
+                     "UCX ERROR ibv_create_ah in CMSSW_16_1_X_2026-11-03-1100 -- is it new?",
+                     "Warning: Could not download index.php from CERNBox: HTTP Error 429: Too Many Requests",
+                     "SLHA::readFile Warning: line 103 - read error or empty line"):
+            self.assertTrue(_LOG_PROBLEM_PASTE_RE.search(text), text)
+
+    def test_ordinary_questions_are_not(self):
+        for text in ("why is the build failing with errors?", "which warnings are new in the latest IB?",
+                     "what is edm::Event used for?", "how many errors in 539.0?"):
+            self.assertFalse(_LOG_PROBLEM_PASTE_RE.search(text), text)
 
 
 if __name__ == "__main__":
