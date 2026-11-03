@@ -1004,7 +1004,8 @@ def _is_latest_ib_question(question: str) -> bool:
     # through to the flat "No imported local evidence" message.
     return bool(
         re.search(rf"\b(?:{_LATEST_WORD_RE})\b", question, re.IGNORECASE)
-        and re.search(r"\b(?:ib|integration\s+build|release)\b", question, re.IGNORECASE)
+        # "build errors in the latest 20_1" (found 2026-11-04: dead end)
+        and re.search(r"\b(?:ib|integration\s+build|release)\b|\b(?:CMSSW_)?\d{1,2}_\d{1,2}(?:_X)?\b", question, re.IGNORECASE)
         and not re.search(r"\b(?:clang|warning)\b", question, re.IGNORECASE)
     )
 

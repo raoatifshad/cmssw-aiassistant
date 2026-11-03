@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from server import api_server
-from server.api_server import _ib_failure_ranking_answer, _loose_arch_choice, _render_metric_deltas, _today_falls_back_to_latest
+from server.api_server import _ib_failure_ranking_answer, _is_latest_ib_question, _loose_arch_choice, _render_metric_deltas, _today_falls_back_to_latest
 
 
 def _driver_with(*results):
@@ -74,6 +74,13 @@ class IbFailureRankingTests(unittest.TestCase):
         self.assertIsNone(_ib_failure_ranking_answer("which package has the most unit test failures?"))
         self.assertIsNone(_ib_failure_ranking_answer("which IB is the newest?"))
         self.assertIsNone(_ib_failure_ranking_answer("most failing workflows in CMSSW_20_1_X_2026-11-02-2300"))
+
+
+class LatestSeriesTests(unittest.TestCase):
+    def test_latest_with_only_a_release_series(self):
+        self.assertTrue(_is_latest_ib_question("build errors in the latest 20_1"))
+        self.assertTrue(_is_latest_ib_question("newest CMSSW_17_1_X, what failed"))
+        self.assertFalse(_is_latest_ib_question("the latest PR about ROOT"))
 
 
 if __name__ == "__main__":
