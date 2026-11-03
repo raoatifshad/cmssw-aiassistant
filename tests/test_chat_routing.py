@@ -810,7 +810,7 @@ class ChatRoutingTests(unittest.TestCase):
             "CMSSW_20_1_NONLTO_X_2026-08-09-0000", arch=None, limit=100
         )
         self.assertEqual(
-            session.run.call_args.kwargs["terms"],
+            [t["term"] for t in session.run.call_args.kwargs["terms"]],
             ["HydjetQMinBias_5519GeV+Run4D121_hi", "34551.85"],
         )
 
@@ -866,7 +866,8 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNotNone(answer)
         self.assertIn("Issue #51757", answer)
         self.assertIn("edm::FileInPath::initialize_()", answer)
-        self.assertEqual(session.run.call_args.kwargs["terms"], ["FileInPath", "edm::FileInPath::initialize_()"])
+        self.assertEqual([t["term"] for t in session.run.call_args.kwargs["terms"]],
+                         ["FileInPath", "edm::FileInPath::initialize_()"])
 
     @patch("server.api_server.get_driver")
     @patch("server.api_server.propose_pr_search_signature")
@@ -3599,6 +3600,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(result.route, "llm_timeout")
         self.assertIn("try again", result.answer.lower())
 
+    @patch("server.api_server._newest_complete_primary_tag", new=lambda *a, **k: (None, ""))  # no live DB
     @patch("server.api_server._retriever", None)
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")
@@ -3668,6 +3670,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(result.route, "capability:relval:no_evidence")
         session_cls.assert_not_called()
 
+    @patch("server.api_server._newest_complete_primary_tag", new=lambda *a, **k: (None, ""))  # no live DB
     @patch("server.api_server._retriever", None)
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")
@@ -4339,6 +4342,7 @@ class ChatRoutingTests(unittest.TestCase):
         executor.submit.assert_called_once()
         self.assertIs(executor.submit.call_args.args[0], _log_router_shadow_decision)
 
+    @patch("server.api_server._newest_complete_primary_tag", new=lambda *a, **k: (None, ""))  # no live DB
     @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", False)
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")
@@ -4364,6 +4368,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertEqual(result.route, "capability:relval")
         verify_answer.assert_not_called()
 
+    @patch("server.api_server._newest_complete_primary_tag", new=lambda *a, **k: (None, ""))  # no live DB
     @patch("server.api_server.DETERMINISTIC_ANSWER_VERIFICATION_ENABLED", True)
     @patch("server.api_server._clear_pending_clarification")
     @patch("server.api_server._store_planning_decision")

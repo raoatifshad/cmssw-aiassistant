@@ -1,0 +1,304 @@
+"""Wrong/dead-end answers found 2026-11-03 by a keyword-trap probe of the live bot
+(one keyword in a question picking a deterministic answer for something else)."""
+import unittest
+from unittest.mock import MagicMock, patch
+
+from server.api_server import (
+    _ABOUT_DATA_RE,
+    _addon_status_answer,
+    _architectures_answer,
+    _ib_variant_glossary_answer,
+    _known_error_list_answer,
+    _latest_ib_answer,
+    _newest_complete_primary_tag,
+    _not_failing_answer,
+    _with_variant_ib_context,
+    _pr_author_ranking_answer,
+    _relval_by_exit_code_answer,
+    _basic_term_answer,
+    _clang_package_warning_answer,
+    _issue_search_term,
+    _latest_ib_contexts,
+    _resolve_short_follow_up,
+    _turn_memory,
+    _unittest_summary_answer,
+)
+from server.request_planner import RequestContext
+
+
+def _driver_with(*results):
+    """A get_driver() mock whose session.run returns each result in turn."""
+    session = MagicMock()
+    session.run.side_effect = list(results)
+    driver = MagicMock()
+    driver.session.return_value.__enter__.return_value = session
+    return driver, session
+
+
+class ShortFollowUpTests(unittest.TestCase):
+    def setUp(self):
+        self.sid = "demo-fixes"
+        _turn_memory.pop(self.sid, None)
+        _latest_ib_contexts.pop(self.sid, None)
+
+    def remember(self, question, answer):
+        _turn_memory[self.sid] = {"question": question, "answer": answer, "route": "deterministic"}
+
+    def test_architecture_follow_up_repeats_previous_question(self):
+        # was a PR/Issue text search for "el8_amd64_gcc14"
+        self.remember("what is the latest IB?", "Newest imported ... `CMSSW_20_1_X_2026-11-02-2300`")
+        self.assertEqual(_resolve_short_follow_up("what about el8?", self.sid), "what is the latest IB on el8")
+
+    def test_architecture_follow_up_replaces_previous_architecture(self):
+        self.remember("unit tests for CMSSW_20_1_X_2026-11-02-2300 on el9_amd64_gcc14", "...")
+        self.assertEqual(_resolve_short_follow_up("and on aarch64 only", self.sid),
+                         "unit tests for CMSSW_20_1_X_2026-11-02-2300 on aarch64")
+
+    def test_which_ones_after_how_many(self):
+        self.remember("how many relvals failed on el9_amd64_gcc14 in the latest IB?", "2 failing")
+        self.assertEqual(_resolve_short_follow_up("which ones?", self.sid),
+                         "which relvals failed on el9_amd64_gcc14 in the latest IB?")
+
+    def test_is_it_good_to_use_after_latest_ib(self):
+        self.remember("what is the latest IB?", "- **IB tag:** `CMSSW_20_1_X_2026-11-02-2300`")
+        self.assertEqual(_resolve_short_follow_up("and is it good to use?", self.sid),
+                         "what is failing in CMSSW_20_1_X_2026-11-02-2300")
+
+    def test_why_prefers_failing_workflow_over_das_error_one(self):
+        self.remember(
+            "how many relvals failed on el9_amd64_gcc14 in CMSSW_20_1_X_2026-11-02-1100?",
+            "DAS errors: `38551.85`\nFailing workflows:\n- SingleGammaPt10 (wf 10804.31, exit 25600)")
+        self.assertEqual(_resolve_short_follow_up("why?", self.sid),
+                         "why is workflow 10804.31 failing in CMSSW_20_1_X_2026-11-02-1100")
+
+    def test_flavour_follow_up_is_not_taken_as_architecture(self):
+        self.remember("relval failures in CMSSW_20_1_X_2026-11-02-2300", "...")
+        self.assertEqual(_resolve_short_follow_up("what about ASAN?", self.sid),
+                         "relval failures in CMSSW_20_1_ASAN_X_2026-11-02-2300")
+
+
+class DefinitionTests(unittest.TestCase):
+    def test_das_error_with_underscore(self):
+        self.assertIn("DAS error", _basic_term_answer("what does DAS_ERROR mean?"))
+
+    def test_difference_between_two_known_terms(self):
+        answer = _basic_term_answer("what is the difference between a relval and a unit test?")
+        self.assertIn("RelVal", answer)
+        self.assertIn("Unit tests", answer)
+
+    def test_difference_with_unknown_term_is_not_answered(self):
+        self.assertIsNone(_basic_term_answer("what is the difference between a relval and a banana?"))
+
+    def test_ib_schedule(self):
+        for question in ("how often are IBs built?", "when are IBs built", "IB schedule"):
+            self.assertIn("11:00 and 23:00", _basic_term_answer(question), question)
+
+    def test_failure_questions_are_not_schedule_questions(self):
+        self.assertIsNone(_basic_term_answer("when did the latest IB build fail?"))
+        self.assertIsNone(_basic_term_answer("how often does 140.111 fail?"))
+
+    def test_cmssw(self):
+        self.assertIn("software framework", _basic_term_answer("what is CMSSW?"))
+
+
+class RankingIsNotAShiftSummaryTests(unittest.TestCase):
+    def test_most_often_over_a_window(self):
+        context = RequestContext.extract("which workflow failed most often in the last 14 days?")
+        self.assertFalse(context.has_shift_summary_request)
+
+    def test_newly_failing_over_a_window_still_is(self):
+        self.assertTrue(RequestContext.extract("what's newly failing in the last 3 days").has_shift_summary_request)
+
+
+class IssueSearchTermTests(unittest.TestCase):
+    def test_short_term_is_whole_word(self):
+        term = _issue_search_term("DAS")
+        self.assertRegex("DAS_ERROR at step1", term["re"].replace("(?is)", ""))
+        self.assertNotRegex("New IB dashboard", "(?i)" + term["re"].replace("(?is)", ""))
+
+    def test_long_term_keeps_substring_match(self):
+        self.assertIsNone(_issue_search_term("FileInPath")["re"])
+
+
+class UnitTestArchitectureTests(unittest.TestCase):
+    @patch("server.api_server._unittest_scope_records")
+    def test_architecture_without_results_says_so(self, records):
+        records.return_value = [
+            {"arch": "el8_amd64_gcc14", "is_default": False, "total": 379, "failed": 0, "passed": 379, "errors": 0},
+            {"arch": "el9_amd64_gcc14", "is_default": True, "total": 379, "failed": 0, "passed": 379, "errors": 0},
+        ]
+        answer = _unittest_summary_answer(
+            "unit tests for CMSSW_20_1_X_2026-11-02-2300 on el9_aarch64_gcc14", None, "demo-ut")
+        self.assertIn("No unit-test results are imported", answer)
+        self.assertIn("el9_aarch64_gcc14", answer)
+        self.assertNotIn("Choose one", answer)
+
+
+class AddOnStatusTests(unittest.TestCase):
+    @patch("server.api_server.get_driver")
+    def test_named_ib_addon_status(self, get_driver):
+        driver, _ = _driver_with([
+            {"tag": "CMSSW_20_1_X_2026-11-02-2300", "variant": None, "arch": "el9_amd64_gcc14", "status": "passed"},
+            {"tag": "CMSSW_20_1_ASAN_X_2026-11-02-2300", "variant": "ASAN", "arch": "el9_amd64_gcc14",
+             "status": "error"},
+        ])
+        get_driver.return_value = driver
+        answer = _addon_status_answer("are addon tests passing in CMSSW_20_1_X_2026-11-02-2300?", "demo-addon")
+        self.assertIn("**1 failing** of 2", answer)
+        self.assertIn("| ASAN | `el9_amd64_gcc14` | `error` |", answer)
+        self.assertIn("and its sub-IBs", answer)
+
+    def test_definition_and_unrelated_questions_are_left_alone(self):
+        self.assertIsNone(_addon_status_answer("what is the latest IB?", "demo-addon"))
+        self.assertIsNone(_addon_status_answer("any PR about addon tests failing?", "demo-addon"))
+
+
+class ClangPackageWarningTests(unittest.TestCase):
+    @patch("server.api_server.get_driver")
+    def test_subsystem_counts_come_from_named_build(self, get_driver):
+        exists = MagicMock()
+        exists.single.return_value = {"w": 1}
+        driver, _ = _driver_with(
+            exists,
+            [{"tag": "CMSSW_20_1_X_2026-08-12-2300", "arch": "el9_amd64_gcc13", "key": "k1"}],
+            [{"package": "FWCore/Services", "locations": 30, "occurrences": 30},
+             {"package": "FWCore/Framework", "locations": 12, "occurrences": 12}],
+        )
+        get_driver.return_value = driver
+        answer = _clang_package_warning_answer("are there any clang warnings in FWCore?")
+        self.assertIn("**42** distinct", answer)
+        self.assertIn("`CMSSW_20_1_X_2026-08-12-2300` on `el9_amd64_gcc13`", answer)
+        self.assertIn("not necessarily the latest IB", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_unknown_package_defers(self, get_driver):
+        missing = MagicMock()
+        missing.single.return_value = None
+        driver, _ = _driver_with(missing)
+        get_driver.return_value = driver
+        self.assertIsNone(_clang_package_warning_answer("clang warnings in Nonexistent/Thing"))
+
+    def test_tag_only_question_is_not_a_package_question(self):
+        self.assertIsNone(_clang_package_warning_answer("clang warnings for CMSSW_20_1_X_2026-08-12-2300"))
+
+
+class RoundTwoFollowUpTests(ShortFollowUpTests):
+    def test_release_series_follow_up(self):
+        self.remember("status of the latest 17_1 IB", "...")
+        self.assertEqual(_resolve_short_follow_up("and 16_1?", self.sid), "status of the latest IB in 16_1")
+
+    def test_release_series_follow_up_replaces_a_tag(self):
+        self.remember("what failed in CMSSW_17_1_X_2026-11-02-2300?", "...")
+        self.assertEqual(_resolve_short_follow_up("what about 16_1", self.sid),
+                         "what failed in the latest IB in 16_1")
+
+    def test_why_after_package_only_overview(self):
+        self.remember("what failed in CMSSW_17_1_X_2026-11-02-2300 on el8_aarch64_gcc13?",
+                      "**Unit tests** -- 2 failing:\n- `el8_aarch64_gcc13`: `CondTools/SiStrip`, `SimG4Core/Geometry`")
+        self.assertEqual(_resolve_short_follow_up("why?", self.sid),
+                         "why is CondTools/SiStrip failing in CMSSW_17_1_X_2026-11-02-2300")
+
+
+class RoundTwoRoutingTests(unittest.TestCase):
+    def test_status_of_latest_ib_is_not_just_its_name(self):
+        self.assertIsNone(_latest_ib_answer("status of the latest 17_1 IB"))
+        self.assertIsNone(_latest_ib_answer("is the latest IB good?"))
+
+    def test_variant_failure_question_is_not_a_definition(self):
+        self.assertIsNone(_ib_variant_glossary_answer("what's wrong with the ROOT642 IB?"))
+        self.assertIn("ROOT 6.42", _ib_variant_glossary_answer("what does ROOT642 mean?"))
+
+    def test_data_freshness_question(self):
+        self.assertTrue(_ABOUT_DATA_RE.search("is the data up to date?"))
+
+    def test_shifter_opener_is_a_shift_summary(self):
+        self.assertTrue(RequestContext.extract("what should I check first as a shifter today?").has_shift_summary_request)
+
+    @patch("server.api_server.get_exit_code_names", return_value={31744: "TimeOut", 16640: "OtherCMS"})
+    @patch("server.api_server.get_driver")
+    def test_timed_out_maps_to_exit_code(self, get_driver, _names):
+        driver, session = _driver_with([
+            {"tag": "CMSSW_20_1_ASAN_X_2026-11-02-2300", "arch": "el9_amd64_gcc14", "n": 1, "examples": ["539.0"]}],
+            MagicMock(single=MagicMock(return_value={"n": 8})))
+        get_driver.return_value = driver
+        answer = _relval_by_exit_code_answer("which workflows timed out in CMSSW_20_1_X_2026-11-02-2300?")
+        self.assertIsNotNone(answer)
+        self.assertEqual(session.run.call_args_list[0].kwargs["code"], 31744)
+
+
+class CompletenessTests(unittest.TestCase):
+    @patch("server.api_server.get_driver")
+    def test_partly_imported_newest_build_is_skipped(self, get_driver):
+        driver, _ = _driver_with([
+            {"tag": "CMSSW_20_1_X_2026-11-02-2300", "arch": "el8_amd64_gcc14", "n": 15},
+            {"tag": "CMSSW_20_1_X_2026-11-02-2300", "arch": "el9_amd64_gcc14", "n": 30},
+            {"tag": "CMSSW_20_1_X_2026-11-02-1100", "arch": "el8_amd64_gcc14", "n": 954},
+            {"tag": "CMSSW_20_1_X_2026-11-02-1100", "arch": "el9_amd64_gcc14", "n": 954},
+            # the 23:00 build before also had aarch64: a missing architecture is not "partial"
+            {"tag": "CMSSW_20_1_X_2026-11-01-2300", "arch": "el8_amd64_gcc14", "n": 954},
+            {"tag": "CMSSW_20_1_X_2026-11-01-2300", "arch": "el9_aarch64_gcc14", "n": 954},
+            {"tag": "CMSSW_20_1_X_2026-11-01-2300", "arch": "el9_amd64_gcc14", "n": 954},
+        ])
+        get_driver.return_value = driver
+        tag, note = _newest_complete_primary_tag("relval")
+        self.assertEqual(tag, "CMSSW_20_1_X_2026-11-02-1100")
+        self.assertIn("partly imported", note)
+
+
+class NewHandlerTests(unittest.TestCase):
+    @patch("server.api_server.get_driver")
+    def test_known_error_list(self, get_driver):
+        driver, _ = _driver_with([
+            {"tag": "CMSSW_20_1_X_2026-11-02-2300", "arch": "el9_aarch64_gcc14", "wf": "10804.31", "name": "x",
+             "reason": "Triton Server Instance for non-x86_64"}])
+        get_driver.return_value = driver
+        answer = _known_error_list_answer("list known errors in CMSSW_20_1_X_2026-11-02-2300", "demo-ke")
+        self.assertIn("**1 known-error RelVal(s)**", answer)
+        self.assertIn("Triton", answer)
+        self.assertIsNone(_known_error_list_answer("what is a known error?", "demo-ke"))
+
+    @patch("server.api_server.get_driver")
+    def test_architectures_marks_stopped_ones(self, get_driver):
+        driver, _ = _driver_with([
+            {"series": "20_1", "arch": "el9_amd64_gcc14", "newest": "2026-11-02-2300", "builds": 150},
+            {"series": "20_1", "arch": "el9_amd64_gcc13", "newest": "2026-08-12-2300", "builds": 41},
+        ])
+        get_driver.return_value = driver
+        answer = _architectures_answer("which architectures are built for 20_1?")
+        self.assertIn("**1 architecture(s)** are currently built", answer)
+        self.assertIn("| `el9_amd64_gcc13` | `CMSSW_20_1_X_2026-08-12-2300` | **no** (stopped?)", answer)
+
+    def test_architecture_failure_question_is_left_alone(self):
+        self.assertIsNone(_architectures_answer("which architectures failed in the latest IB?"))
+
+    @patch("server.api_server.get_driver")
+    def test_pr_author_ranking(self, get_driver):
+        driver, _ = _driver_with(
+            [{"author": "felicepantaleo", "n": 9, "repos": ["cmssw"], "examples": [52346]}],
+            MagicMock(single=MagicMock(return_value={"n": 60})))
+        get_driver.return_value = driver
+        answer = _pr_author_ranking_answer("who merged the most PRs this week?")
+        self.assertIn("| `felicepantaleo` | 9 |", answer)
+        self.assertIn("who pressed merge is not in the imported data", answer)
+        self.assertIsNone(_pr_author_ranking_answer("who authored PR 52346"))
+
+
+class VariantAndNotFailingTests(unittest.TestCase):
+    def test_workflow_question_naming_a_variant_keeps_the_workflow(self):
+        # "is 539.0 failing only in ASAN?" is about the workflow everywhere, not the ASAN IB
+        self.assertEqual(_with_variant_ib_context("is 539.0 failing only in ASAN?"),
+                         "is 539.0 failing only in ASAN?")
+
+    @patch("server.api_server._newest_complete_primary_tag", return_value=("CMSSW_20_1_X_2026-11-02-1100", ""))
+    @patch("server.api_server.get_driver")
+    def test_not_failing_without_a_tag_uses_newest_complete_ib_and_the_arch(self, get_driver, _complete):
+        driver, session = _driver_with([
+            {"tag": "CMSSW_20_1_X_2026-11-02-1100", "arch": "el8_amd64_gcc14", "total": 954, "passed": 952}])
+        get_driver.return_value = driver
+        answer = _not_failing_answer("which relvals are not failing on el8_amd64_gcc14?")
+        self.assertIn("**952 of 954**", answer)
+        self.assertEqual(session.run.call_args.kwargs["arch"], "el8_amd64_gcc14")
+
+
+if __name__ == "__main__":
+    unittest.main()
