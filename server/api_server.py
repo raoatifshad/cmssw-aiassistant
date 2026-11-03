@@ -10623,6 +10623,55 @@ def _unit_test_ranking_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+_IB_RANKING_RE = re.compile(
+    r"\b(?:which|what)\s+(?:\w+\s+){0,2}?(?:ibs?|builds?|integration\s+builds?|sub-?ibs?)\b[^?!]{0,60}\b(?:most|worst|highest)\b|"
+    r"\b(?:ibs?|builds?)\s+with\s+(?:the\s+)?(?:most|highest)\b|\bworst\s+(?:ibs?|builds?)\b",
+    re.IGNORECASE)
+
+
+def _ib_failure_ranking_answer(question: str) -> str | None:
+    """ "Which IBs failed the most relvals this week?" -- found 2026-11-04 going to the LLM, which
+    claimed one failing workflow in one build while builds with 50+ existed. Failed RelVals (or
+    unit tests) per (IB tag, architecture) over a window; architectures are never merged."""
+    if not _IB_RANKING_RE.search(question) or IB_TAG_RE.search(question):
+        return None
+    if not re.search(r"\bfail|\bbroken|\bred\b|\berrors?\b", question, re.IGNORECASE):
+        return None
+    unit = bool(re.search(r"\bunit", question, re.IGNORECASE))
+    days = 30 if re.search(r"\bthis\s+month\b", question, re.IGNORECASE) else _parse_recency_window_days(question, default=7)
+    series = _requested_release_series(question)
+    arch = _requested_ib_arch(question)
+    family = None if arch else _arch_family(question)
+    match = ("MATCH (ib:IB)-[:RAN_UNITTEST]->(x:UnitTest {status:'FAILED'}) WHERE true " if unit else
+             "MATCH (ib:IB)-[:RAN_RELVAL]->(x:RelVal {status:'FAILED'}) WHERE NOT coalesce(x.known_error, false) ")
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            prefix = f"CMSSW_{series[0]}_{series[1]}" if series else _newest_series_prefix(session)
+            if not prefix:
+                return None
+            rows = [dict(r) for r in session.run(
+                match + "AND ib.tag STARTS WITH $p AND right(ib.tag, 15) >= $cut "
+                "AND ($arch IS NULL OR ib.arch = $arch) AND ($family IS NULL OR ib.arch CONTAINS $family) "
+                "RETURN ib.tag AS tag, ib.arch AS arch, count(x) AS failed "
+                "ORDER BY failed DESC, right(ib.tag, 15) DESC, tag, arch LIMIT 10",
+                p=prefix + "_", cut=_window_cutoff(days), arch=arch, family=family)]
+    finally:
+        driver.close()
+    what = "unit-test packages" if unit else "RelVals"
+    window = f"the last {days} days" if days else "all imported builds"
+    where = f" on `{arch}`" if arch else f" on {family}" if family else ""
+    if not rows:
+        return f"No `{prefix}` build{where} has failed {what} over {window}."
+    lines = [f"`{prefix}` builds (primary and sub-IBs){where} with the most failed {what} over {window}:", "",
+             "| IB | Architecture | Failed |", "| --- | --- | ---: |"]
+    lines += [f"| `{r['tag']}` | `{r['arch']}` | {r['failed']} |" for r in rows]
+    if not unit:
+        lines.append("\nKnown errors and DAS errors are not counted.")
+    lines.append(f"Ask \"failed {'unit tests' if unit else 'relvals'} for {rows[0]['tag']} {rows[0]['arch']}\" for the list.")
+    return "\n".join(lines)
+
+
 _FLAKY_RE = re.compile(
     r"\b(?:intermittent\w*|flak(?:y|iness)|flapping|flip[\s-]*flop\w*|sporadic\w*|unstable|on\s+and\s+off|"
     r"randomly\s+fail\w*|sometimes\s+fail\w*|come\s+and\s+go)\b", re.IGNORECASE)
@@ -11248,7 +11297,8 @@ def _chat(req: ChatRequest):
     if step_answer:
         return _chat_response(sid, original_question, step_answer, "deterministic:relval_step_failures")
 
-    for handler, route_name in ((_unit_test_ranking_answer, "unit_test_ranking"), (_flaky_relvals_answer, "flaky_relvals"),
+    for handler, route_name in ((_ib_failure_ranking_answer, "ib_failure_ranking"),
+                                (_unit_test_ranking_answer, "unit_test_ranking"), (_flaky_relvals_answer, "flaky_relvals"),
                                 (_pr_broke_answer, "pr_timing"), (_clang_package_ranking_answer, "clang_package_ranking")):
         try:
             extra_answer = handler(original_question)
