@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unattended bot tester: runs Claude Code headless with scripts/tester_prompt.md in the separate
 # worktree $WORKTREE (branch auto/vacation-fixes). Started by daily_refresh.sh after each refresh
-# (TESTER=0 to skip); can also be run by hand.
+# (TESTER=0 to skip) but runs only at night (below); by hand any time with FORCE=1.
 #
 #   report:  $REPORTS/<YYYY-MM-DD-HHMM>.md   (written by the tester)
 #   log:     $REPORTS/<YYYY-MM-DD-HHMM>.claude.log
@@ -20,6 +20,15 @@ MAX_HOURS=${MAX_HOURS:-6}
 export PATH=/home/rao/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH
 
 mkdir -p "$REPORTS"
+# Night only (user, 2026-11-03): a run takes hours and loads the PC, so it starts only between
+# NIGHT_START and NIGHT_END o'clock -- i.e. after the 00:30 refresh, not the 12:30 one.
+# FORCE=1 runs it anyway.
+NIGHT_START=${NIGHT_START:-20}; NIGHT_END=${NIGHT_END:-6}
+hour=$((10#$(date +%H)))
+if [ "${FORCE:-0}" != 1 ] && [ "$hour" -lt "$NIGHT_START" ] && [ "$hour" -ge "$NIGHT_END" ]; then
+    echo "$(date -Is) daytime, not running (night only, ${NIGHT_START}:00-${NIGHT_END}:00; FORCE=1 to override)" >> "$REPORTS/history.txt"
+    exit 0
+fi
 STAMP=$(date +%F-%H%M)
 LOG="$REPORTS/$STAMP.claude.log"
 
