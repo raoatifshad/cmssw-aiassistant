@@ -7944,6 +7944,12 @@ def _run_llm_investigation(
 
 _LOG_PROBLEM_PASTE_RE = re.compile(
     r"Begin Fatal Exception|An exception of category|ERROR: (?:Address|Leak|Thread|Memory)Sanitizer|"
+    # a sanitizer error type or a log line typed on its own (found 2026-11-04, all "my lookups came
+    # back empty" with the problem in the logs): "heap-use-after-free edm::storage::File::syswrite",
+    # "UCX ERROR ibv_create_ah", "Warning: Could not download ... HTTP Error 429"
+    r"\b(?:heap|stack|global|container)-(?:use-after-\w+|buffer-(?:over|under)flow|overflow)\b|"
+    r"\bdetected memory leaks\b|\buse-of-uninitialized-value\b|\bUCX\s+ERROR\b|\bHTTP Error \d{3}\b|"
+    r"\b\w+::\w+\)?\s+(?:Warning|Error)\b|"
     r"runtime error:|Traceback \(most recent call last\)|Assertion [`'].*failed|"
     r"terminate called after throwing|A fatal system signal has occurred|"
     # a shell's report of a killed test command, as the scanner reads it (SHELL_KILL_RE,
