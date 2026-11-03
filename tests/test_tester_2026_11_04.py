@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from server import api_server
-from server.api_server import _loose_arch_choice, _render_metric_deltas, _today_falls_back_to_latest
+from server.api_server import _ib_failure_ranking_answer, _loose_arch_choice, _render_metric_deltas, _today_falls_back_to_latest
 
 
 def _driver_with(*results):
@@ -55,6 +55,25 @@ class LooseArchChoiceTests(unittest.TestCase):
         self.assertIsNone(_loose_arch_choice("only el9", self.ARCHS))
         self.assertIsNone(_loose_arch_choice("only gcc12", self.ARCHS))
         self.assertIsNone(_loose_arch_choice("which one is best?", self.ARCHS))
+
+
+class IbFailureRankingTests(unittest.TestCase):
+    @patch("server.api_server._newest_series_prefix", return_value="CMSSW_20_1")
+    @patch("server.api_server.get_driver")
+    def test_ranks_per_tag_and_architecture(self, get_driver, _):
+        driver, session = _driver_with([
+            {"tag": "CMSSW_20_1_X_2026-11-02-2300", "arch": "el9_aarch64_gcc14", "failed": 51},
+            {"tag": "CMSSW_20_1_ASAN_X_2026-11-02-2300", "arch": "el9_amd64_gcc14", "failed": 3}])
+        get_driver.return_value = driver
+        text = _ib_failure_ranking_answer("which IBs failed the most relvals this week?")
+        self.assertIn("| `CMSSW_20_1_X_2026-11-02-2300` | `el9_aarch64_gcc14` | 51 |", text)
+        self.assertIn("the last 7 days", text)
+        self.assertIn("known_error", session.run.call_args.args[0])
+
+    def test_other_questions_are_not_taken(self):
+        self.assertIsNone(_ib_failure_ranking_answer("which package has the most unit test failures?"))
+        self.assertIsNone(_ib_failure_ranking_answer("which IB is the newest?"))
+        self.assertIsNone(_ib_failure_ranking_answer("most failing workflows in CMSSW_20_1_X_2026-11-02-2300"))
 
 
 if __name__ == "__main__":
