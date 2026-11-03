@@ -63,8 +63,18 @@ SHIFT_SUMMARY_RE = re.compile(
     r"\b(?:broke|broken|changed|regress\w*)\b[^?!]{0,20}\bbetween\s+yesterday\s+and\s+today\b|"
     r"\bshifters?\b[^?!]{0,40}\b(?:look\s+at|check|start|focus|worry|watch)\b[^?!]{0,20}\b(?:today|now|first|this\s+morning)\b|"
     r"\b(?:where|how)\s+(?:do|should)\s+i\s+start\b|"
+    # "what should I check first as a shifter today?" (found 2026-11-03: LLM dead end)
+    r"\bwhat\s+should\s+(?:i|we|the\s+shifter)\s+(?:check|look\s+at|watch|focus\s+on)\b[^?!]{0,40}"
+    r"\b(?:first|today|now|shift(?:er)?)\b|"
     r"\bmorning\s+(?:report|summary|digest|check)\b|\b(?:daily|today'?s)\s+(?:report|summary|digest)\b|"
     r"\b(?:getting|got)\s+(?:better|worse)\b|\bbetter\s+or\s+worse\b",
+    re.IGNORECASE,
+)
+
+
+RANKING_RE = re.compile(
+    r"\bmost\s+(?:often|frequent(?:ly)?|common(?:ly)?)\b|\btop\s+\d+\b|\bhow\s+often\b|\bfrequently\b|"
+    r"\bmost\s+failing\b|\bfail(?:s|ed)?\s+the\s+most\b",
     re.IGNORECASE,
 )
 
@@ -166,7 +176,9 @@ class RequestContext:
                 r"mark(?:ed)?|classif(?:y|ied)|primary)\b",
                 lowered,
             )),
-            has_shift_summary_request=bool(SHIFT_SUMMARY_RE.search(question)),
+            # a ranking over a window ("which workflow failed most often in the last 14 days")
+            # is the frequent-failure report, not a two-build diff (found 2026-11-03)
+            has_shift_summary_request=bool(SHIFT_SUMMARY_RE.search(question)) and not RANKING_RE.search(question),
             is_bare_ib_tag=bare_tag,
         )
 
