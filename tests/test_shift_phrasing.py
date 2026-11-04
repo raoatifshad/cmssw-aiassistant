@@ -7,6 +7,10 @@ from server.api_server import (
     _basic_term_answer,
     _condense_comparison_for_chat,
     _das_error_count_answer,
+    _external_update_answer,
+    _failure_sets_answer,
+    _failures_by_dimension_answer,
+    _github_since,
     _exit_code_difference_answer,
     _exit_code_meaning_answer,
     _format_raw_evidence,
@@ -177,6 +181,76 @@ class MostCommonFailureTests(unittest.TestCase):
     def test_time_windows_stay_with_the_other_rankings(self):
         self.assertIsNone(_most_common_failure_answer("what's the most common failure this week?"))
         self.assertIsNone(_most_common_failure_answer("what is the latest IB?"))
+
+
+def _build(variant, arch, failed=(), units=(), relvals=954, n_units=380, build="passed"):
+    return {"tag": "T", "arch": arch, "variant": variant, "build": build, "relvals": relvals, "failed": list(failed), "units": n_units, "unit_failed": list(units)}
+
+
+RECORDS = [_build("primary", "el9_amd64_gcc14", ["539.0", "537.0"]), _build("CLANG", "el9_amd64_gcc14", ["539.0"]),
+           _build("primary", "el9_amd64_gcc15", ["10804.31"], relvals=954), _build("primary", "el10_amd64_gcc15", [], ["HeterogeneousTest/ROCmDevice"], build="error"),
+           _build("primary", "el9_aarch64_gcc14", relvals=0, n_units=0)]
+
+
+@patch("server.api_server._latest_ib_records", return_value=LATEST)
+@patch("server.api_server._ib_build_records", return_value=RECORDS)
+class AnalyticalAnswerTests(unittest.TestCase):
+    def test_worst_architecture_never_says_nothing_fails(self, *_):
+        # found 2026-11-04: the LLM said no architecture was failing, with el10's build red
+        answer = _failures_by_dimension_answer("which is the worst architecture right now?")
+        self.assertIn("**`el9_amd64_gcc14`** has the most failing results", answer)
+        self.assertIn("The build itself failed on: `el10_amd64_gcc15`", answer)
+
+    def test_per_sub_ib(self, *_):
+        self.assertIn("| `CLANG` | 1 |", _failures_by_dimension_answer("how many failures per sub-IB in the latest IB?"))
+
+    def test_only_on(self, *_):
+        answer = _failure_sets_answer("what is failing only on el10?")
+        self.assertIn("HeterogeneousTest/ROCmDevice", answer)
+        self.assertNotIn("539.0", answer)
+
+    def test_but_not(self, *_):
+        answer = _failure_sets_answer("what's failing on gcc15 but not gcc14?")
+        self.assertIn("`10804.31`", answer)
+        self.assertNotIn("`539.0`", answer)
+
+    def test_common_to_all(self, *_):
+        answer = _failure_sets_answer("which failures are common to all sub-IBs in the latest IB?")
+        self.assertIn("`539.0`", answer)
+        self.assertNotIn("`537.0`", answer)
+        self.assertIn("don't count", answer)
+
+    def test_time_windows_are_left_alone(self, *_):
+        self.assertIsNone(_failures_by_dimension_answer("which architecture failed most this week?"))
+
+
+class GitHubHourFourTests(unittest.TestCase):
+    def test_links_and_issue_fields(self):
+        self.assertEqual(_shift_question_rewrite("https://github.com/cms-sw/cmssw/pull/52223"), "PR 52223")
+        self.assertEqual(_shift_question_rewrite("https://github.com/cms-sw/cmsdist/pull/10960"), "cmsdist PR 10960")
+        self.assertEqual(_shift_question_rewrite("https://github.com/cms-sw/cmssw/issues/52323"), "issue 52323")
+        self.assertEqual(_shift_question_rewrite("summarize issue 52323"), "issue 52323")
+        self.assertEqual(_shift_question_rewrite("what labels does issue 52354 have?"), "issue 52354")
+        self.assertIsNone(_shift_question_rewrite("who commented on issue 51089?"))
+
+    def test_follow_ups_after_a_list(self):
+        _turn_memory["s-4"] = {"question": "list open issues about ASAN", "answer": "- **Issue #52097** - x\n- **Issue #51787** - y", "route": "x"}
+        self.assertEqual(_resolve_short_follow_up("show the newest one", "s-4"), "issue 52097")
+        _turn_memory["s-4"] = {"question": "q", "answer": "- **cmssw #52372** - [L1T] Update\n- **cmssw #52366** - Define GT", "route": "x"}
+        self.assertIn("#52372", _listed_items_follow_up("which one touches L1T?", "s-4"))
+        self.assertNotIn("#52366", _listed_items_follow_up("which one touches L1T?", "s-4"))
+
+    @patch("server.api_server.get_driver")
+    def test_external_update_matches_the_whole_name(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"n": 1, "title": "Update xrootd version", "merged": "2026-11-02"}, {"n": 2, "title": "[ROOT6] Updated root", "merged": "2026-11-03"}]
+        answer = _external_update_answer("when was ROOT last updated in cmsdist?")
+        self.assertIn("#2", answer)
+        self.assertNotIn("xrootd", answer)
+
+    def test_github_window_since(self):
+        self.assertEqual(_github_since(None, "2026-09-01"), "2026-09-01")
+        self.assertIsNone(_github_since(None, "whenever"))
 
 
 class ConceptTests(unittest.TestCase):

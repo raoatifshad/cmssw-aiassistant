@@ -12430,12 +12430,12 @@ def _github_count_answer(question: str) -> str | None:
             issues = {r["state"]: r["n"] for r in session.run(
                 "MATCH (i:Issue) WHERE i.repo = 'cmssw' RETURN coalesce(i.state, 'unknown') AS state, count(*) AS n")}
             prs = session.run("MATCH (p:PR) WHERE p.repo = 'cmssw' RETURN count(p) AS total, "
-                              "count(p.merged_at) AS merged").single()
+                              "count(p.merged_at) AS merged, sum(CASE WHEN p.github_state = 'open' THEN 1 ELSE 0 END) AS open").single()
     finally:
         driver.close()
     lines = ["Imported cmssw GitHub data:", "",
              f"- **Issues:** {issues.get('open', 0):,} open, {issues.get('closed', 0):,} closed",
-             f"- **PRs:** {prs['total']:,} imported, {prs['merged']:,} of them merged"]
+             f"- **PRs:** {prs['open']:,} open, {prs['merged']:,} merged, {prs['total'] - prs['open'] - prs['merged']:,} closed without merging ({prs['total']:,} imported)"]
     lines.append(f"\n_{_github_export_note()}._")
     lines.append("\nAsk e.g. \"open issues about ASAN\" or \"issue 51787\" for specific ones.")
     return "\n".join(lines)
@@ -12448,7 +12448,7 @@ _FOLLOW_UP_STATE_RE = re.compile(
     r"^\s*(?:and\s+)?(?:is|was|has)\s+(?:it|this|that)(?:\s+one)?\s+(?:still\s+|already\s+|been\s+)?"
     r"(?:open|closed|merged|fixed|resolved)(?:\s+yet)?\s*[?.!]*\s*$", re.IGNORECASE)
 _FOLLOW_UP_WHY_RE = re.compile(
-    r"^\s*(?:and\s+|but\s+)?why\s*(?:is\s+(?:it|that)|did\s+(?:it|that)\s+fail|(?:are|do)\s+they\s+fail(?:ing)?)?\s*[?.!]*\s*$",
+    r"^\s*(?:and\s+|but\s+)?why\s*(?:is\s+(?:it|that)|did\s+(?:it|that)\s+fail|does\s+(?:it|that)\s+fail|(?:are|do)\s+they\s+fail(?:ing)?)?\s*[?.!]*\s*$",
     re.IGNORECASE)
 _FOLLOW_UP_WHAT_DOES_RE = re.compile(
     r"^\s*(?:and\s+|so\s+)?(?:what\s+(?:does|did)\s+(?:it|this|that)(?:\s+(?:one|pr))?\s+(?:do|change|fix)|"
@@ -12545,6 +12545,19 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
     if not last or len(question) > 80:
         return None
     previous = last["question"]
+    pr_before = re.search(r"\b(?:pr|pull\s+request)\s*#?\s*(\d{3,9})\b", previous, re.IGNORECASE)
+    if pr_before and re.fullmatch(r"\s*is\s+it\s+in\s+(?:the\s+)?(?:latest|newest|an?)\s+ib\s*[?.!]*\s*|\s*which\s+ib(?:\s+has\s+it)?\s*[?.!]*\s*", question, re.IGNORECASE):
+        return f"which IB first contains PR {pr_before.group(1)}?"
+    if pr_before and re.fullmatch(r"\s*did\s+(?:the\s+)?(?:failures?|anything|results?)\s+\w+\s+after\s+it\s*[?.!]*\s*|\s*did\s+it\s+break\s+anything\s*[?.!]*\s*", question, re.IGNORECASE):
+        return f"my PR {pr_before.group(1)} was merged, did it break anything?"
+    if re.fullmatch(r"\s*(?:show\s+(?:me\s+)?)?the\s+(?:newest|latest|first|top)(?:\s+one)?\s*[?.!]*\s*", question, re.IGNORECASE):
+        first_item = re.search(r"\*\*(Issue|PR) #(\d{3,6})\*\*", last["answer"])
+        if first_item:
+            # "list open issues about ASAN" then "show the newest one" (found 2026-11-04: the newest IB)
+            return f"{'issue' if first_item.group(1) == 'Issue' else 'PR'} {first_item.group(2)}"
+    single_pr = re.findall(r"\*\*(?:cmssw|cmsdist) #(\d{3,6})\*\*", last["answer"])
+    if len(single_pr) == 1 and re.fullmatch(r"\s*what\s+did\s+it\s+change\s*[?.!]*\s*|\s*what\s+does\s+it\s+do\s*[?.!]*\s*", question, re.IGNORECASE):
+        return f"what does PR {single_pr[0]} do"
     code_before = re.search(r"\bexit\s*code\s+(\d{2,5})\b", previous, re.IGNORECASE)
     if code_before and re.search(r"\b(?:which|what)\s+(?:workflows?|relvals?)\b[^?]*\b(?:it|that)\b", question, re.IGNORECASE):
         # "what does exit code 18176 mean?" then "which workflows have it in the latest IB?" (found 2026-11-04: all failures)
@@ -12809,6 +12822,24 @@ def _shift_question_rewrite(question: str) -> str | None:
     rewritten to the question the existing handlers answer. Nothing here looks at results."""
     if len(question) > 160:
         return None
+    url = re.search(r"github\.com/cms-sw/(cmssw|cmsdist)/(pull|issues)/(\d+)", question)
+    if url:
+        # a pasted link (found 2026-11-04: "com/cms" searched as a term; a dead end)
+        prefix = "" if url.group(1) == "cmssw" else "cmsdist "
+        return f"{prefix}{'PR' if url.group(2) == 'pull' else 'issue'} {url.group(3)}"
+    issue_field = re.search(r"\bissue\s*#?(\d{3,6})\b", question, re.IGNORECASE)
+    if issue_field and re.search(r"\b(?:summari[sz]e|summary|labels?|being\s+worked|assigned|when\s+was|details?|about)\b", question, re.IGNORECASE) and not re.search(r"\bcomment", question, re.IGNORECASE):
+        return f"issue {issue_field.group(1)}"
+    pr_mention = re.search(r"\bprs?\b[^?]*\bmention\w*\s+(?:workflow\s+)?(\d{1,6}\.\d{1,6})\b", question, re.IGNORECASE)
+    if pr_mention:
+        return f"is there an issue for workflow {pr_mention.group(1)}?"
+    who_changed = re.search(r"\bwho\s+(?:changed|touched|modified)\s+([A-Za-z0-9_/]{3,})", question, re.IGNORECASE)
+    if who_changed:
+        return f"any PR about {who_changed.group(1)}?"
+    if re.search(r"\b(?:which|what)\s+(?:workflows?|relvals?)\s+(?:failed|fails?)\s+(?:the\s+)?most\b[^?]*\b(?:week|month|days?)\b", question, re.IGNORECASE):
+        return re.sub(r"(?i)^.*?(\bthis\s+week|\bthis\s+month|\blast\s+\d+\s+days)\b.*$", r"top failing workflows \1", question)
+    if re.search(r"\bpackages?\b[^?]*\bfail\w*\s+(?:the\s+)?most\b", question, re.IGNORECASE):
+        return "what is the most common unit test failure across all architectures"
     number_as_code = re.fullmatch(r"\s*what(?:'s|\s+does|\s+is)\s+(\d{2,5})\s+mean\b[^?]*\s*[?.!]*\s*", question, re.IGNORECASE)
     if number_as_code and re.search(r"\b(?:exit|relvals?|cmsrun|code)\b", question, re.IGNORECASE):
         # "what does 139 mean as a cmsRun exit code?", "what does 62720 mean in relvals?" (found 2026-11-04: a table dump, LLM)
@@ -12946,6 +12977,14 @@ def _exit_ranking_answer(question: str) -> str | None:
 
 def _relval_pass_rate_answer(question: str) -> str | None:
     """ "what percentage of relvals pass on 20_1?" (found 2026-11-04: the failing list, no percentage)."""
+    if re.search(r"\b(?:percent\w*|pass(?:ing)?\s+rate|success\s+rate|%)\b", question, re.IGNORECASE) and re.search(r"\bunit\s*tests?\b", question, re.IGNORECASE):
+        tag = _latest_or_named_tag(question)
+        records = [r for r in _ib_build_records(tag) if r["variant"] == "primary" and r["units"]] if tag else []
+        if not records:
+            return None
+        lines = [f"Unit-test pass rate in `{tag}`, per architecture:", "", "| Architecture | Passed | Total | Pass rate |", "| --- | ---: | ---: | ---: |"]
+        lines += [f"| `{r['arch']}` | {r['units'] - len(r['unit_failed']):,} | {r['units']:,} | {100 * (r['units'] - len(r['unit_failed'])) / r['units']:.1f}% |" for r in sorted(records, key=lambda r: r["arch"])]
+        return "\n".join(lines)
     if not re.search(r"\b(?:percent\w*|pass(?:ing)?\s+rate|success\s+rate|%)\b", question, re.IGNORECASE) or not re.search(r"\brel\s*vals?\b|\bworkflows?\b", question, re.IGNORECASE):
         return None
     series = _requested_release_series(question)
@@ -12999,7 +13038,9 @@ def _health_trend_answer(question: str) -> str | None:
     """ "IB health this month compared with last month?" (found 2026-11-04: today's failures, no comparison)."""
     if not re.search(r"\b(?:this|last|past|previous)\s+(?:month|week)\b|\btrend\b|\bover\s+time\b", question, re.IGNORECASE):
         return None
-    if not re.search(r"\b(?:health|trend|stabil\w*|compared?|better|worse|quality)\b", question, re.IGNORECASE):
+    if re.search(r"\b(?:new|issues?|prs?|exceptions?|unit\s*tests?|top)\b", question, re.IGNORECASE):
+        return None
+    if not re.search(r"\b(?:health|trend|stabil\w*|compared?|better|worse|quality|which\s+day)\b", question, re.IGNORECASE):
         return None
     series = _requested_release_series(question)
     latest = _latest_ib_records(None, series)
@@ -13019,11 +13060,29 @@ def _health_trend_answer(question: str) -> str | None:
         driver.close()
     if not rows:
         return None
-    lines = [f"RelVal results are only kept from {rows[0]['day']} on, so a month-on-month comparison isn't possible yet. "
-             f"Per day for `{head}_X` primary IBs (known errors excluded):", "",
+    with_results = [r for r in rows if r["total"]]
+    worst = max(with_results, key=lambda r: r["failed"]) if with_results else None
+    lead = f"**{worst['day']}** had the most failures: {worst['failed']:,}. " if worst and re.search(r"\bwhich\s+day\b", question, re.IGNORECASE) else ""
+    spike = ""
+    if worst and worst["failed"] >= 100:
+        # one architecture can be the whole spike (found 2026-11-04: 1,881 on 10-29, nearly all fc42_riscv64_gcc15)
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                top_arch = session.run(
+                    "MATCH (ib:IB)-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE ib.variant IS NULL AND ib.tag STARTS WITH $prefix "
+                    "AND left(right(ib.tag, 15), 10) = $day AND NOT coalesce(r.known_error, false) "
+                    "RETURN ib.arch AS arch, count(*) AS n ORDER BY n DESC LIMIT 1", prefix=f"{head}_X_", day=worst["day"]).single()
+        finally:
+            driver.close()
+        if top_arch:
+            spike = f"\n\nOn {worst['day']}, `{top_arch['arch']}` alone accounts for {top_arch['n']:,} of the {worst['failed']:,}."
+    month_note = (f"RelVal results are only kept from {rows[0]['day']} on, so a month-on-month comparison isn't possible yet. "
+                  if re.search(r"\bmonth\b", question, re.IGNORECASE) else "")
+    lines = [f"{lead}{month_note}Per day for `{head}_X` primary IBs (known errors excluded):", "",
              "| Day | Builds | RelVal results | Failed | Failure rate |", "| --- | ---: | ---: | ---: | ---: |"]
     lines += [f"| {r['day']} | {r['builds']} | {r['total']:,} | {r['failed']:,} | {100 * r['failed'] / r['total']:.2f}% |" for r in rows if r["total"]]
-    return "\n".join(lines)
+    return "\n".join(lines) + spike
 
 
 def _ib_count_answer(question: str) -> str | None:
@@ -13168,6 +13227,11 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
         return (f"The imported IB data has one build status per architecture, not which package failed to compile on "
                 f"`{remembered_build[0]}`: the build log on the IB page has that."
                 + (f" Failing unit-test packages in that answer: {listed}." if listed else ""))
+    touches = re.fullmatch(r"\s*which\s+(?:one|ones|pr|prs)\s+(?:touch\w*|mentions?|is\s+about|are\s+about|names?)\s+([A-Za-z0-9_/-]{2,})\s*[?.!]*\s*", question, re.IGNORECASE)
+    if touches and re.search(r"\*\*(?:cmssw|cmsdist) #\d+\*\*", answer):
+        # "which PRs were merged in the latest IB?" then "which one touches L1T?" (found 2026-11-04: the menu)
+        lines = [line for line in answer.split("\n") if line.startswith("- ") and touches.group(1).lower() in line.lower()]
+        return ("From that list, by title:\n" + "\n".join(lines)) if lines else f"No PR in that list names `{touches.group(1)}` in its title; changed files aren't imported for every PR."
     only = re.fullmatch(r"\s*(?:are|is)\s+(?:they|these|those|it)\s+(?:all\s+)?(\w+)\s+only\s*[?.!]*\s*", question, re.IGNORECASE)
     if only and packages:
         word = only.group(1).lower()
@@ -13429,12 +13493,25 @@ def _most_common_failure_answer(question: str) -> str | None:
     """ "what is the most common failure in the latest IB for all the architectures?" (asked by the user 2026-11-04: the whole
     failure list, with no ranking). One IB, ranked; each row says where, so nothing is merged out of sight. Windows
     ("this week") stay with the ranking answers over time."""
-    if not _MOST_COMMON_FAILURE_RE.search(question) or re.search(r"\b(?:week|month|days?|exceptions?)\b", question, re.IGNORECASE):
+    wants_code = re.search(r"\b(?:most\s+(?:common|frequent)|commonest|top)\s+exit\s*codes?\b|\bexit\s*codes?\b[^?]*\bmost\s+(?:common|frequent)\b", question, re.IGNORECASE)
+    if not (_MOST_COMMON_FAILURE_RE.search(question) or wants_code) or re.search(r"\b(?:week|month|days?|exceptions?|packages?|unit\s*tests?)\b", question, re.IGNORECASE):
         return None
     tag_match = IB_TAG_RE.search(question)
     series = _requested_release_series(question)
     latest = None if tag_match else _latest_ib_records(None, series)
     tag = tag_match.group(1) if tag_match else (latest[0]["tag"] if latest else None)
+    flavour = re.search(rf"\b({_ALL_VARIANTS_RE})\s+(?:sub[\s-]*)?(?:ib|build)\b", question, re.IGNORECASE)
+    if flavour and not tag_match and tag:
+        name = _ALL_VARIANTS[flavour.group(1).lower()]
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                row = session.run("MATCH (ib:IB {variant:$v})-[:RAN_RELVAL]->() WHERE ib.tag STARTS WITH $p RETURN ib.tag AS tag ORDER BY tag DESC LIMIT 1",
+                                  v=name, p=tag.rsplit("_X_", 1)[0] + "_").single()
+        finally:
+            driver.close()
+        if row:
+            tag = row["tag"]
     if not tag:
         return None
     arch = _requested_ib_arch(question)
@@ -13483,7 +13560,10 @@ def _most_common_failure_answer(question: str) -> str | None:
         for row in relvals:
             code = _format_exit_code(row["exitcode"], names) if row["exitcode"] else "0"
             by_code[code] = by_code.get(code, 0) + 1
-        lines.append("\nBy exit code: " + ", ".join(f"{code} × {n}" for code, n in sorted(by_code.items(), key=lambda kv: -kv[1])) + ".")
+        ranked_codes = sorted(by_code.items(), key=lambda kv: -kv[1])
+        lines.append("\nBy exit code: " + ", ".join(f"{code} × {n}" for code, n in ranked_codes) + ".")
+        if wants_code:
+            lines.insert(0, f"The most common exit code in `{tag}` and its sub-IBs{scope_text} is **{ranked_codes[0][0]}**: {ranked_codes[0][1]} of the {len(relvals)} failing RelVal results.\n")
     if units:
         by_package: dict[str, list[dict]] = {}
         for row in units:
@@ -13500,7 +13580,7 @@ def _most_common_failure_answer(question: str) -> str | None:
 
 def _latest_exception_answer(question: str) -> str | None:
     """ "what is the latest exception" (found 2026-11-04: the LLM picked CMSSW_9_4). The newest build of the newest series."""
-    if not re.fullmatch(r"\s*(?:what(?:'s|\s+is|\s+are)\s+)?the\s+(?:latest|newest|most\s+recent)\s+exceptions?\s*[?.!]*\s*", question, re.IGNORECASE):
+    if not re.fullmatch(r"\s*(?:what(?:'s|\s+is|\s+are)\s+)?the\s+(?:(?:latest|newest|most\s+recent)\s+exceptions?|most\s+common\s+exceptions?\s+in\s+the\s+(?:latest|newest)\s+ib)\s*[?.!]*\s*", question, re.IGNORECASE):
         return None
     latest = _latest_ib_records()
     if not latest:
@@ -13544,6 +13624,313 @@ def _latest_pr_answer(question: str) -> str | None:
     return text + f"\n\n_{_github_export_note()}._"
 
 
+def _ib_build_records(tag: str, arch: str | None = None, family: str | None = None) -> list[dict]:
+    """One row per build of an IB (primary and sub-IBs, per architecture): what failed in it and how many results it has."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE (ib.tag = $tag OR ib.parent_tag = $tag) AND ($arch IS NULL OR ib.arch = $arch) "
+                "AND ($family IS NULL OR ib.arch CONTAINS $family) "
+                "OPTIONAL MATCH (ib)-[:RAN_RELVAL]->(r:RelVal) "
+                "WITH ib, count(r) AS relvals, [x IN collect(CASE WHEN r.status = 'FAILED' AND NOT coalesce(r.known_error, false) THEN r.workflow_id END) WHERE x IS NOT NULL] AS failed "
+                "OPTIONAL MATCH (ib)-[:RAN_UNITTEST]->(u:UnitTest) "
+                "WITH ib, relvals, failed, count(u) AS units, [x IN collect(CASE WHEN u.status = 'FAILED' THEN u.name END) WHERE x IS NOT NULL] AS unit_failed "
+                "RETURN ib.tag AS tag, ib.arch AS arch, coalesce(ib.variant, 'primary') AS variant, ib.build_status AS build, relvals, failed, units, unit_failed",
+                tag=tag, arch=arch, family=family)]
+    finally:
+        driver.close()
+    return rows
+
+
+def _latest_or_named_tag(question: str) -> str | None:
+    tag_match = IB_TAG_RE.search(question)
+    if tag_match:
+        return tag_match.group(1)
+    latest = _latest_ib_records(None, _requested_release_series(question))
+    return latest[0]["tag"] if latest else None
+
+
+_PER_DIMENSION_RE = re.compile(
+    r"\b(?:which|what)\s+(?:is\s+the\s+)?(?:worst\s+|best\s+)?(arch\w*|sub[\s-]*ibs?|flavou?rs?|variants?)\b[^?]*\b(?:most|worst|fewest|least|best)\b|"
+    r"\b(?:worst|best)\s+(arch\w*|sub[\s-]*ibs?|flavou?rs?)\b|"
+    r"\b(?:failures?|fails?|failing\s+\w+|relvals?\s+failures?)\s+(?:per|by|for\s+each|in\s+each)\s+(arch\w*|sub[\s-]*ibs?|flavou?rs?|variants?)\b", re.IGNORECASE)
+
+
+def _failures_by_dimension_answer(question: str) -> str | None:
+    """ "which architecture has the most failures in the latest IB?", "failures per sub-IB", "worst architecture right now"
+    (found 2026-11-04: the whole list, an unrelated week ranking, and an LLM answer saying nothing was failing with el10 red)."""
+    match = _PER_DIMENSION_RE.search(question)
+    if not match or re.search(r"\b(?:week|month|days?)\b", question, re.IGNORECASE):
+        return None
+    tag = _latest_or_named_tag(question)
+    if not tag:
+        return None
+    word = next(g for g in match.groups() if g).lower()
+    by_arch = word.startswith("arch")
+    groups: dict[str, dict] = {}
+    for r in _ib_build_records(tag):
+        g = groups.setdefault(r["arch"] if by_arch else r["variant"], {"relvals": 0, "failed": 0, "unit_failed": 0, "builds": 0, "errors": 0})
+        g["relvals"] += r["relvals"]
+        g["failed"] += len(r["failed"])
+        g["unit_failed"] += len(r["unit_failed"])
+        g["builds"] += 1
+        g["errors"] += 1 if r["build"] == "error" else 0
+    if not groups:
+        return None
+    ranked = sorted(groups.items(), key=lambda kv: (-kv[1]["errors"], -(kv[1]["failed"] + kv[1]["unit_failed"]), kv[0]))
+    name = "Architecture" if by_arch else "Build type"
+    with_results = [item for item in ranked if item[1]["relvals"]]
+    top = max(with_results or ranked, key=lambda kv: kv[1]["failed"] + kv[1]["unit_failed"])
+    failed_builds = [k for k, v in ranked if v["errors"]]
+    lines = [f"In `{tag}` and its sub-IBs, **`{top[0]}`** has the most failing results: {top[1]['failed']} RelVal(s) and {top[1]['unit_failed']} unit test(s)"
+             + (f", across {top[1]['builds']} builds." if by_arch and top[1]["builds"] > 1 else ".")]
+    if failed_builds:
+        lines.append(f"The build itself failed on: {', '.join(f'`{k}`' for k in failed_builds)}.")
+    lines += ["", f"| {name} | Failing RelVals | Failing unit tests | Failed builds | RelVal results imported |", "| --- | ---: | ---: | ---: | ---: |"]
+    lines += [f"| `{k}` | {v['failed']} | {v['unit_failed']} | {v['errors']} of {v['builds']} | {v['relvals']:,} |" for k, v in ranked]
+    lines.append("\nKnown errors aren't counted. A row with few or no results imported may still be running, so its count can rise; compare the last column.")
+    return "\n".join(lines)
+
+
+def _scope_matches(record: dict, word: str) -> bool:
+    word = word.lower()
+    return word in record["arch"].lower() or record["variant"].lower() == word
+
+
+_ONLY_ON_RE = re.compile(r"\b(?:fail\w*)\b[^?]*\bonly\s+(?:on|in)\s+(?:the\s+)?([A-Za-z0-9_]+)\b|\bonly\s+(?:on|in)\s+(?:the\s+)?([A-Za-z0-9_]+)\b[^?]*\bfail\w*", re.IGNORECASE)
+_BUT_NOT_RE = re.compile(r"\b(?:on|in)\s+(?:the\s+)?([A-Za-z0-9_]+)\s+but\s+not\s+(?:on\s+|in\s+)?(?:the\s+)?([A-Za-z0-9_]+)\b", re.IGNORECASE)
+_COMMON_TO_ALL_RE = re.compile(r"\bcommon\s+(?:to|in|across|between)\s+(?:all\s+)?(?:the\s+)?(sub[\s-]*ibs?|arch\w*|flavou?rs?)\b|\b(?:fail\w*)\b[^?]*\b(?:in|on|across)\s+all\s+(?:the\s+)?(sub[\s-]*ibs?|arch\w*|flavou?rs?)\b", re.IGNORECASE)
+
+
+def _failure_sets_answer(question: str) -> str | None:
+    """ "what is failing only on el10?", "on gcc15 but not gcc14?", "common to all sub-IBs?" in one IB (found 2026-11-04: the whole list)."""
+    only, but_not, common = _ONLY_ON_RE.search(question), _BUT_NOT_RE.search(question), _COMMON_TO_ALL_RE.search(question)
+    if not (only or but_not or common) or re.search(r"\b(?:week|month|days?|issues?|prs?)\b", question, re.IGNORECASE):
+        return None
+    tag = _latest_or_named_tag(question)
+    if not tag:
+        return None
+    records = _ib_build_records(tag)
+    with_results = [r for r in records if r["relvals"] or r["units"]]
+
+    def where_fails(rows: list[dict]) -> tuple[set[str], set[str]]:
+        return ({w for r in rows for w in r["failed"]}, {p for r in rows for p in r["unit_failed"]})
+
+    def listing(workflows: set[str], packages: set[str]) -> str:
+        parts = []
+        if workflows:
+            parts.append("RelVals: " + ", ".join(f"`{w}`" for w in sorted(workflows)))
+        if packages:
+            parts.append("Unit tests: " + ", ".join(f"`{p}`" for p in sorted(packages)))
+        return "\n".join(f"- {p}" for p in parts) if parts else "- none"
+
+    partial = sum(1 for r in records if not r["relvals"])
+    caveat = (f"\n\nBuilds still without results don't count ({partial} of {len(records)} here), and known errors are left out, "
+              "so a later import can change this.") if partial else "\n\nKnown errors are left out."
+    if but_not:
+        a, b = but_not.groups()
+        in_a = [r for r in with_results if _scope_matches(r, a)]
+        in_b = [r for r in with_results if _scope_matches(r, b)]
+        if not in_a or not in_b:
+            return f"`{tag}` has no results yet for {'`' + a + '`' if not in_a else '`' + b + '`'}, so the two can't be compared."
+        wa, pa = where_fails(in_a)
+        wb, pb = where_fails(in_b)
+        return f"In `{tag}` and its sub-IBs, failing on `{a}` but not on `{b}`:\n{listing(wa - wb, pa - pb)}{caveat}"
+    if only:
+        word = only.group(1) or only.group(2)
+        inside = [r for r in with_results if _scope_matches(r, word)]
+        if not inside:
+            return f"`{tag}` has no results for `{word}`."
+        wi, pi = where_fails(inside)
+        wo, po = where_fails([r for r in with_results if not _scope_matches(r, word)])
+        return f"In `{tag}` and its sub-IBs, failing only on `{word}`, and in no other build with results:\n{listing(wi - wo, pi - po)}{caveat}"
+    word = next(g for g in common.groups() if g).lower()
+    key = (lambda r: r["arch"]) if word.startswith("arch") else (lambda r: r["variant"])
+    full = max((r["relvals"] for r in with_results), default=0)
+    complete = [r for r in with_results if r["relvals"] >= 0.9 * full] if full else []
+    if len({key(r) for r in complete}) < 2:
+        return None
+    grouped: dict[str, list[dict]] = {}
+    for r in complete:
+        grouped.setdefault(key(r), []).append(r)
+    sets = [where_fails(rows) for rows in grouped.values()]
+    shared_w, shared_p = set.intersection(*(s[0] for s in sets)), set.intersection(*(s[1] for s in sets))
+    return (f"In `{tag}`, failing in all {len(grouped)} " + ("architectures" if word.startswith("arch") else "build types")
+            + " with complete results (" + ", ".join(f"`{k}`" for k in sorted(grouped)) + f"):\n{listing(shared_w, shared_p)}{caveat}")
+
+
+def _series_compare_answer(question: str) -> str | None:
+    """ "is 17_1 better than 16_1?", "compare 20_1 and 17_1 latest IBs" (found 2026-11-04: a 20_1 digest; "which architecture?")."""
+    if IB_TAG_RE.search(question) or not re.search(r"\b(?:better|worse|compare|vs\.?|versus|healthier)\b", question, re.IGNORECASE):
+        return None
+    found = re.findall(r"\b(?:CMSSW_)?(\d{1,2})_(\d{1,2})(?:_X)?\b", question, re.IGNORECASE)
+    if len(found) != 2 or found[0] == found[1]:
+        return None
+    lines = ["Newest primary IB of each release series, by architecture. Different series run different workflows and architectures, "
+             "so this shows where each stands, not which code is better:", "",
+             "| Release | Build | Architecture | Build status | Failing RelVals / results | Failing unit tests / results |", "| --- | --- | --- | --- | ---: | ---: |"]
+    for major, minor in found:
+        latest = _latest_ib_records(None, (int(major), int(minor)))
+        if not latest:
+            return f"No IB is imported for `CMSSW_{major}_{minor}_X`."
+        tag = latest[0]["tag"]
+        for r in sorted((x for x in _ib_build_records(tag) if x["variant"] == "primary"), key=lambda x: x["arch"]):
+            lines.append(f"| `CMSSW_{major}_{minor}_X` | `{tag.rsplit('_X_', 1)[-1]}` | `{r['arch']}` | {_status_cell(r['build'])} | {len(r['failed'])} / {r['relvals']:,} | {len(r['unit_failed'])} / {r['units']:,} |")
+    return "\n".join(lines)
+
+
+def _failure_change_answer(question: str) -> str | None:
+    """ "did the number of failures go up or down since yesterday?" (found 2026-11-04: a digest without the totals)."""
+    if not re.search(r"\b(?:up\s+or\s+down|down\s+or\s+up|more\s+or\s+(?:fewer|less)|increas\w*|decreas\w*)\b", question, re.IGNORECASE) or not re.search(r"\bfail", question, re.IGNORECASE):
+        return None
+    latest = _latest_ib_records(None, _requested_release_series(question))
+    newer = latest[0]["tag"] if latest else None
+    older = _previous_primary_tag(newer) if newer else None
+    if not older:
+        return None
+    new_rows = {r["arch"]: r for r in _ib_build_records(newer) if r["variant"] == "primary"}
+    old_rows = {r["arch"]: r for r in _ib_build_records(older) if r["variant"] == "primary"}
+    lines = [f"Failing results per architecture, primary IB, `{older}` to `{newer}` (known errors excluded):", "",
+             "| Architecture | RelVals before | RelVals now | Results now | Unit tests before | Unit tests now |", "| --- | ---: | ---: | ---: | ---: | ---: |"]
+    for arch in sorted(set(new_rows) | set(old_rows)):
+        n, o = new_rows.get(arch), old_rows.get(arch)
+        lines.append(f"| `{arch}` | {len(o['failed']) if o and o['relvals'] else 'none yet'} | {len(n['failed']) if n and n['relvals'] else 'none yet'} | {n['relvals'] if n else 0:,} | "
+                     f"{len(o['unit_failed']) if o and o['units'] else 'none yet'} | {len(n['unit_failed']) if n and n['units'] else 'none yet'} |")
+    lines.append("\nA build with few results imported may still be running. Ask for a shift summary to see which ones changed.")
+    return "\n".join(lines)
+
+
+def _issue_comments_answer(question: str) -> str | None:
+    """ "who commented on issue 51089?", "what does the last comment of issue 51354 say?" (found 2026-11-04: text searches, the newest Issue)."""
+    match = re.search(r"\bissues?\s*#?(\d{3,6})\b", question, re.IGNORECASE)
+    if not match or not re.search(r"\bcomment\w*\b", question, re.IGNORECASE):
+        return None
+    number = int(match.group(1))
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            issue = session.run("MATCH (i:Issue {repo:'cmssw', number:$n}) RETURN i.title AS title, i.fetched_via AS via", n=number).single()
+            comments = [dict(r) for r in session.run(
+                "MATCH (:Issue {repo:'cmssw', number:$n})-[:HAS_COMMENT]->(c:GitHubComment) RETURN c.author AS author, c.created_at AS at, c.body AS body ORDER BY at DESC", n=number)]
+    finally:
+        driver.close()
+    if not issue:
+        return _number_not_an_issue_answer(number)
+    if not comments:
+        return f"**Issue #{number}** has no imported comments." + (" It came from the direct GitHub fetch, which imports no comments, so it may have some on GitHub." if issue["via"] else "")
+    authors = list(dict.fromkeys(c["author"] for c in comments if c["author"]))
+    lines = [f"**Issue #{number}** - {issue['title']}: {len(comments)} imported comment(s), from {', '.join(f'`{a}`' for a in authors[:8])}" + (f" and {len(authors) - 8} more." if len(authors) > 8 else "."), "", "Newest first:"]
+    for c in comments[:3]:
+        lines.append(f"- {str(c['at'])[:10]}, `{c['author']}`: {_plain_snippet(c['body'] or '', 300)}")
+    if issue["via"]:
+        lines.append(f"\n_Comments are only imported up to the full export; this Issue changed since, so newer ones may exist. {_github_export_note()}._")
+    return "\n".join(lines)
+
+
+_GITHUB_WINDOW_COUNT_RE = re.compile(r"\bhow\s+many\s+(prs?|pull\s+requests?|issues?)\s+(?:were|have\s+been|got)\s+(merged|opened|created|closed)\b[^?]*\b(?:this\s+(week|month)|since\s+([a-z]+|\d{4}-\d{2}-\d{2}))\b", re.IGNORECASE)
+_MONTHS = {m: i + 1 for i, m in enumerate(("january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"))}
+
+
+def _github_since(period: str | None, since_text: str | None) -> str | None:
+    now = datetime.now(timezone.utc)
+    if period:
+        return (now - timedelta(days=7)).strftime("%Y-%m-%d") if period.lower() == "week" else now.strftime("%Y-%m-01")
+    if since_text and since_text.lower() in _MONTHS:
+        month = _MONTHS[since_text.lower()]
+        return f"{now.year if month <= now.month else now.year - 1}-{month:02d}-01"
+    return since_text if since_text and re.fullmatch(r"\d{4}-\d{2}-\d{2}", since_text) else None
+
+
+def _github_window_count_answer(question: str) -> str | None:
+    """ "how many PRs were merged this month?", "how many issues were closed since September?" (found 2026-11-04: text searches for "many month")."""
+    match = _GITHUB_WINDOW_COUNT_RE.search(question)
+    if not match:
+        return None
+    kind, action, period, since_text = match.groups()
+    since = _github_since(period, since_text)
+    if not since:
+        return None
+    is_pr = kind.lower().startswith(("pr", "pull"))
+    field = {"merged": "merged_at", "closed": "closed_at"}.get(action.lower(), "created_at" if not is_pr else "github_created_at")
+    if is_pr and action.lower() == "closed":
+        field = "merged_at"
+    label = "PR" if is_pr else "Issue"
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            count = session.run(f"MATCH (x:{label}) WHERE x.repo = 'cmssw' AND x.{field} >= $since RETURN count(x) AS n", since=since).single()["n"]
+    finally:
+        driver.close()
+    return f"**{count:,} cmssw {label}(s)** {action.lower()} since {since}, as imported.\n\n_{_github_export_note()}._"
+
+
+def _new_issues_answer(question: str) -> str | None:
+    """ "open issues created this week" (found 2026-11-04: the menu)."""
+    match = re.search(r"\b(open\s+)?issues?\b[^?]*\b(?:created|opened|new)\b[^?]*\bthis\s+(week|month)\b|\bnew\s+(open\s+)?issues?\b[^?]*\bthis\s+(week|month)\b", question, re.IGNORECASE)
+    if not match or re.search(r"\bhow\s+many\b", question, re.IGNORECASE):
+        return None
+    since = _github_since(match.group(2) or match.group(4), None)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (i:Issue {repo:'cmssw'}) WHERE i.created_at >= $since RETURN i.number AS n, i.title AS title, i.state AS state, left(i.created_at, 10) AS at ORDER BY n DESC LIMIT 25", since=since)]
+    finally:
+        driver.close()
+    if not rows:
+        return f"No imported cmssw Issue was opened since {since}. {_github_export_note()}."
+    return f"**{len(rows)} cmssw Issue(s)** opened since {since}, newest first:\n" + "\n".join(f"- **#{r['n']}** - {r['title']} (`{r['state']}`, {r['at']})" for r in rows) + f"\n\n_{_github_export_note()}._"
+
+
+def _external_update_answer(question: str) -> str | None:
+    """ "was Geant4 updated recently?", "when was ROOT last updated in cmsdist?", "the PR that updates ROOT" (found 2026-11-04: dead ends; a PR about xrootd)."""
+    match = re.search(r"\b(?:was|has|did|when\s+was)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9+_-]{2,})\s+(?:last\s+|recently\s+)?(?:been\s+|get\s+)?(?:updated|upgraded|bumped)\b|\bprs?\s+(?:that\s+)?(?:updates?|upgrades?|bumps?)\s+([A-Za-z][A-Za-z0-9+_-]{2,})\b", question, re.IGNORECASE)
+    if not match:
+        return None
+    name = match.group(1) or match.group(2)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (p:PR {repo:'cmsdist'}) WHERE toLower(p.title) CONTAINS toLower($name) AND p.merged_at IS NOT NULL "
+                "RETURN p.number AS n, p.title AS title, left(p.merged_at, 10) AS merged ORDER BY p.merged_at DESC LIMIT 25", name=name)]
+    finally:
+        driver.close()
+    pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", re.IGNORECASE)
+    rows = [r for r in rows if pattern.search(r["title"])][:6]
+    if not rows:
+        return f"No imported cmsdist PR title names `{name}`, so I can't say when it was last updated."
+    return (f"Most recent merged cmsdist PRs naming `{name}` in their title (cmsdist holds the externals' build recipes):\n"
+            + "\n".join(f"- **cmsdist #{r['n']}** - {r['title']} (merged {r['merged']})" for r in rows))
+
+
+def _new_exceptions_answer(question: str) -> str | None:
+    """ "which exceptions are new this week?" (found 2026-11-04: dead end). First recorded in the window, in the newest series."""
+    if not re.search(r"\bnew\b[^?]*\bexceptions?\b|\bexceptions?\b[^?]*\bnew\b", question, re.IGNORECASE):
+        return None
+    days = 30 if re.search(r"\bmonth\b", question, re.IGNORECASE) else 7
+    latest = _latest_ib_records(None, _requested_release_series(question))
+    if not latest:
+        return None
+    head = latest[0]["tag"].rsplit("_X_", 1)[0]
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (e:RelValException) WHERE e.ib_tag STARTS WITH $p WITH e.category AS category, left(e.message, 140) AS message, "
+                "min(right(e.ib_tag, 15)) AS first, count(DISTINCT e.workflow_id) AS workflows WHERE first >= $since "
+                "RETURN category, message, first, workflows ORDER BY first DESC, workflows DESC LIMIT 12", p=f"{head}_", since=_cutoff_stamp(days))]
+    finally:
+        driver.close()
+    if not rows:
+        return f"No RelVal exception message in `{head}_X` is new in the last {days} days. Messages are compared as recorded, so a changed number in a message counts as new."
+    lines = [f"RelVal exception messages first recorded in `{head}_X` in the last {days} days (exceptions are kept from 2026-08-11):", "", "| Category | Message | Workflows | First build |", "| --- | --- | ---: | --- |"]
+    for r in rows:
+        lines.append(f"| {r['category']} | {' '.join((r['message'] or '').split()).replace('|', '/')} | {r['workflows']} | {r['first']} |")
+    return "\n".join(lines)
+
+
 def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     """Answers the 2026-11-04 test pass found missing; each returns None unless its phrasing matches."""
     if "\n" in question or len(question) > 200:
@@ -13557,6 +13944,10 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
         return ("**If it also fails in IBs without your PR, it isn't from your PR.** Compare the same step's error in your PR's "
                 f"test and in the IB; this shows where it fails, not the cause.\n\n{where}", "deterministic:ib_or_pr")
     for handler, route in ((_not_imported_answer, "not_imported"), (_exit_code_difference_answer, "exit_code"),
+                           (_failures_by_dimension_answer, "failures_by_dimension"), (_failure_sets_answer, "failure_sets"),
+                           (_series_compare_answer, "series_compare"), (_failure_change_answer, "failure_change"),
+                           (_issue_comments_answer, "issue_comments"), (_github_window_count_answer, "github_window_count"), (_new_issues_answer, "new_issues"),
+                           (_external_update_answer, "external_update"), (_new_exceptions_answer, "new_exceptions"),
                            (_most_common_failure_answer, "most_common_failure"),
                            (_das_error_count_answer, "das_error_count"), (_workflow_failure_count_answer, "workflow_failure_count"),
                            (_failing_every_build_answer, "failing_every_build"), (_prs_by_author_answer, "prs_by_author"),
@@ -13566,6 +13957,12 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
                            (_ib_count_answer, "ib_count"), (_last_green_answer, "last_green")):
         answer = handler(question)
         if answer:
+            if route == "most_common_failure":
+                # "why does it fail?", "since when?", "is there an issue for it?" are about the top workflow (found 2026-11-04)
+                top = re.search(r"\*\*`(\d{1,6}\.\d{1,6})`\*\*", answer)
+                if top:
+                    _last_workflow_contexts[sid] = top.group(1)
+                    _last_failed_builds.pop(sid, None)
             return answer, f"deterministic:{route}"
     glossary_flavours = re.fullmatch(rf"\s*what\s+(?:do|does)\s+(?:the\s+)?((?:{_ALL_VARIANTS_RE})(?:\s*(?:and|,)\s*(?:{_ALL_VARIANTS_RE}))*)\s+(?:sub[\s-]*)?(?:ibs?|builds?)?\s*(?:test|check|do|for)?\s*[?.!]*\s*",
                                      question, re.IGNORECASE)

@@ -391,7 +391,7 @@ add("N5", "is el10 ready?", all=[r"el10_"])
 add("N5", ["why is 17_1 red?", "since when?"], all=[r"since"])
 add("N5", "is the 17_1 global tag problem tracked anywhere?", all=[r"GitHub evidence", r"Global Tag"])
 add("N5", "is there an open issue about DAS errors?", all=[r"DAS"], none=[r"most common recorded errors"])
-add("N5", "which sub-IB is in the worst shape?", all=[r"most failed"])
+add("N5", "which sub-IB is in the worst shape?", all=[r"most failing"])
 add("N5", "which workflows timed out in the latest IB?", all=[r"31744|TimeOut"])
 
 # ---------------------------------------------------------------- N6: round 4, 2026-11-04
