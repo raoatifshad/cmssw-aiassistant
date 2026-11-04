@@ -9,7 +9,12 @@ from server.api_server import (
     _log_overview_question_answer,
     _condense_comparison_for_chat,
     _das_error_count_answer,
+    _arch_compare_answer,
+    _arch_scope_answer,
     _external_update_answer,
+    _flavour_in,
+    _ib_schedule_now_answer,
+    _month_answer,
     _failure_sets_answer,
     _failures_by_dimension_answer,
     _github_since,
@@ -273,6 +278,53 @@ class LogAndWarningAnswerTests(unittest.TestCase):
         self.assertIn("intermittent", _basic_term_answer("what does 'returned' mean in the test-log summary?"))
         self.assertIn("Still present", _basic_term_answer("what does 'still present' mean?"))
         self.assertIn("ignored warning", _basic_term_answer("what is an ignored warning?"))
+
+
+class HourSixTests(unittest.TestCase):
+    def test_both_tags_never_ask_back(self):
+        a, b = "CMSSW_20_1_X_2026-11-02-2300", "CMSSW_20_1_X_2026-11-03-1100"
+        expected = f"what changed between {a} and {b}"
+        self.assertEqual(_shift_question_rewrite(f"what changed from {a} to {b}"), expected)
+        self.assertEqual(_shift_question_rewrite(f"diff {a} {b}"), expected)
+        self.assertEqual(_shift_question_rewrite(f"which relvals are new in {b} compared to {a}?"), expected)
+        self.assertIsNone(_shift_question_rewrite(f"compare {a} and {b}"))
+        self.assertIsNone(_shift_question_rewrite(f"difference between {a} and {b}"))
+
+    @patch("server.api_server._ib_build_records", return_value=[])
+    @patch("server.api_server._newest_flavour_tag", return_value="CMSSW_20_1_DBG_X_2026-11-02-2300")
+    def test_a_flavour_question_uses_that_flavour(self, *_):
+        self.assertEqual(_shift_question_rewrite("is DBG failing?"), "what is failing in CMSSW_20_1_DBG_X_2026-11-02-2300")
+        self.assertEqual(_shift_question_rewrite("what's failing in CMSSW_5_3_HI?"), "what is failing in CMSSW_20_1_DBG_X_2026-11-02-2300")
+
+    def test_short_flavour_names_need_capitals(self):
+        self.assertIsNone(_flavour_in("hi, is anything broken?"))
+        self.assertEqual(_flavour_in("is HI built?"), "HI")
+
+    def test_digest_new_items_are_read_from_the_digest(self):
+        _turn_memory["s-6"] = {"question": "q", "route": "x", "answer": "## Shift summary: A -> B\n\n#### Newly failing RelVal workflows\n| Workflow | Name |\n| --- | --- |\n| `539.0` | DY |\n\n#### Resolved RelVal workflows\nNone."}
+        answer = _listed_items_follow_up("which are new?", "s-6")
+        self.assertIn("`539.0`", answer)
+
+    def test_month_outside_the_kept_period(self):
+        self.assertIn("kept from", _month_answer("what failed in August?"))
+        self.assertIsNone(_month_answer("what failed in the latest IB?"))
+
+    @patch("server.api_server._cern_now")
+    def test_next_ib_follows_the_schedule(self, now):
+        from datetime import datetime as real
+        from zoneinfo import ZoneInfo
+        now.return_value = real(2026, 11, 7, 12, 0, tzinfo=ZoneInfo("Europe/Zurich"))  # Saturday noon: no 23:00, then Sunday 00:00
+        self.assertIn("Sunday 2026-11-08 00:00", _ib_schedule_now_answer("when will the next IB be built?"))
+
+    @patch("server.api_server._latest_ib_records", return_value=LATEST)
+    @patch("server.api_server._ib_build_records", return_value=[_build("primary", "el8_amd64_gcc14", ["1.0"]), _build("primary", "el9_amd64_gcc14", ["1.0", "2.0"])])
+    def test_arch_compare_and_scope(self, *_):
+        answer = _arch_compare_answer("compare el8 and el9 for 20_1")
+        self.assertIn("| Failing on both | `1.0` |", answer)
+        self.assertIn("| Only on `el9` | `2.0` |", answer)
+        only = _arch_scope_answer("relvals on el8 only")
+        self.assertIn("el8_amd64_gcc14", only)
+        self.assertNotIn("el9_amd64_gcc14", only)
 
 
 class ConceptTests(unittest.TestCase):
