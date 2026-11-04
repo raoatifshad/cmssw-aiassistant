@@ -3474,6 +3474,9 @@ def _artifact_search_answer(question: str) -> str | None:
         for row in fulltext_rows + fallback_rows
     }
     rows = sorted(rows_by_key.values(), key=lambda row: (-row["score"], -row["number"]))
+    if re.search(r"\b(?:recent\w*|lately|this\s+(?:week|month)|last\s+\d+\s+days?)\b", question, re.IGNORECASE):
+        # "anything about TICL v5 merged recently?" (found 2026-11-04: 2019 and 2021 PRs on top)
+        rows.sort(key=lambda row: str(row["merged_at"] or ""), reverse=True)
 
     if not rows:
         return f"No imported Issues or PRs match `{term}`."
@@ -11864,6 +11867,10 @@ def _chat(req: ChatRequest):
     author_answer = _pr_author_answer(original_question)
     if author_answer:
         return _chat_response(sid, original_question, author_answer, "deterministic:pr_author")
+
+    prs_window = _prs_merged_window_answer(original_question)
+    if prs_window:
+        return _chat_response(sid, original_question, prs_window, "deterministic:prs_merged_window")
 
     issue_answer = _issue_number_answer(original_question)
     if issue_answer:
