@@ -2061,7 +2061,7 @@ class ChatRoutingTests(unittest.TestCase):
         )
 
         self.assertIn("Package/Number0", answer)
-        self.assertIn("(+5 more)", answer)
+        self.assertIn("(+5 more;", answer)
         get_failing_unittests.assert_called_once_with(
             "CMSSW_20_1_MULTIARCHSV4_X_2026-09-14-2300", arch="el9_amd64_gcc14", limit=10
         )
