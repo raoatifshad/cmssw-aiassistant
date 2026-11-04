@@ -9391,7 +9391,8 @@ def _exit_code_meaning_answer(question: str) -> str | None:
         candidates.append((code, f"`{code}` is the raw RelVal exit status recorded in the IB results"))
     if code < 256 and (code << 8) in names:
         candidates.append((code << 8, f"`{code}` is the process exit status; RelVal results record it as `{code << 8}` (= {code} × 256)"))
-    if code >= 7000 and ((code & 0xFF) << 8) in names and (code & 0xFF) << 8 != code:
+    # only the edm::errors range: "exit code 99999" read as SIGSYS (found 2026-11-04)
+    if 7000 <= code <= 9999 and ((code & 0xFF) << 8) in names and (code & 0xFF) << 8 != code:
         raw = (code & 0xFF) << 8
         candidates.append((raw, f"`{code}` is the CMSSW `edm::errors` code; the process exits with `{code & 0xFF}` ({code} mod 256), recorded in RelVal results as `{raw}`"))
     if not candidates and 0 < code < 256:
@@ -11725,7 +11726,7 @@ _GREETING_RE = re.compile(r"\s*(?:hi|hii+|hello|hey|heelo|hallo|good (?:morning|
 _THANKS_RE = re.compile(r"\s*(?:thanks?(?: you)?|thank u|thx|ty|great|nice|cool|perfect|awesome)\b[\s!.,]*(?:a lot|so much)?[\s!.,]*(?:that\s+(?:helped|helps|works|worked))?[\s!.]*", re.IGNORECASE)
 _WRITE_ACTION_RE = re.compile(
     r"^\s*(?:(?:please|can you|could you|pls)\s+)?(?:re-?run|restart|re-?trigger|kill|abort|cancel|"
-    r"delete|wipe|purge|drop|merge|approve|reject|reopen|comment\s+on|fix\b(?=[^?]*\bfor\s+me\b)|"
+    r"delete|wipe|purge|drop|merge|approve|reject|reopen|comment\s+on|fix\b(?=[^?]*\bfor\s+me\b)|test\s+(?:pr\b|pull\s+request\b|#\d)|"
     r"(?:close|label|assign|sign|tag)\s+(?:the\s+|this\s+|that\s+)?(?:github\s+)?(?:issues?|prs?|pull\s+requests?|tickets?|#?\d+)|"
     r"(?:create|file|open|post|write)\s+(?:an?\s+|the\s+)?(?:new\s+)?(?:github\s+)?(?:issue|ticket|pr|pull\s+request|comment))\b",
     re.IGNORECASE,
@@ -11785,7 +11786,7 @@ def _conversational_response(sid: str, original_question: str):
             "shifter documentation, or show a workflow's results and history."
         )
         return _chat_response(sid, original_question, message, "conversational:read_only", actions=_CAPABILITY_ACTIONS)
-    if _PASTED_CYPHER_RE.search(original_question):
+    if _PASTED_CYPHER_RE.search(original_question) or re.search(r"\bMATCH\s*\(\s*\w*\s*[:)]|^\s*SELECT\s+.+\s+FROM\s+\w+", original_question, re.IGNORECASE):
         message = ("I don't run database queries typed into the chat. Ask in words instead -- e.g. \"how many relvals "
                    "failed in the latest IB\", \"where is workflow 1349.0 failing\" or \"PRs merged in "
                    "CMSSW_20_1_X_2026-10-14-2300\" -- and I'll look it up in the imported data.")
@@ -12569,6 +12570,24 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
         if first_item:
             # "list open issues about ASAN" then "show the newest one" (found 2026-11-04: the newest IB)
             return f"{'issue' if first_item.group(1) == 'Issue' else 'PR'} {first_item.group(2)}"
+    if re.fullmatch(r"\s*who\s+(?:opened|created|filed|wrote)\s+it\s*[?.!]*\s*", question, re.IGNORECASE) and not pr_before and not re.search(r"\bissues?\s*#?\s*\d", previous, re.IGNORECASE):
+        listed_issue = re.search(r"\*\*Issue #(\d{3,6})\*\*", last["answer"])
+        if listed_issue:
+            # "is there an issue for it?" then "who opened it?": the first one listed (found 2026-11-04: RelVal results)
+            return f"who created issue #{listed_issue.group(1)}"
+    if re.fullmatch(r"\s*what\s+percentage\s+(?:passed|pass|failed|fail)\s*[?.!]*\s*", question, re.IGNORECASE):
+        return f"what percentage of {'unit tests' if re.search(r'unit', previous, re.IGNORECASE) else 'relvals'} pass in the latest IB"
+    named_one = re.fullmatch(r"\s*what\s+did\s+the\s+([A-Za-z0-9_/-]+)\s+(?:one|pr)\s+(?:change|do)\s*[?.!]*\s*", question, re.IGNORECASE)
+    if named_one:
+        for line in last["answer"].split("\n"):
+            match = re.search(r"\*\*(?:cmssw|cmsdist) #(\d{3,6})\*\*", line)
+            if match and named_one.group(1).lower() in line.lower():
+                return f"what does PR {match.group(1)} do"
+    if str(last.get("route", "")) in ("deterministic:test_log_changes", "deterministic:log_overview"):
+        if re.fullmatch(r"\s*how\s+many\s*[?.!]*\s*", question, re.IGNORECASE):
+            return "how many log problems are in the latest IB?"
+        if re.fullmatch(r"\s*which\s+package\s+has\s+the\s+most\s*[?.!]*\s*", question, re.IGNORECASE):
+            return "which package has the most hidden problems?"
     single_pr = re.findall(r"\*\*(?:cmssw|cmsdist) #(\d{3,6})\*\*", last["answer"])
     if len(single_pr) == 1 and re.fullmatch(r"\s*what\s+did\s+it\s+change\s*[?.!]*\s*|\s*what\s+does\s+it\s+do\s*[?.!]*\s*", question, re.IGNORECASE):
         return f"what does PR {single_pr[0]} do"
@@ -12932,6 +12951,26 @@ def _list_ibs_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _unknown_name_answer(question: str) -> str | None:
+    """A tag or architecture typed on its own that isn't imported (found 2026-11-04: `CMSSW_99_9_X_2026-11-03-2300` offered a results menu)."""
+    tag = re.fullmatch(r"\s*(CMSSW_\w+?_X_\S+)\s*[?.!]*\s*", question)
+    arch = re.fullmatch(r"\s*((?:el|fc|slc|cc|cs)\d+_(?:amd64|aarch64|riscv64|ppc64le)_gcc\d+)\s*[?.!]*\s*", question, re.IGNORECASE)
+    if not tag and not arch:
+        return None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            found = session.run("MATCH (ib:IB {tag:$t}) RETURN count(ib) AS n", t=tag.group(1)).single()["n"] if tag else \
+                session.run("MATCH (ib:IB {arch:$a}) RETURN count(ib) AS n", a=arch.group(1).lower()).single()["n"]
+    finally:
+        driver.close()
+    if found:
+        return None
+    if tag:
+        return f"`{tag.group(1)}` isn't imported. Check the name, or ask \"what is the latest IB\"."
+    return f"No IB is imported for `{arch.group(1)}`. Ask \"which architectures are built for 20_1\" to see the current ones."
+
+
 def _ib_schedule_now_answer(question: str) -> str | None:
     """ "when will the next IB be built?", "how old is the latest IB?" (found 2026-11-04: dead end; the tag without the age)."""
     now = _cern_now()
@@ -13202,6 +13241,16 @@ def _shift_question_rewrite(question: str) -> str | None:
     if workflow_wf and not re.search(r"\b(?:why|exception|log|command|step)\b", question, re.IGNORECASE):
         # "whay is 140.0 WF is coming from" (found 2026-11-04: the whole IB's RelVal summary)
         return f"where is workflow {workflow_wf.group(1)} failing"
+    if re.fullmatch(r"\s*(?:CMSSW_)?\d{1,2}_\d{1,2}(?:_X)?\s*[?.!]*\s*", question, re.IGNORECASE):
+        # a release series on its own (found 2026-11-04: dead ends)
+        return f"what is failing in {series_text}"
+    bare_workflow = re.fullmatch(r"\s*(\d{3})\s*[?.!]*\s*", question)
+    if bare_workflow:
+        return f"where is workflow {bare_workflow.group(1)}.0 failing"
+    if re.search(r"\bproblems?\b[^?]*\b(?:hidden|inside)\b[^?]*\bpass\w*\b|\bhidden\b[^?]*\bpass\w*\s+tests?\b", question, re.IGNORECASE):
+        return "any hidden problems in passed tests?"
+    if re.fullmatch(r"\s*is\s+(?:it|this|that|the\s+data)\s+(?:up\s*to\s*date|current|fresh)\s*[?.!]*\s*", question, re.IGNORECASE):
+        return "is the data up to date?"
     going_on = re.search(r"\bwhat(?:'s|\s+is)\s+going\s+on\b[^?]*?(?<![\d.])(\d{1,6}\.\d{1,6})(?![\d.])", question, re.IGNORECASE)
     if going_on:
         return f"where is workflow {going_on.group(1)} failing"
@@ -13357,7 +13406,7 @@ def _series_stability_answer(question: str) -> str | None:
 
 def _health_trend_answer(question: str) -> str | None:
     """ "IB health this month compared with last month?" (found 2026-11-04: today's failures, no comparison)."""
-    if not re.search(r"\b(?:this|last|past|previous)\s+(?:month|week)\b|\btrend\b|\bover\s+time\b", question, re.IGNORECASE):
+    if not re.search(r"\b(?:this|last|past|previous)\s+(?:month|week)\b|\btrend\b|\bover\s+time\b|\bwhich\s+day\b", question, re.IGNORECASE):
         return None
     if re.search(r"\b(?:new|issues?|prs?|exceptions?|unit\s*tests?|top)\b", question, re.IGNORECASE):
         return None
@@ -13479,6 +13528,7 @@ def _last_green_answer(question: str) -> str | None:
 
 
 _last_failed_builds: dict[str, tuple[str, str]] = {}
+_last_exception_answers: dict[str, str] = {}
 
 
 def _status_cell(status: str | None) -> str:
@@ -13509,6 +13559,10 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
     if not last or len(question) > 70 or IB_TAG_RE.search(question) or re.search(r"\d+\.\d+|\b#?\d{4,6}\b", question):
         return None
     answer = last["answer"]
+    if "Recorded message" in answer:
+        _last_exception_answers[sid] = answer
+    elif re.fullmatch(r"\s*is\s+(?:it|this|that)\s+tracked(?:\s+anywhere)?\s*[?.!]*\s*", question, re.IGNORECASE) and sid in _last_exception_answers:
+        answer = _last_exception_answers[sid]
     if re.fullmatch(r"\s*which\s+sub[\s-]*ibs?\s*[?.!]*\s*", question, re.IGNORECASE) and "What's failing in" in answer:
         flavours = list(dict.fromkeys(re.findall(r"`([A-Za-z0-9]+)` `\w+_\w+_gcc\d+`", answer)))
         return ("Sub-IBs with something listed there: " + ", ".join(f"`{f}`" for f in flavours) + "." if flavours
@@ -13559,6 +13613,18 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
             if rows:
                 newly.append(f"- {section[0]}: " + ", ".join(dict.fromkeys(rows)))
         return ("Newly failing in that summary:\n" + "\n".join(newly)) if newly else "Nothing is newly failing in that summary."
+    if re.fullmatch(r"\s*(?:which|what)\s+workflows?\s+(?:have|has|show|hit)\s+(?:this|it|that)\s*[?.!]*\s*", question, re.IGNORECASE) and "Recorded message" in answer:
+        # after a pasted error (found 2026-11-04: the whole IB's RelVal summary)
+        by_workflow = re.search(r"By workflow: ([^\n]+)", answer)
+        if by_workflow:
+            return f"Workflows with this error: {by_workflow.group(1)}"
+        if workflows:
+            return "Workflows with this error: " + ", ".join(f"`{w}`" for w in workflows[:20]) + "."
+    if re.fullmatch(r"\s*is\s+(?:it|this|that)\s+tracked(?:\s+anywhere)?\s*[?.!]*\s*", question, re.IGNORECASE) and "Recorded message" in answer:
+        if "No imported PR or Issue quotes" in answer:
+            return f"No imported PR or Issue quotes this message. {_github_export_note()}."
+        quoted = [line for line in answer.split("\n") if line.lstrip().startswith("- **") and re.search(r"(?:Issue|PR) #\d+", line)]
+        return "These quote it (text match only, not proof of a cause or fix):\n" + "\n".join(quoted[:8]) if quoted else None
     touches = re.fullmatch(r"\s*which\s+(?:one|ones|pr|prs)\s+(?:touch\w*|mentions?|is\s+about|are\s+about|names?)\s+([A-Za-z0-9_/-]{2,})\s*[?.!]*\s*", question, re.IGNORECASE)
     if touches and re.search(r"\*\*(?:cmssw|cmsdist) #\d+\*\*", answer):
         # "which PRs were merged in the latest IB?" then "which one touches L1T?" (found 2026-11-04: the menu)
@@ -13634,6 +13700,8 @@ _NOT_IMPORTED_TOPICS = (
     (r"\bluminosity\b", "luminosity or physics properties of a dataset"),
     (r"\bon\s+time\b[^?]*\b(?:release|pre)\b|\b(?:release|pre-?release)\b[^?]*\b(?:on\s+time|schedule|date)\b|\bnext\s+(?:pre-?)?release\b", "release plans and dates"),
     (r"\bbuild\s+logs?\b", "the build logs themselves (only Clang warnings parsed from some of them), so the IB page is where to read one"),
+    (r"\b(?:which|what|who)\b[^?]*\b(?:developers?|persons?|people|authors?)\b[^?]*\b(?:cause|break|broke|responsible|worst|bad)\w*\b|\bworst\s+developer\b|\bbad\s+at\s+coding\b",
+     "who caused a failure or how good anyone is: the data shows timing and text matches, never causes, and I don't rank people"),
     (r"\bwho\s+broke\b", "who caused a failure: the data shows timing and text matches, never causes. Ask which PRs came into that build, and compare them with the failure"),
 )
 
@@ -14425,6 +14493,68 @@ def _clang_checker_answer(question: str) -> str | None:
             "| Checker | Locations | Occurrences |\n| --- | ---: | ---: |\n" + "\n".join(f"| `{r['checker']}` | {r['locations']:,} | {r['total']:,} |" for r in rows))
 
 
+
+def _about_the_bot_answer(question: str) -> str | None:
+    """How the bot works, in plain words, for people deciding whether to trust it (found 2026-11-04: all reached the menu)."""
+    text = question.strip().lower()
+    if re.search(r"(?:\b|_)api[\s_-]*key\b|\b(?:password|secret|token|credentials?|your\s+configuration)\b|(?<![\w.])\.env\b", text):
+        return "I can't share credentials or configuration. I answer questions about the imported CMSSW Integration Build data."
+    if re.search(r"\byou\s+are\s+now\b|\bpretend\s+(?:you|to)\b|\bno\s+restrictions\b|\bjailbreak\b", text):
+        return "I stay what I am: a read-only assistant for the imported CMSSW Integration Build data. Ask about an IB, workflow, unit test, PR or Issue."
+    if re.search(r"\bdo\s+you\s+use\s+(?:ai|an?\s+llm|chatgpt|gpt)\b|\bare\s+you\s+(?:an?\s+)?(?:ai|llm|chatgpt)\b|\bhow\s+do\s+you\s+work\b", text):
+        return ("Partly. Most answers come straight from database queries, with no AI involved: they are written by fixed code from the imported data. "
+                "An LLM is used only when nothing else matches: it picks read-only lookups and words the result. That answer is then checked: "
+                "its numbers must appear in what the lookups returned, otherwise you get the raw results instead. It is told to answer only from that evidence.")
+    if re.search(r"\bhow\s+(?:do|can)\s+(?:you|i)\s+(?:know|trust)\b|\bhow\s+accurate\b|\baccuracy\b|\bcan\s+i\s+trust\b|\bcan\s+you\s+(?:make\s+up|invent|hallucinate|be\s+wrong)\b|\bdo\s+you\s+make\s+(?:things\s+)?up\b", text):
+        return ("Answers from fixed queries report what is in the database, so they are as right as the imported data. The less certain ones are the LLM's: "
+                "their numbers are checked against the evidence, but the wording isn't proof, and a wrong one is still possible. Answers say which build and "
+                "architecture they cover, and say when results aren't imported yet. PR and Issue matches are text matches, never proof of a cause or fix. "
+                "Check anything important on the IB page.")
+    if re.search(r"\bwhat\s+happens\s+if\s+you\s+don'?t\s+know\b|\bif\s+you\s+don'?t\s+know\b", text):
+        return "I say so, and suggest what I can answer. When results aren't imported, I say \"unknown, not zero\" rather than reporting no failures."
+    if re.search(r"\bwhat\s+can'?t\s+you\s+(?:do|answer)\b|\bwhat\s+are\s+your\s+limits\b|\blimitations?\b", text):
+        return ("I can't change anything: no rerunning jobs, no GitHub actions. I don't have build times, memory or CPU use, physics plots, or who caused a failure. "
+                f"RelVal and unit-test results go back to {_RELVAL_RETENTION_START}, Clang warnings are parsed only up to 2026-08-12, and comments on GitHub items after the export aren't imported.")
+    if re.search(r"\bcan\s+you\s+access\s+(?:github|the\s+(?:internet|web))\b|\bdo\s+you\s+(?:browse|search\s+the\s+web)\b|\bare\s+you\s+online\b", text):
+        return ("No. While answering I only read the local database. GitHub Issues and PRs in it were imported beforehand, by the data refresh. "
+                f"{_github_export_note()}.")
+    if re.search(r"\bis\s+my\s+data\s+sent\b|\bwhere\s+does\s+my\s+(?:question|data)\s+go\b|\bdo\s+you\s+store\b", text):
+        return ("Your questions and my answers are stored in this system's database, so a conversation can continue and answers can be reviewed. When the LLM is used, "
+                "the question and the looked-up evidence go to the LLM service this deployment is configured with.")
+    if re.search(r"\bwho\s+(?:built|made|created|wrote|maintains)\s+you\b", text):
+        return "I'm the CMSSDT knowledge-graph chatbot for CMSSW Integration Builds. I don't have more than that about who works on me."
+    if re.search(r"\bhow\s+many\s+(?:relvals?|unit\s*tests?|prs?|issues?|ibs?)\b[^?]*\b(?:database|graph|imported|do\s+you\s+have|have\s+you\s+got)\b", text):
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                counts = session.run(
+                    "CALL { MATCH (x:IB) RETURN count(x) AS ibs } CALL { MATCH (x:RelVal) RETURN count(x) AS relvals } CALL { MATCH (x:UnitTest) RETURN count(x) AS units } "
+                    "CALL { MATCH (x:PR) RETURN count(x) AS prs } CALL { MATCH (x:Issue) RETURN count(x) AS issues } RETURN ibs, relvals, units, prs, issues").single()
+        finally:
+            driver.close()
+        return (f"Imported: **{counts['ibs']:,}** IB/architecture records, **{counts['relvals']:,}** RelVal results, **{counts['units']:,}** unit-test results, "
+                f"**{counts['prs']:,}** PRs and **{counts['issues']:,}** Issues. Ask \"what data do you have\" for the dates they cover.")
+    return None
+
+
+def _one_line_status_answer(question: str) -> str | None:
+    """ "in one sentence, is 20_1 healthy?", "one line status of CMSSW" (found 2026-11-04: dead ends)."""
+    if not re.search(r"\b(?:one\s+(?:line|sentence)|short\s+status|tl;?dr|is\s+(?:CMSSW_)?\d+_\d+(?:_X)?\s+healthy|is\s+cmssw\s+healthy)\b", question, re.IGNORECASE):
+        return None
+    latest = _latest_ib_records(None, _requested_release_series(question))
+    if not latest:
+        return None
+    tag = latest[0]["tag"]
+    records = _ib_build_records(tag)
+    failed_builds = [f"{r['arch']}" + ("" if r["variant"] == "primary" else f" ({r['variant']})") for r in records if r["build"] == "error"]
+    relvals = sum(len(r["failed"]) for r in records)
+    units = sum(len(r["unit_failed"]) for r in records)
+    waiting = sum(1 for r in records if not r["relvals"])
+    return (f"`{tag}`: {'build failed on ' + ', '.join(f'`{b}`' for b in failed_builds) if failed_builds else 'all builds passed'}, "
+            f"{relvals} RelVal and {units} unit-test failures across {len(records)} builds"
+            + (f", {waiting} still without RelVal results" if waiting else "") + ".")
+
+
 def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     """Answers the 2026-11-04 test pass found missing; each returns None unless its phrasing matches."""
     if "\n" in question or len(question) > 200:
@@ -14441,7 +14571,8 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
         where = _workflow_across_builds_answer(mine.group(1), f"where is {mine.group(1)} failing", sid)
         return ("**If it also fails in IBs without your PR, it isn't from your PR.** Compare the same step's error in your PR's "
                 f"test and in the IB; this shows where it fails, not the cause.\n\n{where}", "deterministic:ib_or_pr")
-    for handler, route in ((_not_imported_answer, "not_imported"), (_exit_code_difference_answer, "exit_code"),
+    for handler, route in ((_unknown_name_answer, "unknown_name"), (_about_the_bot_answer, "about_the_bot"), (_one_line_status_answer, "one_line_status"),
+                           (_not_imported_answer, "not_imported"), (_exit_code_difference_answer, "exit_code"),
                            (_flavour_newest_answer, "flavour_newest"), (_list_ibs_answer, "list_ibs"), (_ib_schedule_now_answer, "ib_schedule_now"),
                            (_month_answer, "month"), (_failures_between_answer, "failures_between"), (_arch_scope_answer, "arch_scope"), (_arch_compare_answer, "arch_compare"),
                            (_log_overview_question_answer, "log_overview"), (_build_warning_scope_answer, "build_warning_scope"), (_clang_checker_answer, "clang_checker"),

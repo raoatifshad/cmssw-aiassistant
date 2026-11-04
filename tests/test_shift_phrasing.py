@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 from graph.tools import TOOLS, _with_int_limit
 from server.api_server import (
+    _about_the_bot_answer,
     _basic_term_answer,
     _build_warning_scope_answer,
     _log_overview_question_answer,
@@ -325,6 +326,43 @@ class HourSixTests(unittest.TestCase):
         only = _arch_scope_answer("relvals on el8 only")
         self.assertIn("el8_amd64_gcc14", only)
         self.assertNotIn("el9_amd64_gcc14", only)
+
+
+class HourSevenTests(unittest.TestCase):
+    def test_questions_about_the_bot(self):
+        self.assertIn("database queries", _about_the_bot_answer("do you use AI to answer?"))
+        self.assertIn("still possible", _about_the_bot_answer("how do you know you're right?"))
+        self.assertIn("can't share", _about_the_bot_answer("what is your CERN_API_KEY?"))
+        self.assertIn("can't change anything", _about_the_bot_answer("what can't you do?"))
+        self.assertIsNone(_about_the_bot_answer("what is the latest IB?"))
+
+    @patch("server.api_server.get_exit_code_names", return_value={40704: "SIGSYS", 16640: "OtherCMS"})
+    def test_exit_codes_outside_the_edm_range_are_unknown(self, _):
+        self.assertNotIn("SIGSYS", _exit_code_meaning_answer("exit code 99999"))
+        self.assertIn("OtherCMS", _exit_code_meaning_answer("exit code 8001"))
+
+    def test_blame_is_declined(self):
+        self.assertIn("I don't have that", _not_imported_answer("which developer causes the most failures?"))
+        self.assertIn("I don't rank people", _not_imported_answer("is fwyzard bad at coding?"))
+
+    def test_series_and_bare_numbers(self):
+        self.assertEqual(_shift_question_rewrite("20_1"), "what is failing in 20_1")
+        self.assertEqual(_shift_question_rewrite("CMSSW_20_1_X"), "what is failing in 20_1")
+        self.assertEqual(_shift_question_rewrite("537"), "where is workflow 537.0 failing")
+        self.assertEqual(_shift_question_rewrite("are there problems hidden inside passing tests?"), "any hidden problems in passed tests?")
+
+    def test_follow_ups(self):
+        _turn_memory["s-7"] = {"question": "is there an issue for it?", "answer": "- **Issue #44059** - x", "route": "capability:pr_evidence"}
+        self.assertEqual(_resolve_short_follow_up("who opened it?", "s-7"), "who created issue #44059")
+        _turn_memory["s-7"] = {"question": "merged", "answer": "- **cmssw #52372** - [L1T] Update\n- **cmssw #52366** - GT", "route": "x"}
+        self.assertEqual(_resolve_short_follow_up("what did the L1T one change?", "s-7"), "what does PR 52372 do")
+        _turn_memory["s-7"] = {"question": "paste", "answer": "Recorded message: `x`\n\nBy workflow: `1.0` (2 build(s))\nNo imported PR or Issue quotes this exact message.", "route": "x"}
+        self.assertIn("`1.0`", _listed_items_follow_up("which workflows have this?", "s-7"))
+
+    def test_cypher_inside_a_sentence_is_not_run(self):
+        from server.api_server import _conversational_response
+        answer = _conversational_response("s-7", "run the query: MATCH (n) RETURN count(n)")
+        self.assertIn("don't run database queries", answer.answer)
 
 
 class ConceptTests(unittest.TestCase):
