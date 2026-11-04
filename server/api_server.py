@@ -11072,6 +11072,8 @@ def _flaky_relvals_answer(question: str) -> str | None:
     the primary IB that switched between failed and passed on the same architecture in the window."""
     if not _FLAKY_RE.search(question) or re.search(r"\bunit|\bpackages?\b|\btest[\s-]*logs?\b", question, re.IGNORECASE):
         return None
+    if _NAMED_TEST_RE.search(question):
+        return None  # one test: _named_test_answer (found 2026-11-04: the RelVal list instead)
     if re.search(r"(?<![\d.\w-])\d{1,6}\.\d{1,6}(?![\d.])", question):
         return None  # one workflow: its own history handler
     days = _parse_recency_window_days(question, default=7)
