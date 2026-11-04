@@ -10745,6 +10745,20 @@ def _test_log_question_answer(question: str, session_id: str, original_question:
                              sum(len(g["tests"]) for e in changes["architectures"] for g in e.get(key) or []))
         (np_, nt), (rp, rt), (gp, gt) = count("new"), count("returned"), count("gone")
         t = dict(t, new_problems=np_, new_tests=nt, returned_problems=rp, returned_tests=rt, gone_problems=gp, gone_tests=gt)
+        # "0 new, 0 returned, 0 gone" read as clean with a buffer overflow in a test passing in
+        # every run (found 2026-11-04): how many there are at all, for this flavour
+        try:
+            driver = get_driver()
+            try:
+                with driver.session() as session:
+                    flavour_present = session.run(
+                        "MATCH (p:LogProblem {ib_tag:$tag}) WHERE p.serious AND p.in_passed RETURN count(p) AS n",
+                        tag=f"{series}_{flavour}_X_{to_when}").single()["n"]
+            finally:
+                driver.close()
+        except Exception as exc:
+            print(f"WARNING: flavour problem count failed: {exc}")
+            flavour_present = None
         scope_text = f"the `{flavour}` build of `{to_tag.rsplit('_X_', 1)[-1]}` (`{series}_{flavour}_X_{to_when}`)"
     lines = [
         f"**Problems inside tests reported as PASSED** -- {scope_text} vs `{from_tag}`, from the raw IB "
@@ -10755,6 +10769,9 @@ def _test_log_question_answer(question: str, session_id: str, original_question:
         f"build (intermittent)",
         f"- ✅ {t['gone_problems']} gone ({t['gone_tests']} test(s))" + ("" if flavour else f"; {t['still_present']} still present"),
     ]
+    if flavour and flavour_present:
+        lines.append(f"- **{flavour_present} serious problem(s)** in passed tests in this build's logs in total "
+                     "(ask \"sanitizer problems\" for the sanitizer ones).")
     shown = 0
     for label, key in (("New", "new"), ("Returned", "returned")):
         for arch_entry in changes["architectures"]:
