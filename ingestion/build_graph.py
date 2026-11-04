@@ -521,11 +521,11 @@ def ingest_merged_prs(driver, path: Path, force: bool = False) -> int:
     payload = json.loads(path.read_text())
     records = merged_pr_records(payload)
 
+    # Links are only added, never deleted: merged_prs_summary.json keeps just the last few
+    # builds per branch, so deleting the previous import's links first (as this did until
+    # 2026-11-04) dropped every older build's merged-PR list on each refresh, against the
+    # 90-day retention. Which PRs went into a build does not change afterwards.
     with driver.session() as session:
-        session.run(
-            "MATCH (:PR)-[rel:MERGED_BEFORE {source_id:$source_id}]->(:IB) DELETE rel",
-            source_id=source_id,
-        )
         session.run(
             "UNWIND $records AS record "
             "MATCH (pr:PR {repo:'cmssw', number:record.number}) "
