@@ -2466,6 +2466,62 @@ def _pr_author_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+_GITHUB_COVERAGE_CACHE: dict[str, object] = {}
+
+
+def _github_export_note() -> str:
+    """How far the imported GitHub Issue export reaches, read from the graph (cached 10 min). Every
+    answer about Issue states or absences says it: the export can be weeks old (found 2026-11-04:
+    "is issue 51354 still open?" -> "currently open", closed on GitHub since September)."""
+    now = datetime.now(timezone.utc)
+    cached = _GITHUB_COVERAGE_CACHE.get("note")
+    if cached and (now - _GITHUB_COVERAGE_CACHE["at"]).total_seconds() < 600:
+        return cached
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                row = session.run("MATCH (i:Issue {repo:'cmssw'}) RETURN max(i.number) AS n, "
+                                  "max(coalesce(i.updated_at, i.created_at)) AS t").single()
+        finally:
+            driver.close()
+        note = (f"GitHub Issues are imported from an export that reaches #{row['n']} ({str(row['t'])[:10]}); "
+                "anything newer on GitHub, including later state changes, is not imported")
+    except Exception as exc:
+        print(f"WARNING: GitHub coverage lookup failed: {exc}")
+        note = "GitHub Issues are imported from an export that may be weeks old; later changes are not imported"
+    _GITHUB_COVERAGE_CACHE.update(note=note, at=now)
+    return note
+
+
+_ISSUE_STATE_RE = re.compile(
+    r"\b(?:is|was|are)\s+(?:the\s+)?(?:github\s+)?issues?\s*#?\s*(\d{3,6})\s+(?:still\s+|already\s+|now\s+)?"
+    r"(open|closed|fixed|resolved)\b|\b(?:state|status)\s+of\s+(?:the\s+)?issue\s*#?\s*(\d{3,6})\b|"
+    r"\bissue\s*#?\s*(\d{3,6})\s+(?:still\s+)?(open|closed)\s*\?", re.IGNORECASE)
+
+
+def _issue_state_answer(question: str) -> str | None:
+    """ "is issue 51354 still open?" -- found 2026-11-04 going to the LLM, which said "currently
+    open" for an Issue closed on GitHub weeks after the export. The imported state, dated."""
+    match = _ISSUE_STATE_RE.search(question)
+    if not match:
+        return None
+    number = int(match.group(1) or match.group(3) or match.group(4))
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            row = session.run("MATCH (i:Issue {repo:'cmssw', number:$n}) RETURN i.title AS title, i.state AS state, "
+                              "i.created_at AS created, i.closed_at AS closed, i.updated_at AS updated", n=number).single()
+    finally:
+        driver.close()
+    if not row:
+        return f"Issue #{number} is not in the imported GitHub data. {_github_export_note()}."
+    when = f", closed {str(row['closed'])[:10]}" if row["closed"] else ""
+    return (f"**Issue #{number}** - {row['title']}: `{row['state']}` in the imported data (created "
+            f"{str(row['created'])[:10]}{when}, last update in the export {str(row['updated'])[:10]}).\n\n"
+            f"_{_github_export_note()}, so its state on GitHub today may differ._")
+
+
 def _issue_number_answer(question: str) -> str | None:
     """ "issue 51757" / "what is issue #51757" -- found live 2026-10-15 replaying real
     sessions: no handler, "No imported local evidence"."""
@@ -2479,8 +2535,7 @@ def _issue_number_answer(question: str) -> str | None:
     summary = _issue_summary(int(match.group(1)))
     if summary:
         return summary
-    return (f"Issue #{match.group(1)} is not in the imported GitHub data. The export covers Issues up to about "
-            f"#51822 (2026-09-03).")
+    return f"Issue #{match.group(1)} is not in the imported GitHub data. {_github_export_note()}."
 
 
 def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
@@ -2519,8 +2574,8 @@ def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
         issue = _issue_summary(int(match.group(1)))
         if issue:  # people say "PR" for any GitHub number
             return f"#{match.group(1)} is an **Issue**, not a PR:\n\n{issue}", []
-        return (f"#{match.group(1)} is not in the imported GitHub data (no PR or Issue with that number). The "
-                f"export covers PRs/Issues up to about #51828 (2026-09-04) plus PRs merged into imported IBs since.", [])
+        return (f"#{match.group(1)} is not in the imported GitHub data (no PR or Issue with that number). "
+                f"{_github_export_note()}; PRs merged into imported IBs since are imported from the IB data.", [])
     if len(rows) > 1:
         named = [row for row in rows if re.search(rf"\b{re.escape(row['repo'])}\b", question, re.IGNORECASE)]
         if len(named) == 1:
@@ -3094,7 +3149,7 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
         driver.close()
 
     if not rows:
-        return "No open CMSSW Issues matched the supplied concrete identifiers in the imported graph."
+        return f"No open CMSSW Issues matched the supplied concrete identifiers in the imported graph. ({_github_export_note()}.)"
 
     # Precise-first, never diluted -- same principle as _pr_evidence_answer: when the
     # LLM-derived signature genuinely matched something, show only those rows rather
@@ -3132,6 +3187,7 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
             f"(matched: {', '.join(f'`{term}`' for term in row['matched_terms'][:5])})"
         )
     lines.append("These are textual matches in imported Issue titles, bodies, or comments; they do not prove a fix or causal relationship.")
+    lines.append(f"\"Open\" means open in the imported data: {_github_export_note()}.")
     return "\n".join(lines)
 
 
@@ -3639,7 +3695,7 @@ def _issue_author_answer(question: str, context_number: int | None = None) -> st
     finally:
         driver.close()
     if not record:
-        return f"Issue #{number} is not present in the imported CMSSW graph."
+        return f"Issue #{number} is not present in the imported CMSSW graph. ({_github_export_note()}.)"
     if not record["author"]:
         return f"Issue #{number} is present in the imported graph, but its author was not imported."
     return f"**Issue #{number}** was opened by **{record['author']}**."
@@ -3711,8 +3767,8 @@ def _issue_detail_answer(question: str, context_number: int | None = None) -> st
         merged = _pr_status(pr_record["merged_at"], pr_record.get("state"))
         return f"**{pr_record['repo']} PR #{number}** - {pr_record['title']} ({merged})."
     if ambiguous:
-        return f"Neither an Issue nor a PR numbered #{number} is present in the imported graph."
-    return f"Issue #{number} is not present in the imported CMSSW graph."
+        return f"Neither an Issue nor a PR numbered #{number} is present in the imported graph. ({_github_export_note()}.)"
+    return f"Issue #{number} is not present in the imported CMSSW graph. ({_github_export_note()}.)"
 
 
 def _latest_issue_answer(question: str) -> str | None:
@@ -8024,6 +8080,9 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
             actions.append({"label": "All architectures", "question": f"summary for {context.tag} all"})
         return (answer, actions) if answer else None
     if capability == "pr_evidence":
+        issue_state = _issue_state_answer(question)
+        if issue_state:
+            return issue_state, []
         tracked = _tracked_failures_answer(question, session_id)
         if tracked:
             return tracked, []
@@ -12346,6 +12405,11 @@ def _chat(req: ChatRequest):
         return conversational
 
     scope_only = bool(_FOLLOW_UP_SCOPE_RE.match(original_question))
+    bare_number = re.fullmatch(r"\s*(?:(?:what\s+is|what's|show(?:\s+me)?|tell\s+me\s+about|details\s+of)\s+)?"
+                               r"#(\d{3,6})\s*[?.!]*\s*", original_question, re.IGNORECASE)
+    if bare_number:
+        # "what is #52330?" (found 2026-11-04: LLM dead end): the PR/Issue answer handles both kinds
+        original_question = question = f"PR {bare_number.group(1)}"
     rewritten = _resolve_short_follow_up(original_question, sid)
     if rewritten:
         original_question = rewritten

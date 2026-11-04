@@ -2805,7 +2805,8 @@ class ChatRoutingTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         answer, _ = result
-        self.assertEqual(answer, "Issue #51756 is not present in the imported CMSSW graph.")
+        self.assertTrue(answer.startswith("Issue #51756 is not present in the imported CMSSW graph."))
+        self.assertIn("export", answer)  # says how far the imported GitHub data reaches (2026-11-04)
 
     @patch("server.api_server.get_driver")
     def test_issue_detail_answer_reports_title_and_state(self, get_driver):
@@ -2837,7 +2838,8 @@ class ChatRoutingTests(unittest.TestCase):
 
         answer = _issue_detail_answer("do you have issue 52041?")
 
-        self.assertEqual(answer, "Neither an Issue nor a PR numbered #52041 is present in the imported graph.")
+        self.assertTrue(answer.startswith("Neither an Issue nor a PR numbered #52041 is present in the imported graph."))
+        self.assertIn("export", answer)  # says how far the imported GitHub data reaches (2026-11-04)
 
     @patch("server.api_server.get_driver")
     def test_issue_detail_answer_existence_check_reports_real_issue(self, get_driver):
