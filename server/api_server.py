@@ -12625,6 +12625,12 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
     asked_package = _PACKAGE_PATH_RE.search(previous)
     listed_package = re.search(r"`([A-Z][A-Za-z0-9]+/[A-Z][A-Za-z0-9]+)`", last["answer"])
     package = asked_package.group(1) if asked_package else (listed_package.group(1) if listed_package else None)
+    if asked_package:
+        _last_package_contexts[sid] = asked_package.group(1)
+    elif not package:
+        package = _last_package_contexts.get(sid)
+    if package and re.fullmatch(r"\s*(?:which|what)\s+arch\w*\s*[?.!]*\s*|\s*on\s+which\s+arch\w*\s*[?.!]*\s*|\s*why\s+only\s+(?:there|on\s+\S+)\s*[?.!]*\s*", question, re.IGNORECASE):
+        return f"is {package} failing?"
     if package:
         if re.fullmatch(r"\s*(?:the\s+)?first(?:\s+one)?\s*[?.!]*\s*", question, re.IGNORECASE) and listed_package:
             return f"is {listed_package.group(1)} failing?"
@@ -12651,6 +12657,10 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
         before = _previous_primary_tag(context_ib)
         if before:
             return f"compare {before} with {context_ib}"
+    if str(last.get("route", "")).endswith("failures_by_dimension") and re.fullmatch(r"\s*why\s*[?.!]*\s*", question, re.IGNORECASE):
+        ranked_first = re.search(r"\*\*`([a-z0-9]+_[a-z0-9]+_gcc\d+)`\*\*", last["answer"])
+        if ranked_first:
+            return f"what is failing in the latest IB on {ranked_first.group(1)}"
     if str(last.get("route", "")).endswith("failures_by_dimension"):
         if re.fullmatch(r"\s*(?:and\s+)?which(?:\s+the)?\s+(?:least|fewest|best)\s*[?.!]*\s*|\s*and\s+the\s+(?:least|fewest|best)\s*[?.!]*\s*", question, re.IGNORECASE):
             return "which architecture has the fewest failures?"
@@ -13046,9 +13056,9 @@ def _unknown_name_answer(question: str) -> str | None:
     """A tag or architecture typed on its own that isn't imported (found 2026-11-04: `CMSSW_99_9_X_2026-11-03-2300` offered a results menu)."""
     tag = re.fullmatch(r"\s*(CMSSW_\w+?_X_\S+)\s*[?.!]*\s*", question)
     arch = re.fullmatch(r"\s*((?:el|fc|slc|cc|cs)\d+_(?:amd64|aarch64|riscv64|ppc64le)_gcc\d+)\s*[?.!]*\s*", question, re.IGNORECASE)
-    family = re.fullmatch(r"\s*(ppc64le|power\s*pc|powerpc|s390x?)(?:\s+(?:ibs?|builds?|failures?|status))?\s*[?.!]*\s*", question, re.IGNORECASE)
+    family = re.fullmatch(r"\s*(ppc64le|ppc|power\s*pc|powerpc|s390x?)(?:\s+(?:ibs?|builds?|failures?|status))?\s*[?.!]*\s*", question, re.IGNORECASE)
     if family:
-        wanted = "ppc64le" if family.group(1).lower().startswith(("pp", "pow")) else "s390"
+        wanted = "ppc64le" if family.group(1).lower().startswith(("ppc", "pow")) else "s390"
         driver = get_driver()
         try:
             with driver.session() as session:
@@ -13286,6 +13296,37 @@ def _terse_question(question: str) -> str | None:
     text = question.strip().rstrip("?.! ")
     if re.fullmatch(r"(?:ib\s+)?status|ib|todays?\s+ib|today'?s\s+ib|latest", text, re.IGNORECASE):
         return "latest ib status"
+    bare_number = re.fullmatch(r"(?:is\s+|when\s+was\s+|labels\s+of\s+|which\s+release\s+does\s+|how\s+big\s+is\s+)?#?(\d{5,6})(?:\s+(?:merged|target|open|closed))?", text, re.IGNORECASE)
+    if bare_number:
+        code = int(bare_number.group(1))
+        try:
+            names = get_exit_code_names() or {}
+        except Exception:
+            names = {}
+        return f"what does exit code {code} mean" if code in names and text.strip("#") == bare_number.group(1) else f"PR {code}"
+    family_status = re.fullmatch(r"(gcc\s*\d+|amd64)\s+status", text, re.IGNORECASE)
+    if family_status:
+        return f"{family_status.group(1)} failures"
+    many_warnings = re.fullmatch(r"why\s+so\s+many\s+warnings\s+on\s+(\S+)", text, re.IGNORECASE)
+    if many_warnings:
+        return f"how many compilation warnings on {many_warnings.group(1)}"
+    if re.fullmatch(r"why\s+(?:does|is)\s+\S+\s+(?:have\s+no\s+results|without\s+results|missing)", text, re.IGNORECASE):
+        return "which builds have no relval results yet?"
+    if re.fullmatch(r"which\s+sub[\s-]*ibs?\s+failed\s+to\s+build", text, re.IGNORECASE):
+        return "build status of the latest IB"
+    flavour_part = re.fullmatch(r"([A-Za-z0-9]+)\s+(unit\s*tests?|relvals?)", text, re.IGNORECASE)
+    if flavour_part and _flavour_in(flavour_part.group(1).upper()):
+        flavour_tag = _newest_flavour_tag(_flavour_in(flavour_part.group(1).upper()))
+        if flavour_tag:
+            return f"{flavour_part.group(2)} in {flavour_tag}"
+    flavour_clean = re.fullmatch(r"is\s+([A-Za-z0-9]+)\s+(?:clean|ok|okay|good|green|healthy)", text, re.IGNORECASE)
+    if flavour_clean and _flavour_in(flavour_clean.group(1).upper()):
+        flavour_tag = _newest_flavour_tag(_flavour_in(flavour_clean.group(1).upper()))
+        if flavour_tag:
+            return f"what is failing in {flavour_tag}"
+    flavour_means = re.fullmatch(r"what\s+does\s+(?:the\s+)?([A-Za-z0-9]+)\s+(?:flavou?r|sub[\s-]*ib|ib)\s+(?:test|do|mean)", text, re.IGNORECASE)
+    if flavour_means:
+        return f"what is {flavour_means.group(1)}?"
     if re.fullmatch(r"clang", text, re.IGNORECASE):
         return "clang warnings in the latest IB"
     if re.fullmatch(r"warnings?", text, re.IGNORECASE):
@@ -13359,6 +13400,9 @@ def _terse_question(question: str) -> str | None:
         flavour = _flavour_in(next(g for g in versus_primary.groups() if g).upper())
         if flavour:
             return f"compare primary and {flavour} in the latest IB"
+    worse_primary = re.fullmatch(r"is\s+(\w+)\s+(?:worse|better)\s+than\s+(?:the\s+)?primary", text, re.IGNORECASE)
+    if worse_primary and _flavour_in(worse_primary.group(1).upper()):
+        return f"compare primary and {_flavour_in(worse_primary.group(1).upper())} in the latest IB"
     worse = re.fullmatch(r"is\s+(\w+)\s+(?:worse|better)\s+than\s+(\w+)", text, re.IGNORECASE)
     if worse and _flavour_in(worse.group(1).upper()) and _flavour_in(worse.group(2).upper()):
         return f"compare {_flavour_in(worse.group(1).upper())} and {_flavour_in(worse.group(2).upper())}"
@@ -13879,6 +13923,7 @@ def _last_green_answer(question: str) -> str | None:
 
 _last_failed_builds: dict[str, tuple[str, str]] = {}
 _last_exception_answers: dict[str, str] = {}
+_last_package_contexts: dict[str, str] = {}
 
 
 def _status_cell(status: str | None) -> str:
@@ -14081,6 +14126,8 @@ def _error_line_answer(question: str) -> str | None:
 
 
 _NOT_IMPORTED_TOPICS = (
+    (r"(?<![-\w])gpus?(?![-\w])[^?]*\b(?:relvals?|ibs?|workflows?|failures?|failing|results?|tests?)\b|\b(?:relvals?|workflows?|failures?|failing)\b[^?]*(?<![-\w])(?:on\s+)?gpus?(?![-\w])|\brntuple\s+relvals?\b",
+     "the GPU and RNTuple RelVal results: they are in the source data but not imported yet, so no answer here counts them"),
     (r"\bwho\s+(?:reviewed|approved|signed(?:\s+off)?)\b", "who reviewed a PR, only its labels and who wrote it"),
     (r"\bwho\s+closed\b", "who closed an Issue, only that it was closed and when"),
     (r"^\s*(?:what|which)\s+files\s*\??\s*$", "which files a PR changed, only how many and the lines added and removed"),
@@ -14105,6 +14152,8 @@ def _not_imported_answer(question: str) -> str | None:
     back empty", which reads as if the data might be there)."""
     for pattern, topic in _NOT_IMPORTED_TOPICS:
         if re.search(pattern, question, re.IGNORECASE):
+            if "GPU" in topic and re.match(r"\s*what\s+(?:is|are)\s+(?:an?\s+)?gpu\b", question, re.IGNORECASE):
+                continue  # the glossary explains what they are
             return (f"I don't have that: the imported data doesn't include {topic}. I can show builds' status, RelVal and "
                     "unit-test results, exceptions, test-log problems, and related PRs and Issues.")
     return None
@@ -15120,7 +15169,7 @@ def _build_progress_answer(question: str) -> str | None:
 
 def _builds_failed_window_answer(question: str) -> str | None:
     """ "how many builds failed this week?" (found 2026-11-04: the newest IB's failures)."""
-    if not re.search(r"\bhow\s+many\s+(?:ib\s+)?builds?\s+(?:have\s+)?(?:failed|broke)\b[^?]*\b(?:week|month|days?)\b", question, re.IGNORECASE):
+    if not re.search(r"\bhow\s+many\s+(?:ib\s+)?builds?\s+(?:have\s+)?(?:failed|broke)\b[^?]*\b(?:week|month|days?)\b|\bwhich\s+(?:series|releases?|builds?)\s+failed\s+to\s+build\b[^?]*\b(?:week|month|days?)\b", question, re.IGNORECASE):
         return None
     since = _since_stamp(question)
     driver = get_driver()
@@ -15580,7 +15629,7 @@ def _build_error_answer(question: str) -> str | None:
     """ "is the el10 build error new?", "when did el10 last build ok?", "which packages failed to compile on el10?" (found 2026-11-04:
     the failure overview; all architectures; failing unit tests presented as compile failures)."""
     word = re.search(r"\b((?:el|fc|slc)\d+_[a-z0-9]+_gcc\d+|el\d+|fc\d+|gcc\s*\d+|aarch64|arm64?|riscv\w*|amd64)\b", question, re.IGNORECASE)
-    if not word or not re.search(r"\bbuild\s+(?:errors?|failures?|failed|broken)\b|\bfailed\s+to\s+(?:compile|build)\b|\bcompile\s+errors?\b|\blast\s+(?:build\s+)?(?:built?\s+)?(?:ok|good|green|fine|pass\w*)\b|\bbuild\s+ok\b", question, re.IGNORECASE):
+    if not word or not re.search(r"\bbuild\s+(?:errors?|failures?|failed|broken)\b|\bfailed\s+to\s+(?:compile|build)\b|\bcompile\s+errors?\b|\blast\s+(?:build\s+)?(?:built?\s+)?(?:ok|good|green|fine|pass\w*)\b|\bbuild\s+ok\b|\bwhen\s+was\s+the\s+last\s+\S+\s+build\b", question, re.IGNORECASE):
         return None
     if IB_TAG_RE.search(question):
         return None
@@ -15740,6 +15789,65 @@ def _who_is_on_topic_answer(question: str) -> str | None:
     return f"{lead} Open items with `{term}` in the title (a text match):\n" + "\n".join(f"- **{r['kind']} #{r['n']}** - {r['title']}" for r in rows)
 
 
+def _series_facts_answer(question: str) -> str | None:
+    """ "is there a 20_0?", "what's the oldest release you have?", "oldest IB imported" (found 2026-11-04: the LLM said no 20_0, with 241 records,
+    and sorted 10_6 before 5_3 as text)."""
+    exists = re.fullmatch(r"\s*(?:is\s+there\s+an?|do\s+you\s+have\s+an?|do\s+we\s+have\s+an?)\s+(?:CMSSW_)?(\d{1,2})_(\d{1,2})(?:_X)?(?:\s+(?:ib|release|series))?\s*[?.!]*\s*", question, re.IGNORECASE)
+    oldest = re.search(r"\b(?:oldest|earliest|first)\s+(release|series|ib|build)\b", question, re.IGNORECASE)
+    if (not exists and not oldest) or re.search(r"\bstill\b", question, re.IGNORECASE):
+        return None
+    if oldest and re.search(r"\b(?:of|in|on)\s+\w+", question, re.IGNORECASE) and not re.search(r"\b(?:you|imported|have|database|graph)\b", question, re.IGNORECASE):
+        return None  # "first IB of November" has its own answer
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            tags = [r["t"] for r in session.run("MATCH (ib:IB) WHERE ib.tag =~ 'CMSSW_[0-9]+_[0-9]+_X_.*' RETURN DISTINCT ib.tag AS t")]
+    finally:
+        driver.close()
+    if exists:
+        prefix = f"CMSSW_{exists.group(1)}_{exists.group(2)}_X_"
+        mine = sorted(t for t in tags if t.startswith(prefix))
+        if not mine:
+            return f"No `{prefix[:-1]}` IB is imported."
+        return f"Yes: {len(mine)} primary `{prefix[:-1]}` IB(s) are imported, newest `{mine[-1]}`."
+    series = sorted({tuple(int(x) for x in re.match(r"CMSSW_(\d+)_(\d+)_", t).groups()) for t in tags})
+    if oldest.group(1).lower() in ("release", "series"):
+        return f"The oldest release series imported is **`CMSSW_{series[0][0]}_{series[0][1]}_X`**. All {len(series)}: " + ", ".join(f"`{a}_{b}`" for a, b in series) + "."
+    first = min(tags, key=lambda t: t.rsplit("_X_", 1)[-1])
+    return f"The earliest build imported is **`{first}`**. RelVal and unit-test results are kept only from {_RELVAL_RETENTION_START}, so older builds have just their build information."
+
+
+def _sub_ib_only_failures_answer(question: str) -> str | None:
+    """ "failures only in sub-IBs, not primary", "failures in primary but not in sub-IBs" (found 2026-11-04: "no results for `sub`")."""
+    only_sub = re.search(r"\bonly\s+(?:in|on)\s+(?:the\s+)?sub[\s-]*ibs?\b|\bin\s+sub[\s-]*ibs?\b[^?]*\bnot\s+(?:in\s+)?(?:the\s+)?primary\b", question, re.IGNORECASE)
+    only_primary = re.search(r"\bonly\s+(?:in|on)\s+(?:the\s+)?primary\b|\bprimary\b[^?]*\bnot\s+(?:in\s+)?(?:the\s+)?sub[\s-]*ibs?\b", question, re.IGNORECASE)
+    if not only_sub and not only_primary:
+        return None
+    tag = _latest_or_named_tag(question)
+    records = _ib_build_records(tag) if tag else []
+    primary = {r["arch"]: r for r in records if r["variant"] == "primary"}
+    subs = [r for r in records if r["variant"] != "primary"]
+    if only_sub:
+        found = []
+        for r in subs:
+            base = primary.get(r["arch"])
+            if not base or not base["relvals"]:
+                continue
+            found += [(w, r["variant"], r["arch"]) for w in r["failed"] if w not in base["failed"]]
+        head = f"Failing in a sub-IB of `{tag}`, not in the primary IB on the same architecture"
+    else:
+        found = []
+        for arch, base in primary.items():
+            same = [r for r in subs if r["arch"] == arch and r["relvals"]]
+            if same:
+                found += [(w, "primary", arch) for w in base["failed"] if not any(w in r["failed"] for r in same)]
+        head = f"Failing in primary `{tag}`, in none of its sub-IBs on the same architecture"
+    lines = [f"{head} (RelVals, known errors excluded): **{len(found)}**"]
+    lines += [f"- `{w}`: {variant} `{arch}`" for w, variant, arch in found[:25]]
+    lines.append("Only architectures where both have results are compared.")
+    return "\n".join(lines)
+
+
 def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     """Answers the 2026-11-04 test pass found missing; each returns None unless its phrasing matches."""
     if "\n" in question or len(question) > 200:
@@ -15762,7 +15870,7 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
                            (_recovered_window_answer, "recovered_window"), (_longest_failing_answer, "longest_failing"), (_workflow_last_pass_answer, "workflow_last_pass"),
                            (_workflow_identity_answer, "workflow_identity"), (_workflows_by_name_answer, "workflows_by_name"), (_who_to_ask_answer, "who_to_ask"),
                            (_merged_about_window_answer, "merged_about_window"), (_pr_version_update_answer, "pr_version_update"), (_pr_in_latest_answer, "pr_in_latest"),
-                           (_closed_issues_answer, "closed_issues"), (_ibs_on_day_answer, "ibs_on_day"), (_prs_merged_on_day_answer, "prs_merged_on_day"), (_digest_family_answer, "digest_family"), (_who_is_on_topic_answer, "who_is_on_topic"), (_build_error_answer, "build_error"), (_most_compilation_warnings_answer, "most_compilation_warnings"),
+                           (_series_facts_answer, "series_facts"), (_sub_ib_only_failures_answer, "sub_ib_only_failures"), (_closed_issues_answer, "closed_issues"), (_ibs_on_day_answer, "ibs_on_day"), (_prs_merged_on_day_answer, "prs_merged_on_day"), (_digest_family_answer, "digest_family"), (_who_is_on_topic_answer, "who_is_on_topic"), (_build_error_answer, "build_error"), (_most_compilation_warnings_answer, "most_compilation_warnings"),
                            (_log_most_problems_answer, "log_most_problems"), (_exception_category_answer, "exception_category"),
                            (_not_imported_answer, "not_imported"), (_exit_code_difference_answer, "exit_code"),
                            (_flavour_newest_answer, "flavour_newest"), (_list_ibs_answer, "list_ibs"), (_ib_schedule_now_answer, "ib_schedule_now"),

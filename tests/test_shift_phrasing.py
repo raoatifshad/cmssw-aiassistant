@@ -549,6 +549,24 @@ class HourTwelveTests(unittest.TestCase):
             self.assertEqual(tools.list_ib_tags()[0]["tag"], "CMSSW_20_1_X_2026-11-03-2300")
 
 
+class HourThirteenTests(unittest.TestCase):
+    def test_new_handlers_leave_other_questions_alone(self):
+        from server.api_server import _series_facts_answer, _sub_ib_only_failures_answer
+        for handler in (_series_facts_answer, _sub_ib_only_failures_answer):
+            for question in ("what is the latest IB?", "what's the first IB of November?", "which failures are only in ROOT6?", "first one"):
+                self.assertIsNone(handler(question), (handler.__name__, question))
+
+    def test_gpu_questions_say_they_are_not_imported(self):
+        self.assertIn("not imported", _not_imported_answer("GPU IB failures"))
+        self.assertIn("not imported", _not_imported_answer("which relvals fail on gpu?"))
+        self.assertIsNone(_not_imported_answer("what does the ib-run-gpu-relvals job do"))
+        self.assertIsNone(_not_imported_answer("what are GPU relvals?"))
+
+    def test_rewrites(self):
+        self.assertEqual(_shift_question_rewrite("gcc16 status"), "gcc16 failures")
+        self.assertEqual(_shift_question_rewrite("is G4ADEPT worse than primary?"), "compare primary and G4ADEPT in the latest IB")
+
+
 class ConceptTests(unittest.TestCase):
     def test_terms(self):
         for question, expected in (("what's a global tag?", "conditions"), ("what is the ORP?", "orp-approved"),
