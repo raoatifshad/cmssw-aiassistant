@@ -1023,6 +1023,8 @@ def _normalize_deterministic_question(question: str) -> str:
         (r"\bpackages?\s+(?:that\s+)?(?:needs?|require|requires)\s+(?:fixing|to\s+be\s+fixed|a\s+fix|attention)\b",
          "failed unit-test packages"),
         (r"\bhow\s+much\b", "how many"),
+        # "exceptions in <tag>" (found 2026-11-04: the whole-IB summary table, no exception in it)
+        (r"(?<!relval )(?<!relvals )\bexceptions?\s+(in|for|of)\s+(?=CMSSW_\d)", r"relval exceptions \1 "),
         # "which PRs went into <tag>" = merged in (found in a held-out pass 2026-10-15)
         (r"\b(?:went|got|go|come|came)\s+into\b|\b(?:are|were)\s+included\s+in\b", "were merged in"),
         (r"\bnumber\s+of\b", "number"),
@@ -3965,15 +3967,22 @@ def _relval_exception_list_answer(question: str, context: dict[str, str | None] 
         WITH collect(DISTINCT ib.tag) AS all_tags
         MATCH (exception:RelValException)
         WHERE exception.ib_tag IN all_tags AND ($arch IS NULL OR exception.arch = $arch)
-        RETURN DISTINCT exception.arch AS arch, exception.workflow_id AS workflow_id,
+        RETURN DISTINCT exception.ib_tag AS tag, exception.arch AS arch, exception.workflow_id AS workflow_id,
                exception.text AS exception, exception.category AS category,
                exception.source_url AS source_url
-        ORDER BY arch, workflow_id, exception
-        LIMIT 100
+        ORDER BY tag, arch, workflow_id, exception
+        LIMIT 2000
+    """
+    failing_query = """
+        MATCH (ib:IB)-[:RAN_RELVAL]->(relval:RelVal {status:'FAILED'})
+        WHERE (ib.tag = $tag OR ib.parent_tag = $tag) AND ($arch IS NULL OR ib.arch = $arch)
+        RETURN ib.tag AS tag, ib.arch AS arch, relval.workflow_id AS workflow_id, relval.exitcode AS exitcode,
+               coalesce(relval.known_error, false) AS known_error
     """
     driver = get_driver()
     try:
         with driver.session() as session:
+            failing = [dict(record) for record in session.run(failing_query, **context)]
             rows = [dict(record) for record in session.run(query, **context)]
     finally:
         driver.close()
@@ -3984,12 +3993,44 @@ def _relval_exception_list_answer(question: str, context: dict[str, str | None] 
             "Neither a `*_EXCEPTIONS.json` source nor staged pyRelValMatrixLogs step logs "
             "have been imported for this scope yet."
         )
-    lines = [f"Imported RelVal exceptions for `{context['tag']}`{scope}:"]
+    # Grouped per build and message: found 2026-11-04, "why are there 50 relval failures on aarch64
+    # in <tag>" was 100+ bullets of one line "Child failed with exit code 1", half of them from a
+    # sub-IB the heading did not mention; and "why is DEVEL showing 4 relval failures" listed the
+    # one workflow with an exception as if it explained all four.
+    for record in rows + failing:
+        record["tag"] = record.get("tag") or context["tag"]
+    known = {(f["tag"], f["arch"], f["workflow_id"]) for f in failing if f.get("known_error")}
+    groups: dict[tuple, dict] = {}
     for row in rows:
-        category = f" **[{row['category']}]**" if row.get("category") else ""
-        lines.append(f"- `{row['arch']}` workflow `{row['workflow_id']}`:{category} `{row['exception']}`")
-        if row.get("source_url"):
-            lines.append(f"  - Source: {row['source_url']}")
+        key = (row["tag"], row["arch"], row.get("category"), row["exception"])
+        group = groups.setdefault(key, {"workflows": [], "source_url": row.get("source_url")})
+        if row["workflow_id"] not in group["workflows"]:
+            group["workflows"].append(row["workflow_id"])
+    with_sub_ibs = len({row["tag"] for row in rows}) > 1 or any(row["tag"] != context["tag"] for row in rows)
+    lines = [f"Imported RelVal exceptions for `{context['tag']}`{' and its sub-IBs' if with_sub_ibs else ''}{scope}:"]
+    for (tag, arch, category, exception), group in sorted(
+            groups.items(), key=lambda kv: (kv[0][0] != context["tag"], kv[0][0], kv[0][1], -len(kv[1]["workflows"]))):
+        workflows = group["workflows"]
+        known_here = sum((tag, arch, wf) in known for wf in workflows)
+        where = f"`{arch}`" if tag == context["tag"] else f"`{tag}` `{arch}`"
+        shown = ", ".join(f"`{wf}`" for wf in workflows[:8]) + (f" +{len(workflows) - 8} more" if len(workflows) > 8 else "")
+        count = f"{len(workflows)} workflows: " if len(workflows) > 1 else "workflow "
+        tail = f" ({known_here} of them known errors)" if known_here and len(workflows) > 1 else " (known error)" if known_here else ""
+        lines.append(f"- {where} {count}{shown}:{' **[' + category + ']**' if category else ''} `{exception}`{tail}")
+        if group["source_url"]:
+            lines.append(f"  - {'Example log' if len(workflows) > 1 else 'Source'}: {group['source_url']}")
+    recorded = {(row["tag"], row["arch"], row["workflow_id"]) for row in rows}
+    silent = sorted((f for f in failing if (f["tag"], f["arch"], f["workflow_id"]) not in recorded and not f.get("known_error")),
+                    key=lambda f: (f["tag"] != context["tag"], f["tag"], f["arch"], str(f["workflow_id"])))
+    if silent:
+        lines.append("\nFailing with no exception text imported (see the step log):")
+        by_build: dict[tuple, list[str]] = {}
+        for f in silent:
+            exit_text = f" (exit {f['exitcode']})" if f.get("exitcode") else ""
+            by_build.setdefault((f["tag"], f["arch"]), []).append(f"`{f['workflow_id']}`{exit_text}")
+        for (tag, arch), items in by_build.items():
+            where = f"`{arch}`" if tag == context["tag"] else f"`{tag}` `{arch}`"
+            lines.append(f"- {where}: " + ", ".join(items[:12]) + (f" +{len(items) - 12} more" if len(items) > 12 else ""))
     return "\n".join(lines)
 
 
