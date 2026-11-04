@@ -9850,6 +9850,8 @@ _DAS_ERROR_EXPLANATION = (
 _WORKFLOW_WHERE_RE = re.compile(
     r"\bwhere\b|\banywhere\b|\bwhich\s+(?:builds?|ibs?|releases?|archs?|architectures?|variants?|sub-?ibs?)\b|"
     r"\bin\s+which\b|\bis\b[^?!]{0,40}\bfail|\bfail(?:s|ing|ed)?\b|"
+    # "is 539.0 timing out everywhere?" (found 2026-11-04: "couldn't match that" menu)
+    r"\btim(?:ed?|ing)[\s-]*out\b|\bcrash\w*\b|\bsegfault\w*\b|"
     # "is 38551.85 broken?", "is X ok", "status of X", "has X failed before" (found live
     # 2026-10-15 getting the latest IB's failure overview instead)
     r"\bbroken\b|\bok(?:ay)?\b|\bhealthy\b|\bworking\b|\bpass(?:es|ing|ed)?\b|\bstatus\b|"
