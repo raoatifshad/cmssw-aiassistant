@@ -200,7 +200,7 @@ add("IS", "is there an issue about IOPool ASAN test failures?", any=[r"51787"])
 add("IS", "open issues about edm::FileInPath", any=[r"51757", r"FileInPath"])
 add("IS", "any issue about pytorch rocm libraries", any=[r"51822"])
 add("IS", "how many open issues are there", any=[r"1009", r"open"])
-add("IS", "latest open issue", any=[r"518\d\d", r"2026-09"])
+add("IS", "latest open issue", any=[r"52376", r"2026-11"])
 add("IS", "is there a GitHub issue for the riscv64 relval failures?", any=[r"riscv", r"Issue"])
 add("IS", "issues mentioning TrackstersProducer", any=[r"TrackstersProducer", r"Issue|PR"])
 add("IS", "is MPICore failure tracked in an issue?", any=[r"MPI", r"Issue"])
@@ -450,9 +450,12 @@ FACTS = [
      "MATCH (r:TestLogRun) WHERE r.ib_tag CONTAINS '_X_2026-10-21-' RETURN count(r) = 0 AS ok"),
     ("cmsdist PR 10960 updates Geant4 to 11.4.3",
      "MATCH (p:PR {number:10960, repo:'cmsdist'}) RETURN p.title CONTAINS '11.4.3' AS ok"),
-    ("Issues 51787 (IOPool ASAN), 51757, 51822, 51793 are open",
-     "MATCH (i:Issue) WHERE i.number IN [51787, 51757, 51822, 51793] AND i.state = 'open' RETURN count(i) = 4 AS ok"),
-    ("1,009 open Issues", "MATCH (i:Issue {state:'open'}) RETURN count(i) = 1009 AS ok"),
+    # states as of the 2026-11-04 web fetch (51757 and 51793 were closed on GitHub since the export)
+    ("Issues 51787 (IOPool ASAN), 51822 are open",
+     "MATCH (i:Issue) WHERE i.number IN [51787, 51822] AND i.state = 'open' RETURN count(i) = 2 AS ok"),
+    ("Issues 51757, 51793 are closed",
+     "MATCH (i:Issue) WHERE i.number IN [51757, 51793] AND i.state = 'closed' RETURN count(i) = 2 AS ok"),
+    ("1,033 open Issues", "MATCH (i:Issue {state:'open'}) RETURN count(i) = 1033 AS ok"),
     ("16_1 and 17_0 IBs are imported",
      "MATCH (i:IB) WHERE i.tag STARTS WITH 'CMSSW_16_1_X_' OR i.tag STARTS WITH 'CMSSW_17_0_X_' "
      "RETURN count(DISTINCT left(i.tag, 13)) = 2 AS ok"),

@@ -2394,7 +2394,8 @@ def _issue_summary_unsafe(number: int) -> str | None:
             row = session.run(
                 "MATCH (i:Issue {repo:'cmssw', number:$n}) "
                 "RETURN i.title AS title, i.state AS state, i.created_at AS created, i.updated_at AS updated, "
-                "i.labels AS labels, i.body AS body, COUNT { (i)-[:HAS_COMMENT]->() } AS comments", n=number).single()
+                "i.labels AS labels, i.body AS body, i.fetched_via AS fetched_via, "
+                "COUNT { (i)-[:HAS_COMMENT]->() } AS comments", n=number).single()
     finally:
         driver.close()
     if not row:
@@ -2411,7 +2412,8 @@ def _issue_summary_unsafe(number: int) -> str | None:
         f"## Issue #{number} - {row['title']}",
         f"- **State:** {row['state']} (opened {str(row['created'])[:10]}, last update {str(row['updated'])[:10]})",
         f"- **Labels:** {labels}" if labels else "",
-        f"- **Comments imported:** {row['comments']}",
+        f"- **Comments imported:** {row['comments']}" + (" (fetched directly from GitHub without comments; any it has "
+                                                          "since the export are not imported)" if row.get("fetched_via") else ""),
         f"\n**Description:** {body}" if body else "",
         f"\nhttps://github.com/cms-sw/cmssw/issues/{number}",
     ) if line)
@@ -2469,6 +2471,21 @@ def _pr_author_answer(question: str) -> str | None:
 _GITHUB_COVERAGE_CACHE: dict[str, object] = {}
 
 
+_LEAKED_REASONING_RE = re.compile(r"^\s*(?:the\s+user\s+(?:asked|asks|is\s+asking|wants)\b|we\s+(?:must|need\s+to|should)\b)",
+                                  re.IGNORECASE)
+
+
+def _strip_leaked_reasoning(answer: str) -> str:
+    """Drop the model's own planning lines from the start of an answer (found 2026-11-04, about one in two for
+    "who won the champions league?": 'The user asked: ... We must respond that we cannot answer.' before the
+    real reply). Only leading whole lines; if nothing would remain the answer is left as it is."""
+    lines = answer.split("\n")
+    start = 0
+    while start < len(lines) and (_LEAKED_REASONING_RE.match(lines[start]) or not lines[start].strip()):
+        start += 1
+    return "\n".join(lines[start:]) if start < len(lines) else answer
+
+
 def _github_export_note() -> str:
     """How far the imported GitHub Issue export reaches, read from the graph (cached 10 min). Every
     answer about Issue states or absences says it: the export can be weeks old (found 2026-11-04:
@@ -2481,12 +2498,27 @@ def _github_export_note() -> str:
         driver = get_driver()
         try:
             with driver.session() as session:
-                row = session.run("MATCH (i:Issue {repo:'cmssw'}) RETURN max(i.number) AS n, "
-                                  "max(coalesce(i.updated_at, i.created_at)) AS t").single()
+                # the export's reach: its newest update time, and the highest Issue created by then (Issues
+                # the web fetch updated since no longer carry the export's copy)
+                row = session.run("MATCH (i:Issue {repo:'cmssw'}) WHERE i.fetched_via IS NULL "
+                                  "WITH max(coalesce(i.updated_at, i.created_at)) AS t "
+                                  "MATCH (j:Issue {repo:'cmssw'}) WHERE j.created_at <= t "
+                                  "RETURN max(j.number) AS n, t").single()
+                web = session.run("MATCH (i:Issue {repo:'cmssw'}) WHERE i.fetched_via IS NOT NULL "
+                                  "RETURN max(i.number) AS n, max(i.updated_at) AS t, max(i.fetched_via) AS via").single()
         finally:
             driver.close()
-        note = (f"GitHub Issues are imported from an export that reaches #{row['n']} ({str(row['t'])[:10]}); "
-                "anything newer on GitHub, including later state changes, is not imported")
+        if web and web["n"]:
+            # the stopgap web fetch (ingestion/fetch_github_web_updates.py, 2026-11-04): newer states and
+            # Issues, no comments
+            fetched_on = str(web["via"]).split()[-1]
+            note = (f"GitHub data: the full export (with comments) reaches {str(row['t'])[:10]}; "
+                    f"Issues/PRs updated since were fetched directly from GitHub on {fetched_on} (titles, "
+                    f"descriptions, labels, states; no comments), newest Issue #{web['n']}, last update {str(web['t'])[:10]}. "
+                    "Anything changed on GitHub after that is not imported")
+        else:
+            note = (f"GitHub Issues are imported from an export that reaches #{row['n']} ({str(row['t'])[:10]}); "
+                    "anything newer on GitHub, including later state changes, is not imported")
     except Exception as exc:
         print(f"WARNING: GitHub coverage lookup failed: {exc}")
         note = "GitHub Issues are imported from an export that may be weeks old; later changes are not imported"
@@ -2518,7 +2550,7 @@ def _issue_state_answer(question: str) -> str | None:
         return f"Issue #{number} is not in the imported GitHub data. {_github_export_note()}."
     when = f", closed {str(row['closed'])[:10]}" if row["closed"] else ""
     return (f"**Issue #{number}** - {row['title']}: `{row['state']}` in the imported data (created "
-            f"{str(row['created'])[:10]}{when}, last update in the export {str(row['updated'])[:10]}).\n\n"
+            f"{str(row['created'])[:10]}{when}, last update in the imported data {str(row['updated'])[:10]}).\n\n"
             f"_{_github_export_note()}, so its state on GitHub today may differ._")
 
 
@@ -2744,7 +2776,7 @@ def _render_pr_evidence_rows(term: str, rows: list[dict], via_llm: bool = False,
     for row in rows:
         lines.append(
             f"- **{row['repo']} #{row['pr_number']}** - {row['title']} "
-            f"(merged {row['merged_at'] or 'unknown'})"
+            f"({'merged ' + str(row['merged_at']) if row['merged_at'] else 'not merged, state `' + str(row.get('state') or 'unknown') + '`'})"
         )
         evidence = ", ".join(row["evidence"])
         details = [f"evidence: {evidence}"]
@@ -8496,7 +8528,7 @@ def _run_llm_investigation(
             if deterministic_fallback is not None:
                 return _respond(answer, f"{route_prefix}llm_unverified_absence")
             return _unverified_absence_response(sid, original_question, planned, route_prefix)
-        return _respond(answer, f"{route_prefix}llm_validated", citations)
+        return _respond(_strip_leaked_reasoning(answer), f"{route_prefix}llm_validated", citations)
     except Exception as exc:
         # The LLM gateway can be slow or briefly unreachable under load (found
         # live via scripts/stress_test_bot.py, 2026-09-22: concurrent
@@ -11554,12 +11586,12 @@ def _about_data_answer(question: str) -> str | None:
     if logs:
         lines.append(f"- **Raw IB test logs** (problems inside passed tests): {day(logs['first'])} to {day(logs['last'])}")
     if issues:
-        lines.append(f"- **GitHub Issues/PRs and comments:** export up to {day(issues['last'])} (about #{issues['number']}); "
-                     + (f"merged PRs up to {day(merged['last'])}" if merged else ""))
+        lines.append(f"- **GitHub Issues/PRs:** {_github_export_note().removeprefix('GitHub data: ')}."
+                     + (f" Merged PRs per build, from the IB data, up to {day(merged['last'])}." if merged else ""))
     if clang:
         lines.append(f"- **Clang static-analyzer warnings:** parsed up to {day(clang['last'])}")
     lines.append("- **Shifter documentation:** the cmssdt-wiki pages (Jenkins jobs, procedures)")
-    lines.append("\nThe data is refreshed by hand, so the newest builds can be missing or partly imported -- I say "
+    lines.append("\nThe data is refreshed twice a day, so the newest builds can be missing or partly imported -- I say "
                  "\"not imported yet\" rather than \"no failures\" when that happens. Ask e.g. \"what is the latest IB\", "
                  "\"where is workflow 1349.0 failing\", or paste an error message.")
     return "\n".join(lines)
@@ -12080,12 +12112,12 @@ def _github_count_answer(question: str) -> str | None:
                 "MATCH (i:Issue) WHERE i.repo = 'cmssw' RETURN coalesce(i.state, 'unknown') AS state, count(*) AS n")}
             prs = session.run("MATCH (p:PR) WHERE p.repo = 'cmssw' RETURN count(p) AS total, "
                               "count(p.merged_at) AS merged").single()
-            newest = session.run("MATCH (i:Issue) RETURN max(i.created_at) AS last").single()["last"]
     finally:
         driver.close()
-    lines = [f"Imported cmssw GitHub data (export up to {str(newest)[:10]}, plus PRs merged into IBs since):", "",
+    lines = ["Imported cmssw GitHub data:", "",
              f"- **Issues:** {issues.get('open', 0):,} open, {issues.get('closed', 0):,} closed",
              f"- **PRs:** {prs['total']:,} imported, {prs['merged']:,} of them merged"]
+    lines.append(f"\n_{_github_export_note()}._")
     lines.append("\nAsk e.g. \"open issues about ASAN\" or \"issue 51787\" for specific ones.")
     return "\n".join(lines)
 

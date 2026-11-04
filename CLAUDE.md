@@ -230,6 +230,16 @@ additionally deletes graph records whose backing source file is gone
 - `--github-issues` — optional raw CMSSW GitHub Issues export
   (dir or `.tar`/`.tar.gz`), imports PR/Issue bodies, labels, comments, and
   explicit `#number`/URL cross-references. Never calls GitHub live.
+  **Stopgap since 2026-11-04:** the backup on cmssdt9-02 is stuck at 2026-09-04
+  (`issues/latest.txt`), so `ingestion/fetch_github_web_updates.py` fetches the
+  Issues/PRs updated since then from the GitHub REST API by hand into
+  `GITHUB-ISSUES/web-update/store` (same layout as the backup), and
+  `build_graph.py --github-issues` imports that (no `--reconcile`). Those nodes
+  carry `fetched_via` and have no new comments (existing ones are kept); answers
+  say so through `_github_export_note`. The bot never reads these files or GitHub
+  while answering, only the database. The importer keeps whichever copy has the
+  newer `updated_at`; when the real backup works again, its copies replace these
+  and clear `fetched_via`, and this fetch should stop being used.
 
 **IB identity is always the pair `(tag, architecture)`** — never merge or
 dedupe across architectures. `CMSSW_<major>_<minor>_X_<timestamp>` is a
