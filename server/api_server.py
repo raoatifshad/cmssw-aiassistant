@@ -11636,6 +11636,9 @@ def _chat(req: ChatRequest):
                     _default_tag_notes[sid] = (
                         f"_No IB was named, so this is for `{picked}`, the newest IB with complete "
                         f"{what} results{' for that architecture' if asked_arch else ''}. {partial_note}_\n\n")
+                elif newest and newest[0]["tag"] != picked and _requested_release_series(question):
+                    # "unit tests for 17_1 latest" (found 2026-11-04: claimed CMSSW_20_1_X has none yet)
+                    _default_tag_notes[sid] = f"_No IB was named, so this is for `{picked}`, the newest one of that release series._\n\n"
                 elif newest and newest[0]["tag"] != picked:
                     _default_tag_notes[sid] = (
                         f"_No IB was named, so this is for `{picked}`, the newest IB with "
