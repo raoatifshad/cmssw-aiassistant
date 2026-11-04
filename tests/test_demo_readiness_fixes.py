@@ -1,6 +1,9 @@
 """Wrong/dead-end answers found 2026-11-03 by a keyword-trap probe of the live bot
 (one keyword in a question picking a deterministic answer for something else)."""
+import ast
 import unittest
+from collections import Counter
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from server.api_server import (
@@ -20,6 +23,9 @@ from server.api_server import (
     _issue_state_answer,
     _GITHUB_COVERAGE_CACHE,
     _github_export_note,
+    _variant_diff_baseline,
+    _variant_tag,
+    _known_error_list_answer,
     _render_pr_evidence_rows,
     _strip_leaked_reasoning,
     _exception_ranking_answer,
@@ -486,6 +492,55 @@ class GitHubStalenessTests(unittest.TestCase):
         self.assertIn("not merged, state `open`", answer)
         self.assertNotIn("merged unknown", answer)
         self.assertIn("(merged 2026-11-02)", _render_pr_evidence_rows("X", [dict(row, merged_at="2026-11-02")]))
+
+
+class KnownErrorListPartialBuildTests(unittest.TestCase):
+    @patch("server.api_server._newest_tag_for_arch_word",
+           return_value=("CMSSW_20_1_X_2026-11-03-2300", ["el9_aarch64_gcc14"]))
+    @patch("server.api_server.get_driver")
+    def test_newest_build_without_relvals_on_the_arch_is_not_reported_as_none(self, get_driver, _newest):
+        known = {"tag": "CMSSW_20_1_X_2026-11-02-2300", "arch": "el9_aarch64_gcc14", "wf": "1.0", "name": "W",
+                 "reason": "tracked"}
+        driver, _ = _driver_with(
+            [],
+            MagicMock(single=MagicMock(return_value={"tag": "CMSSW_20_1_X_2026-11-02-2300"})),
+            [known])
+        get_driver.return_value = driver
+        answer = _known_error_list_answer("known errors list for aarch64 20_1", "s-known-partial")
+        self.assertIn("has no RelVal results imported on `el9_aarch64_gcc14` yet", answer)
+        self.assertIn("**1 known-error RelVal(s)** in `CMSSW_20_1_X_2026-11-02-2300`", answer)
+        self.assertNotIn("No known-error", answer)
+
+
+class ShiftDigestPrimaryBaselineTests(unittest.TestCase):
+    """Found 2026-11-04: 13_0 on el8_amd64_gcc11 listed one HLT unit test as both newly failing and resolved."""
+
+    def test_variant_tag_of_the_primary_is_the_primary_tag(self):
+        # a second definition of _variant_tag replaced this one and gave "CMSSW_13_0__X_...", which sorts
+        # after every primary tag, so "the previous build" was the latest build itself
+        self.assertEqual(_variant_tag("CMSSW_13_0_X_2026-11-03-2300", ""), "CMSSW_13_0_X_2026-11-03-2300")
+        self.assertEqual(_variant_tag("CMSSW_13_0_X_2026-11-03-2300", "HLT"), "CMSSW_13_0_HLT_X_2026-11-03-2300")
+
+    @patch("server.api_server._variant_previous_tag", return_value="CMSSW_13_0_X_2026-11-01-0000")
+    def test_primary_baseline_excludes_its_sub_ib_rows(self, previous):
+        rows = [{"name": "Pkg", "variant": "HLT"}, {"name": "Own", "variant": None}]
+        before, note, has_baseline = _variant_diff_baseline(
+            "", "el8_amd64_gcc11", "CMSSW_13_0_X_2026-11-01-2300", {}, {}, set(), lambda tag, arch: rows,
+            "UnitTest", latest_tag="CMSSW_13_0_X_2026-11-03-2300")
+        self.assertEqual(before, [{"name": "Own", "variant": None}])
+        self.assertTrue(has_baseline)
+        self.assertIn("CMSSW_13_0_X_2026-11-01-0000", note)
+        previous.assert_called_once_with("CMSSW_13_0_X_2026-11-03-2300", None, "el8_amd64_gcc11")
+
+
+class NoDuplicateDefinitionsTests(unittest.TestCase):
+    def test_no_module_level_function_replaces_another(self):
+        # a second _variant_tag silently replaced the first (2026-11-04) and broke the shift digest's baselines
+        root = Path(__file__).resolve().parent.parent
+        for name in ("server/api_server.py", "server/agent.py", "server/request_planner.py", "graph/tools.py"):
+            tree = ast.parse((root / name).read_text())
+            counts = Counter(node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)))
+            self.assertEqual([def_name for def_name, n in counts.items() if n > 1], [], name)
 
 
 class LeakedReasoningTests(unittest.TestCase):

@@ -6078,8 +6078,11 @@ def _variant_diff_baseline(
             f"failures aren't shown as newly failing.",
             False,
         )
+    # A primary tag's rows include its sub-IBs: keep this variant's own, or an HLT failure in the baseline
+    # reads as "resolved" for the primary (found 2026-11-04, 13_0 on el8_amd64_gcc11, which also listed
+    # one workflow twice under Resolved RelVals).
     return (
-        fetch_fn(own_previous_tag, arch),
+        [row for row in fetch_fn(own_previous_tag, arch) if (row.get("variant") or "") == (variant or "")],
         f"`{variant_name}` has no {label} build at `{previous_tag}` -- compared against "
         f"its own previous build `{own_previous_tag}` instead.",
         True,
@@ -9373,26 +9376,41 @@ def _known_error_list_answer(question: str, session_id: str) -> str | None:
         tag = context_tag or (latest[0]["tag"] if latest else None)
     if not tag:
         return None
+    known_error_query = (
+        "MATCH (ib:IB) WHERE (ib.tag = $tag OR (ib.parent_tag = $tag AND ib.tag <> $tag)) "
+        "AND ($arch IS NULL OR ib.arch = $arch) "
+        "MATCH (ib)-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE coalesce(r.known_error, false) "
+        "RETURN ib.tag AS tag, ib.arch AS arch, r.workflow_id AS wf, r.name AS name, "
+        "coalesce(r.known_error_message, 'no reason recorded') AS reason "
+        "ORDER BY ib.tag, ib.arch, r.workflow_id")
+    note = ""
     driver = get_driver()
     try:
         with driver.session() as session:
-            rows = [dict(r) for r in session.run(
-                "MATCH (ib:IB) WHERE (ib.tag = $tag OR (ib.parent_tag = $tag AND ib.tag <> $tag)) "
-                "AND ($arch IS NULL OR ib.arch = $arch) "
-                "MATCH (ib)-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE coalesce(r.known_error, false) "
-                "RETURN ib.tag AS tag, ib.arch AS arch, r.workflow_id AS wf, r.name AS name, "
-                "coalesce(r.known_error_message, 'no reason recorded') AS reason "
-                "ORDER BY ib.tag, ib.arch, r.workflow_id", tag=tag, arch=arch)]
+            rows = [dict(r) for r in session.run(known_error_query, tag=tag, arch=arch)]
+            if not rows and arch and not tag_match:
+                # found 2026-11-04: the newest IB exists on aarch64 but its RelVals are not imported yet,
+                # which is not "no known errors" -- the build before it has 50
+                series = re.match(r"^CMSSW_\d+_\d+_X_", tag)
+                newest = session.run(
+                    "MATCH (ib:IB {arch:$arch}) WHERE ib.tag STARTS WITH $prefix AND EXISTS { (ib)-[:RAN_RELVAL]->() } "
+                    "RETURN ib.tag AS tag ORDER BY ib.tag DESC LIMIT 1",
+                    arch=arch, prefix=series.group(0) if series else tag).single()
+                if newest and newest["tag"] != tag:
+                    note = (f"_`{tag}` has no RelVal results imported on `{arch}` yet, so this is for "
+                            f"`{newest['tag']}`, the newest build that has them._\n\n")
+                    tag = newest["tag"]
+                    rows = [dict(r) for r in session.run(known_error_query, tag=tag, arch=arch)]
     finally:
         driver.close()
     _latest_ib_contexts[session_id] = tag
     scope = f" on `{arch}`" if arch else ""
     if not rows:
-        return f"No known-error RelVals are recorded for `{tag}`{scope} or its sub-IBs in the imported results."
+        return f"{note}No known-error RelVals are recorded for `{tag}`{scope} or its sub-IBs in the imported results."
     by_reason: dict[str, list[dict]] = {}
     for r in rows:
         by_reason.setdefault(r["reason"].strip(), []).append(r)
-    lines = [f"**{len(rows)} known-error RelVal(s)** in `{tag}`{scope} and its sub-IBs (excluded from failing "
+    lines = [f"{note}**{len(rows)} known-error RelVal(s)** in `{tag}`{scope} and its sub-IBs (excluded from failing "
              "counts, as on the IB dashboard), by reason:"]
     for reason, items in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
         builds = sorted({(i["tag"], i["arch"]) for i in items})
@@ -9731,8 +9749,8 @@ _PACKAGE_PATH_RE = re.compile(r"\b([A-Z][A-Za-z0-9]+/[A-Z][A-Za-z0-9]+)\b")
 _ARCH_TERM_RE = re.compile(r"\b(el\d+|fc\d+|amd64|aarch64|ppc64le|riscv64|gcc\d+)\b", re.IGNORECASE)
 
 
-def _variant_tag(tag: str, variant: str) -> str:
-    """The tag of that build flavour with the same timestamp as `tag`."""
+def _flavour_tag(tag: str, variant: str) -> str:
+    """The tag of that sub-IB flavour with the same timestamp as `tag`."""
     parts = re.match(r"(CMSSW_\d+_\d+)_(?:[A-Z0-9]+_)?X_(.+)$", tag)
     return f"{parts.group(1)}_{variant}_X_{parts.group(2)}" if parts else tag
 
@@ -9917,7 +9935,7 @@ def _package_status_answer(question: str, session_id: str) -> str | None:
     if open_issues:
         lines.append("\nOpen Issues naming this package (relevance only, not proof of cause):")
         lines += [f"- **Issue #{i['number']}** - {i['title']}" for i in open_issues]
-    lines.append(_package_failing_tests_note(package, [(f"{tag}" if r["variant"] == "primary" else _variant_tag(tag, r["variant"]), r["arch"])
+    lines.append(_package_failing_tests_note(package, [(f"{tag}" if r["variant"] == "primary" else _flavour_tag(tag, r["variant"]), r["arch"])
                                                        for r in failed[:4]])
                  or "\nThe failure message itself is in the unit-test log on the IB page; it is not imported here.")
     return "\n".join(lines)

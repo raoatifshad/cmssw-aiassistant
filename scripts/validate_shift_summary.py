@@ -245,7 +245,7 @@ def dev_login(client: httpx.Client, username: str) -> None:
         )
 
 
-def run(base_url: str, username: str, num_windows: int) -> int:
+def run(base_url: str, username: str, num_windows: int, num_cycles: int = 3) -> int:
     # Windows list is every historical window, not just adjacent ones --
     # found live 2026-10-01: a window spanning two distant release series
     # (e.g. CMSSW_16_1_X -> CMSSW_17_0_X) legitimately takes ~40s (confirmed
@@ -267,10 +267,22 @@ def run(base_url: str, username: str, num_windows: int) -> int:
     tags = [w["release_name"] for w in windows_resp.json().get("windows", [])]
     print(f"{len(tags)} imported window tag(s) available.")
 
+    # Only windows a shifter can pick: the Shift Console limits its pickers to one release cycle
+    # (ShiftConsolePage.js releaseCycle). The windows list is across all cycles and builds of one
+    # timestamp come in random order per server process, so pairing neighbours gave a random
+    # cross-series window (found 2026-11-04: 20_1 -> 13_0 failed on one server, passed on another).
+    by_cycle: dict[str, list[str]] = {}
+    for tag in tags:
+        by_cycle.setdefault(tag.rsplit("_", 1)[0], []).append(tag)
+    def series_key(cycle: str) -> tuple[int, int]:
+        major, minor = cycle.split("_")[1:3]
+        return int(major), int(minor)
     checks: list[tuple[str, str]] = [("default (latest vs previous)", None)]
-    for i in range(min(num_windows, max(0, len(tags) - 1))):
-        to_tag, from_tag = tags[i], tags[i + 1]
-        checks.append((f"{from_tag} -> {to_tag}", (from_tag, to_tag)))
+    for cycle in sorted(by_cycle, key=series_key, reverse=True)[:num_cycles]:
+        cycle_tags = by_cycle[cycle]
+        for i in range(min(num_windows, max(0, len(cycle_tags) - 1))):
+            to_tag, from_tag = cycle_tags[i], cycle_tags[i + 1]
+            checks.append((f"{from_tag} -> {to_tag}", (from_tag, to_tag)))
 
     all_violations: list[str] = []
     for label, window in checks:
@@ -302,6 +314,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://localhost:8001")
     parser.add_argument("--username", default="mrao", help="Must be in SHIFTER_CERN_USERNAMES.")
-    parser.add_argument("--windows", type=int, default=3, help="Extra past windows to check beyond the default.")
+    parser.add_argument("--windows", type=int, default=3, help="Past windows to check per release cycle, beyond the default.")
+    parser.add_argument("--cycles", type=int, default=3, help="Newest release cycles to check (highest series first).")
     args = parser.parse_args()
-    sys.exit(run(args.base_url, args.username, args.windows))
+    sys.exit(run(args.base_url, args.username, args.windows, args.cycles))
