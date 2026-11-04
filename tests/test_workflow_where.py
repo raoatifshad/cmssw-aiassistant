@@ -105,9 +105,9 @@ class WorkflowWhereTests(unittest.TestCase):
         from CMSSW_8_0 (a differently named 1349.0) and an August EVTGEN3 exception."""
         relvals = (_rows("CMSSW_20_1_X_2026-10-09-2300", ["el9_amd64_gcc14"], status="FAILED", exitcode=256, name="BsToMuMu_13")
                    + _rows("CMSSW_20_1_X_2026-10-12-2300", ["el9_amd64_gcc14"], status="PASSED", exitcode=0, name="BsToMuMu_13")
-                   + _rows("CMSSW_8_0_X_2026-10-11-0000", ["slc7_amd64_gcc530"], status="DAS_ERROR", name="BsToMuMu_13+INPUT"))
+                   + _rows("CMSSW_8_0_X_2026-10-11-0000", ["slc7_amd64_gcc530"], status="DAS_ERROR", name="Other_13+INPUT"))
         details = ["1349.0_BsToMuMu_13: step1=PASSED step2=PASSED step3=FAILED; exit 0 0 256",
-                   "1349.0_BsToMuMu_13+INPUT: step1=DAS_ERROR step2=NOTRUN; exit 1 0"]
+                   "1349.0_Other_13+INPUT: step1=DAS_ERROR step2=NOTRUN; exit 1 0"]
         exceptions = [
             {"tag": "CMSSW_20_1_X_2026-10-09-2300", "arch": "el9_amd64_gcc14", "category": "LogicError", "message": "now"},
             {"tag": "CMSSW_20_1_EVTGEN3_X_2026-08-12-2300", "arch": "el9_amd64_gcc13", "category": "PluginNotFound",
@@ -124,6 +124,18 @@ class WorkflowWhereTests(unittest.TestCase):
         self.assertIn("**[LogicError]** now", answer)
         self.assertNotIn("EvtGen130", answer)
         self.assertIn("Not counted above: 1 run(s) in `CMSSW_8_0`", answer)
+
+    def test_old_release_step_list_names_are_the_same_workflow(self):
+        """Found 2026-11-04: 12_4 stores "RunDoubleMuon2016C+RunDoubleMuon2016C+RAWRECOTE16", 13_0 "RunDoubleMuon2016C";
+        "is 136.9 failing everywhere?" left 12_4 out."""
+        relvals = (_rows("CMSSW_12_4_X_2026-11-03-2300", ["el8_amd64_gcc10"], status="FAILED", exitcode=256,
+                         name="RunDoubleMuon2016C+RunDoubleMuon2016C+RAWRECOTE16")
+                   + _rows("CMSSW_13_0_X_2026-11-03-2300", ["el8_amd64_gcc11"], status="FAILED", exitcode=256, name="RunDoubleMuon2016C"))
+        with self._patch_graph(relvals, [], []), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is workflow 136.9 failing", "s-names")
+        self.assertIn("CMSSW_12_4", answer)
+        self.assertIn("CMSSW_13_0", answer)
+        self.assertNotIn("Not counted above", answer)
 
     def test_still_failing_track_is_named_with_its_start(self):
         relvals = (_rows("CMSSW_20_1_X_2026-10-12-2300", ["el9_amd64_gcc14"], status="PASSED", exitcode=0, name="W")

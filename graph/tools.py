@@ -10,6 +10,7 @@ Two kinds, same rationale as the old SQL system:
   - A general query_graph tool for everything else (the model writes Cypher)
 """
 import copy
+import functools
 import re
 import sys
 import time
@@ -2258,3 +2259,20 @@ TOOLS = {
     "search_test_log_problems": search_test_log_problems,
     "query_graph": query_graph,
 }
+
+
+def _with_int_limit(fn):
+    """The LLM sometimes passes limit as a string ("50"): `min("50", MAX_ROWS)` then raised "'<' not supported
+    between instances of 'int' and 'str'", shown to a user as the answer (found 2026-11-04)."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if isinstance(kwargs.get("limit"), str):
+            try:
+                kwargs["limit"] = int(kwargs["limit"])
+            except ValueError:
+                kwargs.pop("limit")
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+TOOLS = {name: _with_int_limit(fn) for name, fn in TOOLS.items()}
