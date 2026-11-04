@@ -43,7 +43,7 @@ PRINCIPAL=mrao@CERN.CH
 API=${API:-http://localhost:8002}
 MIN_FREE_GB=${MIN_FREE_GB:-60}          # never start copying test logs below this much free disk
 DISK_BUDGET_GB=${DISK_BUDGET_GB:-45}     # max unscanned zips on disk at once (a DBG RelVal zip is ~33 GB)
-STEPS=${STEPS:-"cmsrepo exceptions testlogs docs frontend checks"}
+STEPS=${STEPS:-"cmsrepo exceptions testlogs docs github frontend checks"}
 FRONTEND=/home/rao/CERN/CERN-IB-WORK/cmssdt-18V/public   # Shift Console data: its own updateData.sh
 export NEO4J_URI=bolt://localhost:7688
 export PATH=/usr/sue/bin:/usr/local/bin:/usr/bin:/bin:$PATH
@@ -187,6 +187,18 @@ if want docs; then
         fi
     else status docs "SKIPPED (no shifter-wiki clone)"; fi
 else status docs SKIPPED; fi
+
+# ---------------------------------------------------------------- 4b. GitHub Issues/PRs (stopgap)
+# Only while the backup on cmssdt9-02 is stuck (since 2026-09-04): delete this step when it works again.
+# No comments; never --reconcile (the store holds only what was fetched, not all of GitHub).
+if want github; then
+    GH_STORE=/home/rao/CHAT-BOT-AI/GITHUB-ISSUES/web-update/store
+    if run github-fetch 15m venv/bin/python ingestion/fetch_github_web_updates.py \
+       && run github-import 1h env PYTHONPATH=ingestion venv/bin/python ingestion/build_graph.py \
+              --cmsrepo cmsrepo --github-issues "$GH_STORE"; then
+        status github OK
+    fi
+else status github SKIPPED; fi
 
 # ---------------------------------------------------------------- 5. health checks
 NEWEST_AFTER=$(venv/bin/python - <<'EOF' 2>/dev/null

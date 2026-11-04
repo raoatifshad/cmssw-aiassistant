@@ -356,7 +356,7 @@ add("N4", f"why is DEVEL showing 4 relval failures in CMSSW_20_1_DEVEL_X_2026-11
 add("N4", "why are there 50 relval failures on aarch64 in CMSSW_20_1_X_2026-11-02-2300", all=[r"known errors", r"31 workflows", r"ROOT6"])
 add("N4", f"how many compile warnings in {CPP} el9_amd64_gcc16?", all=[r"439"])
 add("N4", f"which architectures does {CPP} have?", all=[r"el9_amd64_gcc15", r"el9_amd64_gcc16"], none=[r"riscv"])
-add("N4", f"unit test failures in {CPP}", any=[r"Choose one", r"Utilities/General"])
+add("N4", f"unit test failures in {CPP}", any=[r"Utilities/General"])
 add("N4", [f"unit test failures in {CPP}", "and only gcc16?"], all=[r"RecoTracker/LSTCore", r"el9_amd64_gcc16"], none=[r"Choose one"])
 add("N4", "PR 52366 merged in which IB?", all=[r"52366"])
 add("N4", ["PR 52366 merged in which IB?", "what does it do?"], all=[r"SiPixelClusterShapeLimitsRcd"])
@@ -456,7 +456,7 @@ FACTS = [
      "MATCH (i:Issue) WHERE i.number IN [51787, 51822] AND i.state = 'open' RETURN count(i) = 2 AS ok"),
     ("Issues 51757, 51793 are closed",
      "MATCH (i:Issue) WHERE i.number IN [51757, 51793] AND i.state = 'closed' RETURN count(i) = 2 AS ok"),
-    ("1,033 open Issues", "MATCH (i:Issue {state:'open'}) RETURN count(i) = 1033 AS ok"),
+    ("over 1,000 open Issues", "MATCH (i:Issue {state:'open'}) RETURN count(i) > 1000 AS ok"),
     ("16_1 and 17_0 IBs are imported",
      "MATCH (i:IB) WHERE i.tag STARTS WITH 'CMSSW_16_1_X_' OR i.tag STARTS WITH 'CMSSW_17_0_X_' "
      "RETURN count(DISTINCT left(i.tag, 13)) = 2 AS ok"),

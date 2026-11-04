@@ -1831,13 +1831,9 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("40 failing RelVal(s)", answer)
         self.assertIn("All imported RelVal results", answer)
 
-    def test_relval_scope_or_choice_asks_only_when_multiple_defaults_tie(self):
-        # The one remaining case _relval_scope_or_choice still asks about:
-        # a real production incident where an IB had multiple architectures
-        # simultaneously marked is_relval_default, which is genuinely
-        # ambiguous (there's no single "the" architecture to default to).
-        # Zero or exactly one default architecture is never ambiguous this
-        # way -- every other case returns every record directly.
+    def test_relval_scope_or_choice_returns_every_architecture(self):
+        # Several flagged default used to ask, offering only those (2026-11-04: el10 and el8 of 4
+        # imported); every answer has a per-architecture table, so all are shown instead.
         tag = "CMSSW_20_1_X_2026-08-24-2300"
         two_defaults = [
             {"tag": tag, "arch": "el9_amd64_gcc14", "is_relval_default": True},
@@ -1845,8 +1841,8 @@ class ChatRoutingTests(unittest.TestCase):
         ]
         try:
             result = _relval_scope_or_choice("scope-choice-tie", tag, two_defaults, all_requested=False)
-            self.assertIsInstance(result, str)
-            self.assertIn("architecture-specific", result)
+            self.assertEqual(result, two_defaults)
+            self.assertNotIn("scope-choice-tie", _pending_relval_scopes)
 
             one_default = [
                 {"tag": tag, "arch": "el9_amd64_gcc14", "is_relval_default": True},
@@ -1921,10 +1917,7 @@ class ChatRoutingTests(unittest.TestCase):
 
     @patch("server.api_server._relval_scope_records")
     def test_relval_failure_count_rejects_invalid_architecture_choice(self, scope_records):
-        # The pending-choice flow now only triggers when >1 architecture is
-        # simultaneously marked is_relval_default (genuinely ambiguous which
-        # one is "the" build) -- both records need that flag set for this
-        # fixture to still exercise the choice/rejection path being tested.
+        # A choice still pending (the IB -> architecture flow) rejects an architecture not listed.
         session_id = "relval-invalid-scope"
         primary_ib = "CMSSW_20_1_X_2026-08-13-2300"
         scope_records.return_value = [
@@ -1946,7 +1939,9 @@ class ChatRoutingTests(unittest.TestCase):
             },
         ]
         try:
-            _relval_failure_count_answer(f"how many failed relvals in {primary_ib}", session_id)
+            _pending_relval_scopes[session_id] = {
+                "root_tag": primary_ib, "stage": "arch", "records": scope_records.return_value,
+            }
             answer = _relval_failure_count_answer("el11_amd64_gcc16", session_id)
             self.assertIn("not available", answer)
             self.assertIn(session_id, _pending_relval_scopes)
@@ -2002,12 +1997,11 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIn("53 failing RelVal(s)", answer)
         self.assertNotIn("architecture-specific", answer)
 
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._unittest_scope_records")
-    def test_unittest_summary_asks_when_multiple_default_architectures_exist(self, scope_records):
-        # Regression: a real IB had 4 architectures marked default
-        # simultaneously, and their unit-test counts were silently added
-        # together into one misleading headline number ("6 failed") instead
-        # of asking which architecture, same bug class fixed for RelVals.
+    def test_unittest_summary_shows_each_architecture_when_several_are_default(self, scope_records, *_):
+        # Several flagged default: no question, and each architecture keeps its own row.
         scope_records.return_value = [
             {"arch": "el9_amd64_gcc13", "is_default": False, "total": 950, "failed": 3, "passed": 947, "errors": 3},
             {"arch": "el9_amd64_gcc15", "is_default": True, "total": 950, "failed": 3, "passed": 947, "errors": 3},
@@ -2016,12 +2010,11 @@ class ChatRoutingTests(unittest.TestCase):
 
         answer = _unittest_summary_answer("and unit tests", "CMSSW_20_1_X_2026-08-09-0000", "s-multi-unittest")
 
-        self.assertIn("Choose one", answer)
-        self.assertIn("el9_amd64_gcc15", answer)
-        self.assertIn("el9_amd64_gcc16", answer)
-        self.assertNotIn("el9_amd64_gcc13", answer)
-        self.assertIn("s-multi-unittest", _pending_unittest_scopes)
-        _pending_unittest_scopes.pop("s-multi-unittest", None)
+        self.assertNotIn("Choose one", answer)
+        self.assertIn("| `el9_amd64_gcc13` | 3 |", answer)
+        self.assertIn("| `el9_amd64_gcc15` | 3 |", answer)
+        self.assertIn("| `el9_amd64_gcc16` | 4 |", answer)
+        self.assertNotIn("s-multi-unittest", _pending_unittest_scopes)
 
     @patch("server.api_server.get_failing_unittests")
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
@@ -2114,9 +2107,8 @@ class ChatRoutingTests(unittest.TestCase):
             {"arch": "el10_amd64_gcc15", "is_default": True, "total": 368, "failed": 4, "passed": 364, "errors": 16},
         ]
         try:
-            first = _unittest_summary_answer("and unit tests", "CMSSW_20_1_X_2026-08-25-2300", session_id)
-            self.assertIn("Choose one", first)
-
+            _pending_unittest_scopes[session_id] = {"tag": "CMSSW_20_1_X_2026-08-25-2300",
+                                                    "records": scope_records.return_value}
             answer = _unittest_summary_answer("all", None, session_id)
         finally:
             _pending_unittest_scopes.pop(session_id, None)
@@ -2301,7 +2293,8 @@ class ChatRoutingTests(unittest.TestCase):
             {"arch": "el9_amd64_gcc15", "is_default": True, "total": 950, "failed": 3, "passed": 947, "errors": 3},
             {"arch": "el9_amd64_gcc16", "is_default": True, "total": 950, "failed": 4, "passed": 946, "errors": 4},
         ]
-        _unittest_summary_answer("and unit tests", "CMSSW_20_1_X_2026-08-09-0000", "s-resume-unittest")
+        _pending_unittest_scopes["s-resume-unittest"] = {"tag": "CMSSW_20_1_X_2026-08-09-0000",
+                                                         "records": scope_records.return_value}
 
         answer = _unittest_summary_answer("el9_amd64_gcc16", None, "s-resume-unittest")
 
@@ -2343,11 +2336,10 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNotNone(answer)
         self.assertIn("2 failed", answer)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_repeated_relval_question_restarts_pending_scope(self, scope_records):
-        # Both records need is_relval_default set so the pending-choice flow
-        # this test exercises still triggers (see
-        # test_relval_failure_count_rejects_invalid_architecture_choice).
+    def test_repeated_relval_question_shows_every_architecture(self, scope_records, *_):
         session_id = "relval-repeated-question"
         primary_ib = "CMSSW_20_1_X_2026-08-10-1100"
         scope_records.return_value = [
@@ -2373,8 +2365,10 @@ class ChatRoutingTests(unittest.TestCase):
             _relval_failure_count_answer(question, session_id)
             answer = _relval_failure_count_answer(question, session_id)
 
-            self.assertIn("architecture-specific", answer)
+            self.assertNotIn("architecture-specific", answer)
             self.assertIn("el9_aarch64_gcc13", answer)
+            self.assertIn("el9_amd64_gcc13", answer)
+            self.assertNotIn(session_id, _pending_relval_scopes)
             self.assertNotIn("CMSSW_20_1_TF_X_2026-08-10-1100", answer)
         finally:
             _pending_relval_scopes.pop(session_id, None)
@@ -2401,8 +2395,10 @@ class ChatRoutingTests(unittest.TestCase):
             "CMSSW_20_1_X_2026-08-10-1100", include_sub_ibs=False
         )
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_relval_data_availability_asks_when_multiple_default_architectures_exist(self, scope_records):
+    def test_relval_data_availability_shows_each_architecture_when_several_are_default(self, scope_records, *_):
         tag = "CMSSW_20_1_X_2026-08-10-1100"
         scope_records.return_value = [
             {"tag": tag, "arch": "el9_amd64_gcc15", "relval_total": 950, "failed_relvals": 3, "passed_relvals": 947, "is_relval_default": True},
@@ -2411,11 +2407,14 @@ class ChatRoutingTests(unittest.TestCase):
 
         answer = _relval_data_availability_answer(f"do you have data for {tag}?", "s-avail-multi")
 
-        self.assertIn("Choose one", answer)
-        _pending_relval_scopes.pop("s-avail-multi", None)
+        self.assertNotIn("Choose one", answer)
+        self.assertIn("el9_amd64_gcc15", answer)
+        self.assertIn("el9_amd64_gcc16", answer)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_relval_error_count_asks_when_multiple_default_architectures_exist(self, scope_records):
+    def test_relval_error_count_shows_each_architecture_when_several_are_default(self, scope_records, *_):
         tag = "CMSSW_20_1_X_2026-08-10-1100"
         scope_records.return_value = [
             {"tag": tag, "arch": "el9_amd64_gcc15", "relval_total": 950, "failed_relvals": 3, "passed_relvals": 947,
@@ -2426,9 +2425,10 @@ class ChatRoutingTests(unittest.TestCase):
 
         answer = _relval_error_count_answer(f"how many relvals errors in {tag}", "s-errcount-multi")
 
-        self.assertIn("Choose one", answer)
+        self.assertNotIn("Choose one", answer)
+        self.assertIn("el9_amd64_gcc15", answer)
+        self.assertIn("el9_amd64_gcc16", answer)
         scope_records.assert_called_once_with(tag, include_sub_ibs=True)
-        _pending_relval_scopes.pop("s-errcount-multi", None)
 
     @patch("server.api_server.get_failing_relvals", return_value=[])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[])
@@ -2580,13 +2580,10 @@ class ChatRoutingTests(unittest.TestCase):
 
         self.assertIn("🔴", answer)
 
+    @patch("server.api_server.get_failing_relvals", return_value=[])
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
     @patch("server.api_server._relval_scope_records")
-    def test_generic_relval_summary_asks_when_multiple_default_architectures_exist(self, scope_records):
-        # Regression: silently summing every "default" architecture into one
-        # combined headline number is misleading when more than one exists
-        # (a real production IB had 4 simultaneously marked default) -- this
-        # must ask which architecture instead of guessing, same as the
-        # already-correct _relval_failure_count_answer.
+    def test_generic_relval_summary_shows_each_architecture_when_several_are_default(self, scope_records, *_):
         tag = "CMSSW_20_1_X_2026-08-09-0000"
         scope_records.return_value = [
             {"tag": tag, "arch": "el9_amd64_gcc13", "relval_total": 950, "failed_relvals": 5, "passed_relvals": 945, "is_relval_default": False},
@@ -2596,12 +2593,10 @@ class ChatRoutingTests(unittest.TestCase):
 
         answer = _relval_ib_summary_answer(f"show RelVal results for {tag}", "s-multi-default")
 
-        self.assertIn("Choose one", answer)
-        self.assertIn("el9_amd64_gcc15", answer)
-        self.assertIn("el9_amd64_gcc16", answer)
-        self.assertNotIn("el9_amd64_gcc13", answer)
-        self.assertEqual(_pending_relval_scopes["s-multi-default"]["stage"], "arch")
-        _pending_relval_scopes.pop("s-multi-default", None)
+        self.assertNotIn("Choose one", answer)
+        for arch in ("el9_amd64_gcc13", "el9_amd64_gcc15", "el9_amd64_gcc16"):
+            self.assertIn(arch, answer)
+        self.assertNotIn("s-multi-default", _pending_relval_scopes)
 
     def test_relval_summary_preserves_explicit_issue_intent(self):
         self.assertIsNone(_relval_ib_summary_answer(

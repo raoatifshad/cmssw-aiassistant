@@ -1570,10 +1570,9 @@ def _relval_scope_or_choice(
         return selected_records if selected_records else _relval_arch_choice_answer(tag, records)
     if all_requested:
         return records
-    default_records = [record for record in records if record.get("is_relval_default")]
-    if len(default_records) > 1:
-        _pending_relval_scopes[session_id] = {"root_tag": tag, "stage": "arch", "records": default_records}
-        return _relval_arch_choice_answer(tag, default_records)
+    # Several architectures flagged default used to stop here with "choose one", listing only those
+    # (found 2026-11-04: el10 and el8 offered, with 4 architectures imported). Every answer shows a
+    # per-architecture table, so nothing is hidden or merged by showing them all.
     return records
 
 
@@ -1858,6 +1857,15 @@ def _unittest_summary_answer(
     # had already named one turn earlier.
     if not selected_arch and not tag_match:
         selected_arch = context_arch
+    family = None if selected_arch else _arch_family(question)
+    if family:
+        # "on aarch64": every imported architecture of that CPU family, or say there is none
+        family_records = [record for record in records if family in record["arch"]]
+        if family_records:
+            return _unittest_summary_from_records(tag, family_records)
+        have = ", ".join(f"`{arch}`" for arch in sorted({record["arch"] for record in records}))
+        return (f"Unit-test results for `{tag}` have no imported `{family}` build (not run yet, still running, or "
+                f"not run on that architecture) -- unknown there, not passing. Imported for: {have}.")
     if selected_arch:
         selected_records = [record for record in records if record["arch"] == selected_arch]
         if not selected_records:
@@ -1868,18 +1876,8 @@ def _unittest_summary_answer(
                     f"running, or not run on that architecture) -- unknown there, not passing. "
                     f"Imported for: {have}.")
         return _unittest_summary_from_records(tag, selected_records)
-    # Only ask when it's genuinely ambiguous which architecture is "the"
-    # build -- more than one flagged is_default simultaneously (the real
-    # incident this function's docstring describes). Otherwise return every
-    # imported architecture directly, mirroring _relval_scope_or_choice's
-    # fix for the same bug: found live -- this used to narrow to just the
-    # tied defaults even when "all" was said, because the pending state
-    # itself was already pre-filtered before "all" was ever offered as an
-    # option, so a 4-architecture build's "all" answer only ever showed 2.
-    default_records = [record for record in records if record["is_default"]]
-    if len(default_records) > 1 and not all_requested:
-        _pending_unittest_scopes[session_id] = {"tag": tag, "records": records}
-        return _unittest_arch_choice_answer(tag, default_records)
+    # Every imported architecture, in a per-architecture table, as _relval_scope_or_choice does: several
+    # flagged default is no reason to ask (found 2026-11-04: el10 and el8 offered, with 4 imported).
     return _unittest_summary_from_records(tag, records)
 
 
@@ -4258,7 +4256,13 @@ def _relval_error_count_answer(question: str, session_id: str) -> str | None:
     resolved = _relval_scope_or_choice(session_id, tag, records, all_requested)
     if isinstance(resolved, str):
         return resolved
-    return _relval_error_count_summary(resolved, tag)
+    answer = _relval_error_count_summary(resolved, tag)
+    if len(resolved) > 1:
+        # the sum above spans IB/architecture records, which are never one build: show each
+        answer += "\n\n| IB | Architecture | Failed RelVals | Total | Errors |\n| --- | --- | ---: | ---: | ---: |\n" + "\n".join(
+            f"| `{record['tag']}` | `{record['arch']}` | {record.get('failed_relvals') or 0:,} | "
+            f"{record.get('relval_total') or 0:,} | {record.get('error_count') or 0:,} |" for record in resolved)
+    return answer
 
 
 def _concept_answer(question: str) -> str | None:
@@ -4282,7 +4286,7 @@ def _pr_status(merged_at, state) -> str:
     if merged_at:
         return f"merged {str(merged_at)[:10]}"
     if state == "open":
-        return "open, not merged (per GitHub export)"
+        return "open, not merged (per the imported GitHub data)"
     if state == "closed":
         return "closed, no merge recorded"
     return "not merged"
@@ -7291,6 +7295,26 @@ def _is_empty_digest_table(body: str) -> bool:
     return len(lines) <= 2 and all(line.strip().startswith("|") for line in lines)
 
 
+def _condense_baseline_notes(section: str) -> str:
+    """The "#### Sub-IB baselines" section in one line for chat: it took 5,700 of 15,200 characters
+    (found 2026-11-04), one line per variant and data type. Lines saying a variant has no baseline at
+    all stay, since they say what is not compared. The Shift Console keeps the full notes."""
+    heading, *notes = section.split("\n")
+    variants: list[str] = []
+    kept = []
+    for note in notes:
+        match = re.match(r"- `([^`]+)` has no \w*\s*build at .*own previous build", note)
+        if match:
+            if match.group(1) not in variants:
+                variants.append(match.group(1))
+        elif note.strip():
+            kept.append(note)
+    if variants:
+        kept.insert(0, "- Compared with their own previous build, having none at the start of this window: "
+                       + ", ".join(f"`{variant}`" for variant in variants) + ".")
+    return "\n".join([heading, *kept])
+
+
 def _condense_shift_summary_for_chat(markdown: str) -> str:
     """Strips every genuinely-empty #### section and, in turn, every ### architecture
     left with nothing in it, from a generate_shift_summary() markdown before it's shown
@@ -7334,7 +7358,8 @@ def _condense_shift_summary_for_chat(markdown: str) -> str:
             if not sub_heading_match:
                 continue
             if not _is_empty_digest_table(sub[sub_heading_match.end():]):
-                kept_subs.append(_cap_digest_table_rows(sub.rstrip()))
+                kept_subs.append(_condense_baseline_notes(sub.rstrip()) if sub_heading_match.group(1) == "Sub-IB baselines"
+                                 else _cap_digest_table_rows(sub.rstrip()))
                 section = sub_heading_match.group(1)
                 rows = sum(1 for line in sub.splitlines() if line.startswith("| ") and not line.startswith("| ---")) - 1
                 if section.startswith(("Newly failing", "Resolved")) and rows > 0:
@@ -7631,6 +7656,14 @@ def _exception_ranking_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+# everything in a "is X tracked" question that is not the problem's own name
+_TRACKED_NOISE_RE = re.compile(
+    r"\b(?:is|are|was|were|has|have|been|the|a|an|this|that|these|those|it|any|there|of|in|on|for|with|to|by|at|"
+    r"tracked|tracking|known|reported|filed|open|anywhere|somewhere|yet|already|github|issues?|prs?|"
+    r"problems?|fail\w*|broken|red|errors?|crash\w*|latest|newest|ib|ibs|builds?|"
+    r"cmssw_\d+_\d+(?:_x)?|\d+_\d+(?:_x)?)\b|[?,.!]", re.IGNORECASE)
+
+
 def _tracked_failures_answer(question: str, session_id: str) -> str | None:
     """ "is the 17_1 global tag problem tracked anywhere?" (found 2026-11-04: answered with the
     failure overview, no GitHub search at all). The IB's most common recorded error messages,
@@ -7657,20 +7690,43 @@ def _tracked_failures_answer(question: str, session_id: str) -> str | None:
         tag = latest[0]["tag"] if latest else None
     if not tag:
         return None
+    # the problem the question names ("the 17_1 global tag problem"), if any: found 2026-11-04 answering
+    # with other errors because that one is not in the newest build
+    topic = " ".join(_TRACKED_NOISE_RE.sub(" ", IB_TAG_RE.sub(" ", question)).lower().split())
+    topic_note = ""
     driver = get_driver()
     try:
         with driver.session() as session:
             rows = [dict(r) for r in session.run(
                 "MATCH (ib:IB) WHERE ib.tag = $tag OR ib.parent_tag = $tag WITH collect(DISTINCT ib.tag) AS tags "
-                "MATCH (e:RelValException) WHERE e.ib_tag IN tags "
+                "MATCH (e:RelValException) WHERE e.ib_tag IN tags AND ($topic = '' OR toLower(e.message) CONTAINS $topic) "
                 "RETURN e.category AS category, e.message AS message, count(DISTINCT e.workflow_id) AS workflows "
-                "ORDER BY workflows DESC LIMIT 3", tag=tag)]
+                "ORDER BY workflows DESC LIMIT 3", tag=tag, topic=topic)]
+            if not rows and topic:
+                series_prefix = re.match(r"^CMSSW_\d+_\d+_", tag)
+                seen = session.run(
+                    "MATCH (e:RelValException) WHERE e.ib_tag STARTS WITH $prefix AND toLower(e.message) CONTAINS $topic "
+                    "WITH e.ib_tag AS ib_tag ORDER BY right(ib_tag, 15) DESC LIMIT 1 "
+                    "MATCH (ib:IB {tag:ib_tag}) RETURN coalesce(ib.parent_tag, ib.tag) AS tag LIMIT 1",
+                    prefix=series_prefix.group(0) if series_prefix else tag, topic=topic).single()
+                if seen:
+                    topic_note = (f"_No error mentioning \"{topic}\" is recorded in `{tag}`, the newest build; it was "
+                                  f"last recorded in `{seen['tag']}`, so that build is used here._\n\n")
+                    tag = seen["tag"]
+                else:
+                    topic_note = f"_No recorded RelVal error in this release series mentions \"{topic}\"._\n\n"
+                    topic = ""
+                rows = [dict(r) for r in session.run(
+                    "MATCH (ib:IB) WHERE ib.tag = $tag OR ib.parent_tag = $tag WITH collect(DISTINCT ib.tag) AS tags "
+                    "MATCH (e:RelValException) WHERE e.ib_tag IN tags AND ($topic = '' OR toLower(e.message) CONTAINS $topic) "
+                    "RETURN e.category AS category, e.message AS message, count(DISTINCT e.workflow_id) AS workflows "
+                    "ORDER BY workflows DESC LIMIT 3", tag=tag, topic=topic)]
     finally:
         driver.close()
     if not rows:
         return None
     _latest_ib_contexts[session_id] = tag
-    lines = [f"GitHub evidence for the most common recorded errors in `{tag}` and its sub-IBs:"]
+    lines = [f"{topic_note}GitHub evidence for the most common recorded errors in `{tag}` and its sub-IBs:"]
     for row in rows:
         message = " ".join((row["message"] or "").split())
         lines.append(f"\n**{row['category']}** in {row['workflows']} workflow(s): \"{message[:160]}\"")

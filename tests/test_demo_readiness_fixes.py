@@ -22,7 +22,10 @@ from server.api_server import (
     _workflow_log_answer,
     _issue_state_answer,
     _GITHUB_COVERAGE_CACHE,
+    _condense_baseline_notes,
     _github_export_note,
+    _tracked_failures_answer,
+    _unittest_summary_answer,
     _variant_diff_baseline,
     _variant_tag,
     _known_error_list_answer,
@@ -541,6 +544,55 @@ class NoDuplicateDefinitionsTests(unittest.TestCase):
             tree = ast.parse((root / name).read_text())
             counts = Counter(node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)))
             self.assertEqual([def_name for def_name, n in counts.items() if n > 1], [], name)
+
+
+class OpenItemsFixedTests(unittest.TestCase):
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[])
+    @patch("server.api_server.get_failing_unittests", return_value=[])
+    @patch("server.api_server._unittest_scope_records")
+    def test_unit_tests_on_a_cpu_family(self, records, *_):
+        tag = "CMSSW_20_1_X_2026-11-03-2300"
+        rows = [{"arch": "el9_aarch64_gcc14", "is_default": True, "total": 9, "failed": 1, "passed": 8, "errors": 1},
+                {"arch": "el8_amd64_gcc14", "is_default": True, "total": 9, "failed": 0, "passed": 9, "errors": 0}]
+        records.return_value = rows
+        answer = _unittest_summary_answer("unit tests on aarch64", tag, "s-family")
+        self.assertIn("el9_aarch64_gcc14", answer)
+        self.assertNotIn("el8_amd64_gcc14", answer)
+        records.return_value = rows[1:]
+        answer = _unittest_summary_answer("unit tests on aarch64 only", tag, "s-family-none")
+        self.assertIn("have no imported `aarch64` build", answer)
+        self.assertIn("not passing", answer)
+
+    def test_chat_digest_collapses_baseline_notes(self):
+        section = ("#### Sub-IB baselines\n"
+                   "- `primary` has no RelVal build at `A` -- compared against its own previous build `B` instead.\n"
+                   "- `primary` has no UnitTest build at `A` -- compared against its own previous build `C` instead.\n"
+                   "- `HLT` has no build at `A` -- compared its Build/AddOn status against its own previous build `D` instead.\n"
+                   "- `ROOT6` has no previous RelVal build imported, so its current failures aren't shown as newly failing.")
+        out = _condense_baseline_notes(section)
+        self.assertIn("own previous build, having none at the start of this window: `primary`, `HLT`.", out)
+        self.assertIn("`ROOT6` has no previous RelVal build imported", out)
+        self.assertEqual(out.count("\n"), 2)
+
+    @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_17_1_X_2026-11-03-2300"}])
+    @patch("server.api_server.get_driver")
+    def test_tracked_question_searches_the_problem_it_names(self, get_driver, _):
+        driver, session = _driver_with(
+            [],
+            MagicMock(single=MagicMock(return_value={"tag": "CMSSW_17_1_X_2026-11-03-1100"})),
+            [{"category": "ConditionDatabase", "message": 'Global Tag "x" has not been found', "workflows": 9}])
+        get_driver.return_value = driver
+        with patch("server.api_server.find_prs_for_error", return_value=[]), \
+                patch("server.api_server._issues_mentioning", return_value=[], create=True):
+            try:
+                # by now the question usually carries the tag (found live: it became part of the search)
+                answer = _tracked_failures_answer(
+                    "is the 17_1 global tag problem in CMSSW_17_1_X_2026-11-03-2300 tracked anywhere?", "s-tracked")
+            except Exception as exc:  # searches after the query are not what this test is about
+                self.fail(f"{type(exc).__name__}: {exc}")
+        self.assertEqual(session.run.call_args_list[0].kwargs["topic"], "global tag")
+        self.assertIn("last recorded in `CMSSW_17_1_X_2026-11-03-1100`", answer)
+        self.assertIn("Global Tag", answer)
 
 
 class LeakedReasoningTests(unittest.TestCase):
