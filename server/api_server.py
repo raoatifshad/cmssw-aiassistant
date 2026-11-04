@@ -9683,6 +9683,12 @@ _BASIC_TERMS = (
      "A **sub-IB** is another build flavour of the same IB, e.g. `CMSSW_20_1_ASAN_X_2026-11-02-2300` (address "
      "sanitizer) next to the primary `CMSSW_20_1_X_2026-11-02-2300`. Each is built and tested separately and has "
      "its own results; ask \"what does ASAN mean?\" for a flavour."),
+    # the bot's own words in its test-log summary
+    (r"['\"]?returned['\"]?(?:\s+problems?)?(?:\s+mean)?(?:\s+in\s+the\s+test[\s-]*log\s+summary)?",
+     "**Returned** in the test-log summary: a problem seen before, absent in the previous build of that test, and back now. It is intermittent, "
+     "not new. Madgraph `IndexError` RelVals flap like this."),
+    (r"['\"]?still\s+present['\"]?(?:\s+problems?)?(?:\s+mean)?(?:\s+in\s+the\s+test[\s-]*log\s+summary)?", "**Still present** in the test-log summary: a problem that was also in the previous build of that test, so nothing changed."),
+    (r"(?:an?\s+)?ignored\s+warnings?", "An **ignored warning** is a compiler warning the build counts but doesn't treat as a problem: it doesn't change the build status. Each build reports its count next to the compilation warnings."),
     # general CMSSW terms used in logs and workflow names
     (r"(?:the\s+)?(?:cmssw\s+)?framework|(?:the\s+)?edm(?:\s+framework)?",
      "The **CMSSW framework** (EDM, Event Data Model) runs modules on events: `cmsRun` reads a python configuration, then the "
@@ -9970,6 +9976,10 @@ def _basic_term_answer(question: str) -> str | None:
     for pattern, answer in _HOWTO_TERMS:
         if re.search(pattern, question, re.IGNORECASE):
             return answer
+    serious = re.search(r"\bare\s+['\"]?(returned|still\s+present)['\"]?\s+problems?\s+serious\b", question, re.IGNORECASE)
+    if serious:
+        return ("Each problem has its own weight: \"returned\" and \"still present\" only say how it changed between builds. "
+                "A returned problem is intermittent, so compare with what the test printed; many are written by tests on purpose.")
     if re.search(r"\bib\b.*\bdifferent\b.*\brelease\b|\b(?:ib|release)\s+vs\.?\s+(?:ib|release)\b", question, re.IGNORECASE):
         return next(d for pattern, d in _BASIC_TERMS if pattern.startswith("(?:cmssw\\s+)?releases?"))
     diff = _DIFFERENCE_RE.search(question)
@@ -12896,6 +12906,8 @@ def _shift_question_rewrite(question: str) -> str | None:
             second = f"{head}_X_{when[:4]}-{month}-{day}-{int(h2):02d}{m2}"
             older, newer = sorted((first, second))
             return f"compare {older} and {newer} for all architectures"
+    if re.search(r"\bpass\w*\s+but\b[^?]*\b(?:print|show|log|have)\w*\b", question, re.IGNORECASE):
+        return "any hidden problems in passed tests?"
     if re.search(r"\b(?:should|do|must)\s+i\s+(?:worry|care|look\s+at|check|know)\b|\bworry\s+about\b", question, re.IGNORECASE) and re.search(r"\b(?:shift\w*|ibs?|today|now|anything|what)\b", question, re.IGNORECASE):
         # "anything I should worry about as shifter right now?" (found 2026-11-04: raw LLM evidence)
         return f"give me a shift summary{' for ' + series_text if series else ''}" if not series else f"what changed in {series_text} between the last two builds"
@@ -13301,6 +13313,7 @@ _NOT_IMPORTED_TOPICS = (
     (r"\b(?:physics\s+)?comparison\s+plots?\b|\bdqm\s+plots?\b", "physics comparison plots"),
     (r"\bluminosity\b", "luminosity or physics properties of a dataset"),
     (r"\bon\s+time\b[^?]*\b(?:release|pre)\b|\b(?:release|pre-?release)\b[^?]*\b(?:on\s+time|schedule|date)\b|\bnext\s+(?:pre-?)?release\b", "release plans and dates"),
+    (r"\bbuild\s+logs?\b", "the build logs themselves (only Clang warnings parsed from some of them), so the IB page is where to read one"),
     (r"\bwho\s+broke\b", "who caused a failure: the data shows timing and text matches, never causes. Ask which PRs came into that build, and compare them with the failure"),
 )
 
@@ -13661,7 +13674,7 @@ def _failures_by_dimension_answer(question: str) -> str | None:
     """ "which architecture has the most failures in the latest IB?", "failures per sub-IB", "worst architecture right now"
     (found 2026-11-04: the whole list, an unrelated week ranking, and an LLM answer saying nothing was failing with el10 red)."""
     match = _PER_DIMENSION_RE.search(question)
-    if not match or re.search(r"\b(?:week|month|days?)\b", question, re.IGNORECASE):
+    if not match or re.search(r"\b(?:week|month|days?|warnings?)\b", question, re.IGNORECASE):
         return None
     tag = _latest_or_named_tag(question)
     if not tag:
@@ -13931,10 +13944,175 @@ def _new_exceptions_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+_LOG_WORDS_RE = re.compile(r"\b(?:test[\s-]*logs?|logs?|hidden\s+problems?|pass\w*\s+but\b|sanitizer)\b", re.IGNORECASE)
+_LOG_KINDS = {"python_traceback": r"\b(?:tracebacks?|python\s+errors?)\b", "crash": r"\b(?:segfaults?|seg(?:mentation)?\s*(?:fault|violation)s?|crash\w*|aborts?)\b", "assertion": r"\bassert\w*\b"}
+
+
+def _newest_log_stamp(head: str) -> str | None:
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            return session.run("MATCH (r:TestLogRun) WHERE r.ib_tag STARTS WITH $p RETURN max(right(r.ib_tag, 15)) AS when", p=f"{head}_").single()["when"]
+    finally:
+        driver.close()
+
+
+def _log_overview_question_answer(question: str) -> str | None:
+    """Plain questions about the raw test logs (found 2026-11-04: nearly all got the same "new/returned/gone" digest or the
+    failure overview). Serious problems, in the newest build with imported logs, primary and sub-IBs."""
+    package = _PACKAGE_PATH_RE.search(question)
+    has_log_word = _LOG_WORDS_RE.search(question)
+    if "\n" in question or len(question) > 160 or IB_TAG_RE.search(question):
+        return None
+    wants_package = package and re.search(r"\bproblems?\b|\blogs?\b", question, re.IGNORECASE) and not re.search(r"\b(?:prs?|issues?)\b", question, re.IGNORECASE)
+    term = re.search(r"\b(heap[\s-]use[\s-]after[\s-]free|use[\s-]after[\s-]free|stack[\s-]buffer[\s-]overflow|heap[\s-]buffer[\s-]overflow|memory\s+leaks?|data\s+races?)\b", question, re.IGNORECASE)
+    suite = "addon" if re.search(r"\badd[\s-]?on\b", question, re.IGNORECASE) else "relval" if re.search(r"\brel\s*vals?\b", question, re.IGNORECASE) else None
+    kind = next((k for k, pattern in _LOG_KINDS.items() if re.search(pattern, question, re.IGNORECASE)), None)
+    intentional = re.search(r"\bintentional\b", question, re.IGNORECASE)
+    if not (has_log_word or wants_package or term or (kind and suite) or intentional):
+        return None
+    if re.search(r"\b(?:prs?|issues?|github|exit\s*codes?)\b", question, re.IGNORECASE) or re.search(r"\bwhere\b[^?]*\bstored\b", question, re.IGNORECASE):
+        return None
+    latest = _latest_ib_records(None, _requested_release_series(question))
+    if not latest:
+        return None
+    head = latest[0]["tag"].rsplit("_X_", 1)[0]
+    when = _newest_log_stamp(head)
+    if not when:
+        return f"No raw test logs are imported for `{head}_X`."
+    scope = f"builds of {when} in `{head}_X` (primary and sub-IBs)"
+    base = "MATCH (p:LogProblem) WHERE p.ib_tag STARTS WITH $p AND right(p.ib_tag, 15) = $when "
+    params = {"p": f"{head}_", "when": when}
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            if re.search(r"\b(?:missing|imported|available|do\s+you\s+have)\b", question, re.IGNORECASE) and has_log_word and not (package or term or kind):
+                rows = [dict(r) for r in session.run(
+                    "MATCH (r:TestLogRun) WHERE r.ib_tag STARTS WITH $p AND right(r.ib_tag, 15) = $when RETURN r.suite AS suite, collect(DISTINCT r.arch) AS archs, count(*) AS runs ORDER BY suite", **params)]
+                table = "\n".join(f"| {r['suite']} | {r['runs']} | {', '.join(f'`{a}`' for a in sorted(r['archs']))} |" for r in rows)
+                return (f"Newest imported test logs: {scope}.\n\n| Suite | Log runs | Architectures |\n| --- | ---: | --- |\n{table}\n\n"
+                        "A newer build, or an architecture missing here, has no logs imported yet: unknown there, not clean.")
+            if term:
+                needle = re.sub(r"[\s-]+", "-", term.group(1).lower()) if "free" in term.group(1).lower() or "overflow" in term.group(1).lower() else term.group(1).lower().rstrip("s")
+                variant = re.search(rf"\b({_ALL_VARIANTS_RE})\b", question, re.IGNORECASE)
+                rows = [dict(r) for r in session.run(
+                    "MATCH (p:LogProblem) WHERE p.ib_tag STARTS WITH $p AND right(p.ib_tag, 15) >= $since AND toLower(p.summary) CONTAINS $needle "
+                    "AND ($variant IS NULL OR p.ib_tag CONTAINS $variant) AND ($pkg IS NULL OR any(o IN p.owners WHERE o STARTS WITH $pkg)) "
+                    "RETURN left(p.summary, 150) AS summary, p.owners[0] AS owner, size(p.owners) AS tests, p.ib_tag AS tag, p.arch AS arch ORDER BY tag DESC LIMIT 8",
+                    p=f"{head}_", since=_cutoff_stamp(7), needle=needle, variant=f"_{_ALL_VARIANTS[variant.group(1).lower()]}_X_" if variant else None, pkg=package.group(1) if package else None)]
+                if not rows:
+                    return f"No `{term.group(1)}` is recorded in the raw test logs of `{head}_X` from the last 7 days" + (f" in `{package.group(1)}`" if package else "") + ". That covers imported logs only."
+                return (f"`{term.group(1)}` in the raw test logs of `{head}_X`, last 7 days, newest first:\n"
+                        + "\n".join(f"- `{r['tag']}` `{r['arch']}`: {r['summary']} -- e.g. `{r['owner']}` ({r['tests']} test(s))" for r in rows))
+            if wants_package:
+                rows = [dict(r) for r in session.run(
+                    base + "AND any(o IN p.owners WHERE o STARTS WITH $pkg) AND coalesce(p.serious, false) "
+                    "RETURN left(p.summary, 150) AS summary, p.kind AS kind, p.in_passed AS passed, p.owners AS owners, p.arch AS arch ORDER BY p.count DESC LIMIT 8", pkg=package.group(1), **params)]
+                if not rows:
+                    return f"No serious problem is recorded for `{package.group(1)}` in the raw test logs of {scope}."
+                lines = [f"Serious problems in the raw test logs of `{package.group(1)}`, {scope}:"]
+                for r in rows:
+                    tests = [o for o in r["owners"] if o.startswith(package.group(1))]
+                    lines.append(f"- {r['summary']} -- `{tests[0] if tests else package.group(1)}` on `{r['arch']}`" + (" (the test is reported as passed)" if r["passed"] else ""))
+                return "\n".join(lines)
+            if re.search(r"\bintentional\b", question, re.IGNORECASE):
+                row = session.run(base + "AND toLower(p.summary) CONTAINS 'intentional' RETURN count(p) AS n, collect(left(p.summary, 120))[0] AS sample, collect(p.owners[0])[0] AS owner", **params).single()
+                if row and row["n"]:
+                    return (f"Those are written by tests on purpose, going by the message: {row['sample']} (for example in `{row['owner']}`). "
+                            f"{row['n']} such record(s) in {scope}. The bot only marks a problem as expected when someone confirms it, so they stay listed.")
+            if kind or suite:
+                rows = [dict(r) for r in session.run(
+                    base + "AND coalesce(p.serious, false) AND ($kind IS NULL OR p.kind = $kind) AND ($suite IS NULL OR p.suite = $suite) "
+                    "RETURN left(p.summary, 150) AS summary, p.owners[0] AS owner, size(p.owners) AS tests, p.arch AS arch, p.suite AS suite ORDER BY tests DESC LIMIT 8", kind=kind, suite=suite, **params)]
+                what = f"{suite + ' ' if suite else ''}{kind.replace('_', ' ') if kind else 'serious problem'}"
+                if not rows:
+                    return f"No {what} is recorded in the raw test logs of {scope}."
+                return f"{what.capitalize()}s in the raw test logs of {scope}:\n" + "\n".join(f"- {r['summary']} -- `{r['owner']}` on `{r['arch']}`, {r['tests']} test(s) ({r['suite']})" for r in rows)
+            if re.search(r"\bhow\s+many\b|\bmost\b|\bwhich\s+(?:package|unit\s*test|test)s?\b", question, re.IGNORECASE) and not re.search(r"\bnew\b", question, re.IGNORECASE):
+                total = session.run(base + "RETURN count(p) AS n, sum(CASE WHEN coalesce(p.serious, false) THEN 1 ELSE 0 END) AS serious, "
+                                    "sum(CASE WHEN coalesce(p.serious, false) AND p.in_passed AND NOT coalesce(p.in_failed, false) THEN 1 ELSE 0 END) AS hidden", **params).single()
+                categories = [dict(r) for r in session.run(
+                    base + "AND coalesce(p.serious, false) AND p.in_passed RETURN coalesce(p.category, p.kind) AS name, count(p) AS n ORDER BY n DESC LIMIT 6", **params)]
+                packages = [dict(r) for r in session.run(
+                    base + "AND coalesce(p.serious, false) AND p.in_passed AND p.suite = 'unit' UNWIND p.owners AS owner WITH split(owner, '/') AS parts WHERE size(parts) >= 2 "
+                    "RETURN parts[0] + '/' + parts[1] AS name, count(*) AS n ORDER BY n DESC LIMIT 6", **params)]
+                lines = [f"Raw test logs of {scope}: **{total['n']:,}** recorded problem(s), **{total['serious']:,}** serious, **{total['hidden']:,}** of those only in tests reported as passed.", ""]
+                if categories:
+                    lines.append("Most common serious problems in passed tests: " + ", ".join(f"`{c['name']}` × {c['n']}" for c in categories) + ".")
+                if packages:
+                    lines.append("Packages with the most: " + ", ".join(f"`{c['name']}` × {c['n']}" for c in packages) + ".")
+                lines.append("\nMany are written by tests on purpose, and none is marked expected until someone confirms it. Ask for the changes since the previous build to see what is new.")
+                return "\n".join(lines)
+    finally:
+        driver.close()
+    return None
+
+
+_BUILD_WARNING_RE = re.compile(r"\b(?:ignored|build|compilation|compiler)\s+warnings?\b|\bbuild\s+status\s+warning\b", re.IGNORECASE)
+
+
+def _build_warning_scope_answer(question: str) -> str | None:
+    """ "how many ignored warnings on gcc14?" (found 2026-11-04: the LLM said 0, the real count 873), "which sub-IB has the most
+    build warnings?", "why is the build status warning on gcc16?": the IB's own counts."""
+    if not _BUILD_WARNING_RE.search(question) or IB_TAG_RE.search(question) or _requested_ib_arch(question):
+        return None
+    compiler = _ARCH_COMPILER_RE.search(question)
+    os_word = _OS_FAMILY_RE.search(question)
+    by_variant = re.search(r"\b(?:which|what)\s+(?:sub[\s-]*ib|flavou?r|variant|arch\w*)\b", question, re.IGNORECASE)
+    if not (compiler or os_word or by_variant):
+        return None
+    tag = _latest_or_named_tag(question)
+    if not tag:
+        return None
+    word = (compiler or os_word).group(1).lower() if (compiler or os_word) else None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE (ib.tag = $tag OR ib.parent_tag = $tag) AND ($word IS NULL OR ib.arch CONTAINS $word) "
+                "RETURN coalesce(ib.variant, 'primary') AS variant, ib.arch AS arch, ib.build_status AS build, "
+                "coalesce(ib.comp_warnings, 0) AS warnings, coalesce(ib.ignored_warnings, 0) AS ignored ORDER BY warnings DESC, ignored DESC", tag=tag, word=word)]
+    finally:
+        driver.close()
+    if not rows:
+        return f"`{tag}` has no build on `{word}`."
+    lines = [f"Build warning counts in `{tag}` and its sub-IBs" + (f" on `{word}`" if word else "") + ", most first:", "",
+             "| Build type | Architecture | Build status | Compilation warnings | Ignored warnings |", "| --- | --- | --- | ---: | ---: |"]
+    lines += [f"| {r['variant']} | `{r['arch']}` | {_status_cell(r['build'])} | {r['warnings']:,} | {r['ignored']:,} |" for r in rows]
+    if re.search(r"\bwhy\b", question, re.IGNORECASE):
+        lines.append("\nA build's status is `warning` when it finishes with compilation warnings. Which files they come from isn't imported per IB; the build log on the IB page has them.")
+    return "\n".join(lines)
+
+
+def _clang_checker_answer(question: str) -> str | None:
+    """ "which checker has the most clang warnings?", "threadsafety warnings in FWCore?" (found 2026-11-04: right numbers, labelled unverified)."""
+    if not re.search(r"\bchecker\b[^?]*\bwarnings?\b|\bthreadsafety\b|\bthread[\s-]safety\b", question, re.IGNORECASE):
+        return None
+    prefix = re.search(r"\b(?:in|for|of)\s+([A-Z][A-Za-z0-9_/]+)\b", question)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            newest = session.run("MATCH (ib:IB)-[:REPORTED]->(:Warning) RETURN max(ib.tag) AS tag").single()["tag"]
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB {tag:$tag})-[:REPORTED]->(w:Warning) WHERE ($safety = false OR w.flag STARTS WITH 'threadsafety') AND ($prefix IS NULL OR w.package STARTS WITH $prefix) "
+                "RETURN w.flag AS checker, count(DISTINCT w) AS locations, sum(w.count) AS total ORDER BY total DESC LIMIT 10",
+                tag=newest, safety=bool(re.search(r"thread", question, re.IGNORECASE)), prefix=prefix.group(1) if prefix else None)]
+    finally:
+        driver.close()
+    if not rows:
+        return f"No matching Clang warning in `{newest}`, the newest build with parsed Clang logs."
+    return (f"Clang warnings by checker in `{newest}`, the newest build with parsed Clang logs" + (f", in `{prefix.group(1)}`" if prefix else "") + ":\n\n"
+            "| Checker | Locations | Occurrences |\n| --- | ---: | ---: |\n" + "\n".join(f"| `{r['checker']}` | {r['locations']:,} | {r['total']:,} |" for r in rows))
+
+
 def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     """Answers the 2026-11-04 test pass found missing; each returns None unless its phrasing matches."""
     if "\n" in question or len(question) > 200:
         return None   # a pasted log can contain any of these words (found by validate_bot: "known plugins" and a package path)
+    if re.search(r"\b(?:returned|still\s+present)\b", question, re.IGNORECASE) and re.search(r"\b(?:mean|serious)\b", question, re.IGNORECASE):
+        term = _basic_term_answer(question)
+        if term:
+            return term, "deterministic:glossary"
     if re.search(r"\bfavou?rite\b", question, re.IGNORECASE):
         return ("I don't have favourites -- I only answer from the imported CMSSW IB data. Ask e.g. \"which workflows fail most this week\".",
                 "conversational:out_of_scope")
@@ -13944,6 +14122,7 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
         return ("**If it also fails in IBs without your PR, it isn't from your PR.** Compare the same step's error in your PR's "
                 f"test and in the IB; this shows where it fails, not the cause.\n\n{where}", "deterministic:ib_or_pr")
     for handler, route in ((_not_imported_answer, "not_imported"), (_exit_code_difference_answer, "exit_code"),
+                           (_log_overview_question_answer, "log_overview"), (_build_warning_scope_answer, "build_warning_scope"), (_clang_checker_answer, "clang_checker"),
                            (_failures_by_dimension_answer, "failures_by_dimension"), (_failure_sets_answer, "failure_sets"),
                            (_series_compare_answer, "series_compare"), (_failure_change_answer, "failure_change"),
                            (_issue_comments_answer, "issue_comments"), (_github_window_count_answer, "github_window_count"), (_new_issues_answer, "new_issues"),

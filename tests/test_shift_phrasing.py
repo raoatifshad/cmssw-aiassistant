@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 from graph.tools import TOOLS, _with_int_limit
 from server.api_server import (
     _basic_term_answer,
+    _build_warning_scope_answer,
+    _log_overview_question_answer,
     _condense_comparison_for_chat,
     _das_error_count_answer,
     _external_update_answer,
@@ -251,6 +253,26 @@ class GitHubHourFourTests(unittest.TestCase):
     def test_github_window_since(self):
         self.assertEqual(_github_since(None, "2026-09-01"), "2026-09-01")
         self.assertIsNone(_github_since(None, "whenever"))
+
+
+class LogAndWarningAnswerTests(unittest.TestCase):
+    def test_log_overview_leaves_other_questions_alone(self):
+        for question in ("what is the latest IB?", "any PR about the test logs?", "An exception of category 'X' occurred\nin the log"):
+            self.assertIsNone(_log_overview_question_answer(question), question)
+
+    @patch("server.api_server._latest_ib_records", return_value=LATEST)
+    @patch("server.api_server.get_driver")
+    def test_ignored_warnings_use_the_builds_counts(self, get_driver, _):
+        # found 2026-11-04: the LLM said 0, the real count is 873
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = [{"variant": "primary", "arch": "el9_amd64_gcc14", "build": "passed", "warnings": 0, "ignored": 873}]
+        self.assertIn("873", _build_warning_scope_answer("how many ignored warnings on gcc14?"))
+        self.assertIsNone(_build_warning_scope_answer("build warnings in the latest IB on el9_amd64_gcc16"))
+
+    def test_terms(self):
+        self.assertIn("intermittent", _basic_term_answer("what does 'returned' mean in the test-log summary?"))
+        self.assertIn("Still present", _basic_term_answer("what does 'still present' mean?"))
+        self.assertIn("ignored warning", _basic_term_answer("what is an ignored warning?"))
 
 
 class ConceptTests(unittest.TestCase):
