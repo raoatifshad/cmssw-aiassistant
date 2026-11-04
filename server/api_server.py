@@ -11617,6 +11617,10 @@ def _chat(req: ChatRequest):
     if slot_answer:
         return _chat_response(sid, original_question, slot_answer, "deterministic:ib_slot")
 
+    sanitizer_answer = _sanitizer_problems_answer(question, sid)
+    if sanitizer_answer:
+        return _chat_response(sid, original_question, sanitizer_answer, "deterministic:sanitizer_problems")
+
     test_log_answer = _test_log_question_answer(question, sid, original_question)
     if test_log_answer:
         return _chat_response(sid, original_question, test_log_answer, "deterministic:test_log_changes")
