@@ -19,6 +19,9 @@ from server.api_server import (
     _workflow_log_answer,
     _issue_state_answer,
     _GITHUB_COVERAGE_CACHE,
+    _github_export_note,
+    _render_pr_evidence_rows,
+    _strip_leaked_reasoning,
     _exception_ranking_answer,
     _release_series_answer,
     _normalize_deterministic_question,
@@ -449,15 +452,52 @@ class GitHubStalenessTests(unittest.TestCase):
             MagicMock(single=MagicMock(return_value={"title": "LogicError in EvaluateMuonMVAID", "state": "open",
                                                      "created": "2026-06-29T09:04:55Z", "closed": None,
                                                      "updated": "2026-08-31T10:00:00Z"})),
-            MagicMock(single=MagicMock(return_value={"n": 51822, "t": "2026-09-03T21:31:41Z"})))
+            MagicMock(single=MagicMock(return_value={"n": 51822, "t": "2026-09-03T21:31:41Z"})),
+            MagicMock(single=MagicMock(return_value={"n": None, "t": None, "via": None})))
         get_driver.return_value = driver
         answer = _issue_state_answer("is issue 51354 still open?")
         self.assertIn("`open` in the imported data", answer)
         self.assertIn("reaches #51822 (2026-09-03)", answer)
         self.assertNotIn("currently open", answer)
 
+    @patch("server.api_server.get_driver")
+    def test_note_separates_the_export_from_the_web_fetch(self, get_driver):
+        # after the 2026-11-04 web fetch a plain max() would claim the *export* reaches today
+        driver, _ = _driver_with(
+            MagicMock(single=MagicMock(return_value={"n": 51806, "t": "2026-09-03T21:31:41Z"})),
+            MagicMock(single=MagicMock(return_value={"n": 52376, "t": "2026-11-04T10:10:51Z",
+                                                     "via": "github-web-fetch 2026-11-04"})))
+        get_driver.return_value = driver
+        note = _github_export_note()
+        self.assertIn("full export (with comments) reaches 2026-09-03", note)
+        self.assertIn("fetched directly from GitHub on 2026-11-04", note)
+        self.assertIn("no comments", note)
+        self.assertIn("newest Issue #52376, last update 2026-11-04", note)
+        self.assertNotIn("export that reaches #52376", note)
+
     def test_non_state_questions_are_left_alone(self):
         self.assertIsNone(_issue_state_answer("who opened issue 52274?"))
+
+    def test_unmerged_pr_is_not_shown_as_merged(self):
+        # found 2026-11-04: open PR #52384 from the web fetch rendered as "(merged unknown)"
+        row = {"repo": "cmssw", "pr_number": 52384, "title": "Fix", "merged_at": None, "state": "open",
+               "evidence": ["pr_title"], "matched_files": [], "matched_unit_tests": [], "matched_warnings": 0}
+        answer = _render_pr_evidence_rows("ROOT642", [row])
+        self.assertIn("not merged, state `open`", answer)
+        self.assertNotIn("merged unknown", answer)
+        self.assertIn("(merged 2026-11-02)", _render_pr_evidence_rows("X", [dict(row, merged_at="2026-11-02")]))
+
+
+class LeakedReasoningTests(unittest.TestCase):
+    def test_planning_lines_are_dropped(self):
+        leaked = ('The user asked: "who won the champions league?" This is unrelated. We must respond that we '
+                  "cannot answer.\nI'm sorry, but I don't have information on that.")
+        self.assertEqual(_strip_leaked_reasoning(leaked), "I'm sorry, but I don't have information on that.")
+
+    def test_a_real_answer_is_untouched(self):
+        for text in ("**Issue 1** is open.\nWe must note the user asked this.", "The IB is fine.",
+                     "We must respond."):
+            self.assertEqual(_strip_leaked_reasoning(text), text)
 
 
 if __name__ == "__main__":

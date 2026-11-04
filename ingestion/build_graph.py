@@ -973,6 +973,8 @@ def github_pr_from_issue(issue: dict) -> dict | None:
         "url": issue.get("html_url"),
         "created_at": issue.get("created_at"),
         "updated_at": issue.get("updated_at"),
+        # set only by the stopgap web fetch (ingestion/fetch_github_web_updates.py); a real backup clears it
+        "fetched_via": issue.get("_fetched_via"),
     }
 
 
@@ -991,6 +993,7 @@ def github_issue_from_issue(issue: dict) -> dict | None:
         "closed_at": issue.get("closed_at"),
         "labels": [label["name"] for label in issue.get("labels", []) if label.get("name")],
         "author": (issue.get("user") or {}).get("login") or "unknown",
+        "fetched_via": issue.get("_fetched_via"),
     }
 
 
@@ -1044,7 +1047,11 @@ def _import_raw_pr_batch(session, records: list[dict], force: bool) -> int:
     session.run(
         "UNWIND $records AS raw "
         "MERGE (pr:PR {repo:'cmssw', number:raw.number}) "
+        # never overwrite a newer copy with an older one (an old backup re-imported after the
+        # 2026-11-04 web fetch must not undo the newer states)
+        "WITH pr, raw WHERE coalesce(pr.github_updated_at, '') <= coalesce(raw.updated_at, '') "
         "SET pr.pr_key='cmssw:' + toString(raw.number), pr.title=raw.title, pr.body=raw.body, "
+        "pr.fetched_via=raw.fetched_via, "
         "pr.merged_at=raw.merged_at, pr.release=coalesce(pr.release, raw.release), "
         "pr.labels=raw.labels, pr.github_state=raw.state, pr.github_url=raw.url, "
         "pr.github_created_at=raw.created_at, pr.github_updated_at=raw.updated_at, "
@@ -1082,7 +1089,9 @@ def _import_raw_issue_batch(session, records: list[dict], force: bool) -> int:
     session.run(
         "UNWIND $records AS raw "
         "MERGE (issue:Issue {issue_key:'cmssw:' + toString(raw.number)}) "
+        "WITH issue, raw WHERE coalesce(issue.updated_at, '') <= coalesce(raw.updated_at, '') "
         "SET issue.repo='cmssw', issue.number=raw.number, issue.title=raw.title, issue.body=raw.body, "
+        "issue.fetched_via=raw.fetched_via, "
         "issue.state=raw.state, issue.github_url=raw.url, issue.created_at=raw.created_at, "
         "issue.updated_at=raw.updated_at, issue.closed_at=raw.closed_at, issue.labels=raw.labels, "
         "issue.raw_content_hash=raw.content_hash, issue.raw_source_id=raw.source_id "
