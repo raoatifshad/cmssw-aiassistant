@@ -12267,6 +12267,8 @@ def _pr_broke_answer(question: str) -> str | None:
                 return f"build `{build}`, {relvals}, {units}"
             lines.append(f"- Before (`{previous}`): {fmt(before)}")
             lines.append(f"- With the PR (`{first}`): {fmt(after)}")
+            if before and after and (after["relval_total"] or 0) < 0.9 * (before["relval_total"] or 0):
+                lines.append("- Its RelVal results are only partly imported so far, so these numbers can still change.")
         if others:
             lines.append(f"\n{len(others)} other PR(s) came into that same build"
                          + (": " + ", ".join(f"#{o['number']}" for o in others[:8]) + (" ..." if len(others) > 8 else "") if others else "")
@@ -13986,6 +13988,22 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
         return ("Newly failing in that summary:\n" + "\n".join(newly)) if newly else "Nothing is newly failing in that summary."
     if re.fullmatch(r"\s*(?:which|what)\s+workflows?\s+(?:have|has|show|hit)\s+(?:this|it|that)\s*[?.!]*\s*", question, re.IGNORECASE) and "Recorded message" in answer:
         # after a pasted error (found 2026-11-04: the whole IB's RelVal summary)
+        recorded = re.search(r"Recorded message: `([^`\n]+)`", answer)
+        if recorded:
+            # the answer's "e.g." lists stop at 5 per build (found 2026-11-04: 5 listed, the same answer says 9)
+            found = []
+            try:
+                driver = get_driver()
+                try:
+                    with driver.session() as session:
+                        found = sorted({r["w"] for r in session.run("MATCH (e:RelValException {message:$m}) RETURN DISTINCT e.workflow_id AS w", m=recorded.group(1))})
+                finally:
+                    driver.close()
+            except Exception as exc:
+                print(f"WARNING: workflows of a recorded message failed: {exc}")
+            if found:
+                found.sort(key=lambda w: [int(x) for x in w.split(".")])
+                return f"**{len(found)} workflow(s)** recorded with this error: " + ", ".join(f"`{w}`" for w in found[:40]) + (f" and {len(found) - 40} more" if len(found) > 40 else "") + "."
         by_workflow = re.search(r"By workflow: ([^\n]+)", answer)
         if by_workflow:
             return f"Workflows with this error: {by_workflow.group(1)}"
@@ -14887,9 +14905,11 @@ def _about_the_bot_answer(question: str) -> str | None:
     if re.search(r"\byou\s+are\s+now\b|\bpretend\s+(?:you|to)\b|\bno\s+restrictions\b|\bjailbreak\b", text):
         return "I stay what I am: a read-only assistant for the imported CMSSW Integration Build data. Ask about an IB, workflow, unit test, PR or Issue."
     if re.search(r"\bdo\s+you\s+use\s+(?:ai|an?\s+llm|chatgpt|gpt)\b|\bare\s+you\s+(?:an?\s+)?(?:ai|llm|chatgpt)\b|\bhow\s+do\s+you\s+work\b", text):
-        return ("Partly. Most answers come straight from database queries, with no AI involved: they are written by fixed code from the imported data. "
-                "An LLM is used only when nothing else matches: it picks read-only lookups and words the result. That answer is then checked: "
-                "its numbers must appear in what the lookups returned, otherwise you get the raw results instead. It is told to answer only from that evidence.")
+        return ("Partly. Most answers come straight from database queries: they are written by fixed code from the imported data. "
+                "An LLM writes the answer only when nothing else matches: it picks read-only lookups and words the result. That answer is then checked: "
+                "its numbers and IB tags must appear in what the lookups returned, otherwise you get the raw results instead. It is told to answer only from that evidence."
+                + (" An LLM also checks whether some fixed answers fit the question, and may look further if they don't." if DETERMINISTIC_ANSWER_VERIFICATION_ENABLED else "")
+                + (" Separately, it classifies each question in the background so its routing can be compared with the fixed code's; that never decides an answer." if ROUTER_SHADOW_ENABLED else ""))
     if re.search(r"\bhow\s+(?:do|can)\s+(?:you|i)\s+(?:know|trust)\b|\bhow\s+accurate\b|\baccuracy\b|\bcan\s+i\s+trust\b|\bcan\s+you\s+(?:make\s+up|invent|hallucinate|be\s+wrong)\b|\bdo\s+you\s+make\s+(?:things\s+)?up\b", text):
         return ("Answers from fixed queries report what is in the database, so they are as right as the imported data. The less certain ones are the LLM's: "
                 "their numbers are checked against the evidence, but the wording isn't proof, and a wrong one is still possible. Answers say which build and "
@@ -14904,8 +14924,9 @@ def _about_the_bot_answer(question: str) -> str | None:
         return ("No. While answering I only read the local database. GitHub Issues and PRs in it were imported beforehand, by the data refresh. "
                 f"{_github_export_note()}.")
     if re.search(r"\bis\s+my\s+data\s+sent\b|\bwhere\s+does\s+my\s+(?:question|data)\s+go\b|\bdo\s+you\s+store\b", text):
-        return ("Your questions and my answers are stored in this system's database, so a conversation can continue and answers can be reviewed. When the LLM is used, "
-                "the question and the looked-up evidence go to the LLM service this deployment is configured with.")
+        return ("Your questions and my answers are stored in this system's database, so a conversation can continue and answers can be reviewed. "
+                + ("Questions also go to the LLM service this deployment is configured with, for a background routing comparison. " if ROUTER_SHADOW_ENABLED else "")
+                + "When the LLM helps with an answer, the question and the looked-up evidence go to that service too. Nothing goes to GitHub or elsewhere on the web.")
     if re.search(r"\bhow\s+much\s+(?:time|effort|work)\b[^?]*\bsave\b|\bhow\s+many\s+(?:questions|users|people)\b[^?]*\b(?:asked|use|using)\b", text):
         return "I don't have that: time saved hasn't been measured, and I don't report usage figures."
     if re.search(r"\bwho\s+(?:built|made|created|wrote|maintains)\s+you\b", text):
