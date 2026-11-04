@@ -1015,7 +1015,9 @@ def _with_full_year_dates(question: str) -> str:
     shortens a timestamp in speech (found 2026-11-04: dead end, an LLM guessing tags). This year."""
     year = datetime.now().year
     question = re.sub(r"(?<![\d-])((?:0[1-9]|1[0-2])-[0-3]\d)-(\d{4})(?![\d-])", rf"{year}-\1-\2", question)
-    return re.sub(r"(?<![\d-])((?:0[1-9]|1[0-2])-[0-3]\d)\s+(?:at\s+)?(\d{2}):?00\b", rf"{year}-\1-\g<2>00", question)
+    question = re.sub(r"(?<![\d-])((?:0[1-9]|1[0-2])-[0-3]\d)\s+(?:at\s+)?(\d{2}):?00\b", rf"{year}-\1-\g<2>00", question)
+    # "the IB of 2026-11-02 at 23:00" (found 2026-11-04: dead end)
+    return re.sub(r"\b(20\d\d-[01]\d-[0-3]\d)\s+(?:at\s+)?([0-2]\d):?00\b", r"\1-\g<2>00", question)
 
 
 def _normalize_deterministic_question(question: str) -> str:
@@ -2198,7 +2200,8 @@ def _latest_ib_answer(question: str) -> str | None:
     # "status of the latest 17_1 IB" asks about its results, not its name (found 2026-11-03:
     # answered with the tag only); those go on to the failure/summary answers
     if re.search(r"\b(?:status|health\w*|fail\w*|broken|wrong|problems?|errors?|good|ok(?:ay)?|summary|results?|"
-                 r"passing|green|clean|how\s+is|how's|how\s+did|look(?:s|ing)?\s+like)\b", question, re.IGNORECASE):
+                 r"passing|green|clean|how\s+is|how's|how\s+did|look(?:s|ing)?\s+like|better|worse|compare\w*)\b",
+                 question, re.IGNORECASE):
         return None
     if re.search(r"\b(?:interesting|notable|highlights?|tell\s+me\s+about|overview)\b", question, re.IGNORECASE):
         # "tell me something interesting about the latest IB" (found 2026-11-04: a release
@@ -3473,7 +3476,10 @@ def _artifact_search_answer(question: str) -> str | None:
         version_answer = _version_pr_answer(version.group(0))
         if version_answer:
             return version_answer
-    identifiers = [t for t in _pr_search_terms(question) if not IB_TAG_RE.fullmatch(t)]
+    # ... nor is an architecture: "status of <tag> on el8_amd64_gcc13" searched GitHub for the
+    # architecture name (found 2026-11-04)
+    identifiers = [t for t in _pr_search_terms(question) if not IB_TAG_RE.fullmatch(t)
+                   and not (IB_TAG_RE.search(question) and re.fullmatch(r"(?:el|fc|slc|cc|cs)\d+_\w+_gcc\d+", t))]
     if not identifiers:
         return None
 
@@ -4314,6 +4320,8 @@ _RECURRING_FAILURE_INTENT_RE = re.compile(
     r"\b(?:recurring|recurrence|recur(?:s|red)?|happened\s+before|seen\s+(?:this\s+)?before|"
     r"known\s+issue|keeps?\s+failing|how\s+often|history|frequent(?:ly)?|"
     r"common(?:est)?|most\s+(?:often|common|frequent))\b|\btop\b[^?!]{0,20}\bfail|"
+    # "which workflows are failing in every build this week?" (found 2026-11-04: LLM, 17 s)
+    r"\bevery\s+(?:build|ib)\b|\balways\s+fail|\bconsistently\s+fail|\bin\s+all\s+(?:the\s+)?(?:builds|ibs)\b|"
     r"\bwhen\b[^?!]{0,30}\bfail|\bwhere\b[^?!]{0,30}\bfail|"
     # "has workflow 140.051 failed before" -- found live 2026-10-06 dead-ending
     # ("happened before"/"seen before" were covered, "failed before" wasn't).
@@ -7076,6 +7084,45 @@ def _pr_author_ranking_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+_RELEASE_SERIES_RE = re.compile(
+    r"\b(?:which|what|list|all)\b[^?!]{0,25}\b(?:release\s+(?:series|cycles?|branches|queues)|releases|ib\s+queues|"
+    r"release\s+queues)\b[^?!]{0,30}\b(?:active|built|running|current|are\s+there|do\s+we\s+have|exist|imported)\b|"
+    r"\b(?:active|current)\s+(?:release\s+)?(?:series|releases|release\s+cycles?|branches|queues)\b", re.IGNORECASE)
+
+
+def _release_series_answer(question: str) -> str | None:
+    """ "which release series are active?" (found 2026-11-04: LLM dead end). Each CMSSW_X_Y_X series
+    with its newest primary IB, its builds in the last 7 days and whether it is still being built."""
+    if not _RELEASE_SERIES_RE.search(question):
+        return None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE ib.variant IS NULL AND ib.tag =~ 'CMSSW_[0-9]+_[0-9]+_X_.*' "
+                "WITH split(ib.tag, '_') AS p, right(ib.tag, 15) AS ts, ib "
+                "RETURN p[1] + '_' + p[2] AS series, max(ts) AS newest, collect(DISTINCT ts) AS stamps, "
+                "collect(DISTINCT ib.arch) AS archs")]
+    finally:
+        driver.close()
+    if not rows:
+        return None
+    newest_overall = max(r["newest"] for r in rows)
+    day = lambda ts: datetime.strptime(ts[:10], "%Y-%m-%d")
+    week_ago = (day(newest_overall) - timedelta(days=7)).strftime("%Y-%m-%d")
+    rows.sort(key=lambda r: tuple(int(x) for x in r["series"].split("_")), reverse=True)
+    active = [r for r in rows if (day(newest_overall) - day(r["newest"])).days <= 4]
+    lines = [f"**{len(active)} release series** are being built (newest IB within 4 days of `{newest_overall}`), "
+             f"{len(rows)} imported in total:", "",
+             "| Release series | Newest IB | Builds in 7 days | Architectures | Active |", "| --- | --- | ---: | ---: | --- |"]
+    for r in rows:
+        recent = sum(1 for ts in r["stamps"] if ts >= week_ago)
+        lines.append(f"| `CMSSW_{r['series']}_X` | `{r['newest']}` | {recent} | {len(r['archs'])} | "
+                     + ("yes" if r in active else "no") + " |")
+    lines.append("\nThe highest series (first row) is the development release; \"latest IB\" means its newest build.")
+    return "\n".join(lines)
+
+
 _ADDON_STATUS_RE = re.compile(r"\badd[\s-]?ons?(?:\s*tests?)?\b", re.IGNORECASE)
 _ADDON_STATUS_WORDS_RE = re.compile(
     r"\b(?:pass\w*|fail\w*|status|broken|ok(?:ay)?|green|red|results?|errors?|how\s+(?:are|did)|good|clean|state)\b",
@@ -7450,6 +7497,49 @@ def _workflow_log_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+_EXCEPTION_RANKING_RE = re.compile(
+    r"\b(?:most\s+(?:common|frequent)|top|commonest)\b[^?!]{0,20}\b(?:exceptions?|errors?\s+messages?|errors?|crash(?:es)?)\b|"
+    r"\b(?:exceptions?|errors?)\b[^?!]{0,20}\b(?:most\s+(?:often|common|frequent))\b", re.IGNORECASE)
+
+
+def _exception_ranking_answer(question: str) -> str | None:
+    """ "what's the most common exception this week?" (found 2026-11-04: a choose-an-architecture
+    menu). The recorded RelVal exceptions of the release series over the window, by category and
+    message, with how many workflows and builds -- per architecture is shown, never summed away."""
+    if not _EXCEPTION_RANKING_RE.search(question) or IB_TAG_RE.search(question):
+        return None
+    if re.search(r"\b(?:prs?|issues?|github)\b", question, re.IGNORECASE):
+        return None
+    days = _parse_recency_window_days(question, default=7) or 7
+    cut = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d-0000")
+    series = _requested_release_series(question)
+    arch = _requested_ib_arch(question)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            prefix = f"CMSSW_{series[0]}_{series[1]}" if series else _newest_series_prefix(session)
+            rows = [dict(r) for r in session.run(
+                "MATCH (e:RelValException) WHERE e.ib_tag STARTS WITH $p AND right(e.ib_tag, 15) >= $cut "
+                "AND ($arch IS NULL OR e.arch = $arch) "
+                "RETURN e.category AS category, left(e.message, 140) AS message, "
+                "count(DISTINCT e.workflow_id) AS workflows, count(DISTINCT e.ib_tag) AS builds, "
+                "collect(DISTINCT e.arch) AS archs ORDER BY workflows DESC, builds DESC LIMIT 8",
+                p=prefix + "_", cut=cut, arch=arch)]
+    finally:
+        driver.close()
+    scope = f"`{prefix}_X`" + (f" on `{arch}`" if arch else "")
+    if not rows:
+        return f"No RelVal exception is recorded for {scope} in the last {days} days."
+    lines = [f"Most common recorded RelVal exceptions in {scope}, last {days} days (from the Elasticsearch export; "
+             "includes known-error workflows):", "",
+             "| Category | Message | Workflows | Builds | Architectures |", "| --- | --- | ---: | ---: | --- |"]
+    for r in rows:
+        message = " ".join((r["message"] or "").split()).replace("|", "\\|")
+        lines.append(f"| {r['category']} | {message} | {r['workflows']} | {r['builds']} | "
+                     + ", ".join(f"`{a}`" for a in sorted(r["archs"])[:4]) + (" ..." if len(r["archs"]) > 4 else "") + " |")
+    return "\n".join(lines)
+
+
 def _tracked_failures_answer(question: str, session_id: str) -> str | None:
     """ "is the 17_1 global tag problem tracked anywhere?" (found 2026-11-04: answered with the
     failure overview, no GitHub search at all). The IB's most common recorded error messages,
@@ -7656,11 +7746,13 @@ def _failure_overview_answer(tag: str, arch: str | None, item_cap: int = 12) -> 
         try:
             with driver.session() as session:
                 for r in big[:3]:
+                    # only the failing (not known-error) workflows: on aarch64 the 60 known-error
+                    # GridPack workflows' error was named as the cause of 11 real failures (2026-11-04)
                     top = session.run(
-                        "MATCH (e:RelValException {ib_tag:$tag, arch:$arch}) "
+                        "MATCH (e:RelValException {ib_tag:$tag, arch:$arch}) WHERE e.workflow_id IN $wfs "
                         "WITH e.category AS category, e.message AS message, count(DISTINCT e.workflow_id) AS n "
                         "RETURN category, message, n ORDER BY n DESC LIMIT 1",
-                        tag=r["tag"], arch=r["arch"],
+                        tag=r["tag"], arch=r["arch"], wfs=[x["wf"] for x in r["failed_relvals"] if x.get("wf")],
                     ).single()
                     if top and top["n"] >= 5:
                         lines.append(f"  - Most common error in {label(r)}: **{top['category']}** -- "
@@ -7908,6 +8000,10 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         tracked = _tracked_failures_answer(question, session_id)
         if tracked:
             return tracked, []
+        # "any new sanitizer errors?" names the sanitizer reports, not the whole overview (2026-11-04)
+        sanitizer = _sanitizer_problems_answer(question, session_id)
+        if sanitizer:
+            return sanitizer, []
         context = RequestContext.extract(question)
         if not context.tag:
             return None
@@ -10816,6 +10912,13 @@ def _sanitizer_problems_answer(question: str, session_id: str) -> str | None:
     none of them from a sanitizer, right after a question about the ASAN IB."""
     if "\n" in question or not _SANITIZER_LIST_RE.search(question):
         return None
+    if re.search(r"\bnew\b", question, re.IGNORECASE) and not re.search(
+            r"\b(?:prs?|pull\s+requests?|issues?|github|what\s+does|mean)\b", question, re.IGNORECASE):
+        # "any new sanitizer errors?" (found 2026-11-04: the whole failure overview): new / returned /
+        # gone problems in the sanitizer build's test logs against its previous build
+        flavour = "UBSAN" if re.search(r"\bubsan\b", question, re.IGNORECASE) else "ASAN"
+        return _test_log_question_answer(f"what is new in the test logs of the {flavour} IB", session_id,
+                                         f"what is new in the test logs of the {flavour} IB")
     if re.search(r"\b(?:prs?|pull\s+requests?|issues?|github|new|since|what\s+does|mean)\b", question, re.IGNORECASE):
         return None
     # "are there sanitizer errors in passed ASAN tests?" got "0 new, 0 returned, 0 gone" -- true
@@ -11241,6 +11344,9 @@ def _conversational_response(sid: str, original_question: str):
             "- **Procedures:** \"what does the build-any-ib Jenkins job do\""
         )
         return _chat_response(sid, original_question, message, "conversational:help", actions=_CAPABILITY_ACTIONS)
+    if re.fullmatch(r"\s*(?:bye|good\s*bye|see\s+you|cya|ciao|that'?s\s+all|done(?:\s+for\s+now)?)\b[\s!.,]*(?:thanks?)?[\s!.]*",
+                    original_question, re.IGNORECASE):
+        return _chat_response(sid, original_question, "Bye! Ask any time.", "conversational:thanks")
     if _THANKS_RE.fullmatch(original_question):
         return _chat_response(
             sid, original_question, "You're welcome! Ask any time.", "conversational:thanks", actions=_CAPABILITY_ACTIONS,
@@ -11265,7 +11371,7 @@ def _conversational_response(sid: str, original_question: str):
 
 _DATE_INTENT_RE = re.compile(
     r"\b(?:fail\w*|broken|broke|errors?|status|results?|relvals?|unit\s*tests?|builds?|what\s+happened|summary|ok(?:ay)?|"
-    r"warnings?|finish\w*|complete\w*)\b",
+    r"warnings?|finish\w*|complete\w*|changed|new|happen\w*)\b",
     re.IGNORECASE)
 
 
@@ -11342,7 +11448,10 @@ _ABOUT_DATA_RE = re.compile(
     r"\bwhen\s+was\s+(?:the\s+|your\s+)?data\s+(?:last\s+)?(?:updated|imported|refreshed)\b|"
     r"\bwho\s+are\s+you\b[^?!]{0,40}\bdata\b|\bwhat\s+is\s+(?:imported|in\s+(?:the|your)\s+(?:graph|database))\b|"
     # "is the data up to date?" (found 2026-11-03: LLM dead end)
-    r"\b(?:is|are)\s+(?:the|your)\s+(?:data|results?)\s+(?:up[\s-]*to[\s-]*date|current|fresh|recent|stale|old)\b",
+    r"\b(?:is|are)\s+(?:the|your)\s+(?:data|results?)\s+(?:up[\s-]*to[\s-]*date|current|fresh|recent|stale|old)\b|"
+    # "how much data do you have?", "how reliable is this bot?" (found 2026-11-04: LLM dead ends)
+    r"\bhow\s+much\s+data\b|\bhow\s+(?:reliable|accurate|trustworthy)\b|\bcan\s+i\s+trust\b|"
+    r"\bwhere\s+(?:does|do)\s+(?:your|the)\s+(?:data|answers?)\s+come\s+from\b",
     re.IGNORECASE)
 
 
@@ -11470,7 +11579,7 @@ def _unit_test_ranking_answer(question: str) -> str | None:
 
 
 _PRS_MERGED_WINDOW_RE = re.compile(
-    r"\b(?:prs?|pull\s+requests?|what\s+(?:was|got|has\s+been))\b[^?!]{0,40}\bmerged\b[^?!]{0,40}?\b(?:since\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"\b(?:prs?|pull\s+requests?|what\s+(?:was|got|has\s+been))\b[^?!]{0,40}\b(?:merged|touched|touching|changed|changing|modified)\b[^?!]{0,40}?\b(?:since\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
     r"(this\s+week|last\s+week|past\s+week|(?:the\s+)?(?:last|past)\s+(?:few\s+)?days)|(?:in\s+the\s+)?(?:last|past)\s+(\d{1,2})\s+days?)\b", re.IGNORECASE)
 
 
@@ -11509,7 +11618,7 @@ def _prs_merged_window_answer(question: str) -> str | None:
     # a topic ("is there a PR touching ConditionDatabase merged this week?", found 2026-11-04 listing
     # all 75): only the PRs whose title or description name it (changed_files is only a count)
     topic_match = re.search(
-        r"\b(?:touching|about|on|for|related\s+to|mentioning|changing|in)\s+(?:the\s+)?`?"
+        r"\b(?:touching|touched|about|on|for|related\s+to|mentioning|changing|changed|modified|in)\s+(?:the\s+)?`?"
         r"([A-Za-z][\w:./-]*[A-Z/:._][\w:./-]*|[A-Za-z]{4,})`?", IB_TAG_RE.sub(" ", question))
     topic = topic_match.group(1) if topic_match else None
     if topic and topic.lower() in {"cmssw", "cmsdist", "this", "last", "past", "week", "monday", "tuesday",
@@ -11521,7 +11630,8 @@ def _prs_merged_window_answer(question: str) -> str | None:
         hits = [r for r in rows if wanted in (r["title"] or "").lower() or wanted in r["body"].lower()]
         if not hits:
             return (f"None of the {len(rows)} PR(s) merged{where} since {since_day} names `{topic}` in its title or "
-                    "description.")
+                    "description. (Changed file paths are not imported, so a PR that changes it without naming it "
+                    "is not found this way.)")
         rows = hits
         where += f" naming `{topic}`"
     if not rows:
@@ -12300,6 +12410,9 @@ def _chat(req: ChatRequest):
     if named_test:
         return _chat_response(sid, original_question, named_test, "deterministic:named_test")
 
+    exception_ranking = _exception_ranking_answer(question)
+    if exception_ranking:
+        return _chat_response(sid, original_question, exception_ranking, "deterministic:exception_ranking")
     log_answer = _workflow_log_answer(question)
     if log_answer:
         return _chat_response(sid, original_question, log_answer, "deterministic:workflow_log")
@@ -12538,7 +12651,10 @@ def _chat(req: ChatRequest):
             series = _requested_release_series(question)
             resolved_tag = None if series else _latest_ib_contexts.get(sid)
             if not resolved_tag:
-                latest_records = _latest_ib_records(None, series)
+                # with an architecture named, that architecture's newest build ("what is failing on
+                # el8_aarch64_gcc13 in 17_1?" got the newest 17_1 IB, which has no aarch64 build: 2026-11-04)
+                latest_records = (_latest_ib_records(_requested_ib_arch(question), series)
+                                  if _requested_ib_arch(question) else []) or _latest_ib_records(None, series)
                 if latest_records:
                     resolved_tag = latest_records[0]["tag"]
             if resolved_tag:
@@ -12785,6 +12901,9 @@ def _chat(req: ChatRequest):
     clang_warning_answer = _clang_warning_answer(question, _latest_ib_contexts.get(sid))
     if clang_warning_answer:
         return _chat_response(sid, original_question, clang_warning_answer, "deterministic")
+    release_series = _release_series_answer(original_question)
+    if release_series:
+        return _chat_response(sid, original_question, release_series, "deterministic:release_series")
     author_ranking = _pr_author_ranking_answer(original_question)
     if author_ranking:
         return _chat_response(sid, original_question, author_ranking, "deterministic:pr_author_ranking")

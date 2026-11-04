@@ -73,6 +73,8 @@ SHIFT_SUMMARY_RE = re.compile(
     r"\b(?:overview|health|status|state)\b[^?!]{0,30}\b(?:this|last|past)\s+(?:week|\d+\s+days?)\b|"
     r"\b(?:get|got|been|was|were)\s+(?:fixed|resolved)\b[^?!]{0,30}\b(?:today|yesterday|this\s+week|since)\b|"
     r"\banything\s+(?:get\s+|got\s+)?(?:fixed|resolved)\b|"
+    r"\b(?:better|worse)\s+than\b|"
+    r"\bwhat(?:'s|\s+has)?\s+changed\s+in\s+(?:the\s+)?(?:ib\s+of\s+)?(?:CMSSW_|20\d\d-)|"
     r"\bstarted\s+(?:to\s+)?fail(?:ing)?\b|"
     r"\bshift(?:er)?\s+(?:meeting|handover|hand-over)\b",
     re.IGNORECASE,
@@ -185,7 +187,10 @@ class RequestContext:
             )),
             # a ranking over a window ("which workflow failed most often in the last 14 days")
             # is the frequent-failure report, not a two-build diff (found 2026-11-03)
-            has_shift_summary_request=bool(SHIFT_SUMMARY_RE.search(question)) and not RANKING_RE.search(question),
+            # ... nor "any new sanitizer errors?" -- the digest has no sanitizer section (2026-11-04)
+            has_shift_summary_request=bool(SHIFT_SUMMARY_RE.search(question)) and not RANKING_RE.search(question)
+            and not re.search(r"\bsanitizer\b|\b(?:asan|ubsan)\b[^?!]{0,20}\b(?:errors?|problems?|reports?|findings?)\b",
+                              question, re.IGNORECASE),
             is_bare_ib_tag=bare_tag,
         )
 

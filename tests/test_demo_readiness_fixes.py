@@ -17,6 +17,10 @@ from server.api_server import (
     _prs_merged_window_answer,
     _tracked_failures_answer,
     _workflow_log_answer,
+    _exception_ranking_answer,
+    _release_series_answer,
+    _normalize_deterministic_question,
+    _conversational_response,
     _MISSING_RESULTS_RE,
     _ARCH_LIST_RE,
     _test_log_question_answer,
@@ -389,6 +393,47 @@ class RoundThreeTests(unittest.TestCase):
         get_driver.return_value = driver
         self.assertIn(url, _workflow_log_answer("show me the log of 140.5611"))
         self.assertIsNone(_workflow_log_answer("why is 140.5611 failing?"))
+
+
+class RoundFourTests(unittest.TestCase):
+    def test_full_date_with_time_becomes_a_timestamp(self):
+        self.assertIn("2026-11-02-2300", _normalize_deterministic_question("what changed in the IB of 2026-11-02 at 23:00?"))
+
+    def test_about_data_phrasings(self):
+        for q in ("how much data do you have?", "how reliable is this bot?", "can I trust these answers?"):
+            self.assertTrue(_ABOUT_DATA_RE.search(q), q)
+
+    def test_better_than_yesterday_is_a_comparison(self):
+        self.assertTrue(RequestContext.extract("is the latest IB better than yesterday's?").has_shift_summary_request)
+
+    def test_sanitizer_question_is_not_a_shift_summary(self):
+        self.assertFalse(RequestContext.extract("any new sanitizer errors?").has_shift_summary_request)
+        self.assertTrue(RequestContext.extract("is the ASAN build getting better?").has_shift_summary_request)
+
+    @patch("server.api_server._store_chat_turns")
+    def test_bye(self, _store):
+        self.assertEqual(_conversational_response("demo-bye", "bye").answer, "Bye! Ask any time.")
+
+    @patch("server.api_server._newest_series_prefix", return_value="CMSSW_20_1")
+    @patch("server.api_server.get_driver")
+    def test_exception_ranking(self, get_driver, _prefix):
+        driver, _ = _driver_with([{"category": "PluginNotFound", "message": "Unable to find plugin 'HLTTriggerTypeFilter'",
+                                   "workflows": 57, "builds": 2, "archs": ["fc42_riscv64_gcc15"]}])
+        get_driver.return_value = driver
+        answer = _exception_ranking_answer("what's the most common exception this week?")
+        self.assertIn("| PluginNotFound |", answer)
+        self.assertIn("| 57 | 2 |", answer)
+        self.assertIsNone(_exception_ranking_answer("is there a PR for the most common exception?"))
+
+    @patch("server.api_server.get_driver")
+    def test_release_series(self, get_driver):
+        driver, _ = _driver_with([
+            {"series": "20_1", "newest": "2026-11-03-1100", "stamps": ["2026-11-03-1100", "2026-11-02-2300"], "archs": ["a", "b"]},
+            {"series": "12_4", "newest": "2026-09-01-0000", "stamps": ["2026-09-01-0000"], "archs": ["a"]}])
+        get_driver.return_value = driver
+        answer = _release_series_answer("which release series are active?")
+        self.assertIn("**1 release series** are being built", answer)
+        self.assertIn("| `CMSSW_12_4_X` | `2026-09-01-0000` | 0 | 1 | no |", answer)
 
 
 if __name__ == "__main__":
