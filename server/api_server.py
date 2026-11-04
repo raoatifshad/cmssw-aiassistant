@@ -3765,7 +3765,9 @@ def _build_warning_answer(question: str, context_tag: str | None = None) -> str 
         return None
     # "builds" too: "what builds warnings are in <tag>" (found live 2026-10-15 dead-ending)
     # "compile warnings": found 2026-11-04 going to the LLM, which said 0 for a build with 439
-    if not re.search(r"\b(?:builds?|compilation|compiler|compile|compiling)\b", question, re.IGNORECASE):
+    # or a named tag: "NONLTO warnings in the latest build?" becomes "latest IB <tag>" on the way here
+    # (found 2026-11-04: the LLM answered 0 for a build with 12)
+    if not re.search(r"\b(?:builds?|compilation|compiler|compile|compiling)\b", question, re.IGNORECASE) and not IB_TAG_RE.search(question):
         return None
     if not re.search(r"\bwarnings?\b", question, re.IGNORECASE):
         return None
@@ -9693,7 +9695,12 @@ def _with_variant_ib_context(question: str) -> str:
         return question
     match = re.search(
         r"(?<![A-Za-z0-9])(" + "|".join(sorted(_IB_VARIANT_GLOSSARY, key=len, reverse=True)) + r")(?![A-Za-z0-9])"
-        r"(?i:\s+(?:sub[\s-]*)?(?:ibs?|builds?|variant|flavou?r))",
+        r"(?i:\s+(?:sub[\s-]*)?(?:ibs?|builds?|variant|flavou?r|latest|newest)|\b[^?!]{0,30}\b(?:latest|newest)\s+(?:build|ib|release)\b)",
+        question,
+    ) or re.search(
+        # "MULTIARCHSV4 latest relval failures" answered for the primary IB, "NONLTO warnings in the
+        # latest build?" dead-ended (found 2026-11-04)
+        r"(?i:\b(?:latest|newest)\s+)(" + "|".join(sorted(_IB_VARIANT_GLOSSARY, key=len, reverse=True)) + r")(?![A-Za-z0-9])",
         question,
     ) or (not re.search(r"(?<![\d.])\d{1,6}\.\d{1,6}(?![\d.])", question) and re.search(
         # "how many unit tests failed in ASAN?" (found 2026-11-03: every variant was listed);
