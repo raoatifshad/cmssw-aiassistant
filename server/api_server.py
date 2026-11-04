@@ -1031,6 +1031,20 @@ def _normalize_deterministic_question(question: str) -> str:
         (r"\bpackages?\s+(?:that\s+)?(?:needs?|require|requires)\s+(?:fixing|to\s+be\s+fixed|a\s+fix|attention)\b",
          "failed unit-test packages"),
         (r"\bhow\s+much\b", "how many"),
+        # "which IB variant has compilation warnings in ..." (found 2026-11-04: "is a primary IB, not a sub-IB")
+        (r"\bwhich\s+(?:ib\s+)?(?:variants?|flavou?rs?|sub-?ibs?)\s+(?:has|have|had|show\w*)\s+(?:compil\w+\s+|build\s+)?warnings\b",
+         "which builds have build warnings"),
+        # "difference between <tag> and <tag>" (found 2026-11-04: LLM, raw tool dump)
+        (r"\b(?:what(?:'s|\s+is|\s+are)\s+)?(?:the\s+)?differences?\s+between\s+(?=CMSSW_\d)", "compare "),
+        # "status of 20_0" (found 2026-11-04: dead end; "what failed in 16_1" already worked)
+        (r"^\s*(?:what(?:'s|\s+is)\s+the\s+)?(?:status|state|health)\s+of\s+(?:the\s+)?((?:CMSSW_)?\d{1,2}_\d{1,2}(?:_X)?)\s*[?.!]*\s*$",
+         r"what is failing in the latest \1 IB"),
+        # "what exit codes appear in the newest IB?" (found 2026-11-04: just its tag)
+        (r"\bwhat\s+exit\s*codes?\s+(?:\w+\s+)?(?=in\b)", "what is failing "),
+        # "summary for shifters of the latest 2 IBs" (found 2026-11-04: dead end)
+        (r"\bsummary\s+for\s+(?:the\s+)?shifters?\b", "shift summary"),
+        # "what happened to el9_amd64_gcc16, it stopped?" (found 2026-11-04: a PR search for the name)
+        (r"\bwhat\s+happened\s+to\s+((?:el|fc|slc|cc|cs)\d+_\w+)\b", r"is \1 still built"),
         # "should I worry about something in the latest IB?" (found 2026-11-04: just its tag)
         (r"\bshould\s+i\s+(?:be\s+)?worr(?:y|ied)(?:\s+about\s+(?:something|anything))?\b|\bis\s+(?:there\s+)?anything\s+wrong\b",
          "what is failing"),
@@ -6713,6 +6727,8 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
     arch_match = re.search(r"\b((?:el|fc|slc|cc|cs)\d+_(?:amd64|aarch64|riscv64|ppc64le)_gcc\d+)\b", question, re.IGNORECASE)
     if len(tags) != 2:
         return None
+    if _ib_flavour(tags[0]) != _ib_flavour(tags[1]) and tags[0].split("_X_")[0].split("_")[:3] == tags[1].split("_X_")[0].split("_")[:3]:
+        return _cross_flavour_comparison_answer(tags, arch_match.group(1).lower() if arch_match else None)
     if not arch_match:
         driver = get_driver()
         try:
@@ -9151,7 +9167,10 @@ def _relval_by_exit_code_answer(question: str) -> str | None:
 
 _RUN_WORKFLOW_RE = re.compile(
     r"\bhow\s+(?:do|can|should|to)\b[^?!]{0,30}\b(?:run|rerun|re-run|reproduce|execute|test)\b[^?!]{0,30}?"
-    r"(?:\b(?:wf|workflow|relval)\s*#?\s*)?(\d{1,6}\.\d{1,6})\b", re.IGNORECASE)
+    r"(?:\b(?:wf|workflow|relval)\s*#?\s*)?(\d{1,6}\.\d{1,6})\b|"
+    # "show me the cmsDriver command of 10805.31" (found 2026-11-04: dead end; the graph only has
+    # command hashes, the recipe below prints them)
+    r"\bcmsdriver\b[^?!]{0,40}?\b(\d{1,6}\.\d{1,6})\b", re.IGNORECASE)
 
 
 def _run_workflow_howto_answer(question: str) -> str | None:
@@ -9160,7 +9179,7 @@ def _run_workflow_howto_answer(question: str) -> str | None:
     match = _RUN_WORKFLOW_RE.search(question)
     if not match:
         return None
-    workflow_id = match.group(1)
+    workflow_id = match.group(1) or match.group(2)
     try:
         driver = get_driver()
         try:
@@ -9799,6 +9818,13 @@ def _arch_unavailable_answer(question: str, session_id: str) -> str | None:
     """A scope-only follow-up ("what about aarch64") for an IB that has no build of
     that architecture: say so and list what it has. It used to fall through to a
     PR/Issue text search for the word "aarch64" (found live 2026-10-15)."""
+    if re.search(r"\b(?:finish\w*|complete\w*|done|ready)\b", question, re.IGNORECASE) and IB_TAG_RE.search(question):
+        # "did the 20_1 IB from 11-03 11:00 finish on aarch64?" (found 2026-11-04: LLM dead end)
+        scope = _arch_scope_matches(question, session_id)
+        if scope and not scope[2]:
+            listed = ", ".join(f"`{arch}`" for arch in scope[3]) or "none"
+            return (f"`{scope[0]}` has no imported `{scope[1]}` build yet. Architectures imported for it: {listed}. "
+                    "An IB's architectures land hours apart, and the data is refreshed twice a day.")
     if not _CAPABILITY_FOLLOW_UP_KEYWORD.get(_last_capability_contexts.get(session_id) or ""):
         return None
     if len(question.split()) > 9:
@@ -9882,7 +9908,7 @@ def _arch_family(question: str) -> str | None:
     if not match:
         return None
     word = match.group(1).lower()
-    return "aarch64" if word.startswith(("aarch", "arm")) else "riscv64" if word == "riscv64" else "amd64"
+    return "aarch64" if word.startswith(("aarch", "arm")) else "riscv64" if word.startswith("riscv") else "amd64"
 
 
 def _workflow_why_failing_answer(question: str, session_id: str) -> str | None:
@@ -9901,9 +9927,10 @@ def _workflow_why_failing_answer(question: str, session_id: str) -> str | None:
     if not workflow_match:
         return None
     # "show the exception for 539.0 in <tag>": an IB tag plus a long workflow number says
-    # workflow as clearly as the word does
+    # workflow as clearly as the word does; so does "log link for 539.0 in the latest IB"
+    # (found 2026-11-04: just the latest IB's tag)
     if not re.search(r"\b(?:wf|workflow|relval|fail)", question, re.IGNORECASE) and not (
-            IB_TAG_RE.search(question) and re.fullmatch(r"\d{2,6}\.\d+", workflow_match.group(1))):
+            (IB_TAG_RE.search(question) or _is_latest_ib_question(question)) and re.fullmatch(r"\d{2,6}\.\d+", workflow_match.group(1))):
         return None
     workflow_id = workflow_match.group(1)
     tag_match = IB_TAG_RE.search(question)
@@ -10315,7 +10342,8 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
 _NAMED_TEST_RE = re.compile(
     r"(?<![\w/])((?:[A-Z]\w+/){2,}\w+|[Tt]est[A-Z_]\w{3,}|[a-z]\w*_[Tt]est\w*|[A-Z]\w+Test[A-Z_]\w*)(?![\w/.])")
 _NAMED_TEST_INTENT_RE = re.compile(
-    r"\b(?:why|fail\w*|broken|crash\w*|status|passing|passes|passed|error\w*|problems?|what\s+happened)\b", re.IGNORECASE)
+    r"\b(?:why|fail\w*|broken|crash\w*|status|passing|passes|passed|error\w*|problems?|what\s+happened|"
+    r"intermittent\w*|flak(?:y|iness)|flapping)\b", re.IGNORECASE)
 
 
 def _named_test_answer(question: str) -> str | None:
@@ -10821,7 +10849,8 @@ def _conversational_response(sid: str, original_question: str):
 
 
 _DATE_INTENT_RE = re.compile(
-    r"\b(?:fail\w*|broken|broke|errors?|status|results?|relvals?|unit\s*tests?|builds?|what\s+happened|summary|ok(?:ay)?)\b",
+    r"\b(?:fail\w*|broken|broke|errors?|status|results?|relvals?|unit\s*tests?|builds?|what\s+happened|summary|ok(?:ay)?|"
+    r"warnings?|finish\w*|complete\w*)\b",
     re.IGNORECASE)
 
 
@@ -12285,7 +12314,7 @@ def _chat(req: ChatRequest):
     author_ranking = _pr_author_ranking_answer(original_question)
     if author_ranking:
         return _chat_response(sid, original_question, author_ranking, "deterministic:pr_author_ranking")
-    arch_answer = _architectures_answer(original_question)
+    arch_answer = _architectures_answer(question if question != original_question and "still built" in question else original_question)
     if arch_answer:
         return _chat_response(sid, original_question, arch_answer, "deterministic:architectures")
     addon_answer = _addon_status_answer(question, sid)
