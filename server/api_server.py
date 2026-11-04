@@ -10626,7 +10626,8 @@ def _test_log_question_answer(question: str, session_id: str, original_question:
     2026-10-15: both phrasings got the whole-IB failure overview or the shift digest."""
     if "\n" in question or not _TEST_LOG_QUESTION_RE.search(question):
         return None
-    if re.search(r"^\s*how\b|\bhow\s+(?:do|to|does)\b", question, re.IGNORECASE):
+    # not "how many problems in test logs of <tag>?" (found 2026-11-04: the IB failure overview)
+    if re.search(r"^\s*how\b(?!\s+many)|\bhow\s+(?:do|to|does)\b", question, re.IGNORECASE):
         return None
     tag_match = IB_TAG_RE.search(question)
     series_match = re.match(r"(CMSSW_\d+_\d+)_", tag_match.group(1)) if tag_match else None
