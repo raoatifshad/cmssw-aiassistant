@@ -647,7 +647,7 @@ _ARCH_CLAIM_RE = re.compile(r"\b(?:(?:el|slc|cc|cs|fc)\d+_[a-z0-9]+_(?:gcc|clang
 def _plain_hyphens(text: str) -> str:
     """The model writes tags with non-breaking hyphens, which IB_TAG_RE doesn't match: an invented
     `CMSSW_20_1_X_2026\u201111\u201104\u20111749` passed every check (found 2026-11-04), and a real one can't be copied."""
-    return re.sub("[\u2010\u2011\u2012]", "-", text)
+    return re.sub("[\u2010\u2011\u2012]", "-", text).replace("\u202f", " ").replace("\u00a0", " ")
 
 
 def _identifiers_grounded(answer: str, tool_evidence: list[dict], question: str = "") -> bool:
@@ -8488,7 +8488,11 @@ _LLM_ABSENCE_CLAIM_RE = re.compile(
     r"no unit tests? failed|no prs? (?:were )?merged|no ib(?:s| records)|"
     # found live 2026-10-15: "No such `TestLogRun` nodes exist for the IB ... There are
     # no tests that passed yet reported errors" -- false, the runs exist
-    r"\bthere (?:are|were|is) no\b|\bno such\b[^.\n]{0,40}\bexists?\b|\b(?:do|does) not exist\b",
+    r"\bthere (?:are|were|is) no\b|\bno such\b[^.\n]{0,40}\bexists?\b|\b(?:do|does) not exist\b|"
+    # found 2026-11-04 across every round, each false: "No architectures failed to build", "no build-status errors",
+    # "No ... issues were closed between ...", "No Integration Builds for the 20_0 release series are present"
+    r"\A\W*(?:no|none)\b|\bno\b[^.\n]{0,70}\b(?:were|was|are|is)\s+(?:found|present|recorded|closed|built|failed|imported|merged|open)\b|"
+    r"\bno\s+(?:\S+\s+)?(?:build[\s-]status\s+errors?|matching\s+(?:records?|items?|prs?|issues?))\b|\b(?:has|have)\s+no\s+recorded\b|\b(?:graph|database)\s+contains\s+no\b|\bcontains\s+0\b",
     re.IGNORECASE,
 )
 
