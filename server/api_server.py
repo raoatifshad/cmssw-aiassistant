@@ -11205,8 +11205,8 @@ def _unit_test_ranking_answer(question: str) -> str | None:
 
 
 _PRS_MERGED_WINDOW_RE = re.compile(
-    r"\b(?:prs?|pull\s+requests?)\b[^?!]{0,40}\bmerged\b[^?!]{0,40}?\b(?:since\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
-    r"(this\s+week|last\s+week|past\s+week)|(?:in\s+the\s+)?(?:last|past)\s+(\d{1,2})\s+days?)\b", re.IGNORECASE)
+    r"\b(?:prs?|pull\s+requests?|what\s+(?:was|got|has\s+been))\b[^?!]{0,40}\bmerged\b[^?!]{0,40}?\b(?:since\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"(this\s+week|last\s+week|past\s+week|(?:the\s+)?(?:last|past)\s+(?:few\s+)?days)|(?:in\s+the\s+)?(?:last|past)\s+(\d{1,2})\s+days?)\b", re.IGNORECASE)
 
 
 def _prs_merged_window_answer(question: str) -> str | None:
@@ -11226,20 +11226,23 @@ def _prs_merged_window_answer(question: str) -> str | None:
     since_day = since.strftime("%Y-%m-%d")
     series = _requested_release_series(question)
     release = f"CMSSW_{series[0]}_{series[1]}" if series else None
+    repo_match = re.search(r"\b(cmsdist|cmssw)\b", IB_TAG_RE.sub(" ", question), re.IGNORECASE)
+    repo = repo_match.group(1).lower() if repo_match else None
     driver = get_driver()
     try:
         with driver.session() as session:
             rows = [dict(r) for r in session.run(
                 "MATCH (pr:PR) WHERE pr.merged_at >= $since AND ($release IS NULL OR pr.release = $release) "
+                "AND ($repo IS NULL OR pr.repo = $repo) "
                 "OPTIONAL MATCH (pr)-[:AUTHORED_BY]->(a:Author) "
                 "RETURN pr.repo AS repo, pr.number AS number, pr.title AS title, pr.merged_at AS merged_at, a.name AS author "
-                "ORDER BY pr.merged_at DESC", since=since_day, release=release)]
+                "ORDER BY pr.merged_at DESC", since=since_day, release=release, repo=repo)]
     finally:
         driver.close()
-    where = f" for `{release}`" if release else ""
+    where = (f" for `{release}`" if release else "") + (f" in {repo}" if repo else "")
     if not rows:
         return f"No imported PR{where} was merged since {since_day}."
-    lines = [f"**{len(rows)} PR(s)** merged{where} since {since_day} (cmssw and cmsdist), newest first:", ""]
+    lines = [f"**{len(rows)} PR(s)** merged{where} since {since_day}" + ("" if repo else " (cmssw and cmsdist)") + ", newest first:", ""]
     lines += [f"- **{r['repo']} #{r['number']}** - {r['title']} ({str(r['merged_at'])[:10]}"
               + (f", {r['author']}" if r["author"] else "") + ")" for r in rows[:25]]
     if len(rows) > 25:
