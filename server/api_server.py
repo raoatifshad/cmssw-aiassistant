@@ -8754,6 +8754,8 @@ def _exit_code_meaning_answer(question: str) -> str | None:
         return None
     match = _EXIT_CODE_QUESTION_RE.search(question)
     code = int(match.group(1) or match.group(2)) if match else None
+    if code is None and _WORKFLOW_ID_IN_TEXT_RE.search(question):
+        return None   # "537.0 SIGSEGV or SIGABRT, what is the pattern?" is about the workflow (2026-11-04)
     if code is None:
         # "what does SIGSEGV mean for a relval" -- a name from the exit-code table instead of
         # a number (held-out pass 2026-10-15 got RelVal counts)
@@ -9937,7 +9939,10 @@ def _workflow_why_failing_answer(question: str, session_id: str) -> str | None:
     # workflow as clearly as the word does; so does "log link for 539.0 in the latest IB"
     # (found 2026-11-04: just the latest IB's tag)
     if not re.search(r"\b(?:wf|workflow|relval|fail)", question, re.IGNORECASE) and not (
-            (IB_TAG_RE.search(question) or _is_latest_ib_question(question)) and re.fullmatch(r"\d{2,6}\.\d+", workflow_match.group(1))):
+            (IB_TAG_RE.search(question) or _is_latest_ib_question(question)
+             # "why is 539.0 timing out?" (found 2026-11-04: "Please provide the IB tag")
+             or re.search(r"\btim(?:ed?|ing)[\s-]*out\b|\bcrash\w*\b|\bsegfault\w*\b|\bwhy\b", question, re.IGNORECASE))
+            and re.fullmatch(r"\d{2,6}\.\d+", workflow_match.group(1))):
         return None
     workflow_id = workflow_match.group(1)
     tag_match = IB_TAG_RE.search(question)
@@ -10056,7 +10061,7 @@ _WORKFLOW_WHERE_RE = re.compile(
     r"\bwhere\b|\banywhere\b|\bwhich\s+(?:builds?|ibs?|releases?|archs?|architectures?|variants?|sub-?ibs?)\b|"
     r"\bin\s+which\b|\bis\b[^?!]{0,40}\bfail|\bfail(?:s|ing|ed)?\b|"
     # "is 539.0 timing out everywhere?" (found 2026-11-04: "couldn't match that" menu)
-    r"\btim(?:ed?|ing)[\s-]*out\b|\bcrash\w*\b|\bsegfault\w*\b|"
+    r"\btim(?:ed?|ing)[\s-]*out\b|\bcrash\w*\b|\bsegfault\w*\b|\bSIG[A-Z]{3,}\b|\bpattern\b|"
     # "is 38551.85 broken?", "is X ok", "status of X", "has X failed before" (found live
     # 2026-10-15 getting the latest IB's failure overview instead)
     r"\bbroken\b|\bok(?:ay)?\b|\bhealthy\b|\bworking\b|\bpass(?:es|ing|ed)?\b|\bstatus\b|"
