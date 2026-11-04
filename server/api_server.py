@@ -6633,6 +6633,66 @@ def generate_shift_summary(latest_tag: str, previous_tag: str, arch: str | None 
     return "\n".join(lines)
 
 
+def _ib_flavour(tag: str) -> str:
+    match = re.match(r"CMSSW_\d+_\d+_([A-Z0-9a-z]+)_X_", tag)
+    return match.group(1) if match else "primary"
+
+
+def _cross_flavour_comparison_answer(tags: list[str], arch: str | None) -> tuple[str, list[dict]] | None:
+    """Two different build flavours ("compare ROOT6 and the primary", "ASAN and UBSAN"): what fails
+    in each of those two builds. Found 2026-11-04: the normal comparison is one flavour over time,
+    so this answered with every flavour against its own past, never the two asked about."""
+    query = ("MATCH (ib:IB {tag:$tag}) WHERE $arch IS NULL OR ib.arch = $arch "
+             "OPTIONAL MATCH (ib)-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE NOT coalesce(r.known_error, false) "
+             "WITH ib, collect(DISTINCT {id:r.workflow_id, name:r.name, exitcode:r.exitcode}) AS relvals "
+             "OPTIONAL MATCH (ib)-[:RAN_UNITTEST]->(u:UnitTest {status:'FAILED'}) "
+             "RETURN ib.arch AS arch, COUNT { (ib)-[:RAN_RELVAL]->() } AS relval_total, relvals, "
+             "COUNT { (ib)-[:RAN_UNITTEST]->() } AS unit_total, collect(DISTINCT u.name) AS units")
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            first = {r["arch"]: dict(r) for r in session.run(query, tag=tags[0], arch=arch)}
+            second = {r["arch"]: dict(r) for r in session.run(query, tag=tags[1], arch=arch)}
+    finally:
+        driver.close()
+    common = sorted(set(first) & set(second))
+    if not common:
+        return (f"`{tags[0]}` and `{tags[1]}` have no architecture in common" + (f" among `{arch}`" if arch else "") + ", so "
+                "there is nothing to compare: architectures are never merged.", [])
+    if not arch and len(common) > 1:
+        actions = [{"label": a, "question": f"compare {tags[0]} and {tags[1]} {a}"} for a in common]
+        return (f"Which architecture should I compare `{tags[0]}` and `{tags[1]}` on? Both have: "
+                + ", ".join(f"`{a}`" for a in common) + ".", actions)
+    arch = common[0]
+    a, b = first[arch], second[arch]
+    label_a, label_b = _ib_flavour(tags[0]), _ib_flavour(tags[1])
+    names = {r["id"]: r for r in a["relvals"] + b["relvals"] if r.get("id")}
+    ids_a = {r["id"] for r in a["relvals"] if r.get("id")}
+    ids_b = {r["id"] for r in b["relvals"] if r.get("id")}
+    def workflows(ids: set) -> str:
+        shown = sorted(ids, key=str)[:15]
+        return ", ".join(f"`{i}` {names[i].get('name') or ''}".rstrip() + (f" (exit {names[i]['exitcode']})" if names[i].get("exitcode") else "")
+                         for i in shown) + (f" +{len(ids) - 15} more" if len(ids) > 15 else "")
+    lines = [f"## {label_a} vs {label_b} on `{arch}`", "",
+             f"| | `{tags[0]}` | `{tags[1]}` |", "| --- | ---: | ---: |",
+             f"| Failed RelVals (of {a['relval_total']:,} / {b['relval_total']:,}) | {len(ids_a)} | {len(ids_b)} |",
+             f"| Failed unit-test packages (of {a['unit_total']:,} / {b['unit_total']:,}) | {len(a['units'])} | {len(b['units'])} |", ""]
+    if not a["relval_total"] or not b["relval_total"]:
+        lines.append("_One of the two has no RelVal results imported yet, so its zero means not checked, not passing._\n")
+    for title, ids in ((f"RelVals failing only in {label_a}", ids_a - ids_b), (f"RelVals failing only in {label_b}", ids_b - ids_a),
+                       ("RelVals failing in both", ids_a & ids_b)):
+        if ids:
+            lines.append(f"**{title}:** {workflows(ids)}")
+    for title, units in ((f"Unit tests failing only in {label_a}", set(a["units"]) - set(b["units"])),
+                         (f"Unit tests failing only in {label_b}", set(b["units"]) - set(a["units"])),
+                         ("Unit tests failing in both", set(a["units"]) & set(b["units"]))):
+        if units:
+            lines.append(f"**{title}:** " + ", ".join(f"`{u}`" for u in sorted(units)))
+    lines.append("\nKnown errors and DAS errors are not counted. Two flavours of one build differ by design "
+                 "(compiler or build options), so a difference shows where to look, not why.")
+    return "\n".join(lines), []
+
+
 def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
     """Compare relval and unit-test outcomes for two IBs (plus their sub-IBs, e.g.
     ASAN/CLANG/MULTIARCHS/NONLTO) without LLM tool calling."""
@@ -11049,6 +11109,30 @@ _COMPARE_FLAVOUR_PRIMARY_RE = re.compile(
     r"(?:default|primary|normal|main|regular)\b[^?!]{0,30}?\b(\d{4}-\d{2}-\d{2}-\d{4})\b", re.IGNORECASE)
 
 
+def _with_newest_flavour_compare_tags(question: str, session, prefix: str) -> str:
+    """ "compare 20_1 ASAN and UBSAN latest" / "compare latest ROOT6 with the primary": the newest
+    build of each. Found 2026-11-04: "which architecture?" for the primary IBs, the flavour gone."""
+    if IB_TAG_RE.search(question) or not re.search(r"\b(?:compare|comparison)\b", question, re.IGNORECASE):
+        return question
+    flavours = [v for v in _VARIANT_NAMES if re.search(rf"(?<![A-Za-z0-9]){v}(?![A-Za-z0-9])", question, re.IGNORECASE)]
+    with_primary = bool(re.search(r"\b(?:default|primary|normal|main|regular)\b", question, re.IGNORECASE))
+    if not (len(flavours) == 2 or (len(flavours) == 1 and with_primary)):
+        return question
+    series = _requested_release_series(question)
+    prefix = f"CMSSW_{series[0]}_{series[1]}" if series else prefix
+    tags = [r["tag"] for r in session.run(
+        "MATCH (ib:IB) WHERE ib.tag STARTS WITH $p RETURN DISTINCT ib.tag AS tag", p=prefix + "_")]
+    newest = lambda flavour: max((t for t in tags if t.startswith(f"{prefix}_{flavour}_X_")), key=_ib_sort_key, default=None)
+    first = newest(flavours[0])
+    if with_primary and first:
+        same_build = f"{prefix}_X_{first.rsplit('_X_', 1)[-1]}"
+        second = same_build if same_build in tags else max((t for t in tags if t.startswith(f"{prefix}_X_")), key=_ib_sort_key, default=None)
+    else:
+        second = newest(flavours[1]) if len(flavours) == 2 else None
+    arch = _requested_ib_arch(question)
+    return f"compare {first} and {second}" + (f" {arch}" if arch else "") if first and second else question
+
+
 def _with_relative_compare_tags(question: str) -> str:
     """ "compare CLANG yesterday with the day before" / "compare ROOT6 and the default IB for
     2026-10-14-2300" -> the two concrete tags (found 2026-10-16: an arch question for the wrong
@@ -11068,7 +11152,7 @@ def _with_relative_compare_tags(question: str) -> str:
                 return f"compare {prefix}_X_{when} and {prefix}_{flavour}_X_{when}"
             match = _COMPARE_DAYS_RE.search(question)
             if not match:
-                return question
+                return _with_newest_flavour_compare_tags(question, session, prefix)
             from zoneinfo import ZoneInfo
             flavour = match.group(1).upper()
             now = datetime.now(ZoneInfo("Europe/Zurich"))
