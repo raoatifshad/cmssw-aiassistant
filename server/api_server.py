@@ -13420,6 +13420,84 @@ def _log_category_answer(question: str) -> str | None:
             f"Example message: `{str(row['message'])[:300]}`" + (f"\n\nExample from: `{row['example']}`" if row["example"] else ""))
 
 
+_MOST_COMMON_FAILURE_RE = re.compile(
+    r"\b(?:most\s+(?:common|frequent)|commonest|top|biggest|main)\s+(?:\w+\s+)?(?:failures?|problems?|fails?|failing\s+\w+)\b|"
+    r"\b(?:what|which)\b[^?]*\bfail\w*\s+(?:the\s+)?most\b", re.IGNORECASE)
+
+
+def _most_common_failure_answer(question: str) -> str | None:
+    """ "what is the most common failure in the latest IB for all the architectures?" (asked by the user 2026-11-04: the whole
+    failure list, with no ranking). One IB, ranked; each row says where, so nothing is merged out of sight. Windows
+    ("this week") stay with the ranking answers over time."""
+    if not _MOST_COMMON_FAILURE_RE.search(question) or re.search(r"\b(?:week|month|days?|exceptions?)\b", question, re.IGNORECASE):
+        return None
+    tag_match = IB_TAG_RE.search(question)
+    series = _requested_release_series(question)
+    latest = None if tag_match else _latest_ib_records(None, series)
+    tag = tag_match.group(1) if tag_match else (latest[0]["tag"] if latest else None)
+    if not tag:
+        return None
+    arch = _requested_ib_arch(question)
+    family = None if arch else _arch_family(question)
+    scope = "AND ($arch IS NULL OR ib.arch = $arch) AND ($family IS NULL OR ib.arch CONTAINS $family) "
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            relvals = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE (ib.tag = $tag OR ib.parent_tag = $tag) " + scope +
+                "MATCH (ib)-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE NOT coalesce(r.known_error, false) "
+                "RETURN r.workflow_id AS id, r.name AS name, r.exitcode AS exitcode, coalesce(ib.variant, 'primary') AS variant, ib.arch AS arch",
+                tag=tag, arch=arch, family=family)]
+            units = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE (ib.tag = $tag OR ib.parent_tag = $tag) " + scope +
+                "MATCH (ib)-[:RAN_UNITTEST]->(u:UnitTest {status:'FAILED'}) "
+                "RETURN u.name AS id, coalesce(ib.variant, 'primary') AS variant, ib.arch AS arch",
+                tag=tag, arch=arch, family=family)]
+    finally:
+        driver.close()
+    scope_text = f" on `{arch}`" if arch else f" on {family} architectures" if family else " (all imported architectures)"
+    if not relvals and not units:
+        return f"No failing RelVal or unit test is imported for `{tag}` and its sub-IBs{scope_text}."
+    names = get_exit_code_names()
+
+    def where(rows: list[dict]) -> str:
+        return ", ".join(f"{r['variant']} `{r['arch']}`" for r in sorted(rows, key=lambda r: (r["variant"] != "primary", r["variant"], r["arch"])))
+
+    grouped: dict[str, list[dict]] = {}
+    for row in relvals:
+        grouped.setdefault(row["id"], []).append(row)
+    ranked = sorted(grouped.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    lines = []
+    if ranked:
+        top = ranked[0]
+        top_codes = {_format_exit_code(r["exitcode"], names) if r["exitcode"] else "0" for r in top[1]}
+        lines.append(f"In `{tag}` and its sub-IBs{scope_text}, the most common RelVal failure is **`{top[0]}`** "
+                     f"({_workflow_base_name(top[1][0]['name'])}): {len(top[1])} of the {len(relvals)} failing RelVal results, exit {', '.join(sorted(top_codes))}.")
+        lines += ["", "| Workflow | Name | Failing in | Exit code | Where |", "| --- | --- | ---: | --- | --- |"]
+        for workflow, rows in ranked[:8]:
+            codes = sorted({_format_exit_code(r["exitcode"], names) if r["exitcode"] else "0" for r in rows})
+            lines.append(f"| `{workflow}` | {_workflow_base_name(rows[0]['name'])} | {len(rows)} | {', '.join(codes)} | {where(rows)} |")
+        if len(ranked) > 8:
+            lines.append(f"\n{len(ranked) - 8} more workflow(s) fail once or more; ask for the full list.")
+        by_code: dict[str, int] = {}
+        for row in relvals:
+            code = _format_exit_code(row["exitcode"], names) if row["exitcode"] else "0"
+            by_code[code] = by_code.get(code, 0) + 1
+        lines.append("\nBy exit code: " + ", ".join(f"{code} × {n}" for code, n in sorted(by_code.items(), key=lambda kv: -kv[1])) + ".")
+    if units:
+        by_package: dict[str, list[dict]] = {}
+        for row in units:
+            by_package.setdefault(row["id"], []).append(row)
+        lines.append(f"\nUnit tests, {len(units)} failing: " + "; ".join(
+            f"`{package}` in {where(rows)}" for package, rows in sorted(by_package.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:8]) + ".")
+    if not tag_match:
+        note = _newest_complete_primary_tag("relval", arch, series)[1]
+        if note:
+            lines.append("\n_This build's results are only partly imported, so these counts can still change._")
+    lines.append("\nA count says how often something fails here, not why, and a workflow failing in several builds can have different causes.")
+    return "\n".join(lines)
+
+
 def _latest_exception_answer(question: str) -> str | None:
     """ "what is the latest exception" (found 2026-11-04: the LLM picked CMSSW_9_4). The newest build of the newest series."""
     if not re.fullmatch(r"\s*(?:what(?:'s|\s+is|\s+are)\s+)?the\s+(?:latest|newest|most\s+recent)\s+exceptions?\s*[?.!]*\s*", question, re.IGNORECASE):
@@ -13479,6 +13557,7 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
         return ("**If it also fails in IBs without your PR, it isn't from your PR.** Compare the same step's error in your PR's "
                 f"test and in the IB; this shows where it fails, not the cause.\n\n{where}", "deterministic:ib_or_pr")
     for handler, route in ((_not_imported_answer, "not_imported"), (_exit_code_difference_answer, "exit_code"),
+                           (_most_common_failure_answer, "most_common_failure"),
                            (_das_error_count_answer, "das_error_count"), (_workflow_failure_count_answer, "workflow_failure_count"),
                            (_failing_every_build_answer, "failing_every_build"), (_prs_by_author_answer, "prs_by_author"),
                            (_log_category_answer, "log_category"), (_latest_exception_answer, "latest_exception"), (_latest_pr_answer, "latest_pr"),
