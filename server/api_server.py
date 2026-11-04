@@ -8929,6 +8929,10 @@ def _not_failing_answer(question: str) -> str | None:
     some timed out under 8 concurrent users) to produce lists of thousands of names."""
     if not _NOT_FAILING_RE.search(question):
         return None
+    if _TEST_LOG_QUESTION_RE.search(question):
+        # "hidden problems in passed unit tests" asks about the logs, not for the passing ones
+        # (found 2026-11-04: answered "1,873 of 1,880 passed")
+        return None
     unit = bool(re.search(r"\bunit[\s-]*tests?\b|\bpackages?\b", question, re.IGNORECASE))
     rel = "RAN_UNITTEST" if unit else "RAN_RELVAL"
     arch = _requested_ib_arch(question)
@@ -10206,8 +10210,18 @@ def _test_log_question_answer(question: str, session_id: str, original_question:
     if not earlier:
         return f"`{to_tag}` has no earlier build with imported test logs to compare against."
     from_tag = f"{series}_X_{earlier[0]}"
+    wanted_arch = _requested_ib_arch(question)
+    if not wanted_arch and (_ARCH_COMPILER_RE.search(question) or _arch_family(question) or _OS_FAMILY_RE.search(question)):
+        # "hidden problems in the newest IB on el8" (found 2026-11-04: all architectures)
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                wanted_arch = _loose_arch_choice(question, [r["arch"] for r in session.run(
+                    "MATCH (r:TestLogRun) WHERE r.ib_tag = $tag RETURN DISTINCT r.arch AS arch", tag=to_tag)])
+        finally:
+            driver.close()
     try:
-        changes = get_test_log_changes(to_tag, from_tag, _requested_ib_arch(question))
+        changes = get_test_log_changes(to_tag, from_tag, wanted_arch)
     except Exception as exc:
         print(f"WARNING: test-log changes failed: {exc}")
         return "The raw IB test logs could not be searched right now; please try again."
