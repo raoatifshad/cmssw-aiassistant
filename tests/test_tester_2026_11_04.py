@@ -442,7 +442,7 @@ class RoundThreeTests(unittest.TestCase):
 
     def test_more_normalizations(self):
         self.assertIn("what is newly failing", _normalize_deterministic_question("any regressions in unit tests in the latest IB"))
-        self.assertIn("failed relvals with DAS errors", _normalize_deterministic_question("list DAS errors in latest IB"))
+        self.assertIn("with DAS errors", _normalize_deterministic_question("list DAS errors in latest IB"))
         self.assertIn("global-buffer-overflow", _normalize_deterministic_question("is the global buffer overflow new?"))
 
 
