@@ -401,6 +401,26 @@ class HourEightTests(unittest.TestCase):
                 self.assertIsNone(handler(question), (handler.__name__, question))
 
 
+class ReplayRegressionTests(unittest.TestCase):
+    """Each of these worked, then a later fix of the same day broke it; found by replaying every earlier round."""
+
+    def test_a_summary_of_one_ib_is_not_a_list_of_ibs(self):
+        from server.api_server import _list_ibs_answer
+        for question in ("give summary for latest ib", "can you give the summary of latest IB", "show known errors in the latest IB"):
+            self.assertIsNone(_list_ibs_answer(question), question)
+
+    def test_a_flavour_question_with_more_to_it_is_not_that_flavours_overview(self):
+        for question in ("which failures are only in ROOT6?", "unit tests failing in both ASAN and UBSAN", "my unit test FWIO/RNTupleTempTests fails in ROOT6 IB, is it just me?"):
+            self.assertIsNone(_shift_question_rewrite(question), question)
+
+    def test_other_questions_keep_their_own_handlers(self):
+        from server.api_server import _clang_checker_answer, _flavour_newest_answer, _workflows_by_name_answer
+        self.assertIsNone(_workflows_by_name_answer("what's a Phase-2 workflow?"))
+        self.assertIsNone(_clang_checker_answer("do you know about warning: Class 'X' has publically-accessible members [threadsafety.PublicMembers]"))
+        self.assertIsNone(_flavour_newest_answer("show sanitizer problems in the latest ASAN IB"))
+        self.assertIsNone(_shift_question_rewrite("list open PRs about Geant4"))
+
+
 class ConceptTests(unittest.TestCase):
     def test_terms(self):
         for question, expected in (("what's a global tag?", "conditions"), ("what is the ORP?", "orp-approved"),
