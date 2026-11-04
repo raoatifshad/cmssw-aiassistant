@@ -13398,10 +13398,38 @@ def _shift_question_rewrite(question: str) -> str | None:
     if terse and terse.strip().lower() != question.strip().rstrip("?.! ").lower():
         # a rewrite can be the fixed point of another rule ("ib of 3 nov"): never call again with what we were given
         return _shift_question_rewrite(terse) or terse
-    if re.search(r"\bone\s+(?:line|sentence)\b|\bheadlines?\b", question, re.IGNORECASE):
+    if re.search(r"\bone\s+(?:line|sentence)\b|\bheadlines?\b|\bis\s+the\s+(?:latest|newest|last)\s+(?:ib|build)\s+(?:clean|(?:all\s+)?green|ok|okay|good|healthy)\b", question, re.IGNORECASE):
         return None  # _one_line_status_answer (found 2026-11-04: "in one sentence, how are the IBs?" became the whole overview)
     if re.search(r"\b(?:anything|what'?s)\s+new\s+(?:overnight|today|this\s+morning)\b", question, re.IGNORECASE):
         return "what's new?"
+    wrapped_error = re.match(r"\s*(?:what(?:'s|\s+is)\s+this|seen\s+this|error|look\s+up)\s*[:?]\s*(.{12,})$", question, re.IGNORECASE)
+    if wrapped_error:
+        return wrapped_error.group(1).strip()
+    asked_known = re.match(r"\s*(.{12,}?),\s*(?:known|seen\s+before)\s*\??\s*$", question, re.IGNORECASE)
+    if asked_known:
+        return asked_known.group(1).strip()
+    if not IB_TAG_RE.search(question):
+        if re.search(r"\b(?:trouble|what\s+went\s+wrong|what\s+needs\s+attention|needs\s+attention)\b", question, re.IGNORECASE):
+            return "what is failing in the latest IB"
+        if re.search(r"\bregressions?\b[^?]*\b(?:latest|last|newest)\s+(?:ib|build)\b|\bwhich\s+failures\s+(?:went\s+away|disappeared)\b", question, re.IGNORECASE):
+            return "give me a shift summary"
+        if re.search(r"\bwhat\s+got\s+merged\b|\bmerged\s+in\s+the\s+last\s+build\b", question, re.IGNORECASE):
+            return "which PRs were merged in the latest IB?"
+        if re.search(r"\bchanges?\s+between\s+(?:the\s+)?(?:two|last\s+two)\s+(?:most\s+recent\s+|latest\s+)?(?:builds?|ibs?)\b", question, re.IGNORECASE):
+            return "compare the last two IBs"
+        if re.fullmatch(r"\s*(?:what(?:'s|\s+is)\s+)?(?:the\s+)?most\s+recent\s+(?:cmssw\s+)?(?:build|ib)\s*[?.!]*\s*|\s*what\s+ib\s+are\s+we\s+on\s*[?.!]*\s*|\s*did\s+a\s+new\s+ib\s+come\s+out\s*[?.!]*\s*", question, re.IGNORECASE):
+            return "what is the latest IB?"
+        tip = re.fullmatch(r"\s*what(?:'s|\s+is)\s+the\s+tip\s+of\s+(?:CMSSW_)?(\d{1,2}_\d{1,2})(?:_X)?\s*[?.!]*\s*", question, re.IGNORECASE)
+        if tip:
+            return f"latest {tip.group(1)} IB"
+        if re.search(r"\bsummari[sz]e\s+the\s+shift\b|\bhandover\s+note\b|\bwhat\s+do\s+i\s+tell\s+the\s+next\s+shifter\b", question, re.IGNORECASE):
+            return "give me a shift summary"
+    authored = re.fullmatch(r"\s*who\s+(?:authored|wrote|opened|made)\s+(?:pr\s*)?#?(\d{3,6})\s*[?.!]*\s*", question, re.IGNORECASE)
+    if authored:
+        return f"who wrote PR {authored.group(1)}?"
+    mentioning = re.fullmatch(r"\s*open\s+issues?\s+(?:mentioning|talking\s+about|that\s+mention)\s+(\S+)\s*[?.!]*\s*", question, re.IGNORECASE)
+    if mentioning:
+        return f"list open issues about {mentioning.group(1)}"
     if re.search(r"\bwalk\s+me\s+through\b[^?]*\b(?:ib|build|today)\b", question, re.IGNORECASE) and not IB_TAG_RE.search(question):
         return "what is failing in the latest IB"
     if re.search(r"\bwhat(?:'s|\s+is)\s+new\s+in\s+the\s+logs\b|\bwhat\s+(?:disappeared|went\s+away|is\s+gone)\b[^?]*\blogs\b", question, re.IGNORECASE):
@@ -14403,9 +14431,9 @@ def _latest_or_named_tag(question: str) -> str | None:
 
 
 _PER_DIMENSION_RE = re.compile(
-    r"\b(?:which|what)\s+(?:is\s+the\s+)?(?:worst\s+|best\s+)?(arch\w*|sub[\s-]*ibs?|flavou?rs?|variants?)\b[^?]*\b(?:most|worst|fewest|least|best)\b|"
+    r"\b(?:which|what)\s+(?:is\s+the\s+)?(?:worst\s+|best\s+)?(arch\w*|sub[\s-]*ibs?|flavou?rs?|variants?)\b[^?]*\b(?:most|worst|fewest|least|best|healthiest|cleanest)\b|"
     r"\b(?:worst|best)\s+(arch\w*|sub[\s-]*ibs?|flavou?rs?)\b|"
-    r"\b(?:failures?|fails?|failing\s+\w+|relvals?\s+failures?)\s+(?:per|by|for\s+each|in\s+each)\s+(arch\w*|sub[\s-]*ibs?|flavou?rs?|variants?)\b", re.IGNORECASE)
+    r"\b(?:failures?|fails?|failing\s+\w+|relvals?\s+failures?)(?:\s+counts?)?\s+(?:per|by|for\s+each|in\s+each)\s+(arch\w*|sub[\s-]*ibs?|flavou?rs?|variants?)\b", re.IGNORECASE)
 
 
 def _failures_by_dimension_answer(question: str) -> str | None:
@@ -14432,7 +14460,7 @@ def _failures_by_dimension_answer(question: str) -> str | None:
     ranked = sorted(groups.items(), key=lambda kv: (-kv[1]["errors"], -(kv[1]["failed"] + kv[1]["unit_failed"]), kv[0]))
     name = "Architecture" if by_arch else "Build type"
     with_results = [item for item in ranked if item[1]["relvals"]]
-    wants_fewest = bool(re.search(r"\b(?:best|fewest|least)\b", question, re.IGNORECASE))
+    wants_fewest = bool(re.search(r"\b(?:best|fewest|least|healthiest|cleanest)\b", question, re.IGNORECASE))
     pick = min if wants_fewest else max
     candidates = with_results or ranked
     if not by_arch and re.search(r"\bsub[\s-]*ibs?\b", question, re.IGNORECASE):
@@ -14899,7 +14927,8 @@ def _about_the_bot_answer(question: str) -> str | None:
 def _one_line_status_answer(question: str) -> str | None:
     """ "in one sentence, is 20_1 healthy?", "one line status of CMSSW" (found 2026-11-04: dead ends)."""
     safe_to_use = re.search(r"\bsafe\s+to\s+(?:start|cut|make|build|use)\b", question, re.IGNORECASE)
-    if not safe_to_use and not re.search(r"\b(?:one\s+(?:line|sentence)|short\s+status|tl;?dr|headlines?|is\s+(?:CMSSW_)?\d+_\d+(?:_X)?\s+healthy|is\s+cmssw\s+healthy)\b", question, re.IGNORECASE):
+    if not safe_to_use and not re.search(r"\b(?:one\s+(?:line|sentence)|short\s+status|tl;?dr|headlines?|is\s+(?:CMSSW_)?\d+_\d+(?:_X)?\s+healthy|is\s+cmssw\s+healthy|"
+                                         r"is\s+the\s+(?:latest|newest|last)\s+(?:ib|build)\s+(?:clean|(?:all\s+)?green|ok|okay|good|healthy))\b", question, re.IGNORECASE):
         return None
     latest = _latest_ib_records(None, _requested_release_series(question))
     if not latest:
@@ -14910,7 +14939,11 @@ def _one_line_status_answer(question: str) -> str | None:
     relvals = sum(len(r["failed"]) for r in records)
     units = sum(len(r["unit_failed"]) for r in records)
     waiting = sum(1 for r in records if not r["relvals"])
-    return (("That's for the release manager to decide; here is what the data shows. " if safe_to_use else "") +
+    verdict = ""
+    if re.search(r"\b(?:clean|green|ok|okay|good|healthy)\b", question, re.IGNORECASE) and not safe_to_use:
+        # a yes/no question gets its yes or no first; results still missing can't be a yes
+        verdict = "No: " if failed_builds or relvals or units else ("Not known yet: " if waiting else "Yes: ")
+    return (verdict + ("That's for the release manager to decide; here is what the data shows. " if safe_to_use else "") +
             f"`{tag}`: {'build failed on ' + ', '.join(f'`{b}`' for b in failed_builds) if failed_builds else 'all builds passed'}, "
             f"{relvals} RelVal and {units} unit-test failures across {len(records)} builds"
             + (f", {waiting} still without RelVal results" if waiting else "") + ".")
@@ -15624,6 +15657,68 @@ def _exception_category_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _prs_merged_on_day_answer(question: str) -> str | None:
+    """ "PRs merged today", "PRs merged yesterday", "last PR merged" (found 2026-11-04: the newest build's list either way)."""
+    day_word = re.search(r"\bprs?\b[^?]*\bmerged\s+(today|yesterday)\b|\bmerged\s+prs?\s+(today|yesterday)\b", question, re.IGNORECASE)
+    newest = re.search(r"\b(?:last|latest|newest|most\s+recent(?:ly)?)\s+(?:merged\s+pr|pr\s+merged)\b", question, re.IGNORECASE)
+    if (not day_word and not newest) or _requested_release_series(question):
+        return None  # "most recent PR merged in 20_1" has its own answer (found by the replay)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            if newest:
+                rows = [dict(r) for r in session.run("MATCH (p:PR) WHERE p.merged_at IS NOT NULL OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) RETURN p.repo AS repo, p.number AS n, p.title AS title, p.merged_at AS merged, head(collect(a.name)) AS who ORDER BY merged DESC LIMIT 1")]
+            else:
+                word = (day_word.group(1) or day_word.group(2)).lower()
+                day = (datetime.now(timezone.utc) - timedelta(days=1 if word == "yesterday" else 0)).strftime("%Y-%m-%d")
+                rows = [dict(r) for r in session.run("MATCH (p:PR) WHERE p.merged_at STARTS WITH $d OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) RETURN p.repo AS repo, p.number AS n, p.title AS title, p.merged_at AS merged, head(collect(a.name)) AS who ORDER BY merged DESC LIMIT 30", d=day)]
+    finally:
+        driver.close()
+    note = _github_export_note()
+    if newest:
+        if not rows:
+            return None
+        r = rows[0]
+        return f"The most recently merged imported PR is **{r['repo']} #{r['n']}** - {r['title']} (by `{r['who']}`, merged {r['merged'][:10]}). {note}."
+    if not rows:
+        return f"No imported PR was merged on {day} (UTC). {note}."
+    return f"**{len(rows)} PR(s)** merged on {day} (UTC):\n" + "\n".join(f"- **{r['repo']} #{r['n']}** - {r['title']} (by `{r['who']}`)" for r in rows) + f"\n\n{note}."
+
+
+def _digest_family_answer(question: str) -> str | None:
+    """ "shift summary for gcc14", "what's new on gcc14" (found 2026-11-04: the whole digest, the word ignored). The digest is per architecture."""
+    match = re.search(r"\b(?:shift\s+(?:summary|digest)|digest|what(?:'s|\s+is)\s+new|newly\s+(?:red|failing|broken))\b[^?]*\b(?:for|on)\s+(gcc\s*\d+|amd64|x86(?:_64)?)\b", question, re.IGNORECASE)
+    if not match or IB_TAG_RE.search(question):
+        return None
+    word = re.sub(r"\s+", "", match.group(1).lower()).replace("x86_64", "amd64").replace("x86", "amd64")
+    tag = _latest_or_named_tag(question)
+    arches = sorted({r["arch"] for r in _ib_build_records(tag, None, word)}) if tag else []
+    if not arches:
+        return f"`{tag}` has no build on `{word}`."
+    return (f"The shift summary is per architecture, and `{word}` is {len(arches)} of them in `{tag}`: {', '.join(f'`{a}`' for a in arches)}. "
+            f"Ask e.g. \"shift summary for {arches[0]}\", or \"{word} failures\" for what is failing on all of them.")
+
+
+def _who_is_on_topic_answer(question: str) -> str | None:
+    """ "is someone working on the ROCm unit tests?" (found 2026-11-04: "name an IB tag")."""
+    match = re.search(r"\b(?:is\s+(?:someone|anyone|anybody)|who(?:'s|\s+is))\s+(?:working\s+on|looking\s+at|fixing)\s+(?:the\s+)?([A-Za-z0-9_/+-]{3,})", question, re.IGNORECASE)
+    if not match or re.fullmatch(r"(?:it|this|that|these|those|workflow)", match.group(1), re.IGNORECASE):
+        return None
+    term = match.group(1)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (x) WHERE (x:Issue AND x.state = 'open' OR x:PR AND x.github_state = 'open' AND x.merged_at IS NULL) AND x.repo = 'cmssw' AND toLower(x.title) CONTAINS toLower($t) "
+                "RETURN labels(x)[0] AS kind, x.number AS n, x.title AS title ORDER BY n DESC LIMIT 8", t=term)]
+    finally:
+        driver.close()
+    lead = "I have no assignment data, so I can't say who is on it."
+    if not rows:
+        return f"{lead} No open Issue or PR has `{term}` in its title."
+    return f"{lead} Open items with `{term}` in the title (a text match):\n" + "\n".join(f"- **{r['kind']} #{r['n']}** - {r['title']}" for r in rows)
+
+
 def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     """Answers the 2026-11-04 test pass found missing; each returns None unless its phrasing matches."""
     if "\n" in question or len(question) > 200:
@@ -15646,7 +15741,7 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
                            (_recovered_window_answer, "recovered_window"), (_longest_failing_answer, "longest_failing"), (_workflow_last_pass_answer, "workflow_last_pass"),
                            (_workflow_identity_answer, "workflow_identity"), (_workflows_by_name_answer, "workflows_by_name"), (_who_to_ask_answer, "who_to_ask"),
                            (_merged_about_window_answer, "merged_about_window"), (_pr_version_update_answer, "pr_version_update"), (_pr_in_latest_answer, "pr_in_latest"),
-                           (_closed_issues_answer, "closed_issues"), (_ibs_on_day_answer, "ibs_on_day"), (_build_error_answer, "build_error"), (_most_compilation_warnings_answer, "most_compilation_warnings"),
+                           (_closed_issues_answer, "closed_issues"), (_ibs_on_day_answer, "ibs_on_day"), (_prs_merged_on_day_answer, "prs_merged_on_day"), (_digest_family_answer, "digest_family"), (_who_is_on_topic_answer, "who_is_on_topic"), (_build_error_answer, "build_error"), (_most_compilation_warnings_answer, "most_compilation_warnings"),
                            (_log_most_problems_answer, "log_most_problems"), (_exception_category_answer, "exception_category"),
                            (_not_imported_answer, "not_imported"), (_exit_code_difference_answer, "exit_code"),
                            (_flavour_newest_answer, "flavour_newest"), (_list_ibs_answer, "list_ibs"), (_ib_schedule_now_answer, "ib_schedule_now"),
