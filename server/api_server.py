@@ -10088,8 +10088,15 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
         driver.close()
 
     where = f" on `{arch}`" if arch else f" on {family} architectures" if family else ""
+    series = _requested_release_series(question)
+    if series:
+        # "is 10804.31 failing in 16_1?" (found 2026-11-04: the table of every other release)
+        prefix = f"CMSSW_{series[0]}_{series[1]}_"
+        rows = [r for r in rows if r["tag"].startswith(prefix)]
+        exception_rows = [r for r in exception_rows if r["tag"].startswith(prefix)]
+        where += f" in `{prefix[:-1]}`"
     if not rows:
-        if arch or family:
+        if arch or family or series:
             return f"Workflow `{workflow_id}` has no imported RelVal result{where}."
         return _workflow_prefix_choice_answer(session_id, f"{workflow_id.split('.')[0]}.", not_found_id=workflow_id)
     _last_workflow_contexts[session_id] = workflow_id
