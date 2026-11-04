@@ -2296,6 +2296,9 @@ def _pr_search_terms(question: str) -> list[str]:
         *quoted,
         *re.findall(r"\bCMSSW_\d+_\d+(?:_[A-Za-z0-9]+)+\b", question),
         *re.findall(r"\b\d{4,6}\.\d+\b", question),
+        # a global tag: "170X_upgrade2018_realistic_HI_v1" (found 2026-11-04: searched for
+        # `X_upgrade2018_realistic_HI_v1`, the digits cut off, and listed unrelated GT PRs)
+        *re.findall(r"\b\d{2,4}X_[A-Za-z0-9_]+\b", question),
         *package_paths,
         *(
             word for word in standalone
@@ -3495,6 +3498,11 @@ def _artifact_search_answer(question: str) -> str | None:
         lines.append("Matches are textual relevance evidence and do not prove a causal relationship or a fix.")
         return "\n".join(lines)
     lines = [heading]
+    if not fallback_rows and re.search(r"[\d_]", term):
+        # only the fuzzy index matched: "170X_upgrade2018_realistic_HI_v1" found PRs with the 110X
+        # tags, listed as if about it (found 2026-11-04)
+        lines = [f"No imported Issue or PR contains exactly `{term}`. Closest similar text (fuzzy match, may well be "
+                 "something else, e.g. another release's name):"]
     for row in matches:
         item_status = f"merged {row['merged_at']}" if row["merged_at"] else f"state `{row['state']}`"
         lines.append(f"- **{row['kind']} #{row['number']}** - {row['title']} ({item_status})")
