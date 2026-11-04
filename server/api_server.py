@@ -9732,6 +9732,44 @@ def _arch_scope_matches(question: str, session_id: str) -> tuple[str, str, list[
     return tag, words, matches, available
 
 
+_NEWEST_ARCH_IB_RE = re.compile(
+    r"\b(?:latest|newest|last)\s+(aarch64|arm64|arm|riscv\w*|amd64|x86_64|el\d+|slc\d+|gcc\d+)\s+(?:ib|build|release)s?\b", re.IGNORECASE)
+
+
+def _newest_tag_for_arch_word(word: str) -> tuple[str, list[str]] | None:
+    """(newest primary IB tag built on an architecture containing `word`, those architectures)."""
+    word = {"arm": "aarch64", "arm64": "aarch64", "x86_64": "amd64", "riscv": "riscv64"}.get(word.lower(), word.lower())
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB)-[:RAN_RELVAL]->() WHERE ib.variant IS NULL AND ib.arch CONTAINS $w "
+                "RETURN DISTINCT ib.tag AS tag, ib.arch AS arch", w=word)]
+    finally:
+        driver.close()
+    rows = [r for r in rows if _PRIMARY_IB_TAG_RE.match(r["tag"])]
+    if not rows:
+        return None
+    tag = max((r["tag"] for r in rows), key=_ib_sort_key)
+    return tag, sorted({r["arch"] for r in rows if r["tag"] == tag})
+
+
+def _with_newest_arch_ib(question: str) -> str:
+    """ "known errors in the newest aarch64 IB": the newest IB built on that architecture, which is
+    usually not the newest IB (found 2026-11-04: the latest IB's overview, no aarch64 in it)."""
+    match = None if IB_TAG_RE.search(question) else _NEWEST_ARCH_IB_RE.search(question)
+    if not match:
+        return question
+    try:
+        found = _newest_tag_for_arch_word(match.group(1))
+    except Exception as exc:
+        print(f"WARNING: newest architecture IB lookup failed: {exc}")
+        return question
+    if not found:
+        return question
+    return f"{question} {found[0]}" + (f" {found[1][0]}" if len(found[1]) == 1 else "")
+
+
 def _with_arch_family_context(question: str, session_id: str) -> str:
     """Resolve a loose CPU-family reference ("and on aarch64 only", "on arm") or OS
     family ("only el9") to the one full architecture it can mean for the IB in scope,
@@ -11687,6 +11725,7 @@ def _chat(req: ChatRequest):
 
     question = _with_relative_compare_tags(question)
     question = _with_variant_ib_context(question)
+    question = _with_newest_arch_ib(question)
     question, date_message = _date_tag_context(question)
     if date_message:
         today_fallback = _today_falls_back_to_latest(question)
