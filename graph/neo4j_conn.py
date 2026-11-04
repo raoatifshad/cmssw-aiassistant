@@ -99,6 +99,9 @@ def setup_schema(driver):
         "CREATE INDEX IF NOT EXISTS FOR (n:TestLogRun) ON (n.ib_key)",
         "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.source_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.ib_key)",
+        # chat filters test-log problems by IB tag (sanitizer list, named test): 1.8 s over
+        # 538k nodes without it (2026-11-04)
+        "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.ib_tag)",
         # test-log paste search groups matches by signature: a full scan of ~236k rows took 39s
         "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.signature_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.kind, n.in_passed)",
