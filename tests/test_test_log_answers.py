@@ -412,7 +412,7 @@ class PrStatusTests(unittest.TestCase):
     def test_merge_date_wins_then_the_export_state(self):
         from server.api_server import _pr_status
         self.assertEqual(_pr_status("2026-10-11T06:56:00Z", "open"), "merged 2026-10-11")
-        self.assertEqual(_pr_status(None, "open"), "open, not merged (per GitHub export)")
+        self.assertEqual(_pr_status(None, "open"), "open, not merged (per the imported GitHub data)")
         self.assertEqual(_pr_status(None, "closed"), "closed, no merge recorded")
         self.assertEqual(_pr_status(None, None), "not merged")
 

@@ -48,7 +48,7 @@ PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/i
 # the same path again deletes what that path imported before. cmssdt9-02 is reached with
 # your Kerberos ticket (renewed each run, max 5 days; or a fresh one from ~/.mrao.keytab if it
 # exists, kept on this PC only); nothing is stored or installed there.
-scripts/daily_refresh.sh [--install-cron|--uninstall-cron]   # STEPS="cmsrepo exceptions testlogs docs frontend checks"; also runs 10 min after each boot
+scripts/daily_refresh.sh [--install-cron|--uninstall-cron]   # STEPS="cmsrepo exceptions testlogs docs github frontend checks"; also runs 10 min after each boot
 # after each refresh it starts scripts/daily_tester.sh -- NIGHT ONLY (20:00-06:00, so after the 00:30 run; FORCE=1 by hand) (Claude Code headless, prompt scripts/tester_prompt.md,
 # worktree ../../cmssdt-kg-vacation on auto/vacation-fixes; reports in /home/rao/CHAT-BOT-AI/daily-test-reports/; TESTER=0 skips)
 # progress page (read-only, started @reboot by cron): http://localhost:8090 -- copy/scan GB done/left,
@@ -232,14 +232,15 @@ additionally deletes graph records whose backing source file is gone
   explicit `#number`/URL cross-references. Never calls GitHub live.
   **Stopgap since 2026-11-04:** the backup on cmssdt9-02 is stuck at 2026-09-04
   (`issues/latest.txt`), so `ingestion/fetch_github_web_updates.py` fetches the
-  Issues/PRs updated since then from the GitHub REST API by hand into
+  Issues/PRs updated since then from the GitHub REST API into
   `GITHUB-ISSUES/web-update/store` (same layout as the backup), and
-  `build_graph.py --github-issues` imports that (no `--reconcile`). Those nodes
+  `build_graph.py --github-issues` imports that (no `--reconcile`); the `github`
+  step of `scripts/daily_refresh.sh` does both on every refresh. Those nodes
   carry `fetched_via` and have no new comments (existing ones are kept); answers
   say so through `_github_export_note`. The bot never reads these files or GitHub
   while answering, only the database. The importer keeps whichever copy has the
   newer `updated_at`; when the real backup works again, its copies replace these
-  and clear `fetched_via`, and this fetch should stop being used.
+  and clear `fetched_via`, and that step should be deleted.
 
 **IB identity is always the pair `(tag, architecture)`** — never merge or
 dedupe across architectures. `CMSSW_<major>_<minor>_X_<timestamp>` is a
