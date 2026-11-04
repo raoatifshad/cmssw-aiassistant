@@ -1023,6 +1023,11 @@ def _normalize_deterministic_question(question: str) -> str:
         (r"\bpackages?\s+(?:that\s+)?(?:needs?|require|requires)\s+(?:fixing|to\s+be\s+fixed|a\s+fix|attention)\b",
          "failed unit-test packages"),
         (r"\bhow\s+much\b", "how many"),
+        # "should I worry about something in the latest IB?" (found 2026-11-04: just its tag)
+        (r"\bshould\s+i\s+(?:be\s+)?worr(?:y|ied)(?:\s+about\s+(?:something|anything))?\b|\bis\s+(?:there\s+)?anything\s+wrong\b",
+         "what is failing"),
+        # "cmsdist 10977 status?" (found 2026-11-04: "my lookups came back empty")
+        (r"\b(cmsdist|cmssw)\s*#?\s*(?=\d{4,6}\b(?!\.))", r"\1 PR "),
         # "exceptions in <tag>" (found 2026-11-04: the whole-IB summary table, no exception in it)
         (r"(?<!relval )(?<!relvals )\bexceptions?\s+(in|for|of)\s+(?=CMSSW_\d)", r"relval exceptions \1 "),
         # "which PRs went into <tag>" = merged in (found in a held-out pass 2026-10-15)
