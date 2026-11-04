@@ -12,6 +12,7 @@ from server.api_server import (
     _format_raw_evidence,
     _last_failed_builds,
     _listed_items_follow_up,
+    _most_common_failure_answer,
     _no_relvals_message,
     _not_imported_answer,
     _number_not_an_issue_answer,
@@ -150,6 +151,32 @@ class HourThreeTests(unittest.TestCase):
     def test_rewrites(self):
         self.assertEqual(_shift_question_rewrite("whay is 140.0 WF is coming from"), "where is workflow 140.0 failing")
         self.assertEqual(_shift_question_rewrite("what is the dafult IB"), "what is the latest IB")
+
+
+class MostCommonFailureTests(unittest.TestCase):
+    QUESTION = "what is the most common failure in the latest IB for all the architectures?"
+
+    @patch("server.api_server._newest_complete_primary_tag", return_value=("CMSSW_20_1_X_2026-11-03-1100", "partly imported."))
+    @patch("server.api_server.get_exit_code_names", return_value={31744: "TimeOut", 16640: "OtherCMS"})
+    @patch("server.api_server._latest_ib_records", return_value=LATEST)
+    @patch("server.api_server.get_driver")
+    def test_ranks_and_says_where(self, get_driver, *_):
+        def relval(workflow, code, variant):
+            return {"id": workflow, "name": f"N{workflow}", "exitcode": code, "variant": variant, "arch": "el9_amd64_gcc14"}
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.side_effect = [[relval("539.0", 31744, "primary"), relval("539.0", 31744, "CLANG"), relval("537.0", 16640, "primary")],
+                                   [{"id": "SimG4Core/Geometry", "variant": "primary", "arch": "el10_amd64_gcc15"}]]
+        answer = _most_common_failure_answer(self.QUESTION)
+        self.assertIn("**`539.0`**", answer)
+        self.assertIn("2 of the 3 failing RelVal results", answer)
+        self.assertIn("primary `el9_amd64_gcc14`, CLANG `el9_amd64_gcc14`", answer)
+        self.assertIn("31744 (TimeOut) × 2", answer)
+        self.assertIn("`SimG4Core/Geometry`", answer)
+        self.assertIn("partly imported", answer)
+
+    def test_time_windows_stay_with_the_other_rankings(self):
+        self.assertIsNone(_most_common_failure_answer("what's the most common failure this week?"))
+        self.assertIsNone(_most_common_failure_answer("what is the latest IB?"))
 
 
 class ConceptTests(unittest.TestCase):
