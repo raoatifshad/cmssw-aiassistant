@@ -6949,7 +6949,11 @@ def _addon_status_answer(question: str, session_id: str) -> str | None:
     """ "are addon tests passing in the latest IB?" -- found 2026-11-03 answered with just the
     latest IB's tag. The AddOn status per IB/architecture from the IB dashboard
     (IB.addon_status), primary and sub-IBs, never merged across architectures."""
-    if not _ADDON_STATUS_RE.search(question) or not _ADDON_STATUS_WORDS_RE.search(question):
+    if not _ADDON_STATUS_RE.search(question):
+        return None
+    # "addon tests for <tag>" (found 2026-11-04: the IB summary table, no addOn result in it)
+    if not _ADDON_STATUS_WORDS_RE.search(question) and not re.search(r"\b(?:for|in|of|on)\s+(?:the\s+)?(?:CMSSW_\d|latest|newest)",
+                                                                     question, re.IGNORECASE):
         return None
     if re.search(r"\b(?:prs?|pull\s+requests?|issues?|github)\b", question, re.IGNORECASE):
         return None
