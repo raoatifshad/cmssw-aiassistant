@@ -6811,6 +6811,22 @@ def _architectures_answer(question: str) -> str | None:
     match = _ARCH_LIST_RE.search(question)
     if not match or re.search(r"\bfail\w*|\bbroken|\berrors?\b|\bwarnings?\b", question, re.IGNORECASE):
         return None
+    tag_match = IB_TAG_RE.search(question)
+    if tag_match:
+        # "which architectures does <tag> have?" is about that build, not its whole release
+        # series (found 2026-11-04: the CMSSW_20_1_X table for a CPP23 tag)
+        tag = tag_match.group(1)
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                archs = sorted({r["arch"] for r in session.run(
+                    "MATCH (ib:IB {tag:$tag}) RETURN DISTINCT ib.arch AS arch", tag=tag)})
+        finally:
+            driver.close()
+        if not archs:
+            return f"No IB `{tag}` is imported."
+        return (f"`{tag}` is imported for **{len(archs)} architecture(s)**: " + ", ".join(f"`{a}`" for a in archs)
+                + ". An IB's other architectures can land hours later, and the data is refreshed twice a day.")
     word = (match.group(1) or "").lower()
     asked_arch = _requested_ib_arch(question)
     family = _arch_family(question) or (word if re.fullmatch(r"riscv\w*|aarch64|arm\w*|x86\w*|amd64|ppc\w*", word) else None)
