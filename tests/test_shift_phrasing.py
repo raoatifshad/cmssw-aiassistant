@@ -421,6 +421,58 @@ class ReplayRegressionTests(unittest.TestCase):
         self.assertIsNone(_shift_question_rewrite("list open PRs about Geant4"))
 
 
+class TerseInputTests(unittest.TestCase):
+    @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-11-03-2300"}])
+    def test_tags_as_people_type_them(self, _):
+        from server.api_server import _normalize_terse_words as n
+        self.assertEqual(n("cmssw_20_1_x_2026-11-03-1100"), "CMSSW_20_1_X_2026-11-03-1100")
+        self.assertEqual(n("relvals 20_1_X_2026-11-03-1100"), "relvals CMSSW_20_1_X_2026-11-03-1100")
+        self.assertIn("CMSSW_20_1_X_", n("compare 11-03-1100 and 11-03-2300"))
+        self.assertEqual(n("wich arch is worst"), "which arch is worst")
+        self.assertEqual(n("wf 539 failing?"), "workflow 539.0 failing?")
+        self.assertEqual(n("exit 31744"), "exit code 31744")
+
+    def test_dates(self):
+        from datetime import datetime
+        from server.api_server import _day_in_question as d
+        year = datetime.now().year
+        for text in ("nov 3rd", "3 nov", "3rd november", "03/11"):
+            self.assertEqual(d(text), f"{year}-11-03", text)
+        self.assertIsNone(d("what is the latest IB"))
+
+    def test_fragments(self):
+        from server.api_server import _terse_question as t
+        self.assertEqual(t("status"), "latest ib status")
+        self.assertEqual(t("537 log"), "log of 537.0 in the latest IB")
+        self.assertEqual(t("sig 6 what is it"), "what does SIGABRT mean")
+        self.assertEqual(t("why 537 fail"), "why does workflow 537.0 fail")
+        self.assertEqual(t("539.0 too"), "where is workflow 539.0 failing")
+        self.assertEqual(t("10805.31 on gcc15"), "where is workflow 10805.31 failing on gcc15")
+        self.assertEqual(t("SimG4Core/Geometry"), "is SimG4Core/Geometry failing?")
+        self.assertIsNone(t("what is the latest IB?"))
+        self.assertIsNone(t("how many relvals failed in the latest IB?"))
+        self.assertIsNone(t("test logs for 2026-10-21"))
+
+    def test_rewrites_terminate(self):
+        for question in ("ib of 3 nov", "why 537 fail", "why does workflow 537.0 fail", "2026-11-03", "03/11 ib", "ib from nov 3rd", "where is workflow 537.0 failing"):
+            _shift_question_rewrite(question)  # RecursionError found live on the test server
+
+    def test_pastes_are_left_alone(self):
+        self.assertIsNone(_shift_question_rewrite("An exception of category 'X' occurred\nwf 539 in 20_1_X_2026-11-03-1100"))
+
+    def test_exit_and_arch_handlers_leave_other_questions_alone(self):
+        from server.api_server import _arch_word_results_answer, _workflows_by_exit_answer
+        for question in ("what does exit code 16640 mean?", "which workflows time out most?", "what is the latest IB?"):
+            self.assertIsNone(_workflows_by_exit_answer(question), question)
+        for question in ("compare gcc14 and gcc15", "what is failing on el10", "why does 539.0 fail on gcc14"):
+            self.assertIsNone(_arch_word_results_answer(question), question)
+
+    def test_ok_thanks_is_thanks(self):
+        from server.api_server import _THANKS_RE
+        for text in ("ok thanks", "thanks", "okay, thanks a lot"):
+            self.assertTrue(_THANKS_RE.fullmatch(text), text)
+
+
 class ConceptTests(unittest.TestCase):
     def test_terms(self):
         for question, expected in (("what's a global tag?", "conditions"), ("what is the ORP?", "orp-approved"),
