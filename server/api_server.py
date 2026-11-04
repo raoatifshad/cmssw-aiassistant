@@ -11029,6 +11029,19 @@ _FOLLOW_UP_STATE_RE = re.compile(
 _FOLLOW_UP_WHY_RE = re.compile(
     r"^\s*(?:and\s+|but\s+)?why\s*(?:is\s+(?:it|that)|did\s+(?:it|that)\s+fail|(?:are|do)\s+they\s+fail(?:ing)?)?\s*[?.!]*\s*$",
     re.IGNORECASE)
+_FOLLOW_UP_WHAT_DOES_RE = re.compile(
+    r"^\s*(?:and\s+|so\s+)?(?:what\s+(?:does|did)\s+(?:it|this|that)(?:\s+(?:one|pr))?\s+(?:do|change|fix)|"
+    r"what\s+(?:is|was)\s+(?:it|this|that)(?:\s+(?:one|pr))?\s+(?:about|for)|what\s+is\s+in\s+(?:it|this|that))\s*[?.!]*\s*$",
+    re.IGNORECASE)
+_FOLLOW_UP_EXIT_CODE_RE = re.compile(
+    r"^\s*(?:and\s+|so\s+)?what\s+(?:does|is)\s+(?:that|this|the|it)(?:\s+(?:exit\s*)?code)?(?:\s+mean)?\s*[?.!]*\s*$",
+    re.IGNORECASE)
+_FOLLOW_UP_NEW_RE = re.compile(
+    r"^\s*(?:and\s+|so\s+)?(?:(?:are\s+)?any(?:thing)?(?:\s+of\s+(?:them|those|these))?\s+new|what(?:'s|\s+is)\s+new|"
+    r"(?:are\s+)?(?:they|those|these)\s+new)\s*[?.!]*\s*$", re.IGNORECASE)
+_FOLLOW_UP_STEP_RE = re.compile(
+    r"^\s*(?:and\s+|so\s+)?(?:(?:in\s+|at\s+)?which\s+step|what\s+step)(?:\s+(?:did\s+)?(?:it|they|that)?\s*(?:fail(?:ed|s)?)?)?\s*[?.!]*\s*$",
+    re.IGNORECASE)
 _FOLLOW_UP_FLAVOUR_RE = re.compile(
     r"^\s*(?:and|what\s+about|how\s+about|same\s+for|and\s+what\s+about|and\s+for|also\s+for)\b[^?!]{0,30}?"
     r"\b(ASAN|UBSAN|CLANG|CPP23|CUDART|DBG|DEVEL|EVTGEN3|G4ADEPT|G4VECGEOM|GEANT4|MULTIARCHSV4|MULTIARCHS|NONLTO|"
@@ -11093,6 +11106,23 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
         if pr:
             return f"what does PR {pr.group(1)} do"
         return None
+    # found 2026-11-04, all the "couldn't match that" menu: "what does it do?" after a PR,
+    # "what does that exit code mean?", "which step?" after a workflow, "any of them new?" after
+    # the test-log problems
+    if _FOLLOW_UP_WHAT_DOES_RE.match(question):
+        if pr:
+            return f"what does PR {pr.group(1)} do"
+        return f"issue {issue.group(1)}" if issue else None
+    if _FOLLOW_UP_EXIT_CODE_RE.match(question) and not re.search(r"\b(?:it|this|that)\s*(?:mean)?\s*[?.!]*\s*$", question, re.IGNORECASE):
+        code = _EXIT_CODE_QUESTION_RE.search(previous) or re.search(r"\bexit\s+(\d{2,6})\b", last["answer"])
+        return f"what does exit code {next(g for g in code.groups() if g)} mean" if code else None
+    if _FOLLOW_UP_NEW_RE.match(question) and last["route"] == "deterministic:test_log_changes":
+        return previous
+    if _FOLLOW_UP_STEP_RE.match(question):
+        workflow = (_WORKFLOW_ID_IN_TEXT_RE.search(previous) or re.search(r"\bwf\s+(\d{1,6}\.\d{1,6})\b", last["answer"])
+                    or re.search(r"`(\d{1,6}\.\d{1,6})`", last["answer"]))
+        tag = IB_TAG_RE.search(previous) or IB_TAG_RE.search(last["answer"])
+        return (f"why is workflow {workflow.group(1)} failing" + (f" in {tag.group(1)}" if tag else "")) if workflow else None
     if _FOLLOW_UP_WHY_RE.match(question):
         packages = re.findall(r"`([A-Z][A-Za-z0-9]+/[A-Za-z0-9_]+)`", last["answer"].split("Failed packages:", 1)[-1]) \
             if "Failed packages:" in last["answer"] else []

@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 
 from server import api_server
 from server.api_server import (
+    _TEST_LOG_QUESTION_RE, _WORKFLOW_WHERE_RE,
+    _architectures_answer, _not_failing_answer, _pr_search_terms, _resolve_short_follow_up, _turn_memory,
     _LOG_PROBLEM_PASTE_RE, _ib_failure_ranking_answer, _normalize_deterministic_question,
     _relval_exception_list_answer, _is_latest_ib_question, _loose_arch_choice, _render_metric_deltas,
     _today_falls_back_to_latest,
@@ -127,6 +129,68 @@ class ExceptionListTests(unittest.TestCase):
     def test_exceptions_in_a_tag_is_a_relval_exception_question(self):
         self.assertIn("relval exceptions in CMSSW_20_1_X_2026-11-03-1100",
                       _normalize_deterministic_question("exceptions in CMSSW_20_1_X_2026-11-03-1100"))
+
+
+class ShortFollowUpTests(unittest.TestCase):
+    def setUp(self):
+        self.sid = "tester-1104"
+        self.addCleanup(_turn_memory.pop, self.sid, None)
+
+    def _after(self, question, answer="", route="deterministic"):
+        _turn_memory[self.sid] = {"question": question, "answer": answer, "route": route}
+
+    def test_what_does_it_do_after_a_pr(self):
+        self._after("PR 52366 merged in which IB?")
+        self.assertEqual(_resolve_short_follow_up("what does it do?", self.sid), "what does PR 52366 do")
+
+    def test_that_exit_code_after_an_exit_code_question(self):
+        self._after("which workflows have exit code 25600 in the latest 20_1 IB?")
+        self.assertEqual(_resolve_short_follow_up("what does that exit code mean?", self.sid),
+                         "what does exit code 25600 mean")
+
+    def test_which_step_after_a_workflow(self):
+        self._after("why?", "Workflow `11024.2` (`TTbar`) in `CMSSW_17_1_X_2026-11-03-1100`:")
+        self.assertEqual(_resolve_short_follow_up("which step?", self.sid),
+                         "why is workflow 11024.2 failing in CMSSW_17_1_X_2026-11-03-1100")
+
+    def test_any_new_only_after_test_log_problems(self):
+        self._after("hidden problems in the newest IB", route="deterministic:test_log_changes")
+        self.assertEqual(_resolve_short_follow_up("any of them new?", self.sid), "hidden problems in the newest IB")
+        self._after("what is the latest IB?", route="deterministic")
+        self.assertIsNone(_resolve_short_follow_up("any of them new?", self.sid))
+
+
+class PhrasingTests(unittest.TestCase):
+    def test_hidden_problems_are_not_the_passing_list(self):
+        question = "hidden problems in passed unit tests in the newest IB"
+        self.assertTrue(_TEST_LOG_QUESTION_RE.search(question))
+        self.assertIsNone(_not_failing_answer(question))
+
+    def test_cmsdist_number_is_a_pr(self):
+        self.assertIn("cmsdist PR 10977", _normalize_deterministic_question("cmsdist 10977 status?"))
+        self.assertNotIn("PR", _normalize_deterministic_question("CMSSW_20_1 and cmssw 12345.5"))
+
+    def test_worry_is_a_failure_question(self):
+        self.assertIn("what is failing", _normalize_deterministic_question("should I worry about something in the latest IB?"))
+
+    def test_have_exit_code_filters(self):
+        with patch("server.api_server._is_latest_ib_question", return_value=False):
+            self.assertIsNone(api_server._relval_by_exit_code_answer("which workflows have the most failures?"))
+
+    def test_timing_out_is_a_where_question(self):
+        self.assertTrue(_WORKFLOW_WHERE_RE.search("is 539.0 timing out everywhere?"))
+
+    def test_global_tag_keeps_its_digits(self):
+        terms = _pr_search_terms("are there PRs about the missing global tag 170X_upgrade2018_realistic_HI_v1?")
+        self.assertIn("170X_upgrade2018_realistic_HI_v1", terms)
+        self.assertNotIn("X_upgrade2018_realistic_HI_v1", terms)
+
+    @patch("server.api_server.get_driver")
+    def test_architectures_of_one_tag(self, get_driver):
+        driver, _ = _driver_with([{"arch": "el9_amd64_gcc16"}, {"arch": "el9_amd64_gcc14"}])
+        get_driver.return_value = driver
+        text = _architectures_answer("which architectures does CMSSW_20_1_CPP23_X_2026-11-03-1100 have?")
+        self.assertIn("**2 architecture(s)**: `el9_amd64_gcc14`, `el9_amd64_gcc16`", text)
 
 
 if __name__ == "__main__":
