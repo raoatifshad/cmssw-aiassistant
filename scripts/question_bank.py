@@ -393,6 +393,18 @@ add("N5", "is there an open issue about DAS errors?", all=[r"DAS"], none=[r"most
 add("N5", "which sub-IB is in the worst shape?", all=[r"most failed"])
 add("N5", "which workflows timed out in the latest IB?", all=[r"31744|TimeOut"])
 
+# ---------------------------------------------------------------- N6: round 4, 2026-11-04
+add("N6", "status of CMSSW_17_1_X_2026-11-03-1100 on el8_amd64_gcc13", all=[r"el8_amd64_gcc13"], none=[r"Work items matching"])
+add("N6", "what is failing on el8_aarch64_gcc13 in 17_1?", all=[r"el8_aarch64_gcc13"], none=[r"ExternalLHEProducer"])
+add("N6", "any new sanitizer errors?", all=[r"ASAN"], none=[r"Shift summary"])
+add("N6", "which PRs touched FWCore this week?", all=[r"FWCore"])
+add("N6", "what changed in the IB of 2026-11-02 at 23:00?", all=[r"2026-11-02-2300"])
+add("N6", "is the latest IB better than yesterday's?", all=[r"Shift summary"])
+add("N6", "how much data do you have?", all=[r"imported"])
+add("N6", "what's the most common exception this week?", all=[r"Category"])
+add("N6", "which release series are active?", all=[r"CMSSW_20_1_X", r"release series"])
+add("N6", "bye", all=[r"Bye"])
+
 FACTS = [
     ("N4: 10805.31 failed with 25600 on el8 in CMSSW_20_1_X_2026-11-03-1100",
      "MATCH (r:RelVal {ib_tag:'CMSSW_20_1_X_2026-11-03-1100', arch:'el8_amd64_gcc14', workflow_id:'10805.31'}) "
