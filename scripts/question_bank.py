@@ -10,7 +10,8 @@ The expected facts (workflow 539.0's LogicError in CMSSW_20_1_CLANG_X_2026-10-14
 author, ...) were taken from the graph on 2026-10-16, and re-pinned on 2026-11-03 to IBs of
 2026-10-29 .. 2026-11-02 after the old --reconcile had deleted the 10-13/10-14 data. Since
 2026-11-03 the daily refresh keeps RelVal/unit-test results and PRs for 90 days, so these pins
-should hold until about 2027-01-27. Run --check-facts after a refresh: it says which pinned
+should hold until about 2027-01-27 (N4: added by the tester on 2026-11-04, pinned to IBs of
+11-02/03). Run --check-facts after a refresh: it says which pinned
 facts no longer hold, i.e. which questions need new values.
 Every answer is also checked for dead ends ("I couldn't match that", "No imported local
 evidence"), a literal None, "[object Object]", raw <tags> outside code, server errors, answers
@@ -311,9 +312,69 @@ add("RB", "failures in the 11:00 IB today", any=[r"1100|11:00"])
 add("RB", "how many workflows does the IB run?", any=[r"\d{3,}"])
 
 
+# ---------------------------------------------------------------- N4: from the 2026-11-04 tester run
+# pinned to the IBs of 2026-11-02/03 (kept 90 days); see the N4 facts below
+T3 = "CMSSW_20_1_X_2026-11-03-1100"       # 10805.31 ExternalFailure on el8, 539.0 TimeOut
+T17 = "CMSSW_17_1_X_2026-11-03-1100"      # 11 RelVals + CondTools/SiStrip fail: global tags not in the database
+CPP = "CMSSW_20_1_CPP23_X_2026-11-03-1100"  # 439 compile warnings on gcc16; Utilities/General, PerfTools/AllocMonitor
+add("N4", "what's wrong with 17_1 today? lots of relvals failing with 16640", all=[r"16640", r"CMSSW_17_1"])
+add("N4", "which IBs failed the most relvals this week?", all=[r"\| Failed \|"], none=[r"get_failing_relvals"])
+add("N4", "how many relvals failed in the last 30 days on riscv", all=[r"riscv64"])
+add("N4", f"compare CMSSW_20_1_X_2026-11-02-2300 and {T3} on el8_amd64_gcc14", all=[r"10805\.31", r"Newly failing"], none=[r"No new failures"])
+add("N4", "compare CMSSW_20_1_X_2026-11-02-1100 and CMSSW_20_1_X_2026-11-02-2300 el9_amd64_gcc14",
+    all=[r"RelVal errors"], none=[r"No new failures/errors"])
+add("N4", "difference between CMSSW_20_1_X_2026-11-02-1100 and CMSSW_20_1_X_2026-11-02-2300 on el9_amd64_gcc14", all=[r"IB comparison"])
+add("N4", "compare CMSSW_20_1_ROOT6_X_2026-11-02-2300 and CMSSW_20_1_X_2026-11-02-2300 el9_amd64_gcc14",
+    all=[r"ROOT6 vs primary", r"only in ROOT6:\*\* `10805\.31`", r"in both:\*\* `539\.0`"])
+add("N4", "heap-use-after-free edm::storage::File::syswrite", all=[r"heap-use-after-free", r"IOPool/Tests"])
+add("N4", "global-buffer-overflow in HGCalGeometry::getNewCorners, seen in ASAN logs. known?", all=[r"HGCalGeometry::getNewCorners", r"Run4"])
+add("N4", "Warning: Could not download index.php from CERNBox: HTTP Error 429: Too Many Requests", all=[r"test_dqm-plot"])
+add("N4", "Fatal exception 'ConfigFileReadError': unknown python problem occurred. KeyError: 'Run4D500'", all=[r"test_dumpRecoGeometry_Run4"])
+add("N4", 'Global Tag "170X_upgrade2018_realistic_HI_v1" has not been found in the database. from GTProxy::load', all=[r"CMSSW_17_1", r"ConditionDatabase"])
+add("N4", "are there PRs about the missing global tag 170X_upgrade2018_realistic_HI_v1?", all=[r"contains exactly"], none=[r"`X_upgrade"])
+add("N4", "why does TestIntegrationEventSetup fail on aarch64?", all=[r"FWCore/Integration/TestIntegrationEventSetup", r"Couldn't find available IOV slot"])
+add("N4", "FWCore/Integration failing on aarch64, which test?", all=[r"TestIntegrationEventSetup"])
+add("N4", f"why is CondTools/SiStrip failing in {T17}", all=[r"testCondToolsSiStripBuildersReaders", r"Global Tag"])
+add("N4", ["asan failures in CMSSW_20_1_ASAN_X_2026-11-02-2300", "what about the sanitizer problems in the test logs?"],
+    all=[r"sanitizer report", r"HGCalGeometry::getNewCorners"])
+add("N4", "are there sanitizer errors in passed tests in CMSSW_20_1_ASAN_X_2026-11-02-2300?", all=[r"reported as PASSED", r"global-buffer-overflow"])
+add("N4", f"hidden problems in passed unit tests in {T3} on el8_amd64_gcc14", all=[r"Problems inside tests"], none=[r"packages passed"])
+add("N4", f"why is DEVEL showing 4 relval failures in CMSSW_20_1_DEVEL_X_2026-11-02-2300?", all=[r"10804\.31", r"no exception text imported", r"539\.0"])
+add("N4", "why are there 50 relval failures on aarch64 in CMSSW_20_1_X_2026-11-02-2300", all=[r"known errors", r"31 workflows", r"ROOT6"])
+add("N4", f"how many compile warnings in {CPP} el9_amd64_gcc16?", all=[r"439"])
+add("N4", f"which architectures does {CPP} have?", all=[r"el9_amd64_gcc15", r"el9_amd64_gcc16"], none=[r"riscv"])
+add("N4", f"unit test failures in {CPP}", any=[r"Choose one", r"Utilities/General"])
+add("N4", [f"unit test failures in {CPP}", "and only gcc16?"], all=[r"RecoTracker/LSTCore", r"el9_amd64_gcc16"], none=[r"Choose one"])
+add("N4", "PR 52366 merged in which IB?", all=[r"52366"])
+add("N4", ["PR 52366 merged in which IB?", "what does it do?"], all=[r"SiPixelClusterShapeLimitsRcd"])
+add("N4", "cmsdist 10977 status?", all=[r"Geant4", r"Merged"])
+add("N4", [f"which workflows have exit code 25600 in {T3}?", "what does that exit code mean?"], all=[r"ExternalFailure"])
+add("N4", f"which workflows have exit code 25600 in {T3}?", all=[r"10805\.31"], none=[r"539\.0"])
+add("N4", [f"which relvals failed in {T17}?", "why?", "which step?"], all=[r"step2"])
+add("N4", "is 539.0 timing out everywhere?", all=[r"TimeOut", r"CMSSW_20_1"])
+add("N4", "is 10804.31 failing in 16_1?", all=[r"CMSSW_16_1"], none=[r"CMSSW_14_1"])
+add("N4", "known errors in the newest aarch64 IB", any=[r"aarch64"], all=[r"known"])
+add("N4", "show me the cmsDriver command of 10805.31", all=[r"runTheMatrix\.py -ne -l 10805\.31"])
+add("N4", "status of 20_0", all=[r"CMSSW_20_0"])
+add("N4", f"addon tests for {T3}", all=[r"AddOn", r"el8_amd64_gcc14"])
+add("N4", "summary of CMSSW_20_1_ASAN_X_2026-11-02-2300", all=[r"sub-IB"], none=[r"primary IB `CMSSW_20_1_ASAN"])
+
 # ---------------------------------------------------------------- facts the checks rely on
 # (label, cypher returning one row with a boolean `ok`): run with --check-facts
 FACTS = [
+    ("N4: 10805.31 failed with 25600 on el8 in CMSSW_20_1_X_2026-11-03-1100",
+     "MATCH (r:RelVal {ib_tag:'CMSSW_20_1_X_2026-11-03-1100', arch:'el8_amd64_gcc14', workflow_id:'10805.31'}) "
+     "RETURN r.status = 'FAILED' AND r.exitcode = 25600 AS ok"),
+    ("N4: 439 compile warnings in CPP23 11-03-1100 gcc16",
+     "MATCH (ib:IB {tag:'CMSSW_20_1_CPP23_X_2026-11-03-1100', arch:'el9_amd64_gcc16'}) RETURN ib.comp_warnings = 439 AS ok"),
+    ("N4: 17_1 11-03-1100 has global-tag ConditionDatabase exceptions",
+     "MATCH (e:RelValException {ib_tag:'CMSSW_17_1_X_2026-11-03-1100', category:'ConditionDatabase'}) RETURN count(e) = 11 AS ok"),
+    ("N4: TestIntegrationEventSetup failed on aarch64 in 11-02-2300",
+     "MATCH (t:TestLogRun {ib_tag:'CMSSW_20_1_X_2026-11-02-2300', arch:'el9_aarch64_gcc14', suite:'unit'}) "
+     "WHERE 'FWCore/Integration/TestIntegrationEventSetup' IN t.failed_tests RETURN count(t) > 0 AS ok"),
+    ("N4: no PR or Issue quotes the global tag 170X_upgrade2018_realistic_HI_v1",
+     "OPTIONAL MATCH (p) WHERE (p:PR OR p:Issue) AND (p.title CONTAINS '170X_upgrade2018_realistic_HI_v1' OR "
+     "p.body CONTAINS '170X_upgrade2018_realistic_HI_v1') RETURN count(p) = 0 AS ok"),
     ("LogicError 'open output file before input file' in 884 CLANG 10-14-2300 workflows",
      "MATCH (e:RelValException {ib_tag:'CMSSW_20_1_CLANG_X_2026-10-14-2300'}) WHERE e.message STARTS WITH "
      "'Attempt to open output file before input file' RETURN count(DISTINCT e.workflow_id) = 884 AS ok"),
