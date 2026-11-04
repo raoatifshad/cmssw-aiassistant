@@ -12923,7 +12923,7 @@ def _newest_flavour_tag(flavour: str, series: tuple[int, int] | None = None, wit
 def _flavour_newest_answer(question: str) -> str | None:
     """ "latest HeavyIon IB", "is CUDART built?", "last ROCK IB", "which releases have HI flavour?" (found 2026-11-04: the 20_1 primary IB)."""
     flavour = _flavour_in(question)
-    if not flavour or re.search(r"\b(?:fail\w*|broken|better|worse|changed|compare|diff|vs)\b", question, re.IGNORECASE):
+    if not flavour or re.search(r"\b(?:fail\w*|broken|better|worse|changed|compare|diff|vs|problems?|reports?|sanitizer)\b", question, re.IGNORECASE):
         return None
     if not re.search(r"\b(?:latest|newest|last|most\s+recent)\s+\w+\s+(?:ib|build)\b|\bis\s+\w+\s+(?:still\s+)?built\b|\bwhich\s+(?:releases?|series)\b", question, re.IGNORECASE):
         return None
@@ -12953,8 +12953,10 @@ def _flavour_newest_answer(question: str) -> str | None:
 def _list_ibs_answer(question: str) -> str | None:
     """ "show the last 5 IBs", "list IBs for 20_1 this week" (found 2026-11-04: dead ends)."""
     match = re.search(r"\b(?:show|list|give)\b[^?]*?\b(?:(?:last|latest|recent)\s+(\d{1,2})\s+)?ibs?\b", question, re.IGNORECASE)
-    if not match or re.search(r"\b(?:fail\w*|no\s+relval|without|sub[\s-]*ibs?|issues?|prs?)\b", question, re.IGNORECASE):
+    if not match or re.search(r"\b(?:fail\w*|no\s+relval|without|sub[\s-]*ibs?|issues?|prs?|summary|status|results?|known)\b", question, re.IGNORECASE):
         return None
+    if not match.group(1) and not re.search(r"\bibs\b", question, re.IGNORECASE):
+        return None  # "give summary for latest ib" is about one IB (found by the 2026-11-04 replay: real users' phrasing got this list)
     if not match.group(1) and not re.search(r"\b(?:week|month|last|latest|recent|for\s+(?:CMSSW_)?\d+_\d+)\b", question, re.IGNORECASE):
         return None
     count = int(match.group(1) or 14)
@@ -13173,7 +13175,7 @@ def _shift_question_rewrite(question: str) -> str | None:
     if reported:
         topic = re.sub(r"\s+(?:errors?|failures?|problems?|tests?(?:\s+failing.*)?|failing.*)$", "", reported.group(1), flags=re.IGNORECASE)
         return f"any PR or issue about {topic}?"
-    touching = re.search(r"\bopen\s+prs?\s+(?:touching|changing|about)\s+([A-Za-z0-9_/-]{3,})\s*[?.!]*\s*$", question, re.IGNORECASE)
+    touching = re.search(r"\bopen\s+prs?\s+(?:touching|changing)\s+([A-Za-z0-9_/-]{3,})\s*[?.!]*\s*$", question, re.IGNORECASE)
     if touching:
         return f"any open PR about {touching.group(1)}?"
     slot = re.fullmatch(r"\s*(?:what\s+about|and|how\s+about)\s+(yesterday|today)(?:'s)?\s+(\d{1,2}):?(\d{2})\s+(?:ib|build)\s*[?.!]*\s*", question, re.IGNORECASE)
@@ -13231,7 +13233,8 @@ def _shift_question_rewrite(question: str) -> str | None:
         changed = _flavour_change_question(flavour, series)
         if changed:
             return changed
-    if flavour and re.search(r"\bfail\w*\b|\bbroken\b|\bred\b|\bstatus\b", question, re.IGNORECASE) and not re.search(r"\b(?:prs?|issues?|why|because|exit\s*code)\b|(?<![\d.])\d+\.\d+(?![\d.])", question, re.IGNORECASE):
+    if flavour and re.search(r"\bfail\w*\b|\bbroken\b|\bred\b|\bstatus\b", question, re.IGNORECASE) and not re.search(
+            r"\b(?:prs?|issues?|why|because|exit\s*code|only|both|first\s+time|recovered|[A-Z][A-Za-z0-9]+/[A-Z][A-Za-z0-9]+)\b|(?<![\d.])\d+\.\d+(?![\d.])", question, re.IGNORECASE):
         # "is DBG failing?", "what's failing in CMSSW_5_3_HI?", "MULTIARCHS failures on gcc14" (found 2026-11-04: the 20_1 primary IB)
         flavour_tag = _newest_flavour_tag(flavour, series)
         if flavour_tag:
@@ -14537,8 +14540,8 @@ def _build_warning_scope_answer(question: str) -> str | None:
 
 def _clang_checker_answer(question: str) -> str | None:
     """ "which checker has the most clang warnings?", "threadsafety warnings in FWCore?" (found 2026-11-04: right numbers, labelled unverified)."""
-    if not re.search(r"\bchecker\b[^?]*\bwarnings?\b|\bthreadsafety\b|\bthread[\s-]safety\b", question, re.IGNORECASE):
-        return None
+    if not re.search(r"\bchecker\b[^?]*\bwarnings?\b|\bthreadsafety\b|\bthread[\s-]safety\b", question, re.IGNORECASE) or re.search(r"\bwarning:", question, re.IGNORECASE):
+        return None  # "warning: Class 'X' ..." is a pasted message (found by the replay)
     prefix = re.search(r"\b(?:in|for|of)\s+([A-Z][A-Za-z0-9_/]+)\b", question)
     driver = get_driver()
     try:
@@ -14953,7 +14956,7 @@ def _workflow_identity_answer(question: str) -> str | None:
 def _workflows_by_name_answer(question: str) -> str | None:
     """ "workflows related to Herwig", "which workflows use madgraph?", "list failing Phase-2 workflows" (found 2026-11-04: the IB's RelVal summary)."""
     match = re.search(r"\bworkflows?\s+(?:related\s+to|about|using|named|called|matching)\s+([A-Za-z][\w+-]{2,})\b|\bwhich\s+workflows?\s+(?:use|uses|run|runs)\s+([A-Za-z][\w+-]{2,})\b|\b(phase[\s-]*2)\s+workflows?\b", question, re.IGNORECASE)
-    if not match:
+    if not match or re.search(r"\bwhat(?:'s|\s+is)\s+an?\b", question, re.IGNORECASE):
         return None
     term = "Run4" if match.group(3) else (match.group(1) or match.group(2))
     only_failing = bool(re.search(r"\bfail", question, re.IGNORECASE))
