@@ -518,6 +518,14 @@ class HourElevenTests(unittest.TestCase):
         self.assertEqual(_resolve_short_follow_up("and the build?", "s-11"), "build status of CMSSW_17_1_X_2026-11-03-1100")
 
 
+class IbsOnDayTests(unittest.TestCase):
+    @patch("server.api_server._ib_slot_availability_answer", return_value="slots")
+    def test_today_is_asked_as_a_date_the_slot_answer_reads(self, slots):
+        from server.api_server import _ibs_on_day_answer, _IB_SLOT_AVAILABILITY_RE
+        self.assertEqual(_ibs_on_day_answer("which IBs ran today?"), "slots")
+        self.assertTrue(_IB_SLOT_AVAILABILITY_RE.search(slots.call_args[0][0]), slots.call_args[0][0])
+
+
 class ConceptTests(unittest.TestCase):
     def test_terms(self):
         for question, expected in (("what's a global tag?", "conditions"), ("what is the ORP?", "orp-approved"),
