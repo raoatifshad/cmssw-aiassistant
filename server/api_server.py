@@ -9916,6 +9916,19 @@ def _with_newest_arch_ib(question: str) -> str:
     return f"{question} {found[0]}" + (f" {found[1][0]}" if len(found[1]) == 1 else "")
 
 
+def _with_series_change_tags(question: str) -> str:
+    """ "what changed in 17_1 between the last two builds?": that series' two newest primary IBs
+    (found 2026-11-04: just the newest tag). Windows ("this week") stay with the digest."""
+    if IB_TAG_RE.search(question) or not re.search(r"\bwhat\s+changed\b|\bdiff(?:erence)?\b", question, re.IGNORECASE):
+        return question
+    series = _requested_release_series(question)
+    if not series or re.search(r"\bweek|\bmonth|\bdays?\b|\bsince\b", question, re.IGNORECASE):
+        return question
+    latest = _latest_ib_records(None, series)
+    older = _previous_primary_tag(latest[0]["tag"]) if latest else None
+    return f"what changed between {older} and {latest[0]['tag']}" if older else question
+
+
 def _with_arch_family_context(question: str, session_id: str) -> str:
     """Resolve a loose CPU-family reference ("and on aarch64 only", "on arm") or OS
     family ("only el9") to the one full architecture it can mean for the IB in scope,
@@ -11924,6 +11937,7 @@ def _chat(req: ChatRequest):
     question = _with_relative_compare_tags(question)
     question = _with_variant_ib_context(question)
     question = _with_newest_arch_ib(question)
+    question = _with_series_change_tags(question)
     question, date_message = _date_tag_context(question)
     if date_message:
         today_fallback = _today_falls_back_to_latest(question)
