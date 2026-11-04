@@ -5091,7 +5091,8 @@ class RenderMetricDeltasTests(unittest.TestCase):
         joined = "\n".join(lines)
 
         self.assertNotIn("| Failed RelVals |", joined)
-        self.assertIn("No new failures/errors -- Failed RelVals still 1", joined)
+        # RelVal errors moved, so this is not "no new failures" (found 2026-11-04)
+        self.assertIn("Unchanged: Failed RelVals still 1", joined)
         self.assertIn("| RelVal errors | 5 | 6 | +1 |", joined)
 
     def test_all_metrics_unchanged_or_zero_reports_no_changes(self):
@@ -5244,9 +5245,7 @@ class IbComparisonAnswerTests(unittest.TestCase):
         self.assertNotIn("neither requested IB", answer)
         self.assertIn("### `CLANG`", answer)
         # Failed RelVals is unchanged and nonzero (1 -> 1), so it's folded into the
-        # compact "no new failures" note rather than a redundant "1 | 1 | +0" row --
-        # see _render_metric_deltas.
-        self.assertIn("No new failures/errors -- ", answer)
+        # compact note rather than a redundant "1 | 1 | +0" row -- see _render_metric_deltas.
         self.assertIn("Failed RelVals still 1", answer)
         self.assertNotIn("| Failed RelVals |", answer)
 
