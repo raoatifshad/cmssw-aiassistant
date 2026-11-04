@@ -321,9 +321,21 @@ add("N4", "what's wrong with 17_1 today? lots of relvals failing with 16640", al
 add("N4", "which IBs failed the most relvals this week?", all=[r"\| Failed \|"], none=[r"get_failing_relvals"])
 add("N4", "how many relvals failed in the last 30 days on riscv", all=[r"riscv64"])
 add("N4", f"compare CMSSW_20_1_X_2026-11-02-2300 and {T3} on el8_amd64_gcc14", all=[r"10805\.31", r"Newly failing"], none=[r"No new failures"])
-add("N4", "compare CMSSW_20_1_X_2026-11-02-1100 and CMSSW_20_1_X_2026-11-02-2300 el9_amd64_gcc14",
+add("N4", "compare CMSSW_20_1_X_2026-11-02-1100 and CMSSW_20_1_X_2026-11-02-2300 el8_amd64_gcc14",
     all=[r"RelVal errors"], none=[r"No new failures/errors"])
-add("N4", "difference between CMSSW_20_1_X_2026-11-02-1100 and CMSSW_20_1_X_2026-11-02-2300 on el9_amd64_gcc14", all=[r"IB comparison"])
+add("N4", "difference between CMSSW_20_1_X_2026-11-02-1100 and CMSSW_20_1_X_2026-11-02-2300 on el8_amd64_gcc14", all=[r"IB comparison"])
+add("N4", "why is 539.0 timing out?", all=[r"TimeOut"], none=[r"Please provide"])
+add("N4", "MULTIARCHSV4 latest relval failures", all=[r"MULTIARCHSV4"])
+add("N4", "NONLTO warnings in the latest build?", all=[r"NONLTO"])
+add("N4", f"which workflows failed on both el8 and el9 in {T3}?", all=[r"539\.0"], none=[r"10805\.31"])
+add("N4", "known errors list for aarch64 20_1", all=[r"aarch64", r"known"], none=[r"No known-error"])
+add("N4", "what changed in 17_1 between the last two builds?", all=[r"CMSSW_17_1_X"])
+add("N4", f"how many problems in test logs of CMSSW_20_1_ASAN_X_2026-11-02-2300?", all=[r"PASSED"])
+add("N4", "what is an ExternalLHEProducer error?", all=[r"Child failed"], none=[r"What's failing"])
+add("N4", "what does SonicCallFailed mean?", all=[r"call failed after max 1 tries"])
+add("N4", "why would TritonService fail on aarch64?", all=[r"fallback server", r"non-x86_64"])
+add("N4", "which cmsdist PRs were merged in the last 30 days", all=[r"cmsdist #"], none=[r"cmssw #"])
+add("N4", "thanks, that helped", all=[r"welcome"])
 add("N4", "compare CMSSW_20_1_ROOT6_X_2026-11-02-2300 and CMSSW_20_1_X_2026-11-02-2300 el9_amd64_gcc14",
     all=[r"ROOT6 vs primary", r"only in ROOT6:\*\* `10805\.31`", r"in both:\*\* `539\.0`"])
 add("N4", "heap-use-after-free edm::storage::File::syswrite", all=[r"heap-use-after-free", r"IOPool/Tests"])

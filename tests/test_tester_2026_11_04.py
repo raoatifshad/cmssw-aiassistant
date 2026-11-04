@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from server import api_server
 from server.api_server import (
+    _basic_term_answer, _exception_term_answer, _known_error_list_answer, _relvals_on_both_answer, _with_series_change_tags,
     _build_warning_answer, _cross_flavour_comparison_answer, _ib_comparison_answer, _newest_tag_for_arch_word,
     _package_failing_tests_note, _prs_merged_window_answer, _with_full_year_dates, _with_newest_arch_ib,
     _with_newest_flavour_compare_tags, _named_test_answer, _sanitizer_problems_answer, _with_relative_compare_tags,
@@ -374,6 +375,75 @@ class MoreRoutingTests(unittest.TestCase):
     def test_status_of_a_series_and_summary_for_shifters(self):
         self.assertEqual(_normalize_deterministic_question("status of 20_0"), "what is failing in the latest 20_0 IB")
         self.assertIn("shift summary", _normalize_deterministic_question("summary for shifters of the latest 2 IBs"))
+
+
+class RoundThreeTests(unittest.TestCase):
+    def test_sanitizer_list_leaves_github_issue_questions_alone(self):
+        with patch("server.api_server.get_driver") as get_driver:
+            self.assertIsNone(_sanitizer_problems_answer("is there an issue about IOPool ASAN test failures?", "s"))
+            self.assertIsNone(_sanitizer_problems_answer("how many open issues mention ASAN?", "s"))
+            get_driver.assert_not_called()
+
+    @patch("server.api_server.get_driver")
+    def test_on_both_architectures_is_the_intersection(self, get_driver):
+        driver, _ = _driver_with([
+            {"arch": "el8_amd64_gcc14", "total": 954, "failed": ["539.0", "10805.31"], "names": []},
+            {"arch": "el9_amd64_gcc14", "total": 954, "failed": ["539.0"], "names": []},
+            {"arch": "el9_aarch64_gcc14", "total": 0, "failed": [], "names": []}])
+        get_driver.return_value = driver
+        text = _relvals_on_both_answer("which workflows failed on both el8 and el9 in CMSSW_20_1_X_2026-11-03-1100?")
+        self.assertIn("**1 RelVal(s)**", text)
+        self.assertIn("`539.0`", text)
+        self.assertNotIn("10805.31", text)
+        self.assertIsNone(_relvals_on_both_answer("which workflows failed in CMSSW_20_1_X_2026-11-03-1100?"))
+
+    @patch("server.api_server.get_driver")
+    def test_exception_word_shows_what_is_recorded_and_says_it_is_no_definition(self, get_driver):
+        driver, _ = _driver_with(
+            [{"category": "ExternalFailure", "message": "SonicCallFailed: call failed", "n": 33,
+              "workflows": ["10805.31"], "wf_count": 1, "last": "2026-11-03-1100"}],
+            [{"why": "Triton Server Instance for non-x86_64"}])
+        get_driver.return_value = driver
+        text = _exception_term_answer("what does SonicCallFailed mean?")
+        self.assertIn("not an explanation", text)
+        self.assertIn("33 record(s)", text)
+        self.assertIn("non-x86_64", text)
+
+    def test_exception_word_does_no_lookup_for_other_questions(self):
+        with patch("server.api_server.get_driver") as get_driver:
+            self.assertIsNone(_exception_term_answer("which PR fixes SonicCallFailed?"))
+            self.assertIsNone(_exception_term_answer("what is an IB?"))
+            get_driver.assert_not_called()
+
+    @patch("server.api_server._newest_tag_for_arch_word", return_value=("CMSSW_20_1_X_2026-11-02-2300", ["el9_aarch64_gcc14"]))
+    @patch("server.api_server.get_driver")
+    def test_known_errors_for_an_architecture_use_its_newest_build(self, get_driver, _):
+        driver, session = _driver_with([])
+        get_driver.return_value = driver
+        _known_error_list_answer("known errors list for aarch64 20_1", "s")
+        self.assertEqual(session.run.call_args.kwargs["tag"], "CMSSW_20_1_X_2026-11-02-2300")
+        self.assertEqual(session.run.call_args.kwargs["arch"], "el9_aarch64_gcc14")
+
+    @patch("server.api_server._previous_primary_tag", return_value="CMSSW_17_1_X_2026-11-02-2300")
+    @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_17_1_X_2026-11-03-1100"}])
+    def test_what_changed_in_a_series_names_its_two_builds(self, *_):
+        self.assertEqual(_with_series_change_tags("what changed in 17_1 between the last two builds?"),
+                         "what changed between CMSSW_17_1_X_2026-11-02-2300 and CMSSW_17_1_X_2026-11-03-1100")
+        self.assertEqual(_with_series_change_tags("what changed in 17_1 this week?"), "what changed in 17_1 this week?")
+
+    def test_difference_between_das_error_and_failed_is_a_definition(self):
+        text = _basic_term_answer("what's the difference between DAS_ERROR and FAILED?")
+        self.assertIn("DAS error", text)
+        self.assertIn("**FAILED**", text)
+
+    def test_timing_out_and_signals_are_about_the_workflow(self):
+        self.assertTrue(_WORKFLOW_WHERE_RE.search("537.0 SIGSEGV or SIGABRT, what is the pattern?"))
+        self.assertIsNone(api_server._exit_code_meaning_answer("537.0 SIGSEGV or SIGABRT, what is the pattern?"))
+
+    def test_more_normalizations(self):
+        self.assertIn("what is newly failing", _normalize_deterministic_question("any regressions in unit tests in the latest IB"))
+        self.assertIn("failed relvals with DAS errors", _normalize_deterministic_question("list DAS errors in latest IB"))
+        self.assertIn("global-buffer-overflow", _normalize_deterministic_question("is the global buffer overflow new?"))
 
 
 if __name__ == "__main__":
