@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from graph.tools import TOOLS, _with_int_limit
 from server.api_server import (
     _about_the_bot_answer,
+    _latest_ib_contexts,
     _basic_term_answer,
     _build_warning_scope_answer,
     _log_overview_question_answer,
@@ -480,6 +481,41 @@ class AccuracyAuditTests(unittest.TestCase):
 
     def test_exit_code_kind_goes_to_the_exit_answer(self):
         self.assertEqual(_shift_question_rewrite("is exit code 31744 a CMSSW exception?"), "what does exit code 31744 mean")
+
+
+class LongComparisonTests(unittest.TestCase):
+    def test_sub_ib_detail_goes_only_when_too_long(self):
+        from server.api_server import _condense_comparison_for_chat as condense
+        section = "#### `CLANG`\n" + "- x\n" * 4000
+        answer = "## All-architecture IB comparison\n\n**Newly failing:** 1\n\n### `el9_amd64_gcc14`\nkeep me\n\n" + section + "### `el8_amd64_gcc14`\nand me\n"
+        short = condense(answer)
+        self.assertIn("keep me", short)
+        self.assertIn("and me", short)
+        self.assertIn("left out", short)
+        self.assertLess(len(short), 1000)
+        small = "## All-architecture IB comparison\n\n#### `CLANG`\n- x\n"
+        self.assertEqual(condense(small), small)
+
+
+class HourElevenTests(unittest.TestCase):
+    def test_new_handlers_leave_other_questions_alone(self):
+        from server.api_server import _build_error_answer, _exception_category_answer, _log_most_problems_answer, _most_compilation_warnings_answer
+        for handler in (_build_error_answer, _exception_category_answer, _log_most_problems_answer, _most_compilation_warnings_answer):
+            for question in ("what is the latest IB?", "what is failing on el10", "why does 539.0 fail?", "how many ignored warnings in el10?", "what does exit code 16640 mean?"):
+                self.assertIsNone(handler(question), (handler.__name__, question))
+
+    def test_rewrites(self):
+        self.assertEqual(_shift_question_rewrite("what exceptions does 537.0 show?"), "why does workflow 537.0 fail")
+        self.assertEqual(_shift_question_rewrite("is DAS_ERROR a failure?"), "what's a DAS error?")
+        self.assertEqual(_shift_question_rewrite("my PR 52303 merged, is it in an IB?"), "which IB first contains PR 52303?")
+        self.assertEqual(_shift_question_rewrite("any new leak in ASAN?"), "sanitizer reports in the latest ASAN IB")
+
+    @patch("server.api_server._previous_primary_tag", return_value="CMSSW_17_1_X_2026-11-02-2300")
+    def test_compare_with_previous_keeps_the_ib_in_the_conversation(self, _):
+        _turn_memory["s-11"] = {"question": "q", "answer": "a", "route": "x"}
+        _latest_ib_contexts["s-11"] = "CMSSW_17_1_X_2026-11-03-1100"
+        self.assertEqual(_resolve_short_follow_up("compare with the previous one", "s-11"), "compare CMSSW_17_1_X_2026-11-02-2300 with CMSSW_17_1_X_2026-11-03-1100")
+        self.assertEqual(_resolve_short_follow_up("and the build?", "s-11"), "build status of CMSSW_17_1_X_2026-11-03-1100")
 
 
 class ConceptTests(unittest.TestCase):

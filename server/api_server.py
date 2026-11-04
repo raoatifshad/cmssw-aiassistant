@@ -7357,6 +7357,16 @@ def _condense_comparison_for_chat(answer: str) -> str:
     condensed, removed = _SUB_IB_PR_BLOCK_RE.subn("", answer)
     if removed:
         condensed = condensed.rstrip() + f"\n\n_The merged-PR lists of {removed} sub-IB(s) are left out here; ask \"which PRs were merged in [IB tag]\" for one._"
+    if len(condensed) > 15000 and condensed.startswith("## All-architecture"):
+        # still 20k+ (found 2026-11-04): every change is already in the lists at the top, each marked with its sub-IB
+        names: list[str] = []
+        def drop(match: re.Match) -> str:
+            if match.group(1) not in names:
+                names.append(match.group(1))
+            return ""
+        shorter = re.sub(r"(?ms)^#### `([^`]+)`\n.*?(?=^#{2,4} |^_The merged-PR|\Z)", drop, condensed)
+        if names:
+            condensed = shorter.rstrip() + "\n\n_The per-architecture detail of the sub-IBs (" + ", ".join(f"`{n}`" for n in names) + ") is left out; every change is in the lists at the top. Compare one sub-IB tag with another for its own detail._"
     return condensed
 
 
@@ -9622,6 +9632,9 @@ def _known_error_list_answer(question: str, session_id: str) -> str | None:
 
 
 _BASIC_TERMS = (
+    (r"thepeg(?:::|\s+)?(?:exceptions?)?",
+     "**ThePEG** is the C++ event-generator toolkit that Herwig is built on. A `ThePEG::Exception` was thrown inside the generator code; its "
+     "message says what happened. Ask \"which IBs have ThePEG exception\" for where it is recorded."),
     (r"runthematrix(?:\.py)?|the\s+matrix|relval\s+matrix",
      "**`runTheMatrix.py`** is the CMSSW command that runs RelVal workflows by number: inside a CMSSW area "
      "(after `cmsenv`), `runTheMatrix.py -l 1349.0` runs workflow 1349.0, `-l 1349.0,25.0` several, `-j 4` in "
@@ -12628,6 +12641,21 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
     if re.fullmatch(r"\s*list\s+(?:them|those|these)\s*[?.!]*\s*", question, re.IGNORECASE) and _latest_ib_contexts.get(sid):
         kind = "unit tests" if str(last.get("route", "")).endswith("unittest") else "relvals"
         return f"list failed {kind} in {_latest_ib_contexts[sid]}"
+    context_ib = _latest_ib_contexts.get(sid)
+    if context_ib and re.fullmatch(r"\s*(?:and\s+)?(?:the\s+)?builds?\s*[?.!]*\s*", question, re.IGNORECASE):
+        return f"build status of {context_ib}"
+    if context_ib and re.fullmatch(r"\s*compare\s+(?:it\s+)?(?:with|to)\s+(?:the\s+)?previous(?:\s+(?:one|build|ib))?\s*[?.!]*\s*", question, re.IGNORECASE):
+        # found 2026-11-04: compared the newest 20_1 builds, after a question about 17_1
+        before = _previous_primary_tag(context_ib)
+        if before:
+            return f"compare {before} with {context_ib}"
+    if str(last.get("route", "")).endswith("failures_by_dimension"):
+        if re.fullmatch(r"\s*(?:and\s+)?which(?:\s+the)?\s+(?:least|fewest|best)\s*[?.!]*\s*|\s*and\s+the\s+(?:least|fewest|best)\s*[?.!]*\s*", question, re.IGNORECASE):
+            return "which architecture has the fewest failures?"
+        if re.fullmatch(r"\s*which\s+sub[\s-]*ibs?\s*[?.!]*\s*", question, re.IGNORECASE):
+            return "which sub-IB has the most failures?"
+    if pr_before and re.fullmatch(r"\s*which\s+(?:one|ib)\s*[?.!]*\s*", question, re.IGNORECASE):
+        return f"which IB first contains PR {pr_before.group(1)}?"
     other_slot = re.fullmatch(r"\s*compare\s+(?:it|this|that)\s+(?:with|to|against)\s+the\s+(\d{1,2}):?(\d{2})\s+(?:one|ib|build)\s*[?.!]*\s*", question, re.IGNORECASE)
     if other_slot and _latest_ib_contexts.get(sid):
         context_tag = _latest_ib_contexts[sid]
@@ -13374,6 +13402,28 @@ def _shift_question_rewrite(question: str) -> str | None:
         return None  # _one_line_status_answer (found 2026-11-04: "in one sentence, how are the IBs?" became the whole overview)
     if re.search(r"\b(?:anything|what'?s)\s+new\s+(?:overnight|today|this\s+morning)\b", question, re.IGNORECASE):
         return "what's new?"
+    if re.search(r"\bwalk\s+me\s+through\b[^?]*\b(?:ib|build|today)\b", question, re.IGNORECASE) and not IB_TAG_RE.search(question):
+        return "what is failing in the latest IB"
+    if re.search(r"\bwhat(?:'s|\s+is)\s+new\s+in\s+the\s+logs\b|\bwhat\s+(?:disappeared|went\s+away|is\s+gone)\b[^?]*\blogs\b", question, re.IGNORECASE):
+        return "any hidden problems in passed tests?"
+    if re.search(r"\b(?:new\s+)?leaks?\b[^?]*\bASAN\b|\bASAN\b[^?]*\bleaks?\b", question, re.IGNORECASE):
+        return "sanitizer reports in the latest ASAN IB"
+    if re.search(r"\bwhat\s+changed\s+in\s+the\s+code\b", question, re.IGNORECASE) and not IB_TAG_RE.search(question):
+        return "which PRs were merged in the latest IB?"
+    prs_in_slot = re.search(r"\b(?:which|what)\s+prs?\s+(?:came\s+in|went\s+in(?:to)?|are\s+in|were\s+in)\s+(?:the\s+)?(\d{1,2}):?(\d{2})\s+(?:ib|build)\b", question, re.IGNORECASE)
+    if prs_in_slot:
+        return f"which PRs were merged in the latest {int(prs_in_slot.group(1)):02d}:{prs_in_slot.group(2)} IB?"
+    built_slot = re.search(r"\b(?:has|did)\s+today'?s\s+(\d{1,2}):?(\d{2})\s+(?:ib\s+)?(?:built?|finish\w*|out)\b", question, re.IGNORECASE)
+    if built_slot:
+        return f"is the {int(built_slot.group(1)):02d}:{built_slot.group(2)} IB of today out?"
+    if re.search(r"\bis\s+das[\s_]*errors?\s+a\s+(?:failure|fail|problem|bug)\b", question, re.IGNORECASE):
+        return "what's a DAS error?"
+    exceptions_of = re.search(r"\bwhat\s+exceptions?\s+(?:does|did|has)\s+(?:workflow\s+)?(\d{1,8}\.\d{1,7})\b", question, re.IGNORECASE)
+    if exceptions_of and not IB_TAG_RE.search(question):
+        return f"why does workflow {exceptions_of.group(1)} fail"
+    pr_in_ib = re.search(r"\bmy\s+pr\s*#?(\d{3,6})\b[^?]*\bin\s+an?\s+ib\b", question, re.IGNORECASE)
+    if pr_in_ib:
+        return f"which IB first contains PR {pr_in_ib.group(1)}?"
     if re.search(r"\bwhat(?:'s|\s+is)\s+broken\b", question, re.IGNORECASE) and not IB_TAG_RE.search(question):
         return "what is failing in the latest IB"
     if re.search(r"\bshould\s+i\s+escalate\b|\bi\s+should\s+escalate\b|\bworth\s+escalating\b", question, re.IGNORECASE):
@@ -13833,6 +13883,22 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
         named = re.search(r"`(\d{1,8}\.\d{1,7})`", answer)
         if named:
             return _who_to_ask_answer(f"who is looking at workflow {named.group(1)}?")
+    if re.fullmatch(r"\s*which\s+of\s+them\s+failed\s+before\s*[?.!]*\s*", question, re.IGNORECASE):
+        question = "have they failed before?"
+    if re.fullmatch(r"\s*does\s+the\s+(?:ib\s+)?dashboard\s+show\s+(?:these|them|this|those)\s*[?.!]*\s*", question, re.IGNORECASE) and "reported as PASSED" in answer:
+        return "No: these are inside tests the dashboard reports as passed. They come from scanning the raw test logs, so only this chat and the Shift Console show them."
+    shown_issue = re.search(r"## Issue #(\d{3,6})", answer)
+    if shown_issue and re.fullmatch(r"\s*(?:any\s+)?(?:related|linked)\s+(?:prs?|issues?)\s*[?.!]*\s*", question, re.IGNORECASE):
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                linked = [dict(r) for r in session.run(
+                    "MATCH (i:Issue {repo:'cmssw', number:$n})-[:REFERENCES]-(x) RETURN labels(x)[0] AS kind, x.number AS n, x.title AS title ORDER BY n DESC LIMIT 12", n=int(shown_issue.group(1)))]
+        finally:
+            driver.close()
+        if not linked:
+            return f"No imported item explicitly references Issue #{shown_issue.group(1)}. {_github_export_note()}."
+        return f"Items with an explicit reference to or from Issue #{shown_issue.group(1)} (a link, not proof of a fix):\n" + "\n".join(f"- **{r['kind']} #{r['n']}** - {r['title']}" for r in linked)
     if "Recorded message" in answer:
         _last_exception_answers[sid] = answer
     elif re.fullmatch(r"\s*is\s+(?:it|this|that)\s+tracked(?:\s+anywhere)?\s*[?.!]*\s*", question, re.IGNORECASE) and sid in _last_exception_answers:
@@ -13969,6 +14035,9 @@ def _error_line_answer(question: str) -> str | None:
 
 
 _NOT_IMPORTED_TOPICS = (
+    (r"\bwho\s+(?:reviewed|approved|signed(?:\s+off)?)\b", "who reviewed a PR, only its labels and who wrote it"),
+    (r"\bwho\s+closed\b", "who closed an Issue, only that it was closed and when"),
+    (r"^\s*(?:what|which)\s+files\s*\??\s*$", "which files a PR changed, only how many and the lines added and removed"),
     (r"\bdid\s+(?:the\s+)?[\w.-]+\s+(?:update|upgrade|change|bump|merge)\s+(?:break|cause)\b",
      "what caused a failure: the data shows timing and text matches, never causes. Ask when the test started failing and which PRs came in with that build"),
     (r"\bhow\s+long\b[^?]*\b(?:build|ib)\b[^?]*\b(?:take|took|last)\b|\bbuild\s+(?:time|duration)\b", "how long a build took"),
@@ -14365,7 +14434,11 @@ def _failures_by_dimension_answer(question: str) -> str | None:
     with_results = [item for item in ranked if item[1]["relvals"]]
     wants_fewest = bool(re.search(r"\b(?:best|fewest|least)\b", question, re.IGNORECASE))
     pick = min if wants_fewest else max
-    top = pick(with_results or ranked, key=lambda kv: kv[1]["failed"] + kv[1]["unit_failed"])
+    candidates = with_results or ranked
+    if not by_arch and re.search(r"\bsub[\s-]*ibs?\b", question, re.IGNORECASE):
+        # "which sub-IB is worst?" named the primary IB (found 2026-11-04)
+        candidates = [item for item in candidates if item[0] != "primary"] or candidates
+    top = pick(candidates, key=lambda kv: kv[1]["failed"] + kv[1]["unit_failed"])
     failed_builds = [k for k, v in ranked if v["errors"]]
     lines = [f"In `{tag}` and its sub-IBs, **`{top[0]}`** has the {'fewest' if wants_fewest else 'most'} failing results, among those with results: {top[1]['failed']} RelVal(s) and {top[1]['unit_failed']} unit test(s)"
              + (f", across {top[1]['builds']} builds." if by_arch and top[1]["builds"] > 1 else ".")]
@@ -14947,7 +15020,7 @@ def _both_flavours_answer(question: str) -> str | None:
 
 def _build_progress_answer(question: str) -> str | None:
     """ "which builds are still running?", "did the 23:00 build finish?", "which architectures haven't reported?" (found 2026-11-04: dead ends; the list of all architectures)."""
-    match = re.search(r"\bstill\s+(?:running|building|in\s+progress)\b|\bhaven'?t\s+(?:reported|finished)\b|\bnot\s+reported\b|\b(?:no|without)\s+relval\s+results\b|"
+    match = re.search(r"\bstill\s+(?:running|building|in\s+progress)\b|\bhaven'?t\s+(?:reported|finished)\b|\bnot\s+reported\b|\b(?:no|without)\s+relval\s+results\b|\bno\s+results\s+yet\b|"
                       r"\b(?:did|has)\s+the\s+(?:(\d{1,2}):?(\d{2})\s+)?(?:ib|build)\s+finish\w*\b", question, re.IGNORECASE)
     if not match:
         return None
@@ -15324,13 +15397,25 @@ def _workflows_by_exit_answer(question: str) -> str | None:
     if code and (IB_TAG_RE.search(question) or re.search(r"\b(?:latest|newest)\b", question, re.IGNORECASE)):
         return None  # the scoped form has its own handler, with more detail (found by the replay)
     named = re.search(r"\b(sig[a-z]{2,5}|time\s*-?\s*outs?|segfaults?|segv|seg\s+fault|oom|out\s+of\s+memory|aborts?|aborted)\b", question, re.IGNORECASE)
+    if re.search(r"\bdas[\s_-]*errors?\b", question, re.IGNORECASE):
+        return _das_error_count_answer("how many DAS errors in the latest IB")
+    exit_name = None
     if not code and not named:
-        return None
+        # exit names are CamelCase: only then is it worth a lookup
+        candidates = re.findall(r"\b[A-Z][a-z]+[A-Z][A-Za-z]+\b", question)
+        if not candidates:
+            return None
+        known = {str(n).lower(): str(n) for n in (get_exit_code_names() or {}).values() if n}
+        exit_name = next((known[w.lower()] for w in candidates if w.lower() in known), None)
+        if not exit_name:
+            return None
     label, names, codes = "", [], []
     if code:
         number = int(code.group(1))
         codes = [number] + ([number * 256] if number < 256 else []) + ([(number & 0xFF) << 8] if 7000 <= number <= 9999 else [])
         label = f"exit code {number}"
+    elif exit_name:
+        names, label = [exit_name], exit_name
     else:
         word = named.group(1).lower().replace(" ", "").replace("-", "")
         names = (["TimeOut"] if word.startswith("time") else ["SIGSEGV"] if word.startswith(("seg", "sigseg")) else ["BadAlloc", "SIGKILL"] if word in ("oom", "outofmemory")
@@ -15428,6 +15513,117 @@ def _most_architectures_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _ibs_on_day_answer(question: str) -> str | None:
+    """ "which IBs ran today?" (found 2026-11-04: an LLM dead end)."""
+    match = re.search(r"\bwhich\s+ibs?\s+(?:ran|built|were\s+built|have\s+run)\s+(today|yesterday)\b", question, re.IGNORECASE)
+    if not match:
+        return None
+    day = datetime.now() - timedelta(days=1 if match.group(1).lower() == "yesterday" else 0)
+    return _ib_slot_availability_answer(f"ib of {day.day} {list(_MONTH_NUMBERS)[day.month - 1]}")
+
+
+def _build_error_answer(question: str) -> str | None:
+    """ "is the el10 build error new?", "when did el10 last build ok?", "which packages failed to compile on el10?" (found 2026-11-04:
+    the failure overview; all architectures; failing unit tests presented as compile failures)."""
+    word = re.search(r"\b((?:el|fc|slc)\d+_[a-z0-9]+_gcc\d+|el\d+|fc\d+|gcc\s*\d+|aarch64|arm64?|riscv\w*|amd64)\b", question, re.IGNORECASE)
+    if not word or not re.search(r"\bbuild\s+(?:errors?|failures?|failed|broken)\b|\bfailed\s+to\s+(?:compile|build)\b|\bcompile\s+errors?\b|\blast\s+(?:build\s+)?(?:built?\s+)?(?:ok|good|green|fine|pass\w*)\b|\bbuild\s+ok\b", question, re.IGNORECASE):
+        return None
+    if IB_TAG_RE.search(question):
+        return None
+    raw = re.sub(r"\s+", "", word.group(1).lower())
+    family = {"arm": "aarch64", "arm64": "aarch64"}.get(raw, "riscv64" if raw.startswith("riscv") else raw)
+    prefix, _ = _series_prefix(question)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE ib.tag STARTS WITH $p AND ib.arch CONTAINS $f AND ib.build_status IS NOT NULL RETURN ib.tag AS tag, ib.arch AS arch, ib.build_status AS build", p=prefix, f=family)]
+    finally:
+        driver.close()
+    if not rows:
+        return f"No build status is imported for `{family}` in primary `{prefix[:-3]}` IBs."
+    lines = [f"Build status on `{family}`, primary `{prefix[:-3]}` IBs (only builds with imported logs have a status):"]
+    for arch in sorted({r["arch"] for r in rows}):
+        runs = sorted((r for r in rows if r["arch"] == arch), key=lambda r: r["tag"], reverse=True)
+        newest, good = runs[0], next((r for r in runs if r["build"] != "error"), None)
+        broken = [r for r in runs if r["build"] == "error"]
+        if newest["build"] == "error":
+            streak = next((i for i, r in enumerate(runs) if r["build"] != "error"), len(runs))
+            state = f"**failed** in `{newest['tag']}`" + (f", for {streak} build(s) in a row" if streak > 1 else ", the first failure since it last built")
+        else:
+            state = f"built in `{newest['tag']}` (`{newest['build']}`)"
+        lines.append(f"- `{arch}`: {state}. Last good build: {'`' + good['tag'] + '`' if good else 'none imported'}. Failed builds imported: {len(broken)} of {len(runs)}.")
+    lines.append("\nThe compile error and the package it stopped in aren't imported: they are in that build's log on the IB page. Failing unit tests are a separate thing.")
+    return "\n".join(lines)
+
+
+def _most_compilation_warnings_answer(question: str) -> str | None:
+    """ "which build has the most compilation warnings?" (found 2026-11-04: the LLM counted Clang static-analyzer warnings from August instead)."""
+    if not re.search(r"\b(?:which|what)\b[^?]*\b(?:builds?|ibs?|arch\w*)\b[^?]*\bmost\b[^?]*\b(?:compilation|compiler|compile|build)\s+warnings\b", question, re.IGNORECASE) or re.search(r"\bsub[\s-]*ibs?\b", question, re.IGNORECASE):
+        return None
+    tag = _latest_or_named_tag(question)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE (ib.tag = $t OR ib.parent_tag = $t) AND ib.comp_warnings IS NOT NULL RETURN ib.tag AS tag, ib.arch AS arch, coalesce(ib.variant, 'primary') AS variant, ib.comp_warnings AS warnings ORDER BY warnings DESC LIMIT 6", t=tag)]
+    finally:
+        driver.close()
+    if not rows:
+        return f"No compilation-warning counts are imported for `{tag}`."
+    lines = [f"Most compilation warnings in `{tag}` and its sub-IBs: **{rows[0]['warnings']:,}**, {rows[0]['variant']} on `{rows[0]['arch']}`.", "", "| Build type | Architecture | Compilation warnings |", "| --- | --- | ---: |"]
+    lines += [f"| {r['variant']} | `{r['arch']}` | {r['warnings']:,} |" for r in rows]
+    lines.append("\nThese are the compiler's warnings in the build. Clang static-analyzer warnings are counted separately.")
+    return "\n".join(lines)
+
+
+def _log_most_problems_answer(question: str) -> str | None:
+    """ "which test has the most problems?", "show problems in addOn tests" (found 2026-11-04: the failure overview; the IB summary)."""
+    addon = re.search(r"\b(?:show\s+)?problems?\s+in\s+(?:the\s+)?add\s*-?\s*on\s+tests?\b", question, re.IGNORECASE)
+    if not addon and not re.search(r"\bwhich\s+(?:test|unit\s*test)\s+has\s+the\s+most\s+(?:hidden\s+)?(?:log\s+)?problems\b", question, re.IGNORECASE):
+        return None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            stamp = session.run("MATCH (p:LogProblem) WHERE p.ib_tag STARTS WITH $p RETURN max(right(p.ib_tag, 15)) AS s", p=re.match(r"CMSSW_\d+_\d+_", _latest_series_prefix()).group(0)).single()["s"]
+            rows = [dict(r) for r in session.run(
+                "MATCH (p:LogProblem) WHERE p.ib_tag STARTS WITH $p AND p.ib_tag ENDS WITH $s AND p.serious AND ($suite IS NULL OR p.suite = $suite) "
+                "UNWIND p.owners AS owner RETURN owner, count(DISTINCT p) AS problems, collect(DISTINCT p.category)[..3] AS categories ORDER BY problems DESC, owner LIMIT 10",
+                p=re.match(r"CMSSW_\d+_\d+_", _latest_series_prefix()).group(0), s=stamp, suite="addon" if addon else None)]
+    finally:
+        driver.close()
+    label = "addOn tests" if addon else "tests"
+    if not rows:
+        return f"No serious problem is recorded in the raw logs of {label} for builds of {stamp}."
+    lines = [f"{label.capitalize()} with the most serious problems in the raw logs of builds of {stamp}:", "", "| Test | Problems | Categories |", "| --- | ---: | --- |"]
+    lines += [f"| `{r['owner']}` | {r['problems']} | {', '.join(str(c) for c in r['categories'] if c)} |" for r in rows]
+    return "\n".join(lines)
+
+
+def _exception_category_answer(question: str) -> str | None:
+    """ "which IBs have ThePEG exception?" (found 2026-11-04: raw LLM evidence)."""
+    match = re.search(r"\bwhich\s+(?:ibs?|workflows?|builds?)\b[^?]*\b(?:have|has|with|show)\s+(?:the\s+|a\s+)?([A-Za-z][A-Za-z:]{3,})\s+exceptions?\b", question, re.IGNORECASE)
+    if not match:
+        return None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (e:RelValException) WHERE toLower(e.category) CONTAINS toLower($c) RETURN e.ib_tag AS tag, e.arch AS arch, e.workflow_id AS wf", c=match.group(1))]
+    finally:
+        driver.close()
+    if not rows:
+        return f"No recorded RelVal exception has `{match.group(1)}` in its category (exceptions are kept from 2026-08-11)."
+    tags = sorted({r["tag"] for r in rows}, key=_ib_sort_key, reverse=True)
+    workflows = sorted({r["wf"] for r in rows}, key=lambda w: [int(x) for x in w.split(".")])
+    lines = [f"`{match.group(1)}` exceptions: {len(rows)} recorded, {len(workflows)} workflow(s), {len(tags)} build(s). Newest builds:"]
+    for tag in tags[:10]:
+        here = sorted({r["wf"] for r in rows if r["tag"] == tag})
+        lines.append(f"- `{tag}`: {', '.join(f'`{w}`' for w in here[:6])}{' ...' if len(here) > 6 else ''}")
+    lines.append("Workflows: " + ", ".join(f"`{w}`" for w in workflows[:20]) + (" ..." if len(workflows) > 20 else "") + ".")
+    return "\n".join(lines)
+
+
 def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     """Answers the 2026-11-04 test pass found missing; each returns None unless its phrasing matches."""
     if "\n" in question or len(question) > 200:
@@ -15450,7 +15646,8 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
                            (_recovered_window_answer, "recovered_window"), (_longest_failing_answer, "longest_failing"), (_workflow_last_pass_answer, "workflow_last_pass"),
                            (_workflow_identity_answer, "workflow_identity"), (_workflows_by_name_answer, "workflows_by_name"), (_who_to_ask_answer, "who_to_ask"),
                            (_merged_about_window_answer, "merged_about_window"), (_pr_version_update_answer, "pr_version_update"), (_pr_in_latest_answer, "pr_in_latest"),
-                           (_closed_issues_answer, "closed_issues"),
+                           (_closed_issues_answer, "closed_issues"), (_ibs_on_day_answer, "ibs_on_day"), (_build_error_answer, "build_error"), (_most_compilation_warnings_answer, "most_compilation_warnings"),
+                           (_log_most_problems_answer, "log_most_problems"), (_exception_category_answer, "exception_category"),
                            (_not_imported_answer, "not_imported"), (_exit_code_difference_answer, "exit_code"),
                            (_flavour_newest_answer, "flavour_newest"), (_list_ibs_answer, "list_ibs"), (_ib_schedule_now_answer, "ib_schedule_now"),
                            (_month_answer, "month"), (_failures_between_answer, "failures_between"), (_arch_scope_answer, "arch_scope"), (_arch_compare_answer, "arch_compare"),
@@ -15920,6 +16117,9 @@ def _chat(req: ChatRequest):
         _ACK_PREFIX + r"(?:all(?:\s+architectures?)?|everything)\s*[.?!]?\s*", question, re.IGNORECASE
     )
     pending_comparison = _pending_ib_comparisons.get(sid)
+    if pending_comparison and not architecture_only:
+        # the reply to "which architecture?" typed as "on el9_amd64_gcc13" (found 2026-11-04: an LLM list of IBs)
+        architecture_only = re.fullmatch(r"\s*(?:on|for)\s+((?:el|fc|slc|cc|cs)\d+_[a-z0-9]+_gcc\d+)\s*[?.!]*\s*", question, re.IGNORECASE)
     if pending_comparison and architecture_only:
         comparison_type = "Clang warnings" if pending_comparison["clang_warnings"] else "IB results"
         tags = pending_comparison["tags"]
