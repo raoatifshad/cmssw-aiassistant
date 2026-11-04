@@ -365,6 +365,42 @@ class HourSevenTests(unittest.TestCase):
         self.assertIn("don't run database queries", answer.answer)
 
 
+class HourEightTests(unittest.TestCase):
+    def test_an_invented_tag_with_non_breaking_hyphens_is_caught(self):
+        from server.api_server import _identifiers_grounded, _plain_hyphens
+        answer = _plain_hyphens("All fine in `CMSSW_20_1_X_2026\u201111\u201104\u20111749`.")
+        self.assertFalse(_identifiers_grounded(answer, [{"result": "CMSSW_20_1_X_2026-11-03-2300"}], "are the sanitizer IBs ok?"))
+
+    def test_follow_ups_use_the_workflow_in_the_last_answer(self):
+        _turn_memory["s-8"] = {"question": "top failures", "answer": "the most common is **`539.0`** (x)", "route": "x"}
+        self.assertEqual(_resolve_short_follow_up("the first one, why?", "s-8"), "why does workflow 539.0 fail")
+        self.assertEqual(_resolve_short_follow_up("any issue?", "s-8"), "is there an issue for workflow 539.0?")
+        with patch("server.api_server._who_to_ask_answer", return_value="no owner data") as who:
+            self.assertEqual(_listed_items_follow_up("who is looking at it?", "s-8"), "no owner data")
+        who.assert_called_once_with("who is looking at workflow 539.0?")
+
+    def test_rewrites(self):
+        self.assertEqual(_shift_question_rewrite("how's aarch64 doing?"), "what is failing in the latest IB on aarch64")
+        self.assertEqual(_shift_question_rewrite("how's 17_1?"), "what is failing in 17_1")
+        self.assertEqual(_shift_question_rewrite("anything new overnight?"), "what's new?")
+        self.assertEqual(_shift_question_rewrite("has anyone reported the Herwig NaN error?"), "any PR or issue about Herwig NaN?")
+        self.assertIsNone(_shift_question_rewrite("in one sentence, how are the IBs?"))
+
+    def test_since_stamp(self):
+        from server.api_server import _since_stamp
+        self.assertEqual(_since_stamp("recovered since 2026-11-02"), "2026-11-02-0000")
+        self.assertTrue(_since_stamp("recovered since 11-02").endswith("-11-02-0000"))
+
+    def test_new_handlers_leave_other_questions_alone(self):
+        from server.api_server import (_build_progress_answer, _closed_issues_answer, _first_failed_window_answer, _longest_failing_answer,
+                                       _recovered_window_answer, _sanitizer_status_answer, _series_overview_answer, _workflow_identity_answer,
+                                       _workflow_last_pass_answer, _workflows_by_name_answer)
+        for handler in (_build_progress_answer, _closed_issues_answer, _first_failed_window_answer, _longest_failing_answer, _recovered_window_answer,
+                        _sanitizer_status_answer, _series_overview_answer, _workflow_identity_answer, _workflow_last_pass_answer, _workflows_by_name_answer):
+            for question in ("what is the latest IB?", "why does 539.0 fail?", "list open issues about ASAN", "failed relvals in CMSSW_20_1_X_2026-11-03-1100"):
+                self.assertIsNone(handler(question), (handler.__name__, question))
+
+
 class ConceptTests(unittest.TestCase):
     def test_terms(self):
         for question, expected in (("what's a global tag?", "conditions"), ("what is the ORP?", "orp-approved"),
