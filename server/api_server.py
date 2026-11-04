@@ -1010,9 +1010,17 @@ def _is_latest_ib_question(question: str) -> bool:
     )
 
 
+def _with_full_year_dates(question: str) -> str:
+    """ "11-02-2300" / "11-03 11:00" -> "2026-11-02-2300" / "2026-11-03-1100", how the IB dashboard
+    shortens a timestamp in speech (found 2026-11-04: dead end, an LLM guessing tags). This year."""
+    year = datetime.now().year
+    question = re.sub(r"(?<![\d-])((?:0[1-9]|1[0-2])-[0-3]\d)-(\d{4})(?![\d-])", rf"{year}-\1-\2", question)
+    return re.sub(r"(?<![\d-])((?:0[1-9]|1[0-2])-[0-3]\d)\s+(?:at\s+)?(\d{2}):?00\b", rf"{year}-\1-\g<2>00", question)
+
+
 def _normalize_deterministic_question(question: str) -> str:
     """Normalize high-confidence phrasing variants before deterministic routing."""
-    normalized = question
+    normalized = _with_full_year_dates(question)
     for pattern, replacement in (
         # failing counts already exclude known errors: drop the qualifier so the question routes
         # deterministically (stress test 2026-10-15: ~30 s through the LLM path)
@@ -11463,6 +11471,14 @@ _FOLLOW_UP_NEW_RE = re.compile(
 _FOLLOW_UP_STEP_RE = re.compile(
     r"^\s*(?:and\s+|so\s+)?(?:(?:in\s+|at\s+)?which\s+step|what\s+step)(?:\s+(?:did\s+)?(?:it|they|that)?\s*(?:fail(?:ed|s)?)?)?\s*[?.!]*\s*$",
     re.IGNORECASE)
+_FOLLOW_UP_BEFORE_RE = re.compile(
+    r"^\s*(?:and\s+|what\s+about\s+|how\s+about\s+)*(?:the\s+)?(?:one|build|ib|previous(?:\s+(?:one|build|ib))?)(?:\s+before(?:\s+(?:it|that))?)?\s*[?.!]*\s*$",
+    re.IGNORECASE)
+_FOLLOW_UP_FIXED_RE = re.compile(
+    r"^\s*(?:and\s+|so\s+)?is\s+(?:it|that)\s+(?:already\s+|now\s+)?(?:fixed|still\s+failing|still\s+broken)\b(.*)$", re.IGNORECASE)
+_LOOSE_ARCH_RESULTS_RE = re.compile(
+    r"^\s*(el\d+|slc\d+|aarch64|arm64|riscv\w*)\s+(?:(?:latest|newest)\s*)?(?:results?|status|failures?|ib|build)?\s*[?.!]*\s*$",
+    re.IGNORECASE)
 _FOLLOW_UP_FLAVOUR_RE = re.compile(
     r"^\s*(?:and|what\s+about|how\s+about|same\s+for|and\s+what\s+about|and\s+for|also\s+for)\b[^?!]{0,30}?"
     r"\b(ASAN|UBSAN|CLANG|CPP23|CUDART|DBG|DEVEL|EVTGEN3|G4ADEPT|G4VECGEOM|GEANT4|MULTIARCHSV4|MULTIARCHS|NONLTO|"
@@ -11509,10 +11525,31 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
             print(f"WARNING: bare arch lookup failed: {exc}")
             tag = None
         return f"what is failing in {tag} on {arch}" if tag else None
+    loose = _LOOSE_ARCH_RESULTS_RE.match(question)
+    if loose and len(question.split()) > 1:
+        # "el10 latest results" (found 2026-11-04: "lookups came back empty")
+        try:
+            found = _newest_tag_for_arch_word(loose.group(1))
+        except Exception as exc:
+            print(f"WARNING: newest architecture IB lookup failed: {exc}")
+            found = None
+        if found:
+            return f"what is failing in {found[0]}" + (f" on {found[1][0]}" if len(found[1]) == 1 else "")
     last = _turn_memory.get(sid)
     if not last or len(question) > 80:
         return None
     previous = last["question"]
+    package_before = _PACKAGE_PATH_RE.search(previous)
+    fixed = _FOLLOW_UP_FIXED_RE.match(question)
+    if fixed and package_before:
+        # "SimG4Core/Geometry ... since when?" then "is it fixed in the newest aarch64 build?" (found 2026-11-04: menu)
+        return f"is {package_before.group(1)} failing{fixed.group(1)}".rstrip()
+    if _FOLLOW_UP_BEFORE_RE.match(question) and re.search(r"\b(?:before|previous)\b", question, re.IGNORECASE):
+        # "latest IB good to use?" then "and the one before?" (found 2026-11-04: menu)
+        tag_before = IB_TAG_RE.search(previous) or IB_TAG_RE.search(last["answer"])
+        older = _previous_primary_tag(tag_before.group(1)) if tag_before else None
+        if older:
+            return f"what is failing in {older}"
     pr = re.search(r"\b(?:pr|pull\s+request)\s*#?\s*(\d{3,9})\b", previous, re.IGNORECASE)
     issue = re.search(r"\bissues?\s*#?\s*(\d{3,6})\b", previous, re.IGNORECASE)
     if _FOLLOW_UP_AUTHOR_RE.match(question):
