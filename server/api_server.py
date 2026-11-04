@@ -9832,7 +9832,7 @@ _WORKFLOW_WHY_RE = re.compile(
     r"\bwhy\b|\breason\b|\bcause[sd]?\b|what(?:'s| is) wrong|what happened|root cause|explain|"
     # Overview phrasings answered by the same per-IB/arch status table:
     r"\btell\s+me\s+about\b|\bstatus\s+of\b|\bdetails?\b|\binfo(?:rmation)?\b|"
-    r"\b(?:show|display|check|look\s*up)\b|\bexit\s*code\b|\beverywhere\b|"
+    r"\b(?:show|display|check|look\s*up)\b|\bexit\s*code\b|\beverywhere\b|\b(?:did|does|is)\b[^?!]{0,30}\bpass\w*\b|"
     r"\b(?:on\s+)?which\s+arch(?:itecture)?s?\b|\bwhat\s+about\b|\bwhat\s+is\s+(?:wf|workflow)\b|"
     # "give me the log of workflow 1.0 in <tag>", "what step failed for 1349.0 in <tag>"
     r"\blogs?\b|\bstep\b|\bexceptions?\b|\bwhat\s+does\s+(?:wf|workflow|relval)\b|"
@@ -10039,6 +10039,8 @@ def _workflow_where_failing_answer(question: str, session_id: str) -> str | None
     else:
         if IB_TAG_RE.search(question) or not _WORKFLOW_WHERE_RE.search(question):
             return None
+        if _is_latest_ib_question(question):
+            return None  # "did 10805.31 pass in the newest IB?" is about one build (found 2026-11-04)
         if re.search(r"\b(?:prs?|pull requests?|issues?|github|ticket|exceptions?|logs?|commands?|cmsdriver|"
                      r"why|reason|cause[sd]?|step\s*\d|exit\s*code)\b", question, re.IGNORECASE):
             return None  # PR/Issue evidence, exception/log/command/step lookups, "why": other handlers
