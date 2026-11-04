@@ -8915,13 +8915,24 @@ def _known_error_list_answer(question: str, session_id: str) -> str | None:
     The known-error RelVals of one IB and its sub-IBs, per architecture, with their reason."""
     if not re.search(r"\bknown[\s-]*errors?\b", question, re.IGNORECASE):
         return None
-    if not re.search(r"\b(?:which|list|show|how\s+many|what\s+are\s+the|give)\b", question, re.IGNORECASE):
+    if not re.search(r"\b(?:which|list|show|how\s+many|what\s+are\s+the|give)\b|\bknown[\s-]*errors?\s+(?:in|for|on)\b",
+                     question, re.IGNORECASE):
         return None
     if re.search(r"\b\d{1,6}\.\d+\b", question):
         return None   # one workflow: its own history answers that
     tag_match = IB_TAG_RE.search(question)
+    arch = _requested_ib_arch(question)
+    arch_word = None if tag_match or arch else _ARCH_FAMILY_RE.search(question) or _OS_FAMILY_RE.search(question)
     if tag_match:
         tag = tag_match.group(1)
+    elif arch_word:
+        # "known errors list for aarch64 20_1" (found 2026-11-04: "none" from the newest IB, not
+        # yet built on aarch64, with 50 in the newest build that was)
+        found = _newest_tag_for_arch_word(arch_word.group(1))
+        if not found:
+            return None
+        tag = found[0]
+        arch = found[1][0] if len(found[1]) == 1 else None
     else:
         series = _requested_release_series(question)
         context_tag = None if series or _is_latest_ib_question(question) else _latest_ib_contexts.get(session_id)
