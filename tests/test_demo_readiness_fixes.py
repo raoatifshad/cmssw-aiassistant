@@ -542,7 +542,11 @@ class NoDuplicateDefinitionsTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         for name in ("server/api_server.py", "server/agent.py", "server/request_planner.py", "graph/tools.py"):
             tree = ast.parse((root / name).read_text())
-            counts = Counter(node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)))
+            names = [node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef))]
+            # constants too: a reused _GITHUB_COUNT_RE silently broke its old users (2026-11-04)
+            names += [target.id for node in tree.body if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                      for target in node.targets if isinstance(target, ast.Name) and target.id.endswith("_RE")]
+            counts = Counter(names)
             self.assertEqual([def_name for def_name, n in counts.items() if n > 1], [], name)
 
 
