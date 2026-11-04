@@ -44,6 +44,17 @@ if [ "$(git branch --show-current)" != "$BRANCH" ]; then
     exit 1
 fi
 
+# start from the code that is deployed: merge the main checkout's branch into the tester's
+# branch (a fast-forward when the tester has nothing unmerged). On a conflict, stop: testing
+# older code than :8002 runs would report bugs that are already fixed (found 2026-11-04).
+DEPLOYED=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
+if ! git merge --no-edit "$DEPLOYED" >> "$LOG" 2>&1; then
+    git merge --abort 2>/dev/null
+    echo "$(date -Is) FAILED: could not merge $DEPLOYED into $BRANCH (conflict), not running -- see $LOG" \
+        >> "$REPORTS/history.txt"
+    exit 1
+fi
+
 prompt=$(sed "s/__DATE__/$STAMP/g" "$REPO/scripts/tester_prompt.md")
 
 echo "$(date -Is) started -- log $LOG" >> "$REPORTS/history.txt"
@@ -54,7 +65,7 @@ timeout --kill-after=5m "${MAX_HOURS}h" "$CLAUDE" -p "$prompt" \
         "Bash(podman:*)" "Bash(docker:*)" "Bash(ssh:*)" "Bash(scp:*)" "Bash(rsync:*)" \
         "Bash(kinit:*)" "Bash(kdestroy:*)" "Bash(crontab:*)" "Bash(sudo:*)" \
         "WebFetch" "WebSearch" \
-    > "$LOG" 2>&1 < /dev/null
+    >> "$LOG" 2>&1 < /dev/null
 rc=$?
 pkill -f "uvicorn server.api_server:app --port 8003" 2>/dev/null   # in case the tester left it running
 echo "$(date -Is) finished rc=$rc -- report $REPORTS/$STAMP.md $([ -e "$REPORTS/$STAMP.md" ] || echo '(MISSING)')" \
