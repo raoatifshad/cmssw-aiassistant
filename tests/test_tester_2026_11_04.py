@@ -5,7 +5,9 @@ from unittest.mock import MagicMock, patch
 
 from server import api_server
 from server.api_server import (
-    _named_test_answer, _sanitizer_problems_answer, _with_relative_compare_tags,
+    _build_warning_answer, _cross_flavour_comparison_answer, _ib_comparison_answer, _newest_tag_for_arch_word,
+    _package_failing_tests_note, _prs_merged_window_answer, _with_full_year_dates, _with_newest_arch_ib,
+    _with_newest_flavour_compare_tags, _named_test_answer, _sanitizer_problems_answer, _with_relative_compare_tags,
     _TEST_LOG_QUESTION_RE, _WORKFLOW_WHERE_RE,
     _architectures_answer, _not_failing_answer, _pr_search_terms, _resolve_short_follow_up, _turn_memory,
     _LOG_PROBLEM_PASTE_RE, _ib_failure_ranking_answer, _normalize_deterministic_question,
@@ -272,6 +274,106 @@ class RelativeCompareTests(unittest.TestCase):
         get_driver.return_value = driver
         self.assertEqual(_with_relative_compare_tags("compare CLANG yesterday with the day before"),
                          "compare CMSSW_20_1_CLANG_X_2020-01-02-2300 and CMSSW_20_1_CLANG_X_2020-01-05-2300")
+
+
+class CompileWarningsTests(unittest.TestCase):
+    @patch("server.api_server.get_driver")
+    def test_compile_warnings_are_the_build_status_counts(self, get_driver):
+        driver, _ = _driver_with([{"arch": "el9_amd64_gcc16", "status": "warning", "comp_warnings": 439,
+                                   "ignored_warnings": 882, "is_default": False}])
+        get_driver.return_value = driver
+        text = _build_warning_answer("how many compile warnings in CMSSW_20_1_CPP23_X_2026-11-03-1100 el9_amd64_gcc16?")
+        self.assertIn("**439** compilation warning(s)", text)
+
+    def test_across_flavours_is_left_to_the_build_status_table(self):
+        self.assertIsNone(_build_warning_answer("which builds have build warnings in CMSSW_20_1_X_2026-11-02-2300"))
+
+
+class ComparisonPhrasingTests(unittest.TestCase):
+    def test_difference_between_two_tags_is_a_comparison(self):
+        text = _normalize_deterministic_question(
+            "difference between CMSSW_20_1_X_2026-11-02-1100 and CMSSW_20_1_X_2026-11-02-2300 on el9_amd64_gcc14")
+        self.assertTrue(text.startswith("compare CMSSW_20_1_X_2026-11-02-1100"))
+
+    def test_newest_builds_of_two_flavours(self):
+        session = MagicMock()
+        session.run.return_value = [{"tag": t} for t in (
+            "CMSSW_20_1_ROOT6_X_2026-11-02-2300", "CMSSW_20_1_ROOT6_X_2026-11-01-2300", "CMSSW_20_1_X_2026-11-02-2300",
+            "CMSSW_20_1_X_2026-11-03-1100", "CMSSW_20_1_ASAN_X_2026-11-02-2300")]
+        self.assertEqual(_with_newest_flavour_compare_tags("compare latest ROOT6 with the primary el9_amd64_gcc14", session, "CMSSW_20_1"),
+                         "compare CMSSW_20_1_ROOT6_X_2026-11-02-2300 and CMSSW_20_1_X_2026-11-02-2300 el9_amd64_gcc14")
+        self.assertIn("CMSSW_20_1_ASAN_X_2026-11-02-2300", _with_newest_flavour_compare_tags("compare ASAN and ROOT6 latest", session, "CMSSW_20_1"))
+        self.assertEqual(_with_newest_flavour_compare_tags("what does ROOT6 compare to", session, "CMSSW_20_1"), "what does ROOT6 compare to")
+
+    @patch("server.api_server.get_driver")
+    def test_cross_flavour_lists_what_fails_in_each(self, get_driver):
+        tags = ["CMSSW_20_1_ROOT6_X_2026-11-02-2300", "CMSSW_20_1_X_2026-11-02-2300"]
+        relval = lambda i: {"id": i, "name": "wf" + i, "exitcode": 31744}
+        record = lambda ids, units: {"arch": "el9_amd64_gcc14", "relval_total": 954, "relvals": [relval(i) for i in ids],
+                                     "unit_total": 379, "units": units}
+        driver, _ = _driver_with([record(["539.0", "10805.31"], ["FWIO/RNTupleTempTests"])], [record(["537.0", "539.0"], [])])
+        get_driver.return_value = driver
+        text, _ = _ib_comparison_answer(f"compare {tags[0]} and {tags[1]} el9_amd64_gcc14")
+        self.assertIn("## ROOT6 vs primary on `el9_amd64_gcc14`", text)
+        self.assertIn("**RelVals failing only in ROOT6:** `10805.31`", text)
+        self.assertIn("**RelVals failing only in primary:** `537.0`", text)
+        self.assertIn("**RelVals failing in both:** `539.0`", text)
+
+    @patch("server.api_server.get_driver")
+    def test_cross_flavour_asks_only_for_architectures_both_have(self, get_driver):
+        record = lambda arch: {"arch": arch, "relval_total": 1, "relvals": [], "unit_total": 1, "units": []}
+        driver, _ = _driver_with([record("a"), record("b"), record("c")], [record("b"), record("c")])
+        get_driver.return_value = driver
+        text, actions = _cross_flavour_comparison_answer(["CMSSW_20_1_ROOT6_X_2026-11-02-2300", "CMSSW_20_1_X_2026-11-02-2300"], None)
+        self.assertIn("Both have: `b`, `c`", text)
+        self.assertEqual(len(actions), 2)
+
+
+class MoreRoutingTests(unittest.TestCase):
+    def test_short_timestamps_get_the_year(self):
+        self.assertRegex(_with_full_year_dates("warnings in 11-02-2300?"), r"20\d\d-11-02-2300\?")
+        self.assertRegex(_with_full_year_dates("IB from 11-03 11:00"), r"20\d\d-11-03-1100")
+        self.assertEqual(_with_full_year_dates("CMSSW_20_1_X_2026-11-03-1100"), "CMSSW_20_1_X_2026-11-03-1100")
+
+    def test_error_class_in_logs_and_fatal_exception_lines_are_log_searches(self):
+        for text in ("Fatal exception 'ConfigFileReadError': unknown python problem occurred.",
+                     "ConfigFileReadError KeyError Run4D500", "IndexError in Madgraph relval logs, how often?"):
+            self.assertTrue(_LOG_PROBLEM_PASTE_RE.search(text), text)
+
+    @patch("server.api_server.get_driver")
+    def test_newest_ib_on_an_architecture_is_not_the_newest_ib(self, get_driver):
+        driver, _ = _driver_with([{"tag": "CMSSW_20_1_X_2026-11-02-2300", "arch": "el9_aarch64_gcc14"},
+                                  {"tag": "CMSSW_20_1_X_2026-11-01-2300", "arch": "el9_aarch64_gcc14"}])
+        get_driver.return_value = driver
+        self.assertEqual(_with_newest_arch_ib("known errors in the newest aarch64 IB"),
+                         "known errors in the newest aarch64 IB CMSSW_20_1_X_2026-11-02-2300 el9_aarch64_gcc14")
+
+    @patch("server.api_server.get_driver")
+    def test_package_note_names_the_failing_tests_and_their_log_problem(self, get_driver):
+        driver, _ = _driver_with([{"t": "FWCore/Integration/TestX"}], [{"summary": "Fatal exception 'LogicError': boom"}])
+        get_driver.return_value = driver
+        text = _package_failing_tests_note("FWCore/Integration", [("CMSSW_20_1_X_2026-11-02-2300", "el9_aarch64_gcc14")])
+        self.assertIn("`FWCore/Integration/TestX` -- Fatal exception 'LogicError': boom", text)
+
+    @patch("server.api_server.get_driver")
+    def test_package_note_is_none_without_imported_logs(self, get_driver):
+        driver, _ = _driver_with([])
+        get_driver.return_value = driver
+        self.assertIsNone(_package_failing_tests_note("A/B", [("CMSSW_20_1_X_2026-11-02-2300", "x")]))
+
+    @patch("server.api_server.get_driver")
+    def test_prs_merged_since_a_weekday(self, get_driver):
+        driver, session = _driver_with([{"repo": "cmssw", "number": 52331, "title": "T", "merged_at": "2026-11-03T09:19:04", "author": "a"}])
+        get_driver.return_value = driver
+        text = _prs_merged_window_answer("PRs merged into 20_1 since monday")
+        self.assertIn("**1 PR(s)** merged for `CMSSW_20_1`", text)
+        self.assertIn("cmssw #52331", text)
+        self.assertEqual(session.run.call_args.kwargs["release"], "CMSSW_20_1")
+        self.assertIsNone(_prs_merged_window_answer("PRs merged in CMSSW_20_1_X_2026-11-02-2300 this week"))
+
+    def test_status_of_a_series_and_summary_for_shifters(self):
+        self.assertEqual(_normalize_deterministic_question("status of 20_0"), "what is failing in the latest 20_0 IB")
+        self.assertIn("shift summary", _normalize_deterministic_question("summary for shifters of the latest 2 IBs"))
 
 
 if __name__ == "__main__":

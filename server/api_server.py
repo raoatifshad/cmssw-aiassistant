@@ -3739,10 +3739,13 @@ def _build_warning_answer(question: str, context_tag: str | None = None) -> str 
     if re.search(r"\bclang\b", question, re.IGNORECASE):
         return None
     # "builds" too: "what builds warnings are in <tag>" (found live 2026-10-15 dead-ending)
-    if not re.search(r"\b(?:builds?|compilation|compiler)\b", question, re.IGNORECASE):
+    # "compile warnings": found 2026-11-04 going to the LLM, which said 0 for a build with 439
+    if not re.search(r"\b(?:builds?|compilation|compiler|compile|compiling)\b", question, re.IGNORECASE):
         return None
     if not re.search(r"\bwarnings?\b", question, re.IGNORECASE):
         return None
+    if re.search(r"\b(?:which|what)\s+(?!about\b)(?:\w+\s+)?(?:variants?|flavou?rs?|sub-?ibs?|ibs?|builds?)\b", question, re.IGNORECASE):
+        return None  # across the build flavours: _build_status_answer (found 2026-11-04: LLM dead end)
     tag_match = IB_TAG_RE.search(question)
     tag = tag_match.group(1) if tag_match else context_tag
     if not tag:
@@ -3853,7 +3856,8 @@ def _build_status_answer(question: str, context_tag: str | None = None) -> str |
     if not re.search(r"\b(?:build|builds|compilation|compile|built)\b", question, re.IGNORECASE):
         return None
     wants_log = bool(re.search(r"\blogs?\b", question, re.IGNORECASE))
-    if not _BUILD_STATUS_WORDS_RE.search(question) and not wants_log:
+    if not _BUILD_STATUS_WORDS_RE.search(question) and not wants_log and not re.search(
+            r"\b(?:which|what)\s+(?!about\b)(?:\w+\s+)?(?:variants?|flavou?rs?|sub-?ibs?|ibs?|builds?)\b", question, re.IGNORECASE):
         return None
     tag_match = IB_TAG_RE.search(question)
     day = None if tag_match else _question_day(question)
