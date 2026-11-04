@@ -4,7 +4,11 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from server import api_server
-from server.api_server import _LOG_PROBLEM_PASTE_RE, _ib_failure_ranking_answer, _is_latest_ib_question, _loose_arch_choice, _render_metric_deltas, _today_falls_back_to_latest
+from server.api_server import (
+    _LOG_PROBLEM_PASTE_RE, _ib_failure_ranking_answer, _normalize_deterministic_question,
+    _relval_exception_list_answer, _is_latest_ib_question, _loose_arch_choice, _render_metric_deltas,
+    _today_falls_back_to_latest,
+)
 
 
 def _driver_with(*results):
@@ -96,6 +100,33 @@ class ShortLogLineTests(unittest.TestCase):
         for text in ("why is the build failing with errors?", "which warnings are new in the latest IB?",
                      "what is edm::Event used for?", "how many errors in 539.0?"):
             self.assertFalse(_LOG_PROBLEM_PASTE_RE.search(text), text)
+
+
+class ExceptionListTests(unittest.TestCase):
+    @patch("server.api_server.get_driver")
+    def test_groups_per_build_and_message_and_names_silent_failures(self, get_driver):
+        tag = "CMSSW_20_1_X_2026-11-02-2300"
+        sub = "CMSSW_20_1_ROOT6_X_2026-11-02-2300"
+        arch = "el9_aarch64_gcc14"
+        exc = lambda t, wf: {"tag": t, "arch": arch, "workflow_id": wf, "exception": "ExternalLHEProducer: Child failed",
+                             "category": "ExternalLHEProducer", "source_url": "http://x"}
+        driver, _ = _driver_with(
+            [{"tag": tag, "arch": arch, "workflow_id": "1360.0", "exitcode": 256, "known_error": True},
+             {"tag": tag, "arch": arch, "workflow_id": "1361.0", "exitcode": 256, "known_error": True},
+             {"tag": tag, "arch": arch, "workflow_id": "539.0", "exitcode": 31744, "known_error": False}],
+            [exc(tag, "1360.0"), exc(tag, "1361.0"), exc(sub, "1360.0")])
+        get_driver.return_value = driver
+        text = _relval_exception_list_answer("why are they failing", {"tag": tag, "arch": arch})
+        self.assertIn("and its sub-IBs", text)
+        self.assertIn("2 workflows: `1360.0`, `1361.0`", text)
+        self.assertIn("2 of them known errors", text)
+        self.assertIn(f"`{sub}` `{arch}` workflow `1360.0`", text)
+        self.assertIn("`539.0` (exit 31744)", text)
+        self.assertEqual(text.count("Child failed"), 2)
+
+    def test_exceptions_in_a_tag_is_a_relval_exception_question(self):
+        self.assertIn("relval exceptions in CMSSW_20_1_X_2026-11-03-1100",
+                      _normalize_deterministic_question("exceptions in CMSSW_20_1_X_2026-11-03-1100"))
 
 
 if __name__ == "__main__":
