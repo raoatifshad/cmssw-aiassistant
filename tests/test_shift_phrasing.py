@@ -567,6 +567,25 @@ class HourThirteenTests(unittest.TestCase):
         self.assertEqual(_shift_question_rewrite("is G4ADEPT worse than primary?"), "compare primary and G4ADEPT in the latest IB")
 
 
+class LlmAbsenceClaimTests(unittest.TestCase):
+    def test_a_flat_no_from_the_llm_is_an_absence_claim(self):
+        from server.api_server import _llm_answer_is_absence_claim as claim
+        for answer in ("No architectures failed to build for the requested IB tag.",
+                       "No CMSSW/CMSSDT issues were closed between 2026-10-28 and 2026-11-04.",
+                       "No CMSSW Integration Builds for the 20_0 release series are present in the local graph.",
+                       "I've checked the most recent builds and there are **no build-status errors** recorded in the graph.",
+                       "**No** sanitizer builds failed.",
+                       "**Utilities/General** has no recorded warnings in the current graph.",
+                       "the graph contains no problems of category asan"):
+            self.assertTrue(claim(answer), answer)
+
+    def test_a_real_answer_is_not(self):
+        from server.api_server import _llm_answer_is_absence_claim as claim
+        for answer in ("**PR #52372 was authored by**: **RobertJWard**", "`52391` is an **Issue** (labelled `Issue` in the graph).",
+                       "**Number of imported RelValException nodes:** 13,083", "Random RelVal failures due to No dictionary for edm::Wrapper<int>"):
+            self.assertFalse(claim(answer), answer)
+
+
 class ConceptTests(unittest.TestCase):
     def test_terms(self):
         for question, expected in (("what's a global tag?", "conditions"), ("what is the ORP?", "orp-approved"),
