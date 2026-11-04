@@ -6,9 +6,14 @@ from graph.tools import TOOLS, _with_int_limit
 from server.api_server import (
     _basic_term_answer,
     _condense_comparison_for_chat,
+    _das_error_count_answer,
+    _exit_code_difference_answer,
+    _exit_code_meaning_answer,
     _format_raw_evidence,
     _last_failed_builds,
     _listed_items_follow_up,
+    _not_imported_answer,
+    _strip_leaked_reasoning,
     _shift_direct_answer,
     _shift_question_rewrite,
     _turn_memory,
@@ -50,6 +55,53 @@ class RewriteTests(unittest.TestCase):
     def test_who_works_on_it_searches_open_issues(self):
         self.assertEqual(_shift_question_rewrite("who is working on Herwig7 failures in 537.0?"), "is there an open issue for workflow 537.0?")
         self.assertEqual(_shift_question_rewrite("does anyone know about the ROCm HeterogeneousTest failures on el10?"), "any open issues about ROCm?")
+
+
+class RewriteHourTwoTests(unittest.TestCase):
+    def test_series_shift_summary_keeps_its_series(self):
+        # found 2026-11-04: "give me a shift summary for 17_1" answered for 20_1
+        self.assertEqual(_shift_question_rewrite("give me a shift summary for 17_1"), "what changed in 17_1 between the last two builds")
+
+    def test_a_workflow_in_a_named_build_gets_its_status(self):
+        self.assertEqual(_shift_question_rewrite("is 537.0 failing in CMSSW_20_1_X_2026-11-03-1100 on el8_amd64_gcc14?"),
+                         "why is workflow 537.0 failing in CMSSW_20_1_X_2026-11-03-1100 on el8_amd64_gcc14")
+
+    def test_bare_numbers_as_exit_codes(self):
+        self.assertEqual(_shift_question_rewrite("what does 139 mean as a cmsRun exit code?"), "what does exit code 139 mean")
+        self.assertIsNone(_shift_question_rewrite("what does 2026 mean for the plan?"))
+
+    def test_architecture_and_series_counts(self):
+        self.assertEqual(_shift_question_rewrite("how many architectures does 20_1 have?"), "which architectures are built for 20_1?")
+        self.assertEqual(_shift_question_rewrite("how many release series are built?"), "which release series are active?")
+        self.assertEqual(_shift_question_rewrite("which is the newest ASAN build?"), "when was the last ASAN IB?")
+
+
+class AnswersHourTwoTests(unittest.TestCase):
+    def test_not_imported_topics_say_so(self):
+        for question in ("how long did the 20_1 build take?", "what is the memory usage of workflow 539.0?", "who broke the el10 build?",
+                         "when is the next pre-release?", "show me the physics comparison plots for 537.0"):
+            self.assertIn("I don't have that", _not_imported_answer(question), question)
+        self.assertIsNone(_not_imported_answer("what is failing in the latest IB?"))
+
+    def test_das_count_leaves_github_questions_alone(self):
+        self.assertIsNone(_das_error_count_answer("how many open issues mention DAS?"))
+
+    @patch("server.api_server.get_exit_code_names", return_value={18688: "Configuration", 16640: "OtherCMS", 16896: "StdException", 31744: "TimeOut"})
+    def test_exit_meanings_and_differences(self, _):
+        self.assertIn("python configuration", _exit_code_meaning_answer("what does Configuration mean?"))
+        self.assertIn("isn't a CMSSW exception", _exit_code_meaning_answer("what does exit code 31744 mean?"))
+        answer = _exit_code_difference_answer("what's the difference between OtherCMS and StdException?")
+        self.assertIn("OtherCMS", answer)
+        self.assertIn("StdException", answer)
+        self.assertIsNone(_exit_code_difference_answer("difference between DIGI and RECO"))
+
+    def test_leaked_docs_line(self):
+        self.assertEqual(_strip_leaked_reasoning("We have docs. Provide answer.\nA backport is ..."), "A backport is ...")
+
+    def test_terms(self):
+        for question, expected in (("what is an EDProducer?", "EDProducer"), ("what is the DQM?", "Data Quality"), ("what does cmsenv do?", "runtime environment"),
+                                   ("what does Run4D128 mean?", "geometry"), ("what is a forward port?", "older release cycle"), ("what's the difference between DIGI and RECO?", "reconstruction")):
+            self.assertIn(expected, _basic_term_answer(question), question)
 
 
 class ConceptTests(unittest.TestCase):
