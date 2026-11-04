@@ -11783,6 +11783,7 @@ def _chat(req: ChatRequest):
     if conversational:
         return conversational
 
+    scope_only = bool(_FOLLOW_UP_SCOPE_RE.match(original_question))
     rewritten = _resolve_short_follow_up(original_question, sid)
     if rewritten:
         original_question = rewritten
@@ -11812,6 +11813,13 @@ def _chat(req: ChatRequest):
         question, _default_tag_notes[sid] = today_fallback
     question = _with_workflow_follow_up_context(question, sid)
     arch_unavailable = _arch_unavailable_answer(question, sid)
+    if not arch_unavailable and scope_only:
+        # "and on aarch64 only" rewritten to the previous question: for an IB without aarch64 that
+        # answered for all its other architectures (validate_bot, found 2026-11-04 on a half-built IB)
+        scope = _arch_scope_matches(question, sid)
+        if scope and not scope[2]:
+            listed = ", ".join(f"`{arch}`" for arch in scope[3]) or "none"
+            arch_unavailable = f"`{scope[0]}` has no imported `{scope[1]}` build. Architectures imported for it: {listed}."
     if arch_unavailable:
         return _chat_response(sid, original_question, arch_unavailable, "deterministic:arch_unavailable")
     question = _with_arch_family_context(question, sid)
