@@ -15519,7 +15519,7 @@ def _ibs_on_day_answer(question: str) -> str | None:
     if not match:
         return None
     day = datetime.now() - timedelta(days=1 if match.group(1).lower() == "yesterday" else 0)
-    return _ib_slot_availability_answer(f"ib of {day.day} {list(_MONTH_NUMBERS)[day.month - 1]}")
+    return _ib_slot_availability_answer(_normalize_deterministic_question(f"is the IB of {day:%Y-%m-%d} out?"))
 
 
 def _build_error_answer(question: str) -> str | None:
