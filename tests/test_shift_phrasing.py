@@ -526,6 +526,29 @@ class IbsOnDayTests(unittest.TestCase):
         self.assertTrue(_IB_SLOT_AVAILABILITY_RE.search(slots.call_args[0][0]), slots.call_args[0][0])
 
 
+class HourTwelveTests(unittest.TestCase):
+    def test_a_sentence_with_latest_ib_in_it_is_not_the_latest_ib_question(self):
+        self.assertEqual(_shift_question_rewrite("any trouble in the latest IB?"), "what is failing in the latest IB")
+        self.assertEqual(_shift_question_rewrite("regressions in the latest IB?"), "give me a shift summary")
+        self.assertEqual(_shift_question_rewrite("what got merged in the last build?"), "which PRs were merged in the latest IB?")
+        self.assertEqual(_shift_question_rewrite("changes between the two most recent builds"), "compare the last two IBs")
+
+    def test_a_series_keeps_the_pr_question_with_its_handler(self):
+        from server.api_server import _prs_merged_on_day_answer
+        self.assertIsNone(_prs_merged_on_day_answer("what is the most recent PR merged in 20_1?"))
+
+    def test_wrapped_errors_reach_the_paste_path(self):
+        self.assertEqual(_shift_question_rewrite("what's this: SonicCallFailed: call failed after max 1 tries"), "SonicCallFailed: call failed after max 1 tries")
+        self.assertEqual(_shift_question_rewrite("segmentation violation in Herwig7GeneratorFilter, known?"), "segmentation violation in Herwig7GeneratorFilter")
+
+    def test_the_primary_ib_sorts_first_at_the_same_time(self):
+        rows = [{"tag": "CMSSW_20_1_CLANG_X_2026-11-03-2300"}, {"tag": "CMSSW_20_1_X_2026-11-03-2300"}, {"tag": "CMSSW_20_1_ROOT6_X_2026-11-03-2300"}]
+        import graph.tools as tools
+        with patch("graph.tools.get_driver") as driver:
+            driver.return_value.session.return_value.__enter__.return_value.run.return_value = [dict(r) for r in rows]
+            self.assertEqual(tools.list_ib_tags()[0]["tag"], "CMSSW_20_1_X_2026-11-03-2300")
+
+
 class ConceptTests(unittest.TestCase):
     def test_terms(self):
         for question, expected in (("what's a global tag?", "conditions"), ("what is the ORP?", "orp-approved"),

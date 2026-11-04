@@ -240,7 +240,8 @@ def list_ib_tags(release: str | None = None, arch: str | None = None, limit: int
             rows = [dict(r) for r in s.run(cypher, {"rel": release, "arch": arch})]
     finally:
         driver.close()
-    rows.sort(key=lambda row: _ib_sort_key(row["tag"]), reverse=True)
+    # same series and time: the primary IB first, or the LLM reports a sub-IB as "the latest IB" (found 2026-11-04: CLANG, by alphabet)
+    rows.sort(key=lambda row: (_ib_sort_key(row["tag"]), "_X_" in row["tag"] and bool(re.match(r"CMSSW_\d+_\d+_X_", row["tag"]))), reverse=True)
     return rows[:limit]
 
 
