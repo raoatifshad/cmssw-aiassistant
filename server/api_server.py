@@ -9760,7 +9760,7 @@ _WORKFLOW_WHY_RE = re.compile(
     r"^\s*(?:wf|workflow)\s*\d+\.\d+\s*\??\s*$",
     re.IGNORECASE,
 )
-_ARCH_FAMILY_RE = re.compile(r"\b(aarch64|arm(?:64)?|amd64|x86(?:_64)?|riscv64)\b", re.IGNORECASE)
+_ARCH_FAMILY_RE = re.compile(r"\b(aarch64|arm(?:64)?|amd64|x86(?:_64)?|riscv(?:64)?)\b", re.IGNORECASE)
 # an OS family named alone ("only el9", "slc7"), never part of a full architecture name
 _OS_FAMILY_RE = re.compile(r"(?<![\w])(el\d+|slc\d+|cc\d+|cs\d+)(?![\w])", re.IGNORECASE)
 
@@ -10924,9 +10924,55 @@ def _unit_test_ranking_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+_PRS_MERGED_WINDOW_RE = re.compile(
+    r"\b(?:prs?|pull\s+requests?)\b[^?!]{0,40}\bmerged\b[^?!]{0,40}?\b(?:since\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"(this\s+week|last\s+week|past\s+week)|(?:in\s+the\s+)?(?:last|past)\s+(\d{1,2})\s+days?)\b", re.IGNORECASE)
+
+
+def _prs_merged_window_answer(question: str) -> str | None:
+    """ "PRs merged into 20_1 since monday" -- found 2026-11-04: a GitHub text search for "20_1 since
+    monday". The PRs merged in that window, newest first, of the named release series if any."""
+    match = _PRS_MERGED_WINDOW_RE.search(question)
+    if not match or IB_TAG_RE.search(question):
+        return None
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Europe/Zurich"))
+    if match.group(1):
+        names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        back = (now.weekday() - names.index(match.group(1).lower())) % 7
+        since = now - timedelta(days=back)
+    else:
+        since = now - timedelta(days=int(match.group(3)) if match.group(3) else 7)
+    since_day = since.strftime("%Y-%m-%d")
+    series = _requested_release_series(question)
+    release = f"CMSSW_{series[0]}_{series[1]}" if series else None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (pr:PR) WHERE pr.merged_at >= $since AND ($release IS NULL OR pr.release = $release) "
+                "OPTIONAL MATCH (pr)-[:AUTHORED_BY]->(a:Author) "
+                "RETURN pr.repo AS repo, pr.number AS number, pr.title AS title, pr.merged_at AS merged_at, a.name AS author "
+                "ORDER BY pr.merged_at DESC", since=since_day, release=release)]
+    finally:
+        driver.close()
+    where = f" for `{release}`" if release else ""
+    if not rows:
+        return f"No imported PR{where} was merged since {since_day}."
+    lines = [f"**{len(rows)} PR(s)** merged{where} since {since_day} (cmssw and cmsdist), newest first:", ""]
+    lines += [f"- **{r['repo']} #{r['number']}** - {r['title']} ({str(r['merged_at'])[:10]}"
+              + (f", {r['author']}" if r["author"] else "") + ")" for r in rows[:25]]
+    if len(rows) > 25:
+        lines.append(f"- ... and {len(rows) - 25} more.")
+    return "\n".join(lines)
+
+
 _IB_RANKING_RE = re.compile(
     r"\b(?:which|what)\s+(?:\w+\s+){0,2}?(?:ibs?|builds?|integration\s+builds?|sub-?ibs?)\b[^?!]{0,60}\b(?:most|worst|highest)\b|"
-    r"\b(?:ibs?|builds?)\s+with\s+(?:the\s+)?(?:most|highest)\b|\bworst\s+(?:ibs?|builds?)\b",
+    r"\b(?:ibs?|builds?)\s+with\s+(?:the\s+)?(?:most|highest)\b|\bworst\s+(?:ibs?|builds?)\b|"
+    # "how many relvals failed on riscv this week" (found 2026-11-04: "lookups came back empty")
+    r"\bhow\s+many\s+(?:relvals?|workflows?|wfs?|unit[\s-]*tests?)\b[^?!]{0,40}\bfail\w*\b[^?!]{0,40}"
+    r"\b(?:(?:this|last|past)\s+(?:week|month)|(?:last|past)\s+\d+\s+days?)\b",
     re.IGNORECASE)
 
 
