@@ -17,6 +17,8 @@ from server.api_server import (
     _prs_merged_window_answer,
     _tracked_failures_answer,
     _workflow_log_answer,
+    _issue_state_answer,
+    _GITHUB_COVERAGE_CACHE,
     _exception_ranking_answer,
     _release_series_answer,
     _normalize_deterministic_question,
@@ -434,6 +436,28 @@ class RoundFourTests(unittest.TestCase):
         answer = _release_series_answer("which release series are active?")
         self.assertIn("**1 release series** are being built", answer)
         self.assertIn("| `CMSSW_12_4_X` | `2026-09-01-0000` | 0 | 1 | no |", answer)
+
+
+class GitHubStalenessTests(unittest.TestCase):
+    def setUp(self):
+        _GITHUB_COVERAGE_CACHE.clear()
+
+    @patch("server.api_server.get_driver")
+    def test_issue_state_is_dated_never_current(self, get_driver):
+        # found 2026-11-04: "is issue 51354 still open?" -> "currently open"; closed on GitHub since
+        driver, _ = _driver_with(
+            MagicMock(single=MagicMock(return_value={"title": "LogicError in EvaluateMuonMVAID", "state": "open",
+                                                     "created": "2026-06-29T09:04:55Z", "closed": None,
+                                                     "updated": "2026-08-31T10:00:00Z"})),
+            MagicMock(single=MagicMock(return_value={"n": 51822, "t": "2026-09-03T21:31:41Z"})))
+        get_driver.return_value = driver
+        answer = _issue_state_answer("is issue 51354 still open?")
+        self.assertIn("`open` in the imported data", answer)
+        self.assertIn("reaches #51822 (2026-09-03)", answer)
+        self.assertNotIn("currently open", answer)
+
+    def test_non_state_questions_are_left_alone(self):
+        self.assertIsNone(_issue_state_answer("who opened issue 52274?"))
 
 
 if __name__ == "__main__":
