@@ -8087,6 +8087,9 @@ _LOG_PROBLEM_PASTE_RE = re.compile(
     # "UCX ERROR ibv_create_ah", "Warning: Could not download ... HTTP Error 429"
     r"\b(?:heap|stack|global|container)-(?:use-after-\w+|buffer-(?:over|under)flow|overflow)\b|"
     r"\bdetected memory leaks\b|\buse-of-uninitialized-value\b|\bUCX\s+ERROR\b|\bHTTP Error \d{3}\b|"
+    # "Fatal exception 'ConfigFileReadError': ...", "ConfigFileReadError KeyError Run4D500",
+    # "IndexError in Madgraph relval logs" (found 2026-11-04: dead end, GitHub only, "which architecture?")
+    r"\bFatal exception '\w+|\b[A-Z]\w+Error\s+[A-Z]\w+Error\b|\b[A-Z][a-z]\w*Error\b[^?!\n]{0,40}\blogs?\b|"
     r"\b\w+::\w+\)?\s+(?:Warning|Error)\b|"
     r"runtime error:|Traceback \(most recent call last\)|Assertion [`'].*failed|"
     r"terminate called after throwing|A fatal system signal has occurred|"
