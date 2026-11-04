@@ -10144,6 +10144,142 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
     return "\n".join(lines)
 
 
+_NAMED_TEST_RE = re.compile(
+    r"(?<![\w/])((?:[A-Z]\w+/){2,}\w+|[Tt]est[A-Z_]\w{3,}|[a-z]\w*_[Tt]est\w*|[A-Z]\w+Test[A-Z_]\w*)(?![\w/.])")
+_NAMED_TEST_INTENT_RE = re.compile(
+    r"\b(?:why|fail\w*|broken|crash\w*|status|passing|passes|passed|error\w*|problems?|what\s+happened)\b", re.IGNORECASE)
+
+
+def _named_test_answer(question: str) -> str | None:
+    """ "Why does TestIntegrationEventSetup fail on aarch64?" -- one test inside a package, by
+    name, from the raw test logs (the dashboard only knows packages). Found 2026-11-04: answered
+    with the latest IB's failure overview, the test nowhere in it. None when no imported log run
+    has a test of that name, so other handlers keep any other meaning of the word."""
+    if "\n" in question or not _NAMED_TEST_INTENT_RE.search(question):
+        return None
+    match = _NAMED_TEST_RE.search(IB_TAG_RE.sub(" ", question))
+    if not match:
+        return None
+    name = match.group(1)
+    arch = _requested_ib_arch(question)
+    family = None if arch else _arch_family(question)
+    tag_match = IB_TAG_RE.search(question)
+    tag = tag_match.group(1) if tag_match else None
+    scope = ("WHERE ($arch IS NULL OR r.arch = $arch) AND ($family IS NULL OR r.arch CONTAINS $family) "
+             "AND ($tag IS NULL OR r.ib_tag = $tag) ")
+    in_list = "[t IN coalesce(r.{}, []) WHERE t = $name OR t ENDS WITH ('/' + $name)]"
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(row) for row in session.run(
+                f"MATCH (r:TestLogRun {{suite:'unit'}}) {scope}"
+                f"WITH r, {in_list.format('failed_tests')} AS failed, {in_list.format('passed_tests')} AS passed, "
+                f"{in_list.format('other_tests')} AS other WHERE size(failed) + size(passed) + size(other) > 0 "
+                "RETURN r.ib_tag AS tag, r.arch AS arch, r.run_variant AS run_variant, failed, passed, other",
+                name=name, arch=arch, family=family, tag=tag)]
+            if not rows:
+                return None
+            full = next(iter(rows[0]["failed"] + rows[0]["passed"] + rows[0]["other"]))
+            bad = sorted((r for r in rows if r["failed"] or r["other"]), key=lambda r: _ib_sort_key(r["tag"]), reverse=True)
+            newest = bad[0] if bad else max(rows, key=lambda r: _ib_sort_key(r["tag"]))
+            problems = [dict(row) for row in session.run(
+                "MATCH (p:LogProblem) WHERE p.ib_tag = $tag AND p.arch = $arch AND $full IN p.owners AND p.serious "
+                "RETURN p.kind AS kind, p.category AS category, p.summary AS summary LIMIT 4",
+                tag=newest["tag"], arch=newest["arch"], full=full)]
+    finally:
+        driver.close()
+    where = f" on `{arch}`" if arch else f" on {family}" if family else ""
+    where += f" in `{tag}`" if tag else ""
+    whens = sorted(r["tag"].rsplit("_X_", 1)[-1] for r in rows)
+    lines = [f"Unit test `{full}`{where}, from the raw IB test logs: "
+             + (f"**not passed in {len(bad)} of {len(rows)}** imported run(s)" if bad else f"**passed in all {len(rows)}** imported run(s)")
+             + f" (builds {whens[0]} to {whens[-1]}).", ""]
+    if bad:
+        lines += ["| IB | Architecture | Run | Result |", "| --- | --- | --- | --- |"]
+        lines += [f"| `{r['tag']}` | `{r['arch']}` | {r['run_variant'] or 'default'} | {'failed' if r['failed'] else 'other'} |" for r in bad[:10]]
+        if len(bad) > 10:
+            lines.append(f"\n... and {len(bad) - 10} older run(s).")
+        if problems:
+            lines.append(f"\nSerious problems in its log in `{bad[0]['tag']}` on `{bad[0]['arch']}`:")
+            lines += [f"- {_LOG_KIND_LABELS.get(p['kind'], p['kind'])}: {p['summary']}" for p in problems]
+            lines.append("\nThe log shows what happened, not why. Paste the error to see where else it appears.")
+        else:
+            lines.append(f"\nNo serious problem was recognised in its log in `{bad[0]['tag']}`; see the unit-test log on the IB page.")
+    elif problems:
+        lines.append(f"It passed, but its log in `{newest['tag']}` on `{newest['arch']}` has:")
+        lines += [f"- {_LOG_KIND_LABELS.get(p['kind'], p['kind'])}: {p['summary']}" for p in problems]
+    return "\n".join(lines)
+
+
+_SANITIZER_LIST_RE = re.compile(
+    r"\b(?:sanitizer|asan|ubsan)\b[^?!\n]{0,40}\b(?:problems?|errors?|reports?|findings?|issues?)\b|"
+    r"\b(?:problems?|errors?|reports?|findings?|issues?)\b[^?!\n]{0,30}\b(?:sanitizer|asan|ubsan)\b",
+    re.IGNORECASE)
+
+
+def _sanitizer_problems_answer(question: str, session_id: str) -> str | None:
+    """ "What about the sanitizer problems in the test logs?" -- the sanitizer reports of one build,
+    from its raw logs. Found 2026-11-04: answered with new/gone problems of the newest primary IB,
+    none of them from a sanitizer, right after a question about the ASAN IB."""
+    if "\n" in question or not _SANITIZER_LIST_RE.search(question):
+        return None
+    if re.search(r"\b(?:prs?|pull\s+requests?|issues?\s+#|github|new|since|what\s+does|mean)\b", question, re.IGNORECASE):
+        return None
+    # "are there sanitizer errors in passed ASAN tests?" got "0 new, 0 returned, 0 gone" -- true
+    # and useless, with a buffer overflow in a test passing in every run
+    only_passed = bool(re.search(r"\bpass(?:ed|ing)\b", question, re.IGNORECASE))
+    flavour = "UBSAN" if re.search(r"\bubsan\b", question, re.IGNORECASE) else "ASAN"
+    tag_match = IB_TAG_RE.search(question)
+    tag = tag_match.group(1) if tag_match else None
+    if not tag:
+        context = _latest_ib_contexts.get(session_id) or ""
+        tag = context if re.search(r"_(?:ASAN|UBSAN)_X_", context) else None
+    arch = _requested_ib_arch(question)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            if not tag:
+                tags = [r["tag"] for r in session.run(
+                    "MATCH (r:TestLogRun) WHERE r.ib_tag CONTAINS $v RETURN DISTINCT r.ib_tag AS tag", v=f"_{flavour}_X_")]
+                if not tags:
+                    return None
+                tag = max(tags, key=_ib_sort_key)
+            runs = session.run("MATCH (r:TestLogRun {ib_tag:$tag}) RETURN count(r) AS n", tag=tag).single()["n"]
+            rows = [dict(r) for r in session.run(
+                "MATCH (p:LogProblem) WHERE p.ib_tag = $tag AND p.kind IN ['sanitizer', 'ubsan'] AND ($arch IS NULL OR p.arch = $arch) "
+                "AND (NOT $only_passed OR p.in_passed) "
+                "RETURN p.category AS category, p.summary AS summary, p.arch AS arch, p.owners AS owners",
+                tag=tag, arch=arch, only_passed=only_passed)]
+    finally:
+        driver.close()
+    where = f"`{tag}`" + (f" on `{arch}`" if arch else "")
+    inside = "inside tests reported as PASSED, " if only_passed else ""
+    if not runs:
+        return f"No raw test logs are imported for `{tag}` -- that is not the same as zero sanitizer reports."
+    if not rows:
+        return f"No sanitizer report {inside}was found in the {runs} imported test-log run(s) of {where}."
+    # one report per message, whatever the run-specific address or stack
+    merged: dict[str, dict] = {}
+    for row in rows:
+        text = re.sub(r"0x[0-9a-f]+", "0x...", row["summary"] or "")
+        one = merged.setdefault(text, {"category": row["category"], "summary": text, "archs": set(), "owners": []})
+        one["archs"].add(row["arch"])
+        one["owners"] += row["owners"] or []
+    rows = list(merged.values())
+    leak = lambda r: "LeakSanitizer" in (r["category"] or "")
+    rows.sort(key=lambda r: (leak(r), -len(set(r["owners"])), r["summary"]))
+    lines = [f"**{len(rows)} distinct sanitizer report(s)** {inside}in the raw test logs of {where} "
+             f"({sum(1 for r in rows if not leak(r))} besides leak reports), from {runs} log run(s):", ""]
+    for row in rows[:12]:
+        owners = sorted(set(row["owners"]))
+        lines.append(f"- {row['summary']} -- {', '.join(f'`{a}`' for a in sorted(row['archs']))}; "
+                     f"{len(owners)} test(s), e.g. `{owners[0]}`" if owners else f"- {row['summary']}")
+    if len(rows) > 12:
+        lines.append(f"- ... and {len(rows) - 12} more (leak reports last).")
+    lines.append("\nPaste one of them to see where else it appears and since when.")
+    return "\n".join(lines)
+
+
 _TEST_LOG_QUESTION_RE = re.compile(
     r"\bhidden\s+(?:problems?|errors?|failures?|issues?)\b|\b(?:problems?|errors?|exceptions?|crash(?:es)?|issues?)\s+"
     r"(?:in|inside)\s+(?:the\s+)?pass(?:ed|ing)\s+(?:tests?|workflows?|steps?)\b|\btest[\s-]*logs?\b|\braw\s+logs?\b|"
@@ -11395,6 +11531,14 @@ def _chat(req: ChatRequest):
     exit_code_answer = _exit_code_meaning_answer(question)
     if exit_code_answer:
         return _chat_response(sid, original_question, exit_code_answer, "deterministic:exit_code")
+
+    try:
+        named_test = _named_test_answer(question)
+    except Exception as exc:
+        print(f"WARNING: named test lookup failed: {exc}")
+        named_test = None
+    if named_test:
+        return _chat_response(sid, original_question, named_test, "deterministic:named_test")
 
     package_answer = _package_status_answer(question, sid)
     if package_answer:
