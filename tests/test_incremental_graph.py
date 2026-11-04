@@ -235,6 +235,26 @@ class IncrementalGraphTests(unittest.TestCase):
         by_arch = {record["arch"]: record["addon_status"] for record in records}
         self.assertEqual(by_arch, {"el9_amd64_gcc13": "error", "el8_amd64_gcc14": None})
 
+    def test_merged_pr_import_keeps_earlier_builds_links(self):
+        # 2026-11-04: each import deleted the previous import's MERGED_BEFORE links, and the
+        # source file only lists the last few builds, so older builds lost their PR lists
+        import tempfile, json as _json
+        from unittest.mock import MagicMock, patch as _patch
+        import build_graph
+        session = MagicMock()
+        driver = MagicMock()
+        driver.session.return_value.__enter__.return_value = session
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            _json.dump([{"base_branch": "CMSSW_20_1_X", "comparisons": [{
+                "compared_tags": "CMSSW_20_1_X_2026-11-01-2300-->CMSSW_20_1_X_2026-11-02-1100",
+                "merged_prs": [{"number": "52223", "author_login": "fwyzard", "hash": "abc"}]}]}], handle)
+        with _patch.object(build_graph, "source_needs_import", return_value=True), \
+                _patch.object(build_graph, "mark_source_imported"):
+            build_graph.ingest_merged_prs(driver, build_graph.Path(handle.name))
+        queries = " ".join(str(call.args[0]) for call in session.run.call_args_list)
+        self.assertNotIn("DELETE", queries)
+        self.assertIn("MERGE (pr)-[rel:MERGED_BEFORE]->(ib)", queries)
+
     def test_merged_pr_records_attach_to_the_target_tag_of_each_comparison(self):
         # merged_prs_summary.json's compared_tags is "SOURCE-->TARGET"; the
         # PRs in merged_prs are new as of TARGET, not SOURCE -- this is the
