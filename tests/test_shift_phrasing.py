@@ -12,7 +12,9 @@ from server.api_server import (
     _format_raw_evidence,
     _last_failed_builds,
     _listed_items_follow_up,
+    _no_relvals_message,
     _not_imported_answer,
+    _number_not_an_issue_answer,
     _strip_leaked_reasoning,
     _shift_direct_answer,
     _shift_question_rewrite,
@@ -102,6 +104,42 @@ class AnswersHourTwoTests(unittest.TestCase):
         for question, expected in (("what is an EDProducer?", "EDProducer"), ("what is the DQM?", "Data Quality"), ("what does cmsenv do?", "runtime environment"),
                                    ("what does Run4D128 mean?", "geometry"), ("what is a forward port?", "older release cycle"), ("what's the difference between DIGI and RECO?", "reconstruction")):
             self.assertIn(expected, _basic_term_answer(question), question)
+
+
+class HourThreeTests(unittest.TestCase):
+    """From replaying real logged sessions, 2026-11-04."""
+
+    def test_a_github_question_is_not_taken_as_a_follow_up(self):
+        _turn_memory["s-3"] = {"question": "q", "answer": "workflows `1.0`, `2.0` and Issues/PRs in the note", "route": "x"}
+        self.assertIsNone(_listed_items_follow_up("is there any memory leak issue created?", "s-3"))
+
+    @patch("server.api_server.get_driver")
+    def test_is_there_an_issue_uses_the_list_without_the_note(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value = []
+        _turn_memory["s-3"] = {"question": "q", "answer": "workflow `537.0`; Issues/PRs updated since", "route": "x"}
+        answer = _listed_items_follow_up("is there an issue?", "s-3")
+        self.assertIn("`537.0`", answer)
+        self.assertNotIn("`Issues/PRs`", answer)
+
+    @patch("server.api_server._newest_primary_tag_with_results", return_value="CMSSW_20_1_X_2026-11-03-2300")
+    def test_old_builds_are_not_still_running(self, _):
+        self.assertIn("no longer available", _no_relvals_message("CMSSW_20_1_X_2026-08-13-2300"))
+        self.assertIn("may still be running", _no_relvals_message("CMSSW_20_1_X_2026-11-03-2300"))
+
+    def test_failed_query_is_not_evidence(self):
+        answer = _format_raw_evidence([{"tool": "query_graph", "result": {"ok": False, "error": "Neo.ClientError.Statement"}}])
+        self.assertNotIn("Neo.ClientError", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_a_number_that_is_a_pr_says_so(self, get_driver):
+        session = get_driver.return_value.session.return_value.__enter__.return_value
+        session.run.return_value.single.return_value = {"title": "L1T keep", "merged": None, "state": "open"}
+        self.assertIn("#52392 is a PR, not an Issue", _number_not_an_issue_answer(52392))
+
+    def test_rewrites(self):
+        self.assertEqual(_shift_question_rewrite("whay is 140.0 WF is coming from"), "where is workflow 140.0 failing")
+        self.assertEqual(_shift_question_rewrite("what is the dafult IB"), "what is the latest IB")
 
 
 class ConceptTests(unittest.TestCase):

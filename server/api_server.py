@@ -553,7 +553,8 @@ def _format_raw_evidence(
     # and 'str'" shown as the answer)
     specific = [item for item in tool_evidence if item.get("tool") not in _GENERIC_EVIDENCE_TOOLS
                 and item.get("result") not in (None, [], {}, "")
-                and not (isinstance(item.get("result"), dict) and set(item["result"]) == {"error"})
+                and not (isinstance(item.get("result"), dict) and "error" in item["result"]
+                         and (set(item["result"]) == {"error"} or item["result"].get("ok") is False))
                 and not (isinstance(item.get("result"), dict) and "rows" in item["result"] and not item["result"]["rows"])]
     if not specific:
         return ("I couldn't find evidence specific to this question in the imported data. "
@@ -761,10 +762,37 @@ def _shifter_doc_claims_grounded(question: str, answer: str, tool_evidence: list
 _default_tag_notes: dict[str, str] = {}
 
 
+def _number_not_an_issue_answer(number: int) -> str:
+    """Issues and PRs share one number sequence (found 2026-11-04: "do you have info about #52392" said it wasn't
+    imported, with PR #52392 in the graph)."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            pr = session.run("MATCH (p:PR {repo:'cmssw', number:$n}) RETURN p.title AS title, p.merged_at AS merged, p.github_state AS state", n=number).single()
+    finally:
+        driver.close()
+    if pr:
+        return (f"#{number} is a PR, not an Issue: **{pr['title']}** ({_pr_status(pr['merged'], pr['state'])}). "
+                f"Ask \"what does PR {number} do\" for its details.")
+    return f"Issue #{number} is not present in the imported CMSSW graph. ({_github_export_note()}.)"
+
+
+_RELVAL_RETENTION_START = "2026-10-26"
+
+
+def _results_no_longer_kept(tag: str) -> bool:
+    """RelVal and unit-test results older than this are gone for good (the dashboard keeps about two weeks, and we keep
+    what we had from this date on); such a build is not "still running"."""
+    return tag.rsplit("_X_", 1)[-1][:10] < _RELVAL_RETENTION_START
+
+
 def _no_relvals_message(tag: str) -> str:
     """No RelVal records for this IB -- usually because its RelVals are still running: say
-    so and name the newest IB that has them (found in the held-out pass 2026-10-15)."""
-    base = f"No RelVal results are imported for `{tag}` yet (its RelVals may still be running) -- unknown, not zero."
+    so and name the newest IB that has them (found in the held-out pass 2026-10-15). A build
+    from before the kept period is different: found 2026-11-04, August builds "may still be running"."""
+    base = (f"RelVal results for `{tag}` are no longer available: results are kept from {_RELVAL_RETENTION_START} on, so its failures are unknown, not zero."
+            if _results_no_longer_kept(tag) else
+            f"No RelVal results are imported for `{tag}` yet (its RelVals may still be running) -- unknown, not zero.")
     try:
         newest = _newest_primary_tag_with_results("relval")
     except Exception:
@@ -3738,7 +3766,7 @@ def _issue_author_answer(question: str, context_number: int | None = None) -> st
     finally:
         driver.close()
     if not record:
-        return f"Issue #{number} is not present in the imported CMSSW graph. ({_github_export_note()}.)"
+        return _number_not_an_issue_answer(number)
     if not record["author"]:
         return f"Issue #{number} is present in the imported graph, but its author was not imported."
     return f"**Issue #{number}** was opened by **{record['author']}**."
@@ -3811,7 +3839,7 @@ def _issue_detail_answer(question: str, context_number: int | None = None) -> st
         return f"**{pr_record['repo']} PR #{number}** - {pr_record['title']} ({merged})."
     if ambiguous:
         return f"Neither an Issue nor a PR numbered #{number} is present in the imported graph. ({_github_export_note()}.)"
-    return f"Issue #{number} is not present in the imported CMSSW graph. ({_github_export_note()}.)"
+    return _number_not_an_issue_answer(number)
 
 
 def _latest_issue_answer(question: str) -> str | None:
@@ -4382,6 +4410,9 @@ def _failed_relval_list_answer(question: str, context: dict[str, str] | None) ->
         if context.get("arch") and not get_relval_workflow_ids(context["tag"], arch=context["arch"]):
             return (f"`{context['tag']}` has no RelVal results on `{context['arch']}` (no build there yet, or its "
                     f"RelVals are not imported) -- unknown, not passing.")
+        if not context.get("arch") and not get_relval_workflow_ids(context["tag"]):
+            # found 2026-11-04: an August build with no results read as "nothing failed"
+            return _no_relvals_message(context["tag"])
         return f"No failing RelVals were found for `{context['tag']}`{arch_clause}."
     exit_code_names = get_exit_code_names()
     shown_cap = 100
@@ -7905,7 +7936,9 @@ def _failure_overview_answer(tag: str, arch: str | None, item_cap: int = 12) -> 
         if len(relval_rows) > item_cap:
             lines.append(f"- ... and {len(relval_rows) - item_cap} more IB/architecture record(s) with failing RelVals")
     elif len(no_relvals) == len(rows):
-        lines.append("\n**RelVals** -- not imported yet for this IB (the RelVals may still be running), "
+        lines.append(f"\n**RelVals** -- no longer available: results are kept from {_RELVAL_RETENTION_START} on, so failures are unknown, not zero."
+                     if _results_no_longer_kept(tag) else
+                     "\n**RelVals** -- not imported yet for this IB (the RelVals may still be running), "
                      "so failures are unknown, not zero.")
     else:
         lines.append("\n**RelVals** -- none failing in the imported results.")
@@ -7951,7 +7984,8 @@ def _failure_overview_answer(tag: str, arch: str | None, item_cap: int = 12) -> 
         if len(unittest_rows) > item_cap:
             lines.append(f"- ... and {len(unittest_rows) - item_cap} more IB/architecture record(s) with failing unit tests")
     elif len(no_unittests) == len(rows):
-        lines.append("\n**Unit tests** -- not imported yet for this IB, so failures are unknown, not zero.")
+        lines.append(f"\n**Unit tests** -- no longer available: results are kept from {_RELVAL_RETENTION_START} on, so failures are unknown, not zero."
+                     if _results_no_longer_kept(tag) else "\n**Unit tests** -- not imported yet for this IB, so failures are unknown, not zero.")
     else:
         lines.append("\n**Unit tests** -- none failing in the imported results.")
     if no_unittests and len(no_unittests) < len(rows):
@@ -12798,6 +12832,12 @@ def _shift_question_rewrite(question: str) -> str | None:
                       if re.search(r"[A-Z]", w[1:]) or "/" in w), None)
         if topic:
             return f"any open issues about {topic}?"
+    if re.fullmatch(r"\s*(?:what(?:'s|\s+is)\s+)?the\s+d[ae]?f[au]*lt\s+(?:ib|build)\s*[?.!]*\s*|\s*which\s+is\s+the\s+d[ae]?f[au]*lt\s+(?:ib|build)\s*[?.!]*\s*", question, re.IGNORECASE):
+        return "what is the latest IB"
+    workflow_wf = re.search(r"(?<![\d.])(\d{1,6}\.\d{1,6})\s+(?:wf|workflow)\b", question, re.IGNORECASE)
+    if workflow_wf and not re.search(r"\b(?:why|exception|log|command|step)\b", question, re.IGNORECASE):
+        # "whay is 140.0 WF is coming from" (found 2026-11-04: the whole IB's RelVal summary)
+        return f"where is workflow {workflow_wf.group(1)} failing"
     going_on = re.search(r"\bwhat(?:'s|\s+is)\s+going\s+on\b[^?]*?(?<![\d.])(\d{1,6}\.\d{1,6})(?![\d.])", question, re.IGNORECASE)
     if going_on:
         return f"where is workflow {going_on.group(1)} failing"
@@ -13076,7 +13116,8 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
         flavours = list(dict.fromkeys(re.findall(r"`([A-Za-z0-9]+)` `\w+_\w+_gcc\d+`", answer)))
         return ("Sub-IBs with something listed there: " + ", ".join(f"`{f}`" for f in flavours) + "." if flavours
                 else "None: everything in that answer is from the primary IB.")
-    packages = list(dict.fromkeys(re.findall(r"\b[A-Z][A-Za-z0-9]+/[A-Z][A-Za-z0-9]+\b", answer)))
+    # not "Issues/PRs" from the coverage note (found 2026-11-04 listed as a package)
+    packages = [p for p in dict.fromkeys(re.findall(r"\b[A-Z][A-Za-z0-9]+/[A-Z][A-Za-z0-9]+\b", answer)) if p != "Issues/PRs"]
     workflows = list(dict.fromkeys(re.findall(r"`(\d{1,6}\.\d{1,6})`", answer)))
     failed_build = re.search(r"\*\*Build\*\* -- failed: `(\w+)`", answer)
     tag = IB_TAG_RE.search(answer)
@@ -13125,7 +13166,7 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
         if parts and len(packages) > 4:
             parts.append(f"Shown for the first 4 of {len(packages)} packages; ask about another by name.")
         return "\n\n".join(parts) if parts else None
-    if re.search(r"\b(?:which|any|do|does)\b[^?]*\b(?:issues?|tickets?|prs?)\b|\b(?:already|have)\b[^?]*\bissues?\b|^\s*is\s+there\s+an?\s+(?:open\s+)?(?:issue|ticket)\s*[?.!]*\s*$", question, re.IGNORECASE) and (packages or workflows) and (re.search(r"\b(?:ones?|they|them|these|those|of\s+them|it)\b", question, re.IGNORECASE) or re.match(r"\s*is\s+there", question, re.IGNORECASE)):
+    if re.search(r"\b(?:which|any|do|does)\b[^?]*\b(?:issues?|tickets?|prs?)\b|\b(?:already|have)\b[^?]*\bissues?\b|^\s*is\s+there\s+an?\s+(?:open\s+)?(?:issue|ticket)\s*[?.!]*\s*$", question, re.IGNORECASE) and (packages or workflows) and (re.search(r"\b(?:ones?|they|them|these|those|of\s+them|it)\b", question, re.IGNORECASE) or re.fullmatch(r"\s*is\s+there\s+an?\s+(?:open\s+)?(?:issue|ticket)\s*[?.!]*\s*", question, re.IGNORECASE)):
         terms = packages[:6] + workflows[:8]
         driver = get_driver()
         lines = []
@@ -13362,6 +13403,52 @@ def _log_category_answer(question: str) -> str | None:
             f"Example message: `{str(row['message'])[:300]}`" + (f"\n\nExample from: `{row['example']}`" if row["example"] else ""))
 
 
+def _latest_exception_answer(question: str) -> str | None:
+    """ "what is the latest exception" (found 2026-11-04: the LLM picked CMSSW_9_4). The newest build of the newest series."""
+    if not re.fullmatch(r"\s*(?:what(?:'s|\s+is|\s+are)\s+)?the\s+(?:latest|newest|most\s+recent)\s+exceptions?\s*[?.!]*\s*", question, re.IGNORECASE):
+        return None
+    latest = _latest_ib_records()
+    if not latest:
+        return None
+    head = latest[0]["tag"].rsplit("_X_", 1)[0]
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            newest = session.run("MATCH (e:RelValException) WHERE e.ib_tag STARTS WITH $p RETURN max(right(e.ib_tag, 15)) AS when", p=f"{head}_").single()["when"]
+            rows = [dict(r) for r in session.run(
+                "MATCH (e:RelValException) WHERE e.ib_tag STARTS WITH $p AND right(e.ib_tag, 15) = $when "
+                "RETURN e.category AS category, left(e.message, 140) AS message, count(DISTINCT e.workflow_id) AS workflows, "
+                "collect(DISTINCT e.ib_tag)[..2] AS tags ORDER BY workflows DESC LIMIT 6", p=f"{head}_", when=newest)] if newest else []
+    finally:
+        driver.close()
+    if not rows:
+        return None
+    lines = [f"Newest recorded RelVal exceptions in `{head}_X`, builds of {newest}:", "", "| Category | Message | Workflows | Build |", "| --- | --- | ---: | --- |"]
+    for r in rows:
+        message = " ".join((r["message"] or "").split()).replace("|", "/")
+        lines.append(f"| {r['category']} | {message} | {r['workflows']} | `{r['tags'][0]}` |")
+    return "\n".join(lines)
+
+
+def _latest_pr_answer(question: str) -> str | None:
+    """ "what is the latest PR" (found 2026-11-04: an LLM table, with the newest PR missing)."""
+    if not re.fullmatch(r"\s*(?:what(?:'s|\s+is)\s+)?the\s+(?:latest|newest|most\s+recent|last)\s+(?:pr|pull\s+request)(?:\s+number)?(?:\s+you\s+have)?\s*[?.!]*\s*", question, re.IGNORECASE):
+        return None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            newest = session.run("MATCH (p:PR {repo:'cmssw'}) RETURN p.number AS n, p.title AS title, p.merged_at AS merged, p.github_state AS state ORDER BY p.number DESC LIMIT 1").single()
+            merged = session.run("MATCH (p:PR {repo:'cmssw'}) WHERE p.merged_at IS NOT NULL RETURN p.number AS n, p.title AS title, p.merged_at AS merged ORDER BY p.merged_at DESC LIMIT 1").single()
+    finally:
+        driver.close()
+    if not newest:
+        return None
+    text = f"The newest imported cmssw PR is **#{newest['n']}** - {newest['title']} ({_pr_status(newest['merged'], newest['state'])})."
+    if merged and merged["n"] != newest["n"]:
+        text += f" The most recently merged is **#{merged['n']}** - {merged['title']} (merged {str(merged['merged'])[:10]})."
+    return text + f"\n\n_{_github_export_note()}._"
+
+
 def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     """Answers the 2026-11-04 test pass found missing; each returns None unless its phrasing matches."""
     if "\n" in question or len(question) > 200:
@@ -13377,7 +13464,7 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     for handler, route in ((_not_imported_answer, "not_imported"), (_exit_code_difference_answer, "exit_code"),
                            (_das_error_count_answer, "das_error_count"), (_workflow_failure_count_answer, "workflow_failure_count"),
                            (_failing_every_build_answer, "failing_every_build"), (_prs_by_author_answer, "prs_by_author"),
-                           (_log_category_answer, "log_category"),
+                           (_log_category_answer, "log_category"), (_latest_exception_answer, "latest_exception"), (_latest_pr_answer, "latest_pr"),
                            (_exit_ranking_answer, "exit_ranking"), (_relval_pass_rate_answer, "relval_pass_rate"),
                            (_series_stability_answer, "series_stability"), (_health_trend_answer, "health_trend"),
                            (_ib_count_answer, "ib_count"), (_last_green_answer, "last_green")):
