@@ -373,6 +373,26 @@ add("N4", "summary of CMSSW_20_1_ASAN_X_2026-11-02-2300", all=[r"sub-IB"], none=
 
 # ---------------------------------------------------------------- facts the checks rely on
 # (label, cypher returning one row with a boolean `ok`): run with --check-facts
+# ---------------------------------------------------------------- N5: keyword traps found 2026-11-04 (round 3)
+add("N5", "latest IB for 17_1 on aarch64", all=[r"aarch64", r"CMSSW_17_1_X"], none=[r"CMSSW_20_1_X"])
+add("N5", "compare 17_1 latest with previous on el8_amd64_gcc13", all=[r"CMSSW_17_1_X"], none=[r"CMSSW_20_1_X"])
+add("N5", "is the ASAN build getting better?", all=[r"CMSSW_20_1_ASAN_X_\S+ -> CMSSW_20_1_ASAN_X_"])
+add("N5", "what's broken on gcc16?", all=[r"gcc16"])
+add("N5", "show me the log of 140.5611", all=[r"logreader", r"140\.5611"])
+add("N5", "is there a PR touching ConditionDatabase merged this week?", all=[r"ConditionDatabase"])
+add("N5", "which IBs have no relval results yet?", all=[r"RelVal results"], none=[r"unit-test results"])
+add("N5", "did anything get fixed today?", all=[r"Shift summary"])
+add("N5", "which unit tests started failing this week?", all=[r"Shift summary"])
+add("N5", "summary for the shift meeting", all=[r"Shift summary"])
+add("N5", "tell me something interesting about the latest IB", all=[r"What's failing"], none=[r"PR #"])
+add("N5", "what is the status of riscv?", all=[r"riscv64"])
+add("N5", "is el10 ready?", all=[r"el10_"])
+add("N5", ["why is 17_1 red?", "since when?"], all=[r"since"])
+add("N5", "is the 17_1 global tag problem tracked anywhere?", all=[r"GitHub evidence", r"Global Tag"])
+add("N5", "is there an open issue about DAS errors?", all=[r"DAS"], none=[r"most common recorded errors"])
+add("N5", "which sub-IB is in the worst shape?", all=[r"most failed"])
+add("N5", "which workflows timed out in the latest IB?", all=[r"31744|TimeOut"])
+
 FACTS = [
     ("N4: 10805.31 failed with 25600 on el8 in CMSSW_20_1_X_2026-11-03-1100",
      "MATCH (r:RelVal {ib_tag:'CMSSW_20_1_X_2026-11-03-1100', arch:'el8_amd64_gcc14', workflow_id:'10805.31'}) "

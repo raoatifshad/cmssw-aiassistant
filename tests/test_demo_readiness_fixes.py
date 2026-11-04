@@ -12,6 +12,13 @@ from server.api_server import (
     _latest_ib_answer,
     _newest_complete_primary_tag,
     _not_failing_answer,
+    _package_status_answer,
+    _previous_primary_tag,
+    _prs_merged_window_answer,
+    _tracked_failures_answer,
+    _workflow_log_answer,
+    _MISSING_RESULTS_RE,
+    _ARCH_LIST_RE,
     _test_log_question_answer,
     _with_variant_ib_context,
     _pr_author_ranking_answer,
@@ -311,6 +318,77 @@ class TestLogDateTests(unittest.TestCase):
         answer = _test_log_question_answer("test logs for 2026-10-21", "demo-tl")
         self.assertIn("No raw test logs are imported for `CMSSW_20_1_X` builds of 2026-10-21", answer)
         self.assertIn("2026-10-16 and 2026-10-27", answer)
+
+
+class PackageSessionScopeTests(unittest.TestCase):
+    @patch("server.api_server._package_newest_status_answer", return_value="**Failing now in 4 of 26** ...")
+    @patch("server.api_server.get_driver")
+    def test_package_passing_in_session_ib_shows_where_it_fails(self, get_driver, newest):
+        history = MagicMock(single=MagicMock(return_value={"total": 300, "failed": 40, "first_failed": "2026-10-26-2300"}))
+        driver, _ = _driver_with(
+            [{"variant": "primary", "arch": "el8_amd64_gcc14", "status": "PASSED", "errors": 0}], history)
+        get_driver.return_value = driver
+        _latest_ib_contexts["demo-pkg"] = "CMSSW_20_1_X_2026-11-03-1100"
+        answer = _package_status_answer("why does SimG4Core/Geometry fail?", "demo-pkg")
+        self.assertIn("passes in every record of `CMSSW_20_1_X_2026-11-03-1100`", answer)
+        self.assertIn("Failing now in 4 of 26", answer)
+
+
+class RoundThreeTests(unittest.TestCase):
+    def setUp(self):
+        _turn_memory.pop("demo-r3", None)
+
+    def test_since_when_after_an_overview(self):
+        _turn_memory["demo-r3"] = {"question": "why is 17_1 red?", "route": "capability:failure_overview",
+                                   "answer": "- `el8_amd64_gcc13`: **11 failing** -- e.g. `7.4` CosmicsPEAK2018"}
+        self.assertEqual(_resolve_short_follow_up("since when?", "demo-r3"), "since when is workflow 7.4 failing")
+
+    def test_shift_summary_phrasings(self):
+        for q in ("give me an overview of IB health this week", "did anything get fixed today?",
+                  "which unit tests started failing this week?", "summary for the shift meeting"):
+            self.assertTrue(RequestContext.extract(q).has_shift_summary_request, q)
+
+    def test_missing_results_captures_the_kind(self):
+        self.assertEqual(_MISSING_RESULTS_RE.search("which IBs have no relval results yet?").group(1).lower(), "relval")
+
+    def test_architecture_status_phrasings(self):
+        self.assertTrue(_ARCH_LIST_RE.search("what is the status of riscv?"))
+        self.assertTrue(_ARCH_LIST_RE.search("is el10 ready?"))
+
+    def test_tracked_question_with_its_own_topic_defers(self):
+        self.assertIsNone(_tracked_failures_answer("is there an open issue about DAS errors?", "demo-r3"))
+        self.assertIsNone(_tracked_failures_answer("what failed in 17_1?", "demo-r3"))
+        self.assertIsNone(_tracked_failures_answer("latest open issue", "demo-r3"))
+
+    @patch("server.api_server.get_driver")
+    def test_sub_ib_previous_build_is_its_own_flavour(self, get_driver):
+        driver, session = _driver_with(MagicMock(single=MagicMock(return_value={"tag": "CMSSW_20_1_ASAN_X_2026-10-30-2300"})))
+        get_driver.return_value = driver
+        self.assertEqual(_previous_primary_tag("CMSSW_20_1_ASAN_X_2026-11-02-2300", same_flavour=True),
+                         "CMSSW_20_1_ASAN_X_2026-10-30-2300")
+        self.assertEqual(session.run.call_args.kwargs["prefix"], "CMSSW_20_1_ASAN_X_")
+
+    @patch("server.api_server.get_driver")
+    def test_merged_window_filters_by_topic(self, get_driver):
+        driver, _ = _driver_with([
+            {"repo": "cmssw", "number": 52316, "title": "[12_4_X] XrdAdaptor: Use inactive sources first",
+             "merged_at": "2026-11-03", "author": "makortel", "body": ""},
+            {"repo": "cmsdist", "number": 10979, "title": "Update virtualenv", "merged_at": "2026-11-03",
+             "author": "cms-sw", "body": ""}])
+        get_driver.return_value = driver
+        answer = _prs_merged_window_answer("PRs about XrdAdaptor merged this week")
+        self.assertIn("#52316", answer)
+        self.assertNotIn("#10979", answer)
+
+    @patch("server.api_server.get_driver")
+    def test_workflow_log_links(self, get_driver):
+        url = ("https://cmssdt.cern.ch/SDT/cgi-bin/logreader/el8_amd64_gcc13/CMSSW_17_1_X_2026-11-03-1100/"
+               "pyRelValMatrixLogs/run/140.5611_RunHI2018reMINIAOD/step3_RunHI2018reMINIAOD.log")
+        driver, _ = _driver_with([{"tag": "CMSSW_17_1_X_2026-11-03-1100", "arch": "el8_amd64_gcc13", "step": "step3",
+                                   "url": url, "category": "ConditionDatabase"}])
+        get_driver.return_value = driver
+        self.assertIn(url, _workflow_log_answer("show me the log of 140.5611"))
+        self.assertIsNone(_workflow_log_answer("why is 140.5611 failing?"))
 
 
 if __name__ == "__main__":

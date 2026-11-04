@@ -67,7 +67,14 @@ SHIFT_SUMMARY_RE = re.compile(
     r"\bwhat\s+should\s+(?:i|we|the\s+shifter)\s+(?:check|look\s+at|watch|focus\s+on)\b[^?!]{0,40}"
     r"\b(?:first|today|now|shift(?:er)?)\b|"
     r"\bmorning\s+(?:report|summary|digest|check)\b|\b(?:daily|today'?s)\s+(?:report|summary|digest)\b|"
-    r"\b(?:getting|got)\s+(?:better|worse)\b|\bbetter\s+or\s+worse\b",
+    r"\b(?:getting|got)\s+(?:better|worse)\b|\bbetter\s+or\s+worse\b|"
+    # found 2026-11-04: "overview of IB health this week" (one build only), "did anything get
+    # fixed today?", "which unit tests started failing this week?", "summary for the shift meeting"
+    r"\b(?:overview|health|status|state)\b[^?!]{0,30}\b(?:this|last|past)\s+(?:week|\d+\s+days?)\b|"
+    r"\b(?:get|got|been|was|were)\s+(?:fixed|resolved)\b[^?!]{0,30}\b(?:today|yesterday|this\s+week|since)\b|"
+    r"\banything\s+(?:get\s+|got\s+)?(?:fixed|resolved)\b|"
+    r"\bstarted\s+(?:to\s+)?fail(?:ing)?\b|"
+    r"\bshift(?:er)?\s+(?:meeting|handover|hand-over)\b",
     re.IGNORECASE,
 )
 
