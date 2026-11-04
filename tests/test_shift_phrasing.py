@@ -16,6 +16,7 @@ from server.api_server import (
     _not_imported_answer,
     _number_not_an_issue_answer,
     _strip_leaked_reasoning,
+    _resolve_short_follow_up,
     _shift_direct_answer,
     _shift_question_rewrite,
     _turn_memory,
@@ -136,6 +137,15 @@ class HourThreeTests(unittest.TestCase):
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value.single.return_value = {"title": "L1T keep", "merged": None, "state": "open"}
         self.assertIn("#52392 is a PR, not an Issue", _number_not_an_issue_answer(52392))
+
+    def test_scope_alone_without_a_previous_question(self):
+        _turn_memory.pop("s-first", None)
+        self.assertEqual(_resolve_short_follow_up("and 16_1?", "s-first"), "what is failing in 16_1")
+        self.assertEqual(_resolve_short_follow_up("what about aarch64", "s-first"), "what is failing in the latest IB on aarch64")
+        self.assertEqual(_resolve_short_follow_up("only on aarch64", "s-first"), "what is failing in the latest IB on aarch64")
+
+    def test_worry_is_the_shift_summary(self):
+        self.assertEqual(_shift_question_rewrite("anything I should worry about as shifter right now?"), "give me a shift summary")
 
     def test_rewrites(self):
         self.assertEqual(_shift_question_rewrite("whay is 140.0 WF is coming from"), "where is workflow 140.0 failing")

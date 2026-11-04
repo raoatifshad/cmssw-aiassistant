@@ -12512,10 +12512,16 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
         # a bare architecture typed on its own: what is failing on it (found 2026-10-16: "couldn't find evidence")
         arch = bare_arch.group(1).lower()
         try:
-            tag, _ = _newest_complete_primary_tag("relval", arch)
+            tag, note = _newest_complete_primary_tag("relval", arch)
         except Exception as exc:
             print(f"WARNING: bare arch lookup failed: {exc}")
-            tag = None
+            tag, note = None, ""
+        if tag and note:
+            # found 2026-11-04: "el10_amd64_gcc15" said "no build errors" from the last complete build, with the newest build red
+            newer = IB_TAG_RE.search(note)
+            status = single_ib_status(newer.group(1), arch) if newer else None
+            red = status and status.get("build_status") == "error"
+            _default_tag_notes[sid] = f"_{note.strip()}{' Its build failed.' if red else ''}_\n\n"
         return f"what is failing in {tag} on {arch}" if tag else None
     loose = _LOOSE_ARCH_RESULTS_RE.match(question)
     if loose and len(question.split()) > 1:
@@ -12528,6 +12534,14 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
         if found:
             return f"what is failing in {found[0]}" + (f" on {found[1][0]}" if len(found[1]) == 1 else "")
     last = _turn_memory.get(sid)
+    if not last and len(question) <= 40:
+        # "what about aarch64", "and 16_1?" as the first message (found 2026-11-04: a text search, a dead end)
+        series_alone = _FOLLOW_UP_SERIES_RE.match(question)
+        if series_alone:
+            return f"what is failing in {series_alone.group(1)}_{series_alone.group(2)}"
+        scope_alone = _FOLLOW_UP_SCOPE_RE.match(question) or re.fullmatch(rf"\s*(?:only\s+)?(?:on\s+|for\s+)?({_SCOPE_WORD})(?:\s+only)?\s*[?.!]*\s*", question, re.IGNORECASE)
+        if scope_alone:
+            return f"what is failing in the latest IB on {scope_alone.group(1).lower()}"
     if not last or len(question) > 80:
         return None
     previous = last["question"]
@@ -12851,6 +12865,9 @@ def _shift_question_rewrite(question: str) -> str | None:
             second = f"{head}_X_{when[:4]}-{month}-{day}-{int(h2):02d}{m2}"
             older, newer = sorted((first, second))
             return f"compare {older} and {newer} for all architectures"
+    if re.search(r"\b(?:should|do|must)\s+i\s+(?:worry|care|look\s+at|check|know)\b|\bworry\s+about\b", question, re.IGNORECASE) and re.search(r"\b(?:shift\w*|ibs?|today|now|anything|what)\b", question, re.IGNORECASE):
+        # "anything I should worry about as shifter right now?" (found 2026-11-04: raw LLM evidence)
+        return f"give me a shift summary{' for ' + series_text if series else ''}" if not series else f"what changed in {series_text} between the last two builds"
     if _IB_STATE_RE.search(question):
         return f"what is failing in {series_text}" if series else "what is failing in the latest IB"
     if _BUILD_RED_RE.search(question):
@@ -13515,6 +13532,12 @@ def _chat(req: ChatRequest):
     conversational = _conversational_response(sid, original_question)
     if conversational:
         return conversational
+    # "..., aside from the known-issue ones": counts already leave known errors out, and the word "issue" sent this to the
+    # open Issues search (found 2026-11-04 replaying logged phrasings)
+    without_known = re.sub(r"[\s,]*\b(?:aside\s+from|apart\s+from|besides|excluding|except(?:\s+for)?|not\s+counting|ignoring|without)\s+(?:the\s+)?known[\s-]*(?:issues?|errors?)(?:[\s-]*ones)?\b", "", original_question, flags=re.IGNORECASE)
+    if without_known != original_question:
+        original_question = without_known
+        question = _normalize_deterministic_question(without_known)
 
     scope_only = bool(_FOLLOW_UP_SCOPE_RE.match(original_question))
     bare_number = re.fullmatch(r"\s*(?:(?:what\s+is|what's|show(?:\s+me)?|tell\s+me\s+about|details\s+of)\s+)?"
