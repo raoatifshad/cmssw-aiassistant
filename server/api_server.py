@@ -10946,6 +10946,12 @@ def _with_relative_compare_tags(question: str) -> str:
     newer, older = newest_on(first_day), newest_on(second_day)
     if newer and older:
         return f"compare {older} and {newer}"
+    # a flavour is not built every day: its two newest builds up to that day, both named in the
+    # answer (found 2026-11-04: no CLANG build "yesterday", so "which architecture?" for the
+    # primary IBs, the CLANG gone)
+    up_to_day = sorted((t for t in tags if t.rsplit("_X_", 1)[-1][:10] <= f"{first_day:%Y-%m-%d}"), key=_ib_sort_key)
+    if len(up_to_day) >= 2:
+        return f"compare {up_to_day[-2]} and {up_to_day[-1]}"
     return question
 
 
