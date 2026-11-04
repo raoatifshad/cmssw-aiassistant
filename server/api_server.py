@@ -9771,6 +9771,102 @@ def _arch_scope_matches(question: str, session_id: str) -> tuple[str, str, list[
     return tag, words, matches, available
 
 
+_RELVALS_ON_BOTH_RE = re.compile(
+    r"\b(?:relvals?|workflows?|wfs?)\b[^?!]{0,30}\bfail\w*\b[^?!]{0,20}\b(?:on|in)\s+(?:both\s+(\S+)\s+and\s+(\S+?)|all\s+(?:the\s+)?arch\w*)\b",
+    re.IGNORECASE)
+
+
+def _relvals_on_both_answer(question: str) -> str | None:
+    """ "which workflows failed on both el8 and el9 in <tag>?" -- found 2026-11-04: the list for el8
+    only. RelVals failing on every one of those architectures of the primary IB."""
+    match = _RELVALS_ON_BOTH_RE.search(question)
+    if not match:
+        return None
+    tag_match = IB_TAG_RE.search(question)
+    if tag_match:
+        tag = tag_match.group(1)
+    else:
+        latest = _latest_ib_records(None, _requested_release_series(question))
+        if not latest:
+            return None
+        tag = latest[0]["tag"]
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB {tag:$tag}) OPTIONAL MATCH (ib)-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) "
+                "WHERE NOT coalesce(r.known_error, false) "
+                "RETURN ib.arch AS arch, COUNT { (ib)-[:RAN_RELVAL]->() } AS total, collect(DISTINCT r.workflow_id) AS failed, "
+                "collect(DISTINCT r.name) AS names", tag=tag)]
+    finally:
+        driver.close()
+    rows = [r for r in rows if r["total"]]
+    if match.group(1):
+        words = [w.lower().rstrip("?.,") for w in match.groups()[:2]]
+        rows = [r for r in rows if any(w in r["arch"] for w in words)]
+        if len({w for w in words for r in rows if w in r["arch"]}) < 2:
+            return (f"`{tag}` has no RelVal results on one of " + " / ".join(f"`{w}`" for w in words) + ": it has them on "
+                    + (", ".join(f"`{r['arch']}`" for r in rows) or "neither") + ".")
+    if len(rows) < 2:
+        return None
+    common = set.intersection(*(set(r["failed"]) for r in rows))
+    archs = ", ".join(f"`{r['arch']}`" for r in sorted(rows, key=lambda r: r["arch"]))
+    if not common:
+        return f"No RelVal fails on all of {archs} in `{tag}` (known errors and DAS errors not counted)."
+    return (f"**{len(common)} RelVal(s)** fail on all of {archs} in `{tag}`: " + ", ".join(f"`{w}`" for w in sorted(common, key=str))
+            + ".\n\nKnown errors and DAS errors are not counted; sub-IBs are separate builds and not included.")
+
+
+_EXCEPTION_TERM_RE = re.compile(r"\bwhat\s+(?:is|are|does)\b|\bmeaning\s+of\b|\bwhy\s+(?:would|does|do|did|is)\b", re.IGNORECASE)
+_CAMEL_TERM_RE = re.compile(r"(?<![\w:/.-])([A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+)(?![\w/.-])")
+
+
+def _exception_term_answer(question: str) -> str | None:
+    """ "What is an ExternalLHEProducer error?", "what does SonicCallFailed mean?", "why would
+    TritonService fail on aarch64?" -- found 2026-11-04: the latest IB's failure overview, or a dead
+    end. What the imported exceptions record about that word; what it means is not in the data."""
+    if "\n" in question or IB_TAG_RE.search(question) or not _EXCEPTION_TERM_RE.search(question):
+        return None
+    if re.search(r"\b(?:prs?|pull\s+requests?|issues?|github)\b", question, re.IGNORECASE):
+        return None
+    match = _CAMEL_TERM_RE.search(question)
+    if not match:
+        return None
+    term = match.group(1)
+    family = _arch_family(question)
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (e:RelValException) WHERE (e.category = $w OR e.message CONTAINS $w) "
+                "AND ($family IS NULL OR e.arch CONTAINS $family) "
+                "WITH e.category AS category, left(coalesce(e.message, ''), 180) AS message, count(*) AS n, "
+                "collect(DISTINCT e.workflow_id) AS workflows, max(right(e.ib_tag, 15)) AS last "
+                "RETURN category, message, n, workflows[0..4] AS workflows, size(workflows) AS wf_count, last "
+                "ORDER BY n DESC LIMIT 4", w=term, family=family)]
+            known = [r["why"] for r in session.run(
+                "MATCH (r:RelVal) WHERE r.workflow_id IN $wfs AND coalesce(r.known_error, false) "
+                "AND ($family IS NULL OR r.arch CONTAINS $family) "
+                "RETURN DISTINCT r.known_error_message AS why LIMIT 3",
+                wfs=[w for row in rows for w in row["workflows"]], family=family)] if rows else []
+    finally:
+        driver.close()
+    if not rows:
+        return None
+    where = f" on {family}" if family else ""
+    lines = [f"`{term}` in the imported RelVal exceptions{where} (what is recorded, not an explanation; the imported "
+             "data does not define it):", ""]
+    for row in rows:
+        shown = ", ".join(f"`{w}`" for w in row["workflows"]) + (f" +{row['wf_count'] - 4} more" if row["wf_count"] > 4 else "")
+        lines.append(f"- **[{row['category']}]** `{row['message'].strip()}` -- {row['n']} record(s), {row['wf_count']} workflow(s) "
+                     f"({shown}), newest build {row['last']}")
+    known = [k for k in known if k]
+    if known:
+        lines.append("\nKnown error reason on the IB dashboard for those workflows: " + "; ".join(known) + ".")
+    lines.append("\nPaste the full error to see where it appears in the test logs, or ask for PRs about it.")
+    return "\n".join(lines)
+
+
 _NEWEST_ARCH_IB_RE = re.compile(
     r"\b(?:latest|newest|last)\s+(aarch64|arm64|arm|riscv\w*|amd64|x86_64|el\d+|slc\d+|gcc\d+)\s+(?:ib|build|release)s?\b", re.IGNORECASE)
 
@@ -11881,6 +11977,15 @@ def _chat(req: ChatRequest):
     if basic_term:
         return _chat_response(sid, original_question, basic_term, "deterministic:glossary")
 
+
+    for handler, route_name in ((_relvals_on_both_answer, "relvals_on_both"), (_exception_term_answer, "exception_term")):
+        try:
+            term_answer = handler(question)
+        except Exception as exc:
+            print(f"WARNING: {route_name} failed: {exc}")
+            term_answer = None
+        if term_answer:
+            return _chat_response(sid, original_question, term_answer, f"deterministic:{route_name}")
 
     by_exit = _relval_by_exit_code_answer(question)
     if by_exit:
