@@ -317,7 +317,8 @@ add("RB", "how many workflows does the IB run?", any=[r"\d{3,}"])
 T3 = "CMSSW_20_1_X_2026-11-03-1100"       # 10805.31 ExternalFailure on el8, 539.0 TimeOut
 T17 = "CMSSW_17_1_X_2026-11-03-1100"      # 11 RelVals + CondTools/SiStrip fail: global tags not in the database
 CPP = "CMSSW_20_1_CPP23_X_2026-11-03-1100"  # 439 compile warnings on gcc16; Utilities/General, PerfTools/AllocMonitor
-add("N4", "what's wrong with 17_1 today? lots of relvals failing with 16640", all=[r"16640", r"CMSSW_17_1"])
+# whether 16640 shows depends on the newest build (2026-11-03-2300: its 16640s are all known errors)
+add("N4", "what's wrong with 17_1 today? lots of relvals failing with 16640", all=[r"CMSSW_17_1", r"failing|failed"])
 add("N4", "which IBs failed the most relvals this week?", all=[r"\| Failed \|"], none=[r"get_failing_relvals"])
 add("N4", "how many relvals failed in the last 30 days on riscv", all=[r"riscv64"])
 add("N4", f"compare CMSSW_20_1_X_2026-11-02-2300 and {T3} on el8_amd64_gcc14", all=[r"10805\.31", r"Newly failing"], none=[r"No new failures"])

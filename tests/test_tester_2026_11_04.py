@@ -418,11 +418,11 @@ class RoundThreeTests(unittest.TestCase):
     @patch("server.api_server._newest_tag_for_arch_word", return_value=("CMSSW_20_1_X_2026-11-02-2300", ["el9_aarch64_gcc14"]))
     @patch("server.api_server.get_driver")
     def test_known_errors_for_an_architecture_use_its_newest_build(self, get_driver, _):
-        driver, session = _driver_with([])
+        driver, session = _driver_with([], MagicMock(single=MagicMock(return_value={"tag": "CMSSW_20_1_X_2026-11-02-2300"})))
         get_driver.return_value = driver
         _known_error_list_answer("known errors list for aarch64 20_1", "s")
-        self.assertEqual(session.run.call_args.kwargs["tag"], "CMSSW_20_1_X_2026-11-02-2300")
-        self.assertEqual(session.run.call_args.kwargs["arch"], "el9_aarch64_gcc14")
+        self.assertEqual(session.run.call_args_list[0].kwargs["tag"], "CMSSW_20_1_X_2026-11-02-2300")
+        self.assertEqual(session.run.call_args_list[0].kwargs["arch"], "el9_aarch64_gcc14")
 
     @patch("server.api_server._previous_primary_tag", return_value="CMSSW_17_1_X_2026-11-02-2300")
     @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_17_1_X_2026-11-03-1100"}])
