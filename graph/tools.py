@@ -866,7 +866,8 @@ def get_unittest_names(ib_tag: str, arch: str | None = None, include_sub_ibs: bo
 _PRIMARY_IB_TAG_RE = re.compile(r"^CMSSW_(\d+)_(\d+)_X_(\d{4}-\d{2}-\d{2}-\d{4})$")
 
 
-def latest_and_previous_primary_tags(arch: str | None = None) -> tuple[str, str] | None:
+def latest_and_previous_primary_tags(arch: str | None = None,
+                                     series: tuple[int, int] | None = None) -> tuple[str, str] | None:
     """Return (latest_tag, previous_tag): the two most recent primary builds within
     the newest (highest major.minor) release series, or None if fewer than two
     exist. Lives here (not server/api_server.py) so both the chat "compare two
@@ -894,7 +895,9 @@ def latest_and_previous_primary_tags(arch: str | None = None) -> tuple[str, str]
         return (int(major), int(minor), timestamp)
 
     keyed = [(version_key(row["tag"]), row["tag"]) for row in rows]
-    newest_series = max(key[:2] for key, _ in keyed)
+    # a named release series ("compare 17_1 latest with previous", found 2026-11-04 comparing
+    # 20_1 builds instead); otherwise the newest series
+    newest_series = tuple(series) if series else max(key[:2] for key, _ in keyed)
     timestamps = sorted({key[2] for key, _ in keyed if key[:2] == newest_series}, reverse=True)
     if len(timestamps) < 2:
         return None
