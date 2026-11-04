@@ -10408,8 +10408,8 @@ def _named_test_answer(question: str) -> str | None:
 
 
 _SANITIZER_LIST_RE = re.compile(
-    r"\b(?:sanitizer|asan|ubsan)\b[^?!\n]{0,40}\b(?:problems?|errors?|reports?|findings?|issues?)\b|"
-    r"\b(?:problems?|errors?|reports?|findings?|issues?)\b[^?!\n]{0,30}\b(?:sanitizer|asan|ubsan)\b",
+    r"\b(?:sanitizer|asan|ubsan)\b[^?!\n]{0,40}\b(?:problems?|errors?|reports?|findings?)\b|"
+    r"\b(?:problems?|errors?|reports?|findings?)\b[^?!\n]{0,30}\b(?:sanitizer|asan|ubsan)\b",
     re.IGNORECASE)
 
 
@@ -10419,7 +10419,7 @@ def _sanitizer_problems_answer(question: str, session_id: str) -> str | None:
     none of them from a sanitizer, right after a question about the ASAN IB."""
     if "\n" in question or not _SANITIZER_LIST_RE.search(question):
         return None
-    if re.search(r"\b(?:prs?|pull\s+requests?|issues?\s+#|github|new|since|what\s+does|mean)\b", question, re.IGNORECASE):
+    if re.search(r"\b(?:prs?|pull\s+requests?|issues?|github|new|since|what\s+does|mean)\b", question, re.IGNORECASE):
         return None
     # "are there sanitizer errors in passed ASAN tests?" got "0 new, 0 returned, 0 gone" -- true
     # and useless, with a buffer overflow in a test passing in every run
