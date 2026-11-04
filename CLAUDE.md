@@ -160,6 +160,9 @@ additionally deletes graph records whose backing source file is gone
 
 - `cmsrepo/data/{relvals,commands,prs}` — sparse-checkout of
   `cms-sw/cms-sw.github.io`, expected at `--cmsrepo`.
+  Only `relvals/<arch>/<date>/*.json` is read: the GPU and RNTuple results in
+  `<date>/gpu/<card>/` and `<date>/other/rntuple/` are **not imported** (found
+  2026-11-04), and the chat says so when asked.
 - `--clang-root` — a separately-staged tree of `<ib-tag>/<arch>/build-logs/**/log.html`
   (kept outside `cmsrepo`, parsed by `ingestion/clang_parser.py`).
 - `--es-exceptions-json` — RelVal exception text, sourced from an
