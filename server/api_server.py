@@ -1031,6 +1031,12 @@ def _normalize_deterministic_question(question: str) -> str:
         (r"\bpackages?\s+(?:that\s+)?(?:needs?|require|requires)\s+(?:fixing|to\s+be\s+fixed|a\s+fix|attention)\b",
          "failed unit-test packages"),
         (r"\bhow\s+much\b", "how many"),
+        # "is the HGCal global buffer overflow new?": the words as the sanitizer writes them
+        (r"\b(global|heap|stack)\s+buffer\s+overflow\b", r"\1-buffer-overflow"),
+        (r"\b(heap|stack)\s+use\s+after\s+(free|scope|return)\b", r"\1-use-after-\2"),
+        # "any regressions in unit tests in the latest IB compared to the previous?", "list DAS errors in latest IB"
+        (r"\bany\s+regressions?\b", "what is newly failing"),
+        (r"\b(?:list|show)\s+(?:the\s+)?das[\s_-]*errors?\b", "failed relvals with DAS errors"),
         # "which IB variant has compilation warnings in ..." (found 2026-11-04: "is a primary IB, not a sub-IB")
         (r"\bwhich\s+(?:ib\s+)?(?:variants?|flavou?rs?|sub-?ibs?)\s+(?:has|have|had|show\w*)\s+(?:compil\w+\s+|build\s+)?warnings\b",
          "which builds have build warnings"),
@@ -8114,7 +8120,7 @@ _LOG_PROBLEM_PASTE_RE = re.compile(
     # a sanitizer error type or a log line typed on its own (found 2026-11-04, all "my lookups came
     # back empty" with the problem in the logs): "heap-use-after-free edm::storage::File::syswrite",
     # "UCX ERROR ibv_create_ah", "Warning: Could not download ... HTTP Error 429"
-    r"\b(?:heap|stack|global|container)-(?:use-after-\w+|buffer-(?:over|under)flow|overflow)\b|"
+    r"\b(?:heap|stack|global|container)[\s-](?:use[\s-]after[\s-]\w+|buffer[\s-](?:over|under)flow|overflow)\b|"
     r"\bdetected memory leaks\b|\buse-of-uninitialized-value\b|\bUCX\s+ERROR\b|\bHTTP Error \d{3}\b|"
     # "Fatal exception 'ConfigFileReadError': ...", "ConfigFileReadError KeyError Run4D500",
     # "IndexError in Madgraph relval logs" (found 2026-11-04: dead end, GitHub only, "which architecture?")
@@ -8940,7 +8946,6 @@ def _known_error_list_answer(question: str, session_id: str) -> str | None:
         tag = context_tag or (latest[0]["tag"] if latest else None)
     if not tag:
         return None
-    arch = _requested_ib_arch(question)
     driver = get_driver()
     try:
         with driver.session() as session:
@@ -9034,6 +9039,9 @@ _BASIC_TERMS = (
      "**CMSSW** is the CMS experiment's software framework (event generation, simulation, reconstruction and "
      "analysis), developed in `cms-sw/cmssw` on GitHub. It is released in series such as `CMSSW_20_1_X`; the "
      "Integration Builds (IBs) are the automatic builds of those series this bot answers about."),
+    (r"failed|a\s+failure",
+     "**FAILED** on the IB dashboard: the RelVal or unit test ran and a step did not succeed. A RelVal with a known "
+     "error is also failed there, but excluded from the failing counts here; a **DAS error** never ran at all."),
     (r"(?:a\s+)?sub[\s-]*ibs?",
      "A **sub-IB** is another build flavour of the same IB, e.g. `CMSSW_20_1_ASAN_X_2026-11-02-2300` (address "
      "sanitizer) next to the primary `CMSSW_20_1_X_2026-11-02-2300`. Each is built and tested separately and has "
@@ -10930,7 +10938,7 @@ def _variant_day_failure_answer(question: str, session_id: str) -> tuple[str, li
 
 
 _GREETING_RE = re.compile(r"\s*(?:hi|hii+|hello|hey|heelo|hallo|good (?:morning|afternoon|evening)|salam|yo)\b[\s!.,]*(?:there|bot)?[\s!.]*", re.IGNORECASE)
-_THANKS_RE = re.compile(r"\s*(?:thanks?(?: you)?|thank u|thx|ty|great|nice|cool|perfect|awesome)\b[\s!.,]*(?:a lot|so much)?[\s!.]*", re.IGNORECASE)
+_THANKS_RE = re.compile(r"\s*(?:thanks?(?: you)?|thank u|thx|ty|great|nice|cool|perfect|awesome)\b[\s!.,]*(?:a lot|so much)?[\s!.,]*(?:that\s+(?:helped|helps|works|worked))?[\s!.]*", re.IGNORECASE)
 _WRITE_ACTION_RE = re.compile(
     r"^\s*(?:(?:please|can you|could you|pls)\s+)?(?:re-?run|restart|re-?trigger|kill|abort|cancel|"
     r"delete|wipe|purge|merge|approve|reject|reopen|comment\s+on|"
@@ -11654,7 +11662,7 @@ _FOLLOW_UP_NEW_RE = re.compile(
     r"^\s*(?:and\s+|so\s+)?(?:(?:are\s+)?any(?:thing)?(?:\s+of\s+(?:them|those|these))?\s+new|what(?:'s|\s+is)\s+new|"
     r"(?:are\s+)?(?:they|those|these)\s+new)\s*[?.!]*\s*$", re.IGNORECASE)
 _FOLLOW_UP_STEP_RE = re.compile(
-    r"^\s*(?:and\s+|so\s+)?(?:(?:in\s+|at\s+)?which\s+step|what\s+step)(?:\s+(?:did\s+)?(?:it|they|that)?\s*(?:fail(?:ed|s)?)?)?\s*[?.!]*\s*$",
+    r"^\s*(?:and\s+|so\s+)?(?:(?:in\s+|at\s+)?which\s+step|what\s+step|(?:what\s+|which\s+)?exit\s*code)(?:\s+(?:did\s+)?(?:it|they|that)?\s*(?:fail(?:ed|s)?)?)?\s*[?.!]*\s*$",
     re.IGNORECASE)
 _FOLLOW_UP_BEFORE_RE = re.compile(
     r"^\s*(?:and\s+|what\s+about\s+|how\s+about\s+)*(?:the\s+)?(?:one|build|ib|previous(?:\s+(?:one|build|ib))?)(?:\s+before(?:\s+(?:it|that))?)?\s*[?.!]*\s*$",
