@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from server import api_server
 from server.api_server import (
+    _named_test_answer, _sanitizer_problems_answer, _with_relative_compare_tags,
     _TEST_LOG_QUESTION_RE, _WORKFLOW_WHERE_RE,
     _architectures_answer, _not_failing_answer, _pr_search_terms, _resolve_short_follow_up, _turn_memory,
     _LOG_PROBLEM_PASTE_RE, _ib_failure_ranking_answer, _normalize_deterministic_question,
@@ -191,6 +192,86 @@ class PhrasingTests(unittest.TestCase):
         get_driver.return_value = driver
         text = _architectures_answer("which architectures does CMSSW_20_1_CPP23_X_2026-11-03-1100 have?")
         self.assertIn("**2 architecture(s)**: `el9_amd64_gcc14`, `el9_amd64_gcc16`", text)
+
+
+class NamedTestTests(unittest.TestCase):
+    FULL = "FWCore/Integration/TestIntegrationEventSetup"
+
+    def _run(self, question, runs, problems):
+        driver, session = _driver_with(runs, problems)
+        with patch("server.api_server.get_driver", return_value=driver):
+            return _named_test_answer(question), session
+
+    def test_failed_run_with_its_log_problem(self):
+        tag = "CMSSW_20_1_X_2026-11-02-2300"
+        text, session = self._run("why does TestIntegrationEventSetup fail on aarch64?", [
+            {"tag": tag, "arch": "el9_aarch64_gcc14", "run_variant": "", "failed": [self.FULL], "passed": [], "other": []},
+            {"tag": "CMSSW_20_1_X_2026-11-01-2300", "arch": "el9_aarch64_gcc14", "run_variant": "", "failed": [], "passed": [self.FULL], "other": []},
+        ], [{"kind": "fatal_exception", "category": "LogicError", "summary": "Fatal exception 'LogicError': boom"}])
+        self.assertIn("not passed in 1 of 2", text)
+        self.assertIn(f"`{tag}` | `el9_aarch64_gcc14`", text)
+        self.assertIn("boom", text)
+        self.assertEqual(session.run.call_args_list[0].kwargs["family"], "aarch64")
+
+    def test_passed_says_so_and_shows_what_its_log_has(self):
+        text, _ = self._run("why is TestIntegrationEventSetup failing", [
+            {"tag": "CMSSW_20_1_X_2026-11-01-2300", "arch": "el9_amd64_gcc14", "run_variant": "", "failed": [], "passed": [self.FULL], "other": []},
+        ], [{"kind": "sanitizer", "category": "x", "summary": "AddressSanitizer: overflow"}])
+        self.assertIn("passed in all 1", text)
+        self.assertIn("It passed, but its log", text)
+
+    def test_no_such_test_leaves_the_question_to_others(self):
+        driver, _ = _driver_with([])
+        with patch("server.api_server.get_driver", return_value=driver):
+            self.assertIsNone(_named_test_answer("why does TestNothingLikeThis fail?"))
+
+    def test_questions_without_a_test_name_do_no_lookup(self):
+        with patch("server.api_server.get_driver") as get_driver:
+            self.assertIsNone(_named_test_answer("why does the latest IB fail?"))
+            self.assertIsNone(_named_test_answer("what is TestIntegrationEventSetup used for"))
+            get_driver.assert_not_called()
+
+
+class SanitizerListTests(unittest.TestCase):
+    def _session(self, *results):
+        driver, session = _driver_with(*results)
+        return patch("server.api_server.get_driver", return_value=driver), session
+
+    def test_uses_the_sanitizer_ib_of_the_conversation_and_lists_leaks_last(self):
+        tag = "CMSSW_20_1_ASAN_X_2026-11-02-2300"
+        count = MagicMock()
+        count.single.return_value = {"n": 4}
+        patcher, session = self._session(count, [
+            {"category": "LeakSanitizer: detected memory leaks", "summary": "leak in bash", "arch": "a", "owners": ["x", "y"]},
+            {"category": "AddressSanitizer: heap-use-after-free", "summary": "use after free", "arch": "a", "owners": ["z"]},
+            {"category": "AddressSanitizer: heap-use-after-free", "summary": "use after free", "arch": "b", "owners": ["z"]},
+        ])
+        with patch.dict(api_server._latest_ib_contexts, {"s": tag}), patcher:
+            text = _sanitizer_problems_answer("what about the sanitizer problems in the test logs?", "s")
+        self.assertIn(f"`{tag}`", text)
+        self.assertLess(text.index("use after free"), text.index("leak in bash"))
+        self.assertIn("(1 besides leak reports)", text)
+
+    def test_passed_tests_filter_and_definitions(self):
+        tag = "CMSSW_20_1_ASAN_X_2026-11-02-2300"
+        count = MagicMock()
+        count.single.return_value = {"n": 4}
+        patcher, session = self._session(count, [])
+        with patcher:
+            text = _sanitizer_problems_answer(f"are there sanitizer errors in passed tests in {tag}?", "s")
+        self.assertIn("inside tests reported as PASSED", text)
+        self.assertIs(session.run.call_args.kwargs["only_passed"], True)
+        self.assertIsNone(_sanitizer_problems_answer("what does the ASAN error mean?", "s"))
+
+
+class RelativeCompareTests(unittest.TestCase):
+    @patch("server.api_server._newest_series_prefix", return_value="CMSSW_20_1")
+    @patch("server.api_server.get_driver")
+    def test_flavour_not_built_that_day_uses_its_two_newest_builds_up_to_it(self, get_driver, _):
+        driver, _session = _driver_with([{"tag": f"CMSSW_20_1_CLANG_X_2020-01-0{d}-2300"} for d in (1, 2, 5)])
+        get_driver.return_value = driver
+        self.assertEqual(_with_relative_compare_tags("compare CLANG yesterday with the day before"),
+                         "compare CMSSW_20_1_CLANG_X_2020-01-02-2300 and CMSSW_20_1_CLANG_X_2020-01-05-2300")
 
 
 if __name__ == "__main__":
