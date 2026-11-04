@@ -9004,7 +9004,8 @@ def _relval_by_exit_code_answer(question: str) -> str | None:
     if re.search(r"\b(?:relvals?|workflows?|wfs?|anything|which|what)\b", question, re.IGNORECASE):
         question = re.sub(r"\b(?:timed?[\s-]*out|time[\s-]*outs?|timeouts?)\b", "failed with TimeOut", question,
                           flags=re.IGNORECASE)
-    if not re.search(r"\bfail(?:ed|ing|s)?\s+with\b|\bwith\s+exit\s+code\b", question, re.IGNORECASE):
+    if not re.search(r"\bfail(?:ed|ing|s)?\s+with\b|\b(?:with|have|has|had|having|got|get)\s+(?:an?\s+|the\s+)?exit\s*code\b",
+                     question, re.IGNORECASE):
         return None
     tag_match = IB_TAG_RE.search(question)
     if not tag_match:
