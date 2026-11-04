@@ -473,6 +473,15 @@ class TerseInputTests(unittest.TestCase):
             self.assertTrue(_THANKS_RE.fullmatch(text), text)
 
 
+class AccuracyAuditTests(unittest.TestCase):
+    def test_long_workflow_ids_are_recognised(self):
+        # 36 ids and 6,989 imported rows have seven decimals (found 2026-11-04 by sampling)
+        self.assertEqual(_shift_question_rewrite("wf 2022.0000002 log"), "log of 2022.0000002 in the latest IB")
+
+    def test_exit_code_kind_goes_to_the_exit_answer(self):
+        self.assertEqual(_shift_question_rewrite("is exit code 31744 a CMSSW exception?"), "what does exit code 31744 mean")
+
+
 class ConceptTests(unittest.TestCase):
     def test_terms(self):
         for question, expected in (("what's a global tag?", "conditions"), ("what is the ORP?", "orp-approved"),
