@@ -4874,7 +4874,7 @@ def _ib_results_summary_answer(
             variant_rows.setdefault(row["ib_tag"], []).append(row)
 
     lines = [
-        f"Imported results for primary IB `{tag}`:",
+        f"Imported results for {'primary IB' if _PRIMARY_IB_TAG_RE.match(tag) else 'sub-IB'} `{tag}`:",
         "",
         f"Scope: {scope_description}.",
         "",
