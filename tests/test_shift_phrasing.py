@@ -586,6 +586,38 @@ class LlmAbsenceClaimTests(unittest.TestCase):
             self.assertFalse(claim(answer), answer)
 
 
+class MetaConversationTests(unittest.TestCase):
+    def test_questions_about_the_previous_answer(self):
+        from server.api_server import _meta_conversation_answer as meta
+        _turn_memory["s-m"] = {"question": "q", "answer": "the answer", "route": "capability:relval"}
+        self.assertIn("fixed code", meta("are you sure?", "s-m"))
+        self.assertIn("fixed code", meta("where did you get that from?", "s-m"))
+        self.assertEqual(meta("repeat that", "s-m"), "the answer")
+        self.assertIn("can't change imported data", meta("that's wrong", "s-m"))
+        _turn_memory["s-m"]["route"] = "llm_validated"
+        self.assertIn("An LLM wrote that", meta("are you sure?", "s-m"))
+        self.assertIn("starting fresh", meta("start over", "s-m"))
+        self.assertNotIn("s-m", _turn_memory)
+
+    def test_ordinary_questions_are_not_meta(self):
+        from server.api_server import _meta_conversation_answer as meta
+        for question in ("what is the latest IB?", "is that known?", "why?", "first one", "source of 539.0"):
+            self.assertIsNone(meta(question, "s-none"), question)
+
+
+class AlertAnswerTests(unittest.TestCase):
+    @patch("graph.alerts.evaluate_rules", return_value=[{"rule": {"name": "r1"}, "message": "13 newly failing:\n- a", "evidence": {}}])
+    @patch("graph.alerts.list_rules", return_value=[{"name": "r1", "rule_type": "relval_regression", "threshold": 1}])
+    def test_firing_rules_are_named(self, *_):
+        from server.api_server import _alerts_question_answer
+        answer = _alerts_question_answer("are any alerts firing?")
+        self.assertIn("**r1**: 13 newly failing:", answer)
+        self.assertNotIn("None", answer)
+        self.assertIn("can't set alerts", _alerts_question_answer("alert me when el10 is fixed"))
+        self.assertIsNone(_alerts_question_answer("what is the latest IB?"))
+        self.assertIsNone(_alerts_question_answer("<script>alert(1)</script>"))
+
+
 class ConceptTests(unittest.TestCase):
     def test_terms(self):
         for question, expected in (("what's a global tag?", "conditions"), ("what is the ORP?", "orp-approved"),

@@ -9636,6 +9636,15 @@ def _known_error_list_answer(question: str, session_id: str) -> str | None:
 
 
 _BASIC_TERMS = (
+    (r"\bwhat\s+does\s+ib\s+(?:stand\s+for|mean)\b", "**IB** stands for **Integration Build**: an automatic build of a CMSSW release branch with the PRs merged so far, tested with RelVals and unit tests."),
+    (r"\barchitecture\s+(?:string|name)\b", "An **architecture** like `el9_amd64_gcc14` reads as the operating system (Enterprise Linux 9), the CPU family (amd64, aarch64, riscv64) and the compiler (GCC 14). Results are kept separately for each."),
+    (r"\bstep\s*1\b[^?]*\bstep\s*2\b", "A RelVal workflow is a chain of `cmsRun` steps. Usually step1 is generation and simulation (or reading input data), step2 digitisation and trigger, step3 reconstruction, but it depends on the workflow."),
+    (r"\bpre[\s-]*releases?\b", "A **pre-release** (e.g. `CMSSW_20_1_0_pre5`) is a development snapshot of a release cycle, taken from the release branch that IBs also build, ahead of the final `CMSSW_20_1_0`."),
+    (r"\bpile[\s-]*up\b|\bPU\b(?=[^?]*\bworkflow)", "**Pileup** means extra proton-proton collisions overlaid on the event of interest. `PU` in a workflow name means it simulates them."),
+    (r"\bsonic\b", "**SONIC** is the CMSSW framework for running ML inference on a server rather than inside the job. A `SonicCallFailed` error means such a call failed, often through `TritonService`."),
+    (r"\btriton\b", "**Triton** is NVIDIA's inference server. CMSSW's `TritonService` starts or connects to it, so that modules can run ML models through SONIC."),
+    (r"\balpaka\b", "**alpaka** is a C++ portability library. CMSSW uses it to write one version of code that runs on CPUs and on NVIDIA (CUDA) or AMD (ROCm) GPUs."),
+    (r"\bclang\s+static[\s-]*analy[sz]er\b", "The **Clang static analyzer** checks source code without running it. CMSSW adds its own checkers, such as `threadsafety.StaticLocal`, and each finding appears as a warning in the build logs parsed here."),
     (r"thepeg(?:::|\s+)?(?:exceptions?)?",
      "**ThePEG** is the C++ event-generator toolkit that Herwig is built on. A `ThePEG::Exception` was thrown inside the generator code; its "
      "message says what happened. Ask \"which IBs have ThePEG exception\" for where it is recorded."),
@@ -12653,6 +12662,8 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
     if re.fullmatch(r"\s*list\s+(?:them|those|these)\s*[?.!]*\s*", question, re.IGNORECASE) and _latest_ib_contexts.get(sid):
         kind = "unit tests" if str(last.get("route", "")).endswith("unittest") else "relvals"
         return f"list failed {kind} in {_latest_ib_contexts[sid]}"
+    if re.fullmatch(r"\s*(?:try\s+again|again|retry)\s*[?.!]*\s*", question, re.IGNORECASE):
+        return previous
     context_ib = _latest_ib_contexts.get(sid)
     if context_ib and re.fullmatch(r"\s*(?:and\s+)?(?:the\s+)?builds?\s*[?.!]*\s*", question, re.IGNORECASE):
         return f"build status of {context_ib}"
@@ -13262,6 +13273,9 @@ def _normalize_terse_words(question: str) -> str:
     text = re.sub(r"\b(?:wf|relval)\s*(\d{1,8})(\.\d+)?\b|\bworkflow\s*(\d{1,8})(\.\d+)?\b",
                   lambda m: f"workflow {m.group(1) or m.group(3)}{m.group(2) or m.group(4) or '.0'}", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(?:error\s+code|exit)\s+(\d{1,6})\b", r"exit code \1", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bcompile\s+warnings\b", "compilation warnings", text, flags=re.IGNORECASE)
+    if re.search(r"(?<![\w-])\d{4}-\d{2}-\d{2}-\d{4}(?![\d-])", text):
+        text = re.sub(r"(?<![\w-])(\d{4}-\d{2}-\d{2}-\d{4})(?![\d-])", lambda m: f"{_latest_series_prefix()}{m.group(1)}", text)
     return text
 
 
@@ -13333,6 +13347,11 @@ def _terse_question(question: str) -> str | None:
         return f"what is {flavour_means.group(1)}?"
     if re.fullmatch(r"clang", text, re.IGNORECASE):
         return "clang warnings in the latest IB"
+    if re.fullmatch(r"clang\s+warnings\s+(?:per|by)\s+checker", text, re.IGNORECASE):
+        return "which checker has the most clang warnings?"
+    package_warnings = re.fullmatch(r"(?:warnings\s+in|which\s+files\s+in)\s+([A-Z][A-Za-z0-9]+/[A-Z][A-Za-z0-9]+)(?:\s+have\s+warnings)?", text)
+    if package_warnings:
+        return f"clang warnings in {package_warnings.group(1)}"
     if re.fullmatch(r"warnings?", text, re.IGNORECASE):
         return "build warnings in the latest IB"
     if re.fullmatch(r"build\s+errors?|builds?", text, re.IGNORECASE):
@@ -13950,10 +13969,56 @@ def _open_issues_naming(term: str, limit: int = 5) -> str:
             + "\n".join(f"- **#{h['n']}** {h['title']}" for h in hits))
 
 
+def _answer_source_note(route: str, answer: str) -> str:
+    route = route or ""
+    if "llm" in route:
+        return ("An LLM wrote that from read-only lookups. Its numbers and IB tags were checked against what the lookups returned, its wording wasn't, so check it on the IB page before relying on it.")
+    if "doc" in route or "glossary" in route:
+        return "That comes from fixed text and the imported shifter documentation, not from today's results."
+    source = ("the raw IB test logs" if "log" in route or "test_log" in route else
+              "imported GitHub Issues and PRs" if "pr_" in route or "issue" in route or "github" in route else
+              "the imported RelVal exception export" if "exception" in route else
+              "the IB results on cms-sw.github.io, as imported")
+    return f"That was written by fixed code from a database query on {source}, with no LLM wording. It is as current as the last data refresh (twice a day), and the IB page is the place to compare it with."
+
+
+def _meta_conversation_answer(question: str, sid: str) -> str | None:
+    """ "are you sure?", "where did you get that from?", "that's wrong", "repeat that", "start over" (found 2026-11-04: all the generic menu)."""
+    text = question.strip().lower().rstrip("?.! ")
+    last = _turn_memory.get(sid)
+    if re.fullmatch(r"(?:never\s*mind|nvm|forget\s+it|start\s+over|reset|clear|new\s+topic|let'?s\s+start\s+over)", text):
+        _turn_memory.pop(sid, None)
+        _latest_ib_contexts.pop(sid, None)
+        _last_package_contexts.pop(sid, None)
+        return "OK, starting fresh. What would you like to check?"
+    if re.fullmatch(r"(?:are\s+you\s+(?:sure|certain)|is\s+that\s+(?:right|correct|true)|really|where\s+did\s+you\s+get\s+(?:that|this)(?:\s+from)?|where\s+(?:is|does)\s+(?:that|this)\s+(?:from|come\s+from)|what(?:'s|\s+is)\s+the\s+source|show\s+me\s+the\s+source|source|how\s+do\s+you\s+know(?:\s+that)?)", text):
+        if not last:
+            return "Nothing asked yet in this conversation. Ask something, and I'll say where its answer comes from."
+        return _answer_source_note(str(last.get("route", "")), last["answer"])
+    if re.fullmatch(r"(?:that(?:'s|\s+is)\s+(?:wrong|incorrect|not\s+(?:right|correct|true))|wrong|incorrect|not\s+correct|you(?:'re|\s+are)\s+wrong|this\s+is\s+wrong)", text):
+        return ("I can't change imported data from the chat. Tell me the build and what you expected and I'll look it up, or use the feedback buttons under the answer: "
+                "feedback is checked against the data and never overwrites it. The IB may also have moved on since the last data refresh.")
+    if re.fullmatch(r"(?:repeat(?:\s+that|\s+it)?|say\s+(?:that|it)\s+again|what\s+did\s+you\s+(?:just\s+)?say|come\s+again)", text):
+        return last["answer"] if last else "I haven't said anything yet in this conversation."
+    if re.fullmatch(r"(?:shorter(?:\s+please)?|too\s+long|summari[sz]e\s+(?:that|it)|short\s+version|tl;?dr)", text):
+        tag = IB_TAG_RE.search(last["answer"]) if last else None
+        if tag and "What's failing in" in last["answer"]:
+            return _status_line(tag.group(1))
+        return "I can't shorten answers in general. Ask for less, e.g. \"in one line, how is the latest IB\" or name one architecture."
+    if re.fullmatch(r"(?:(?:in|as)\s+a\s+table(?:\s+please)?|explain\s+(?:it|that)\s+(?:simply|in\s+simple\s+words)|simpler(?:\s+please)?|in\s+plain\s+english)", text):
+        return "I answer in fixed formats and can't rewrite an answer. Ask about one term if it helps, e.g. \"what is a DAS error\"."
+    if re.fullmatch(r"(?:can\s+you\s+)?(?:export|download|save)(?:\s+(?:this|that|it))?(?:\s+please)?", text):
+        return f"This conversation can be exported as Markdown from `/api/chat/{sid}/export.md`."
+    return None
+
+
 def _listed_items_follow_up(question: str, sid: str) -> str | None:
     """A short follow-up about what the previous answer listed: "which ones already have an issue open?", "have they
     failed before?", and after a failed build "since when?" / "which packages?" (all found 2026-11-04 reaching the menu
     or a text search for "ok ones")."""
+    meta = _meta_conversation_answer(question, sid) if len(question) <= 50 else None
+    if meta:
+        return meta
     last = _turn_memory.get(sid)
     if not last or len(question) > 70 or IB_TAG_RE.search(question) or re.search(r"\d+\.\d+|\b#?\d{4,6}\b", question):
         return None
@@ -15007,7 +15072,10 @@ def _one_line_status_answer(question: str) -> str | None:
     latest = _latest_ib_records(None, _requested_release_series(question))
     if not latest:
         return None
-    tag = latest[0]["tag"]
+    return _status_line(latest[0]["tag"], question, bool(safe_to_use))
+
+
+def _status_line(tag: str, question: str = "", safe_to_use: bool = False) -> str:
     records = _ib_build_records(tag)
     failed_builds = [f"{r['arch']}" + ("" if r["variant"] == "primary" else f" ({r['variant']})") for r in records if r["build"] == "error"]
     relvals = sum(len(r["failed"]) for r in records)
@@ -15852,6 +15920,47 @@ def _sub_ib_only_failures_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _alerts_question_answer(question: str) -> str | None:
+    """ "what alerts are configured?", "are any alerts firing?", "alert me when el10 is fixed" (found 2026-11-04: raw LLM evidence; a text search for el10)."""
+    if not re.search(r"\balerts?\b(?!\s*\()", question, re.IGNORECASE) or re.search(r"[<>{}]", question):
+        return None  # "<script>alert(1)</script>" isn't a question about alerts (found by the replay)
+    if re.search(r"\balert\s+me\b|\bnotify\s+me\b", question, re.IGNORECASE):
+        return "I can't set alerts from the chat: I'm read-only. Alert rules are managed separately. Ask \"what alerts are configured\" to see them."
+    from graph.alerts import evaluate_rules, list_rules
+    rules = list_rules()
+    if re.search(r"\b(?:firing|fired|fire|triggered|active\s+now|going\s+off|last\s+alert)\b", question, re.IGNORECASE):
+        fired = evaluate_rules(_NullNotifier())
+        if not fired:
+            return f"None of the {len(rules)} active alert rule(s) triggers on the current data."
+        lines = [f"**{len(fired)} of {len(rules)}** active alert rule(s) trigger on the current data:"]
+        lines += [f"- **{a['rule'].get('name')}**: {str(a.get('message') or '').splitlines()[0][:240]}" for a in fired[:10]]
+        lines.append("This checks the data now; alert history isn't kept here. The regression alert counts each workflow once per build, while the shift summary also counts one that fails with a different exit code, so its number can be higher.")
+        return "\n".join(lines)
+    if not rules:
+        return "No alert rules are configured."
+    lines = [f"**{len(rules)} active alert rule(s)**:"]
+    lines += [f"- **{r.get('name')}** (`{r.get('rule_type')}`)" + (f", threshold {r.get('threshold')}" if r.get("threshold") is not None else "") for r in rules[:15]]
+    lines.append("They look for failures that weren't in the previous build, or counts over a threshold. Ask \"are any alerts firing\" for now.")
+    return "\n".join(lines)
+
+
+def _clang_freshness_answer(question: str) -> str | None:
+    """ "how recent is the clang data?", "why is the clang data old?" (found 2026-11-04: dead ends)."""
+    if not re.search(r"\bclang\b", question, re.IGNORECASE) or not re.search(r"\bhow\s+(?:recent|old|fresh)\b|\bwhy\b[^?]*\b(?:old|stale|outdated|behind)\b|\bup\s*to\s*date\b", question, re.IGNORECASE):
+        return None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            tags = [r["t"] for r in session.run("MATCH (ib:IB)-[:REPORTED]->() RETURN DISTINCT ib.tag AS t")]
+    finally:
+        driver.close()
+    if not tags:
+        return "No Clang warning data is imported."
+    newest = max(tags, key=lambda t: t.rsplit("_X_", 1)[-1])
+    return (f"Clang warnings are parsed up to `{newest}`, so they are older than the RelVal and unit-test results. They come from build logs staged separately, "
+            "not from the daily data refresh, and nothing newer has been staged.")
+
+
 def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     """Answers the 2026-11-04 test pass found missing; each returns None unless its phrasing matches."""
     if "\n" in question or len(question) > 200:
@@ -15874,7 +15983,7 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
                            (_recovered_window_answer, "recovered_window"), (_longest_failing_answer, "longest_failing"), (_workflow_last_pass_answer, "workflow_last_pass"),
                            (_workflow_identity_answer, "workflow_identity"), (_workflows_by_name_answer, "workflows_by_name"), (_who_to_ask_answer, "who_to_ask"),
                            (_merged_about_window_answer, "merged_about_window"), (_pr_version_update_answer, "pr_version_update"), (_pr_in_latest_answer, "pr_in_latest"),
-                           (_series_facts_answer, "series_facts"), (_sub_ib_only_failures_answer, "sub_ib_only_failures"), (_closed_issues_answer, "closed_issues"), (_ibs_on_day_answer, "ibs_on_day"), (_prs_merged_on_day_answer, "prs_merged_on_day"), (_digest_family_answer, "digest_family"), (_who_is_on_topic_answer, "who_is_on_topic"), (_build_error_answer, "build_error"), (_most_compilation_warnings_answer, "most_compilation_warnings"),
+                           (_alerts_question_answer, "alerts"), (_clang_freshness_answer, "clang_freshness"), (_series_facts_answer, "series_facts"), (_sub_ib_only_failures_answer, "sub_ib_only_failures"), (_closed_issues_answer, "closed_issues"), (_ibs_on_day_answer, "ibs_on_day"), (_prs_merged_on_day_answer, "prs_merged_on_day"), (_digest_family_answer, "digest_family"), (_who_is_on_topic_answer, "who_is_on_topic"), (_build_error_answer, "build_error"), (_most_compilation_warnings_answer, "most_compilation_warnings"),
                            (_log_most_problems_answer, "log_most_problems"), (_exception_category_answer, "exception_category"),
                            (_not_imported_answer, "not_imported"), (_exit_code_difference_answer, "exit_code"),
                            (_flavour_newest_answer, "flavour_newest"), (_list_ibs_answer, "list_ibs"), (_ib_schedule_now_answer, "ib_schedule_now"),
