@@ -9251,6 +9251,47 @@ _PACKAGE_PATH_RE = re.compile(r"\b([A-Z][A-Za-z0-9]+/[A-Z][A-Za-z0-9]+)\b")
 _ARCH_TERM_RE = re.compile(r"\b(el\d+|fc\d+|amd64|aarch64|ppc64le|riscv64|gcc\d+)\b", re.IGNORECASE)
 
 
+def _variant_tag(tag: str, variant: str) -> str:
+    """The tag of that build flavour with the same timestamp as `tag`."""
+    parts = re.match(r"(CMSSW_\d+_\d+)_(?:[A-Z0-9]+_)?X_(.+)$", tag)
+    return f"{parts.group(1)}_{variant}_X_{parts.group(2)}" if parts else tag
+
+
+def _package_failing_tests_note(package: str, builds: list[tuple[str, str]]) -> str | None:
+    """Which tests of a failing package failed in those (tag, arch) builds, and what their logs
+    show, from the raw test logs. Found 2026-11-04: "FWCore/Integration failing on aarch64, which
+    test?" said the message "is not imported" with TestIntegrationEventSetup and its LogicError
+    imported. None when no log run is imported for those builds, so the caller says that."""
+    if not builds:
+        return None
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                lines: list[str] = []
+                for tag, arch in builds:
+                    tests = sorted({t for r in session.run(
+                        "MATCH (r:TestLogRun {ib_tag:$tag, arch:$arch, suite:'unit'}) "
+                        "UNWIND [t IN coalesce(r.failed_tests, []) WHERE t STARTS WITH $prefix] AS t RETURN t",
+                        tag=tag, arch=arch, prefix=package + "/") for t in [r["t"]]})
+                    if not tests:
+                        continue
+                    summaries = [r["summary"] for r in session.run(
+                        "MATCH (p:LogProblem {ib_tag:$tag, arch:$arch}) WHERE p.serious AND any(o IN p.owners WHERE o IN $tests) "
+                        "RETURN DISTINCT p.summary AS summary LIMIT 2", tag=tag, arch=arch, tests=tests)]
+                    lines.append(f"- `{tag}` `{arch}`: " + ", ".join(f"`{t}`" for t in tests[:5])
+                                 + (f" +{len(tests) - 5} more" if len(tests) > 5 else "")
+                                 + (f" -- {'; '.join(summaries)}" if summaries else ""))
+        finally:
+            driver.close()
+    except Exception as exc:
+        print(f"WARNING: package failing tests lookup failed: {exc}")
+        return None
+    if not lines:
+        return None
+    return "\nFailing tests, from the raw test logs (what the log shows, not why):\n" + "\n".join(lines)
+
+
 def _package_newest_status_answer(package: str, question: str) -> str | None:
     """"Is X still failing?" with no IB named: the package's newest result in each IB
     flavour / architecture of the newest release series, so a half-imported newest build
@@ -9310,8 +9351,9 @@ def _package_newest_status_answer(package: str, question: str) -> str | None:
         lines += [f"- {v} `{a}`: last failed in `{last}`, passing in `{t}`" for v, a, t, last in sorted(passing_after)[:10]]
         if len(passing_after) > 10:
             lines.append(f"- ... and {len(passing_after) - 10} more")
-    lines.append("\nThe failure message itself is in the unit-test log on the IB page; ask \"hidden problems in the test "
-                 "logs\" for what the imported raw logs show.")
+    tests_note = _package_failing_tests_note(package, [(t, a) for _, a, t, _, _ in sorted(now_failing)[:4]])
+    lines.append(tests_note or ("\nThe failure message itself is in the unit-test log on the IB page; ask \"hidden problems "
+                                "in the test logs\" for what the imported raw logs show."))
     return "\n".join(lines)
 
 
@@ -9325,8 +9367,9 @@ def _package_status_answer(question: str, session_id: str) -> str | None:
     match = _PACKAGE_PATH_RE.search(question)
     if not match:
         return None
-    if not re.search(r"\b(?:why|fail\w*|status|broken|everywhere|state|passing|red|green|unit[\s-]*tests?)\b",
-                     question, re.IGNORECASE):
+    # "since when" / "fixed" (found 2026-11-04: "SimG4Core/Geometry on aarch64 since when?" dead end)
+    if not re.search(r"\b(?:why|fail\w*|status|broken|everywhere|state|passing|red|green|unit[\s-]*tests?|"
+                     r"since\s+when|fixed|which\s+tests?)\b", question, re.IGNORECASE):
         return None
     if re.search(r"\b(?:prs?|pull\s+requests?|issues?|clang|warnings?|merged)\b", question, re.IGNORECASE):
         return None  # evidence / warning questions have their own handlers
@@ -9383,9 +9426,9 @@ def _package_status_answer(question: str, session_id: str) -> str | None:
     if open_issues:
         lines.append("\nOpen Issues naming this package (relevance only, not proof of cause):")
         lines += [f"- **Issue #{i['number']}** - {i['title']}" for i in open_issues]
-    lines.append(
-        "\nThe failure message itself is in the unit-test log on the IB page; it is not imported here."
-    )
+    lines.append(_package_failing_tests_note(package, [(f"{tag}" if r["variant"] == "primary" else _variant_tag(tag, r["variant"]), r["arch"])
+                                                       for r in failed[:4]])
+                 or "\nThe failure message itself is in the unit-test log on the IB page; it is not imported here.")
     return "\n".join(lines)
 
 
