@@ -36,7 +36,7 @@ from tools import (  # noqa: E402
     get_unittest_names, relval_failure_architectures, search_concepts, search_issues_by_text,
     search_workflow_ids, store_shift_summary, top_recurring_relval_failures,
     latest_and_previous_primary_tags, variant_previous_tag, single_ib_status,
-    search_test_log_problems, search_test_log_problems_report, test_log_coverage, parse_pasted_error,
+    search_test_log_problems, search_test_log_problems_report, test_log_coverage, parse_pasted_error, result_codes,
     get_test_log_changes, get_unittest_log_details, get_unittest_recurrence, prefetch_relval_exception_evidence,
     _workflow_id_pattern,
 )
@@ -2563,7 +2563,7 @@ def _github_export_note() -> str:
 
 _ISSUE_STATE_RE = re.compile(
     r"\b(?:is|was|are)\s+(?:the\s+)?(?:github\s+)?issues?\s*#?\s*(\d{3,6})\s+(?:still\s+|already\s+|now\s+)?"
-    r"(open|closed|fixed|resolved)\b|\b(?:state|status)\s+of\s+(?:the\s+)?issue\s*#?\s*(\d{3,6})\b|"
+    r"(open|closed|fixed|resolved)\b|\b(?:state|status)\s+of\s+(?:the\s+)?issue\s*#?\s*(\d{3,6})\b(?!\.\d)|"
     r"\bissue\s*#?\s*(\d{3,6})\s+(?:still\s+)?(open|closed)\s*\?", re.IGNORECASE)
 
 
@@ -2605,9 +2605,34 @@ def _issue_number_answer(question: str) -> str | None:
     return f"Issue #{match.group(1)} is not in the imported GitHub data. {_github_export_note()}."
 
 
+def _pr_not_in_ib_text(merged_at: str) -> str:
+    """Why a merged PR is in no imported IB. Found 2026-11-04: a PR merged in 2021 was "merged after
+    the newest imported build"; imported IBs only go back about 90 days."""
+    day = merged_at[:10]
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                span = session.run("MATCH (ib:IB) WITH substring(ib.tag, size(ib.tag) - 15) AS w "
+                                   "RETURN min(w) AS first, max(w) AS last").single()
+                first, last = span["first"], span["last"]
+        finally:
+            driver.close()
+    except Exception as exc:
+        print(f"WARNING: imported IB date span lookup failed: {exc}")
+        first = last = None
+    if isinstance(first, str) and day < first[:10]:
+        return f"none, it was merged {day}, before the oldest imported build ({first[:10]})"
+    if isinstance(last, str) and day > last[:10]:
+        return f"not yet, it was merged {day}, after the newest imported build ({last[:10]})"
+    if isinstance(first, str):
+        return "none list it, so that build's merged-PR list is probably not imported"
+    return "no imported IB lists it as newly merged"
+
+
 def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
     """Return graph facts directly when the question includes a PR number."""
-    match = re.search(r"\b(?:pr|pull\s+request)s?\s*(?:(?:for|about|number|no\.?)\s+)?#?\s*(\d{3,9})\b",
+    match = re.search(r"\b(?:pr|pull\s+request)s?\s*(?:(?:for|about|number|no\.?)\s+)?#?\s*(\d{3,9})\b(?!\.\d)",
                       question, re.IGNORECASE)
     if not match:
         return None
@@ -2792,8 +2817,7 @@ def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
         lines.append(f"- **In IBs:** first in `{first}`" + (f" ({len(ib_tags)} IB builds incl. sub-IBs list it as newly merged)"
                                                              if len(ib_tags) > 1 else ""))
     elif pr["merged_at"]:
-        lines.append("- **In IBs:** not in any imported IB yet (merged after the newest imported build, "
-                     "or that build's merged-PR list is not imported)")
+        lines.append(f"- **In IBs:** {_pr_not_in_ib_text(pr['merged_at'])}")
     lines.extend(["", f"**Summary:** {summary}"])
     return "\n".join(lines), [pr]
 
@@ -3464,13 +3488,15 @@ def _workflow_artifact_answer(question: str) -> str | None:
                item.number AS number, item.title AS title,
                coalesce(item.state, item.github_state, 'unknown') AS state,
                item.merged_at AS merged_at, matched_field
-        ORDER BY CASE matched_field WHEN 'title' THEN 0 WHEN 'body' THEN 1 ELSE 2 END, number DESC
+        ORDER BY CASE WHEN $open_first AND merged_at IS NULL AND state = 'open' THEN 0 ELSE 1 END,
+                 CASE matched_field WHEN 'title' THEN 0 WHEN 'body' THEN 1 ELSE 2 END, number DESC
         LIMIT 20
     """
+    asked_open = bool(re.search(r"\bopen\b", question, re.IGNORECASE))
     driver = get_driver()
     try:
         with driver.session() as session:
-            rows = [dict(record) for record in session.run(query, lid=workflow_id.lower(), pattern=pattern)]
+            rows = [dict(record) for record in session.run(query, lid=workflow_id.lower(), pattern=pattern, open_first=asked_open)]
     finally:
         driver.close()
     if not rows and error_lines:
@@ -3503,8 +3529,19 @@ def _workflow_artifact_answer(question: str) -> str | None:
             )
         return f"No imported CMSSW PR or Issue text contains the exact workflow ID `{workflow_id}`."
 
-    lines = list(error_lines)
-    if lines:
+    lines = []
+    if asked_open:
+        # "any open issue or PR for X": the answer to that, before the list (found 2026-11-04)
+        open_count = sum(1 for row in rows if not row["merged_at"] and row["state"] == "open")
+        unknown = sum(1 for row in rows if not row["merged_at"] and row["state"] == "unknown")
+        if open_count:
+            lines.append(f"**Yes: {open_count} open PR(s)/Issue(s) name workflow `{workflow_id}`**, listed first below.")
+        else:
+            lines.append(f"**No open PR or Issue names workflow `{workflow_id}`**"
+                         + (f" ({unknown} with an unknown state)" if unknown else "") + f". {_github_export_note()}.")
+        lines.append("")
+    lines += error_lines
+    if error_lines:
         lines.append("")
     lines.append(f"PRs/Issues that name workflow `{workflow_id}` (a human mention, e.g. a workflow they tested -- "
                  f"weaker than quoting its error):")
@@ -4208,6 +4245,9 @@ def _relval_exception_list_answer(question: str, context: dict[str, str | None] 
     try:
         with driver.session() as session:
             failing = [dict(record) for record in session.run(failing_query, **context)]
+            # "across all imported architectures" read as "none on aarch64" (found 2026-11-04)
+            uncovered = [] if context["arch"] else sorted(record["arch"] for record in session.run(
+                "MATCH (ib:IB {tag:$tag}) WHERE NOT (ib)-[:RAN_RELVAL]->(:RelVal) RETURN ib.arch AS arch", tag=context["tag"]))
             rows = [dict(record) for record in session.run(query, **context)]
     finally:
         driver.close()
@@ -4256,6 +4296,8 @@ def _relval_exception_list_answer(question: str, context: dict[str, str | None] 
         for (tag, arch), items in by_build.items():
             where = f"`{arch}`" if tag == context["tag"] else f"`{tag}` `{arch}`"
             lines.append(f"- {where}: " + ", ".join(items[:12]) + (f" +{len(items) - 12} more" if len(items) > 12 else ""))
+    if uncovered:
+        lines.append("\nNot covered, no RelVal results imported for this IB on: " + ", ".join(f"`{a}`" for a in uncovered) + ".")
     return "\n".join(lines)
 
 
@@ -8725,6 +8767,21 @@ _LOG_KIND_LABELS = {
 }
 
 
+def _first_last_builds_text(tags: list[str], first_label: str, last_label: str) -> str:
+    """First and last build by date, never by release series: "First recorded in CMSSW_12_4_X_2026-11-03"
+    for an error recorded since August (found 2026-11-04). Builds of one date tie, and that is said."""
+    whens = {tag[-15:] for tag in tags}
+    if len(tags) > 1 and len(whens) == 1:
+        return f"all from the `{next(iter(whens))}` builds"
+
+    def build_of(when: str) -> str:
+        same = [tag for tag in tags if tag[-15:] == when]
+        best = max(same, key=_ib_sort_key)
+        return f"`{best}`" + (f" (and {len(same) - 1} other build(s) from that date)" if len(same) > 1 else "")
+
+    return f"{first_label} {build_of(min(whens))}, {last_label} {build_of(max(whens))}"
+
+
 def _test_log_problem_answer(question: str, category: str | None = None) -> str | None:
     """Where a pasted error appears in the imported raw IB test logs (unit tests,
     addOn tests, RelVal steps) -- including inside tests the dashboard shows as
@@ -8827,8 +8884,14 @@ def _test_log_problem_answer(question: str, category: str | None = None) -> str 
             lines.append(f"   - ... and {len(problem['tests']) - 6} more tests/workflows")
         archs = problem["architectures"]
         arch_text = ", ".join(f"`{a}`" for a in archs[:4]) + (f" +{len(archs) - 4} more" if len(archs) > 4 else "")
+        seen_tags = problem.get("ib_tags") or [t for t in (problem.get("first_seen_tag"), problem.get("last_seen_tag")) if t]
         lines.append(f"   - Seen in **{problem['ib_count']} IBs** on {len(archs)} architecture(s) ({arch_text}); "
-                     f"first in `{problem['first_seen_tag']}`, last in `{problem['last_seen_tag']}`.")
+                     + _first_last_builds_text(seen_tags, "first in", "last in") + ".")
+        other_codes = problem.get("other_result_codes") or []
+        if other_codes:
+            codes_text = ", ".join(f"code {c['code']} in {c['ib_count']} IB(s), e.g. `{c['example']}`" for c in other_codes[:3])
+            lines.append(f"   - Same wording with a different code than your paste: {codes_text}"
+                         + (". These are all the records of this wording." if how != "exact" else "; not counted above."))
         if problem["series_gone"]:
             gone = problem["series_gone"]
             lines.append(f"   - Not seen in newer builds of {len(gone)} of {problem['series_total']} affected build series "
@@ -8838,7 +8901,8 @@ def _test_log_problem_answer(question: str, category: str | None = None) -> str 
         for tag in sorted(asked_tags):
             hits = sorted({place.split(" ")[1] for place in problem["places"] if place.split(" ")[0] == tag})
             lines.append(f"   - In `{tag}`: " + (f"present ({', '.join(f'`{a}`' for a in hits)})." if hits
-                                                   else "not found in its imported logs."))
+                                                   else "not found in its imported logs." if how == "exact"
+                                                   else "this one is not in its imported logs."))
         if problem.get("origin") in ("cmssw", "infrastructure"):
             lines.append(f"   - Origin from the stack/location: {problem['origin']}.")
         if problem.get("intentional_hint"):
@@ -9102,6 +9166,11 @@ def _exception_category_and_names(question: str) -> tuple[str, list[str]] | None
     return (category, []) if not leftover else None
 
 
+def _recorded_span_text(tags: list[str]) -> str:
+    text = _first_last_builds_text(tags, "First recorded in", "most recently in")
+    return text if text.startswith("First") else f"Recorded only in {text.removeprefix('all from ')}"
+
+
 def _relval_exception_message_answer(question: str) -> str | None:
     """Where an exact pasted error message was recorded in the imported RelVal exceptions,
     and whether any PR/Issue quotes it. Found live 2026-10-15: pasting "LogicError: Attempt
@@ -9191,6 +9260,12 @@ def _relval_exception_message_answer(question: str) -> str | None:
         if row["step"]:
             entry["steps"].add(row["step"])
     total_runs = sum(len(e["workflows"]) for e in by_build.values())
+    # the same message can be recorded under several categories (found 2026-11-04: 241 ExternalFailure
+    # and 3 FallbackFailed, all labelled ExternalFailure)
+    by_category: dict[str, set] = {}
+    for row in rows:
+        if row["category"]:
+            by_category.setdefault(row["category"], set()).update((row["tag"], row["arch"], w) for w in row["workflows"])
     # newest builds first: the question is usually "is this happening now"
     ordered = sorted(by_build.items(), key=lambda kv: (_ib_sort_key(kv[0][0]), len(kv[1]["workflows"])), reverse=True)
     shown_category = category or rows[0]["category"]
@@ -9200,7 +9275,8 @@ def _relval_exception_message_answer(question: str) -> str | None:
     recorded = re.sub(r"\s+", " ", max((r["message"] or "" for r in rows), key=len)).strip()
     lines = [f"{what}{total_runs:,} RelVal workflow run(s)** across "
              f"{len(by_build)} build/architecture pair(s) (imported RelVal exceptions"
-             + (f", category `{shown_category}`" if shown_category else "") + "):", ""]
+             + (", categories " + ", ".join(f"`{c}` ({len(v):,})" for c, v in sorted(by_category.items(), key=lambda kv: -len(kv[1])))
+                if len(by_category) > 1 else f", category `{shown_category}`" if shown_category else "") + "):", ""]
     lines += (["Recorded message: `" + recorded[:240].replace("`", "'") + ("...`" if len(recorded) > 240 else "`"), ""]
               if recorded else ["The recorded exceptions have no message text, only the category.", ""])
     wf_key = lambda w: float(w) if re.fullmatch(r"[\d.]+", w) else 0
@@ -9213,18 +9289,18 @@ def _relval_exception_message_answer(question: str) -> str | None:
         lines.append("By workflow: " + ", ".join(f"`{w}` ({n} build(s))" for w, n in
                                                  sorted(per_workflow.items(), key=lambda kv: -kv[1])) + ".")
         lines.append("")
-    lines.append("Most recent:" if len(ordered) > 8 else "Where:")
+    lines.append("Newest release series first:" if len(ordered) > 8 else "Where:")
     for (tag, arch), entry in ordered[:8]:
         examples = ", ".join(f"`{w}`" for w in sorted(entry["workflows"], key=wf_key)[:5])
         steps = f" ({', '.join(sorted(entry['steps']))})" if entry["steps"] else ""
         lines.append(f"- `{tag}` on `{arch}`: **{len(entry['workflows']):,}** workflow(s){steps}, e.g. {examples}")
     if len(ordered) > 8:
-        lines.append(f"- ... and {len(ordered) - 8} older build/architecture pair(s)")
+        lines.append(f"- ... and {len(ordered) - 8} more build/architecture pair(s)")
     tags = sorted({tag for tag, _ in by_build}, key=_ib_sort_key)
     variants = sorted({(re.match(r"CMSSW_\d+_\d+_(?:(.+)_)?X_", t).group(1) or "primary") if re.match(r"CMSSW_\d+_\d+_", t) else t
                        for t in tags})
     if len(tags) > 1:
-        lines.append(f"\nFirst recorded in `{tags[0]}`, most recently in `{tags[-1]}`.")
+        lines.append("\n" + _recorded_span_text(tags) + ".")
     if len(variants) == 1:
         lines.append(f"Only seen in {variants[0]} builds -- not in the other build types.")
     if quoting:
@@ -9239,7 +9315,144 @@ def _relval_exception_message_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
-def _pasted_exception_response(sid: str, original_question: str, question: str):
+def _is_pasted_log(question: str) -> bool:
+    """A pasted log block, as opposed to a question that happens to mention an error: its words are
+    log text, never keywords. Found 2026-11-04: "failed with exit code 65280" inside a pasted
+    TritonService exception was read as a question about RelVal exit codes, "no RelVal failed with
+    it", about an IB that has this very exception."""
+    return bool(_pasted_exception_signature(question) or "Begin Fatal Exception" in question
+                or ("\n" in question.strip() and _LOG_PROBLEM_PASTE_RE.search(question)))
+
+
+def _pasted_error_in_ib_lead(question: str) -> str | None:
+    """ "is this exception in <tag> on <arch>?" with the error pasted: the direct answer, from the
+    RelVal exceptions and the test logs of that IB and its sub-IBs. None when no IB is named, or
+    when it could not be looked up (never a "no" from a failed search)."""
+    tags = list(dict.fromkeys(IB_TAG_RE.findall(question)))
+    parsed = _pasted_error_message(question)
+    if not tags or len(tags) > 3 or not parsed:
+        return None
+    needle = " ".join(parsed[1].split()).lower().replace("'", "").replace('"', "")[:200]
+    if len(needle) < 20:
+        return None
+    arch = _requested_ib_arch(question)
+    try:
+        signature_ids = parse_pasted_error(question).get("signature_ids") or []
+    except Exception:
+        signature_ids = []
+    pasted_codes = result_codes(parsed[1])
+    parts = []
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            for tag in tags:
+                builds = [dict(r) for r in session.run(
+                    "MATCH (ib:IB) WHERE ib.tag = $tag OR ib.parent_tag = $tag "
+                    "RETURN ib.tag AS tag, ib.arch AS arch, COUNT { (ib)-[:RAN_RELVAL]->(:RelVal) } AS relvals", tag=tag)]
+                all_tags = sorted({b["tag"] for b in builds})
+                found: dict[tuple, dict] = {}
+                for row in session.run(
+                        "MATCH (e:RelValException) WHERE e.ib_tag IN $tags "
+                        "AND replace(replace(toLower(e.message), \"'\", ''), '\"', '') CONTAINS $needle "
+                        "RETURN e.ib_tag AS tag, e.arch AS arch, e.workflow_id AS workflow, e.step AS step",
+                        tags=all_tags, needle=needle):
+                    entry = found.setdefault((row["tag"], row["arch"]), {"workflows": set(), "steps": set(), "tests": {}})
+                    entry["workflows"].add(row["workflow"])
+                    if row["step"]:
+                        entry["steps"].add(row["step"])
+                logs = [dict(r) for r in session.run(
+                    "MATCH (p:LogProblem) WHERE p.ib_tag IN $tags AND (p.signature_id IN $ids "
+                    "OR replace(toLower(p.text), '\\n', ' ') CONTAINS $needle) "
+                    "RETURN p.ib_tag AS tag, p.arch AS arch, p.text AS text, p.owners AS owners, p.owner_statuses AS statuses",
+                    tags=all_tags, ids=signature_ids, needle=needle)]
+                for row in logs:
+                    codes = result_codes(row["text"])
+                    if pasted_codes and codes and not codes & pasted_codes:
+                        continue
+                    entry = found.setdefault((row["tag"], row["arch"]), {"workflows": set(), "steps": set(), "tests": {}})
+                    for owner, status in zip(row["owners"] or [], row["statuses"] or []):
+                        if not re.match(r"[\d.]+_", owner) or owner.split("_", 1)[0] not in entry["workflows"]:
+                            entry["tests"][owner] = status
+                log_runs = session.run("MATCH (r:TestLogRun) WHERE r.ib_tag = $tag AND ($arch IS NULL OR r.arch = $arch) "
+                                       "AND r.suite = 'relval' RETURN count(r) AS n", tag=tag, arch=arch).single()["n"]
+                parts.append(_ib_presence_text(tag, arch, builds, found, log_runs))
+    except Exception as exc:
+        print(f"WARNING: pasted error lookup in the named IB failed: {exc}")
+        return None
+    finally:
+        driver.close()
+    return "\n\n".join(parts)
+
+
+def _ib_presence_text(tag: str, arch: str | None, builds: list[dict], found: dict[tuple, dict], log_runs: int) -> str:
+    scope = f" on `{arch}`" if arch else ""
+
+    def where(entry: dict) -> str:
+        items = [f"`{w}`" for w in sorted(entry["workflows"])[:8]]
+        if len(entry["workflows"]) > 8:
+            items.append(f"+{len(entry['workflows']) - 8} more")
+        text = ", ".join(items) + (f" ({', '.join(sorted(entry['steps']))})" if entry["steps"] else "")
+        tests = [f"`{name}` (test log, reported {status})" for name, status in sorted(entry["tests"].items())[:5]]
+        return ", ".join(part for part in [text, *tests] if part)
+
+    in_scope = {key: e for key, e in found.items() if (arch is None or key[1] == arch)}
+    here = {key: e for key, e in in_scope.items() if key[0] == tag}
+    sub_ibs = {key: e for key, e in in_scope.items() if key[0] != tag}
+    other_arch = {key: e for key, e in found.items() if key not in in_scope}
+    sub_lines = [f"- `{key[0]}` on `{key[1]}`: {where(e)}" for key, e in sorted(sub_ibs.items())[:6]]
+    if here:
+        if arch:
+            lines = [f"**Yes, this exception is in `{tag}`{scope}:** " + where(next(iter(here.values())))]
+        else:
+            lines = [f"**Yes, this exception is in `{tag}`:**"] + [f"- `{key[1]}`: {where(e)}" for key, e in sorted(here.items())]
+        if sub_lines:
+            lines += ["", "Also in its sub-IBs:"] + sub_lines
+        return "\n".join(lines)
+    if sub_lines:
+        return "\n".join([f"**Not in `{tag}` itself{scope}, but in its sub-IBs:**"] + sub_lines)
+    if not any(b["tag"] == tag for b in builds):
+        return f"**I can't say: `{tag}` is not imported.**"
+    scoped_builds = [b for b in builds if b["tag"] == tag and (arch is None or b["arch"] == arch)]
+    if not scoped_builds:
+        text = f"**`{tag}` has no imported build{scope}, so it can't be there.**"
+    elif not log_runs and not any(b["relvals"] for b in scoped_builds):
+        # the IB was built there but its RelVals aren't in yet: unknown, not absent
+        text = f"**I can't say yet:** no RelVal results or RelVal test logs are imported for `{tag}`{scope}."
+    else:
+        checked = "its imported RelVal exceptions and test logs" if log_runs else (
+            "its imported RelVal exceptions (its RelVal test logs are not imported, so a problem inside a passed step would not show)")
+        sub_note = " and those of its sub-IBs" if any(b["tag"] != tag for b in builds) else ""
+        text = f"**No, this exception is not recorded in `{tag}`{scope}**: I checked {checked}{sub_note}."
+    if other_arch:
+        text += "\n\nIt is on other architectures:\n" + "\n".join(
+            f"- `{key[0]}` on `{key[1]}`: {where(e)}" for key, e in sorted(other_arch.items())[:6])
+    return text
+
+
+def _pasted_log_response(sid: str, original_question: str, question: str):
+    """Every answer to a pasted error, led by the direct answer when the question names an IB."""
+    lead = _pasted_error_in_ib_lead(original_question)
+    prefix = f"{lead}\n\n" if lead else ""
+    try:
+        exact_error_answer = _relval_exception_message_answer(original_question)
+    except Exception as exc:  # supplementary lookup -- never break the paste handling below
+        print(f"WARNING: RelVal exception message lookup failed: {exc}")
+        exact_error_answer = None
+    if exact_error_answer:
+        # the same message can also be in a unit/addOn test log (often a test that passed);
+        # only an exact or containing match there is worth adding
+        log_answer = _test_log_problem_answer(question)
+        if log_answer and ("This exact error is in the imported IB test logs" in log_answer
+                           or "problems whose log text contains your pasted text" in log_answer):
+            exact_error_answer += "\n\n" + log_answer
+        return _chat_response(sid, original_question, prefix + exact_error_answer, "deterministic:relval_exception_message")
+    error_line = _error_line_answer(original_question)
+    if error_line:
+        return _chat_response(sid, original_question, prefix + error_line, "deterministic:error_line_github")
+    return _pasted_exception_response(sid, original_question, question, prefix)
+
+
+def _pasted_exception_response(sid: str, original_question: str, question: str, prefix: str = ""):
     """If the question is a pasted raw CMSSW exception log, answer it directly
     -- regardless of what other capability keywords happen to appear
     incidentally in the pasted text. Checked before RequestPlanner routing.
@@ -9278,7 +9491,7 @@ def _pasted_exception_response(sid: str, original_question: str, question: str):
         combined = "\n\n".join(part for part in (log_answer, _referenced_items_note(question), github_answer) if part)
         if not combined:
             return None
-        return _chat_response(sid, original_question, combined, "deterministic:test_log_problem")
+        return _chat_response(sid, original_question, prefix + combined, "deterministic:test_log_problem")
     # The test logs are searched with the whole paste, not just the category: they
     # are the only source that sees an exception inside a test reported as passed.
     # When they match, the category-only GitHub list is broad context, so it is
@@ -9310,7 +9523,7 @@ def _pasted_exception_response(sid: str, original_question: str, question: str):
             "(not necessarily this problem):\n" + pasted_exception_search_answer,
         ) if part)
     return _chat_response(
-        sid, original_question, pasted_exception_search_answer, "deterministic", github_matches=github_matches
+        sid, original_question, prefix + pasted_exception_search_answer, "deterministic", github_matches=github_matches
     )
 
 
@@ -9896,6 +10109,8 @@ def _relval_by_exit_code_answer(question: str) -> str | None:
     if re.search(r"\b(?:relvals?|workflows?|wfs?|anything|which|what)\b", question, re.IGNORECASE):
         question = re.sub(r"\b(?:timed?[\s-]*out|time[\s-]*outs?|timeouts?)\b", "failed with TimeOut", question,
                           flags=re.IGNORECASE)
+    if re.search(r"\b[A-Za-z_]\w*:\s[^?\n]*\bfail\w*\s+with\s+exit\s*code\b", question):
+        return None   # "TritonService: Starting ... failed with exit code 65280": an error's own text, not a RelVal's exit code
     if not re.search(r"\bfail(?:ed|ing|s)?\s+with\b|\b(?:with|have|has|had|having|got|get)\s+(?:an?\s+|the\s+)?exit\s*code\b",
                      question, re.IGNORECASE):
         return None
@@ -12217,8 +12432,8 @@ def _flaky_relvals_answer(question: str) -> str | None:
 
 
 _PR_BROKE_RE = re.compile(
-    r"\b(?:pr|pull\s+request)\s*#?\s*(\d{3,9})\b[^?!]{0,60}\b(?:break|broke|broken|caus\w+|responsible|introduc\w+|blame)|"
-    r"\b(?:break|broke|broken|caus\w+|responsible|introduc\w+|blame)\w*\b[^?!]{0,40}\b(?:by|from)\s+(?:pr|pull\s+request)\s*#?\s*(\d{3,9})\b",
+    r"\b(?:pr|pull\s+request)\s*#?\s*(\d{3,9})\b(?!\.\d)[^?!]{0,60}\b(?:break|broke|broken|caus\w+|responsible|introduc\w+|blame)|"
+    r"\b(?:break|broke|broken|caus\w+|responsible|introduc\w+|blame)\w*\b[^?!]{0,40}\b(?:by|from)\s+(?:pr|pull\s+request)\s*#?\s*(\d{3,9})\b(?!\.\d)",
     re.IGNORECASE)
 
 
@@ -13518,7 +13733,7 @@ def _shift_question_rewrite(question: str) -> str | None:
     exceptions_of = re.search(r"\bwhat\s+exceptions?\s+(?:does|did|has)\s+(?:workflow\s+)?(\d{1,8}\.\d{1,7})\b", question, re.IGNORECASE)
     if exceptions_of and not IB_TAG_RE.search(question):
         return f"why does workflow {exceptions_of.group(1)} fail"
-    pr_in_ib = re.search(r"\bmy\s+pr\s*#?(\d{3,6})\b[^?]*\bin\s+an?\s+ib\b", question, re.IGNORECASE)
+    pr_in_ib = re.search(r"\bmy\s+pr\s*#?(\d{3,6})\b(?!\.\d)[^?]*\bin\s+an?\s+ib\b", question, re.IGNORECASE)
     if pr_in_ib:
         return f"which IB first contains PR {pr_in_ib.group(1)}?"
     if re.search(r"\bwhat(?:'s|\s+is)\s+broken\b", question, re.IGNORECASE) and not IB_TAG_RE.search(question):
@@ -13549,7 +13764,7 @@ def _shift_question_rewrite(question: str) -> str | None:
         # a pasted link (found 2026-11-04: "com/cms" searched as a term; a dead end)
         prefix = "" if url.group(1) == "cmssw" else "cmsdist "
         return f"{prefix}{'PR' if url.group(2) == 'pull' else 'issue'} {url.group(3)}"
-    issue_field = re.search(r"\bissue\s*#?(\d{3,6})\b", question, re.IGNORECASE)
+    issue_field = re.search(r"\bissue\s*#?(\d{3,6})\b(?!\.\d)", question, re.IGNORECASE)
     if issue_field and re.search(r"\b(?:summari[sz]e|summary|labels?|being\s+worked|assigned|when\s+was|details?|about)\b", question, re.IGNORECASE) and not re.search(r"\bcomment", question, re.IGNORECASE):
         return f"issue {issue_field.group(1)}"
     pr_mention = re.search(r"\bprs?\b[^?]*\bmention\w*\s+(?:workflow\s+)?(\d{1,8}\.\d{1,7})\b", question, re.IGNORECASE)
@@ -14724,7 +14939,7 @@ def _failure_change_answer(question: str) -> str | None:
 
 def _issue_comments_answer(question: str) -> str | None:
     """ "who commented on issue 51089?", "what does the last comment of issue 51354 say?" (found 2026-11-04: text searches, the newest Issue)."""
-    match = re.search(r"\bissues?\s*#?(\d{3,6})\b", question, re.IGNORECASE)
+    match = re.search(r"\bissues?\s*#?(\d{3,6})\b(?!\.\d)", question, re.IGNORECASE)
     if not match or not re.search(r"\bcomment\w*\b", question, re.IGNORECASE):
         return None
     number = int(match.group(1))
@@ -16060,6 +16275,12 @@ def _chat(req: ChatRequest):
         original_question = without_known
         question = _normalize_deterministic_question(without_known)
 
+    if _is_pasted_log(original_question):
+        # before the keyword handlers: any word in a log can look like a question to one of them
+        pasted_log = _pasted_log_response(sid, original_question, question)
+        if pasted_log:
+            return pasted_log
+
     scope_only = bool(_FOLLOW_UP_SCOPE_RE.match(original_question))
     bare_number = re.fullmatch(r"\s*(?:(?:what\s+is|what's|show(?:\s+me)?|tell\s+me\s+about|details\s+of)\s+)?"
                                r"#(\d{3,6})\s*[?.!]*\s*", original_question, re.IGNORECASE)
@@ -16266,24 +16487,7 @@ def _chat(req: ChatRequest):
     if clang_text_answer:
         return _chat_response(sid, original_question, clang_text_answer, "deterministic:clang_warning_text")
 
-    try:
-        exact_error_answer = _relval_exception_message_answer(original_question)
-    except Exception as exc:  # supplementary lookup -- never break the paste handling below
-        print(f"WARNING: RelVal exception message lookup failed: {exc}")
-        exact_error_answer = None
-    if exact_error_answer:
-        # the same message can also be in a unit/addOn test log (often a test that passed);
-        # only an exact or containing match there is worth adding
-        log_answer = _test_log_problem_answer(question)
-        if log_answer and ("This exact error is in the imported IB test logs" in log_answer
-                           or "problems whose log text contains your pasted text" in log_answer):
-            exact_error_answer += "\n\n" + log_answer
-        return _chat_response(sid, original_question, exact_error_answer, "deterministic:relval_exception_message")
-    error_line = _error_line_answer(original_question)
-    if error_line:
-        return _chat_response(sid, original_question, error_line, "deterministic:error_line_github")
-
-    pasted_exception_response = _pasted_exception_response(sid, original_question, question)
+    pasted_exception_response = _pasted_log_response(sid, original_question, question)
     if pasted_exception_response:
         return pasted_exception_response
 
