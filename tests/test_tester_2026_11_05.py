@@ -283,7 +283,7 @@ class SinceAndFlavourRewriteTests(unittest.TestCase):
                          "what changed between CMSSW_20_1_X_2026-11-03-2300 and CMSSW_20_1_X_2026-11-04-1100")
 
     def test_worse_than_the_primary(self):
-        self.assertEqual(api_server._shift_question_rewrite("is NONLTO worse than the primary in the newest IB?"), "compare NONLTO with the primary")
+        self.assertEqual(api_server._shift_question_rewrite("is NONLTO worse than the primary in the newest IB?"), "compare primary and NONLTO in the latest IB")
         self.assertIsNone(api_server._shift_question_rewrite("is it worse than the primary?"))
 
     def test_compared_with_the_primary_after_a_sub_ib_answer(self):
