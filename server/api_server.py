@@ -13767,6 +13767,17 @@ def _shift_question_rewrite(question: str) -> str | None:
     normalized = _normalize_terse_words(question)
     if normalized != question:
         return _shift_question_rewrite(normalized) or normalized
+    since_tag = re.search(r"\b(?:new|changed?|different|happened)\b[^?]*\bsince\s+(?:the\s+)?(CMSSW_\w+?_X_\d{4}-\d{2}-\d{2}-\d{4})", question, re.IGNORECASE)
+    if since_tag:
+        # "what's new since the 11-03-2300 build?" (found 2026-11-05: the digest *ending* at that build, 11-03-1100 -> 11-03-2300)
+        series = re.match(r"CMSSW_(\d+)_(\d+)", since_tag.group(1))
+        newest = _latest_ib_records(None, (int(series.group(1)), int(series.group(2)))) if series else []
+        if newest and newest[0]["tag"] != since_tag.group(1):
+            return f"what changed between {since_tag.group(1)} and {newest[0]['tag']}"
+    worse = re.fullmatch(r"\s*(?:is|was|are)\s+(?:the\s+)?(\w+)\s+(?:worse|better)\s+than\s+(?:the\s+)?(primary|default|\w+)(?:\s+(?:in|for|on)\s+(?:the\s+)?(?:latest|newest)(?:\s+(?:ib|build))?)?\s*[?.!]*\s*", question, re.IGNORECASE)
+    if worse and worse.group(1).lower() in _ALL_VARIANTS:
+        # "is NONLTO worse than the primary in the newest IB?" (found 2026-11-05: the shift digest)
+        return f"compare {worse.group(1)} with {'the primary' if worse.group(2).lower() in ('primary', 'default') else worse.group(2)}"
     looks = re.fullmatch(r"\s*(?:what\s+does|how\s+does)\s+(?:the\s+)?(?:(?:latest|newest)\s+)?(?:CMSSW_)?(\d{1,2}_\d{1,2})(?:_X)?(?:\s+(?:ib|build|release|series))?\s+look(?:\s+like)?\s*(?:today|now)?\s*[?.!]*\s*", question, re.IGNORECASE)
     if looks:
         # "what does the 16_1 IB look like?" (found 2026-11-05: "my lookups came back empty")
