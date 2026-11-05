@@ -10897,6 +10897,8 @@ def _with_arch_missing_from_newest(question: str, session_id: str) -> str:
     if re.search(r"\b(?:compare\w*|vs|versus|both|week|month|days?|since|finish\w*|done|ready|yet|out|prs?|issues?|clang|warnings?|exit\s*codes?|only)\b|"
                  r"(?<![\d.])\d+\.\d+(?![\d.])", question, re.IGNORECASE):
         return question
+    if re.search(r"\b[A-Z][a-z0-9]+[A-Z]\w*", question):
+        return question  # about one named thing ("why would TritonService fail on aarch64?", a test name), not an IB's overview
     try:
         if _packages_named_loosely(question):
             return question

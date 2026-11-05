@@ -405,7 +405,8 @@ class ArchMissingFromNewestTests(unittest.TestCase):
     def test_left_alone(self):
         for question in ("is gcc16 out yet?", "compare gcc15 and gcc16 failures", "failures on gcc16 this week",
                          "why is 537.0 failing on gcc16?", "what failed on gcc16 in 17_1?",
-                         "what's broken in CMSSW_20_1_X_2026-11-03-2300 on gcc16?"):
+                         "what's broken in CMSSW_20_1_X_2026-11-03-2300 on gcc16?", "why would TritonService fail on aarch64?",
+                         "why does TestIntegrationEventSetup fail on aarch64?"):
             self.assertEqual(_with_arch_missing_from_newest(question, "a"), question, question)
         self.assertNotIn("a", _default_tag_notes)
 
