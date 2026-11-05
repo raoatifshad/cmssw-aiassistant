@@ -1723,6 +1723,9 @@ def parse_pasted_error(text: str) -> dict:
     as stored in LogProblem.names), context_keys ("<category>|<producer>"),
     modules, executable, libraries, packages, IB tags and architectures."""
     scanner = _test_log_scanner()
+    # a traceback flattened to one line: read as an empty traceback, whose signature then matched *any* traceback the
+    # scanner kept without its error, labelled "this exact error" with unrelated tests (found 2026-11-05)
+    text = re.sub(r"(Traceback \(most recent call last\):)[ \t]+(?=\S)", r"\1\n", text)
     lines = text.replace("\r\n", "\n").split("\n")
     if (scanner.EXCEPTION_CATEGORY_RE.search(text) and not any(scanner.FATAL_BEGIN_RE.match(l.strip()) for l in lines)):
         # pasted without the "----- Begin Fatal Exception" banner: the scanner needs it
@@ -1737,6 +1740,10 @@ def parse_pasted_error(text: str) -> dict:
     if not message:
         m = re.search(r"Exception Message:\s*(.+?)(?:-{3,} End Fatal|$)", text, re.S)
         message = " ".join(m.group(1).split()) if m else ""
+    if not message and "Traceback (most recent call last)" in text:
+        # what a traceback says is its last line; the frames are specific to the paste
+        raised = [l.strip() for l in lines if re.match(r"\s*[A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit)\b", l)]
+        message = raised[-1] if raised else ""
     if not message and not read_as_exception:  # a fragment: all but the context lines is the message
         message = " ".join(l.strip() for l in lines if l.strip() and not scanner.CONTEXT_LINE_RE.match(l))
     details = scanner.problem_details(lines, category)
