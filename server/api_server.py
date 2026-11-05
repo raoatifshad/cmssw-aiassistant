@@ -16501,8 +16501,10 @@ def _workflow_on_day_answer(question: str) -> str | None:
     known = sum(1 for r in rows if r["status"] != "PASSED" and r["known"])
     passed = sum(1 for r in rows if r["status"] == "PASSED")
     lead = f"Workflow `{workflow}` on {day}: **{len(failed)} failed**, {passed} passed" + (f", {known} known error(s), not counted as failures" if known else "") + f", of {len(rows)} run(s) across all releases and flavours."
+    # the verdict answers what was asked: "did it fail?" is the opposite of "did it pass?" (found 2026-11-05: "**Yes.** ... 0 failed")
+    asked_failure = bool(re.search(r"\b(?:fail\w*|red|broken)\b", question, re.IGNORECASE)) and not re.search(r"\b(?:pass\w*|green|ok(?:ay)?|good)\b", question, re.IGNORECASE)
     if not failed:
-        return f"**Yes.** {lead}"
+        return f"**{'No' if asked_failure else 'Yes'}.** {lead}"
     def describe(r):
         try:
             code = int(r["exit"])
@@ -16515,7 +16517,7 @@ def _workflow_on_day_answer(question: str) -> str | None:
     more = f"\n\n(+{len(listed) - 15} more)" if len(listed) > 15 else ""
     series = sorted({r["tag"].split("_X_")[0].split("_")[1] + "_" + r["tag"].split("_X_")[0].split("_")[2] for r in failed})
     number_note = "\n\nA workflow number can mean different workflows in different release series." if len(series) > 1 else ""
-    return f"**No.** {lead}\n\n| Build | Flavour | Architecture | Exit |\n| --- | --- | --- | --- |\n{table}{more}{number_note}"
+    return f"**{'Yes' if asked_failure else 'No'}.** {lead}\n\n| Build | Flavour | Architecture | Exit |\n| --- | --- | --- | --- |\n{table}{more}{number_note}"
 
 
 def _arch_on_day_answer(question: str) -> str | None:
