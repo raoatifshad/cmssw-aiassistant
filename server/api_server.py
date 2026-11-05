@@ -10898,10 +10898,11 @@ def _with_arch_missing_from_newest(question: str, session_id: str) -> str:
     so right after each build the newest IB has only el8/el9, and the answer silently replaced the asked architecture
     with those (found 2026-11-05, bank N504). The newest IB that was built on it instead, saying so. Not for a follow-up
     about a build in another release series, nor for "is it out yet?", which asks exactly that."""
-    if IB_TAG_RE.search(question) or _requested_release_series(question) or _requested_ib_arch(question) or _PACKAGE_PATH_RE.search(question):
+    if IB_TAG_RE.search(question) or _requested_ib_arch(question) or _PACKAGE_PATH_RE.search(question):
         return question
     if not re.search(r"\b(?:fail\w*|broken|wrong|problems?|status|results?|relvals?|unit[\s-]*tests?)\b", question, re.IGNORECASE):
         return question
+    series = _requested_release_series(question)
     if re.search(r"\b(?:compare\w*|vs|versus|both|week|month|days?|since|finish\w*|done|ready|yet|out|prs?|issues?|clang|warnings?|exit\s*codes?|only)\b|"
                  r"(?<![\d.])\d+\.\d+(?![\d.])", question, re.IGNORECASE):
         return question
@@ -13962,7 +13963,7 @@ def _shift_question_rewrite(question: str) -> str | None:
         return f"any PR about {who_changed.group(1)}?"
     if re.search(r"\b(?:which|what)\s+(?:workflows?|relvals?)\s+(?:failed|fails?)\s+(?:the\s+)?most\b[^?]*\b(?:week|month|days?)\b", question, re.IGNORECASE):
         return re.sub(r"(?i)^.*?(\bthis\s+week|\bthis\s+month|\blast\s+\d+\s+days)\b.*$", r"top failing workflows \1", question)
-    if re.search(r"\bpackages?\b[^?]*\bfail\w*\s+(?:the\s+)?most\b", question, re.IGNORECASE):
+    if re.search(r"\bpackages?\b[^?]*\bfail\w*\s+(?:the\s+)?most\b", question, re.IGNORECASE) and not re.search(r"\b(?:week|month|days?)\b", question, re.IGNORECASE):
         return "what is the most common unit test failure across all architectures"
     number_as_code = re.fullmatch(r"\s*what(?:'s|\s+does|\s+is)\s+(\d{2,5})\s+mean\b[^?]*\s*[?.!]*\s*", question, re.IGNORECASE)
     if number_as_code and re.search(r"\b(?:exit|relvals?|cmsrun|code)\b", question, re.IGNORECASE):
