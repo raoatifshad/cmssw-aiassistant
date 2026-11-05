@@ -12715,6 +12715,20 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
             return f"who created issue #{listed_issue.group(1)}"
     if re.fullmatch(r"\s*what\s+percentage\s+(?:passed|pass|failed|fail)\s*[?.!]*\s*", question, re.IGNORECASE):
         return f"what percentage of {'unit tests' if re.search(r'unit', previous, re.IGNORECASE) else 'relvals'} pass in the latest IB"
+    there = re.fullmatch(r"\s*(?:and\s+)?(?:what\s+about\s+)?(?:(unit[\s-]*tests?|relvals?|workflows?)\s+there|how\s+many\s+(?:(unit[\s-]*tests?|relvals?|workflows?)\s+)?failed\s+there)\s*[?.!]*\s*", question, re.IGNORECASE)
+    arch_word = _ARCH_TERM_RE.search(IB_TAG_RE.sub(" ", previous)) if there else None
+    if there and arch_word:
+        # "RelVal failures on el10 in the newest IB?" then "unit tests there?" (found 2026-11-05): the same IB and architecture
+        moved = re.search(r"\bthis\s+is(?:\s+for)?\s+`(CMSSW_\w+?_X_[\d-]+)`", last["answer"])
+        named = moved or IB_TAG_RE.search(previous) or IB_TAG_RE.search(last["answer"][:400])
+        archs = sorted({a for a in re.findall(r"\b((?:el|fc|slc)\d+_\w+?_gcc\d+)\b", last["answer"]) if arch_word.group(1).lower() in a})
+        if named and len(archs) == 1:
+            kind = there.group(1) or there.group(2) or ("relvals" if re.search(r"relval|workflow", previous, re.IGNORECASE) else "")
+            if re.search(r"unit", kind, re.IGNORECASE):
+                return f"failed unit tests in {named.group(1)} on {archs[0]}"
+            if kind:
+                return f"failed relvals in {named.group(1)} on {archs[0]}"
+            return f"what is failing in {named.group(1)} on {archs[0]}"
     first_workflow = re.search(r"`(\d{1,8}\.\d{1,7})`", last["answer"])
     if first_workflow:
         wf = first_workflow.group(1)
