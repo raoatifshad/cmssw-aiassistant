@@ -14177,6 +14177,73 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
     return None
 
 
+_PASTE_FOLLOW_UP_RE = re.compile(
+    r"^\s*(?:and\s+|so\s+)?(?:(?P<since>since\s+when|how\s+long|when\s+did\s+(?:it|this|that)\s+start|first\s+seen|"
+    r"(?:is|was)\s+(?:it|this|that)\s+new)|"
+    r"(?P<which>(?:(?:which|what)|how\s+many)\s+(?:unit\s+)?(?:tests?|workflows?|relvals?)(?:\s+(?:show|shows|have|has|hit|hits|see|sees|log|logs|had|are)\s+(?:it|this|that|these|those|affected))?)|"
+    r"(?P<arch>(?:is|are)\s+(?:it|this|that)\s+(?:only\s+)?(?:on\s+)?(?P<word>[A-Za-z0-9_]+)(?:\s+(?:only|too|as\s+well))?|"
+    r"on\s+(?P<word2>[A-Za-z0-9_]+)\s+(?:only|too|as\s+well)|which\s+arch\w*|on\s+which\s+arch\w*)|"
+    r"(?P<still>(?:is|are)\s+(?:it|this|that)\s+still\s+(?:there|present|happening)|still\s+there|is\s+(?:it|this|that)\s+gone))"
+    r"\s*[?.!]*\s*$", re.IGNORECASE)
+
+
+def _paste_follow_up_answer(question: str, sid: str) -> str | None:
+    """A short question about the error just pasted: "since when?", "which tests show this?", "is that on el10
+    only?" (found 2026-11-05: the menu, or the whole IB's summary). Answered from the same test-log search,
+    across builds; what the logs show, not a cause."""
+    last = _turn_memory.get(sid)
+    if not last or len(question) > 70 or "in the imported IB test logs" not in last["answer"]:
+        return None
+    if last["answer"].lstrip().startswith("**This exact error is not"):
+        return None
+    asked = _PASTE_FOLLOW_UP_RE.match(question)
+    if not asked:
+        return None
+    word = asked.group("word") or asked.group("word2")
+    if word and not re.fullmatch(r"(?:el|slc|fc)\d+\w*|gcc\d+|aarch64|arm|arm64|amd64|x86_64|riscv\w*", word, re.IGNORECASE):
+        return None
+    report = search_test_log_problems_report(last["question"], limit=4)
+    problems = [p for p in report["problems"] if p.get("match") in ("exact", "contains")]
+    if not problems:
+        return None
+    tags = sorted({t for p in problems for t in p["ib_tags"]}, key=lambda t: t[-15:])
+    archs = sorted({a for p in problems for a in p["architectures"]})
+    tests: dict[str, dict] = {}
+    for p in problems:
+        for name, counts in p["tests"].items():
+            entry = tests.setdefault(name, {"passed": 0, "failed": 0})
+            entry["passed"] += counts["passed"]
+            entry["failed"] += counts["failed"]
+    span = f"first in `{tags[0]}`, last in `{tags[-1]}`, {len(tags)} IB(s)"
+    arch_list = ", ".join(f"`{a}`" for a in archs)
+    if asked.group("since"):
+        coverage = test_log_coverage()
+        start = str(coverage.get("first") or "")[:10]
+        return (f"In the imported test logs this error is {span}, on {arch_list}."
+                + (f" The logs imported here start at {start}, so it may be older than that." if start else ""))
+    if asked.group("which"):
+        rows = sorted(tests.items())
+        shown = [f"- `{name}` ({'reported failed' if c['failed'] and not c['passed'] else 'reported PASSED' if not c['failed'] else 'mixed: passed in ' + str(c['passed']) + ', failed in ' + str(c['failed'])})"
+                 for name, c in rows[:25]]
+        return (f"**{len(rows)} test(s)/workflow step(s)** show this error in the imported test logs ({span}):\n" + "\n".join(shown)
+                + (f"\n- ... and {len(rows) - 25} more" if len(rows) > 25 else ""))
+    if word:
+        wanted = {"arm": "aarch64", "arm64": "aarch64", "x86_64": "amd64"}.get(word.lower(), word.lower())
+        matching = [a for a in archs if wanted in a]
+        if not matching:
+            return f"No: this error is not on `{wanted}` in the imported test logs. It is on {arch_list} ({span})."
+        if len(matching) == len(archs):
+            return f"In the imported test logs it is only on {arch_list} ({span}). That is only where it was seen: other architectures may simply not have run it yet."
+        return f"Not only: it is on {arch_list} ({span})."
+    if asked.group("arch"):
+        return f"In the imported test logs this error is on {arch_list} ({span})."
+    gone = sum(1 for p in problems for _ in p.get("series_gone") or [])
+    total = sum(p.get("series_total") or 0 for p in problems)
+    return (f"Last seen in `{tags[-1]}` ({span})."
+            + (f" Newer builds show no such line in {gone} of {total} affected build track(s)." if gone
+               else " Still present in the newest imported build of every affected build track."))
+
+
 def _error_line_answer(question: str) -> str | None:
     """One error line typed on its own that no exception or test-log search knows: search the GitHub text for it
     (found 2026-11-04: "Tried to write a NaN or Inf double to a persistent stream" -> "no PRs", with Issue #52323
@@ -16074,6 +16141,18 @@ def _chat(req: ChatRequest):
     if bare_number:
         # "what is #52330?" (found 2026-11-04: LLM dead end): the PR/Issue answer handles both kinds
         original_question = question = f"PR {bare_number.group(1)}"
+    try:
+        paste_follow_up = _paste_follow_up_answer(original_question, sid)
+    except Exception as exc:
+        print(f"WARNING: follow-up about a pasted error failed: {exc}")
+        paste_follow_up = None
+    if paste_follow_up:
+        # kept on the paste's turn, so a second follow-up still refers to the paste
+        pasted_turn = _turn_memory.get(sid)
+        response = _chat_response(sid, original_question, paste_follow_up, "deterministic:paste_follow_up")
+        if pasted_turn:
+            _turn_memory[sid] = pasted_turn
+        return response
     listed_follow_up = _listed_items_follow_up(original_question, sid)
     if listed_follow_up:
         return _chat_response(sid, original_question, listed_follow_up, "deterministic:listed_items_follow_up")

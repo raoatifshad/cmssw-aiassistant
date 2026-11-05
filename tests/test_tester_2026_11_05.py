@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from server import api_server
 from server.api_server import (
-    _EARLY_LOG_LINE_RE, _LOG_PROBLEM_PASTE_RE,
+    _EARLY_LOG_LINE_RE, _LOG_PROBLEM_PASTE_RE, _paste_follow_up_answer, _turn_memory,
 )
 from graph import tools
 
@@ -57,6 +57,40 @@ class PastedLogLineTests(unittest.TestCase):
         queries = [call.args[2].get("q", "") for call in channel.call_args_list]
         self.assertTrue(any('"error failed to parse x509 proxy: bad"' in q for q in queries), queries)
         self.assertEqual([p["match"] for p in report["problems"]], ["contains"])
+
+
+class PasteFollowUpTests(unittest.TestCase):
+    PROBLEM = {"match": "contains", "ib_tags": ["CMSSW_20_1_X_2026-11-03-2300"], "architectures": ["el10_amd64_gcc15"],
+               "tests": {"HeterogeneousTest/ROCmDevice/testA": {"suite": "unit", "passed": 0, "failed": 1, "other": 0}},
+               "series_gone": [], "series_total": 1}
+
+    def setUp(self):
+        _turn_memory["s"] = {"question": "Fatal exception 'PluginNotFound': ...", "route": "deterministic:test_log_problem",
+                             "answer": "**Found in the imported IB test logs** -- problems ..."}
+        self.addCleanup(_turn_memory.pop, "s", None)
+        patcher = patch("server.api_server.search_test_log_problems_report", return_value={"problems": [self.PROBLEM]})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @patch("server.api_server.test_log_coverage", return_value={"first": "2026-10-01-2300"})
+    def test_since_when(self, _):
+        answer = _paste_follow_up_answer("since when?", "s")
+        self.assertIn("first in `CMSSW_20_1_X_2026-11-03-2300`", answer)
+        self.assertIn("start at 2026-10-01,", answer)
+
+    def test_which_tests(self):
+        answer = _paste_follow_up_answer("which tests show this?", "s")
+        self.assertIn("`HeterogeneousTest/ROCmDevice/testA` (reported failed)", answer)
+
+    def test_architecture_scope(self):
+        self.assertIn("only on `el10_amd64_gcc15`", _paste_follow_up_answer("is that on el10 only?", "s"))
+        self.assertIn("No: this error is not on `aarch64`", _paste_follow_up_answer("on aarch64 too?", "s"))
+
+    def test_other_questions_and_other_turns_are_left_alone(self):
+        self.assertIsNone(_paste_follow_up_answer("is that a known error?", "s"))
+        self.assertIsNone(_paste_follow_up_answer("what's the latest IB?", "s"))
+        _turn_memory["s"]["answer"] = "RelVal results for ..."
+        self.assertIsNone(_paste_follow_up_answer("since when?", "s"))
 
 
 if __name__ == "__main__":
