@@ -11047,14 +11047,29 @@ def _rewrite_lost_arch_word(question: str, rewrite: str) -> bool:
     return any(word not in rewrite.lower() for word in words)
 
 
+_PLAIN_OVERVIEW_WORDS = frozenset(
+    "what what's whats is are was were anything any show me list all the broken failing failed fail fails failure failures "
+    "wrong problem problems error errors on for in at latest newest ib build".split())
+
+
+def _is_plain_arch_overview(question: str) -> bool:
+    """Only "what's broken on gcc16?", "arm failures": nothing asked but the failures on that architecture.
+    Found replaying 1,570 turns: "why would TritonService fail on aarch64?", "error for <package> on el10",
+    "did the build fail anywhere else besides el10?" lost their own answers to the overview."""
+    rest = question.replace("\u2019", "'").lower()
+    for regex in (_ARCH_COMPILER_RE, _ARCH_FAMILY_RE, _OS_FAMILY_RE):
+        rest = regex.sub(" ", rest)
+    words = re.findall(r"[a-z0-9_'./-]+", rest)
+    return bool(words) and all(word in _PLAIN_OVERVIEW_WORDS for word in words) and bool(
+        re.search(r"\b(?:broken|fail\w*|wrong|problems?|errors?)\b", rest))
+
+
 def _loose_arch_failure_scope(question: str, session_id: str) -> tuple[str, str | None]:
     """ "what's broken on gcc16?" with no IB named, when the newest IB isn't built there yet
     (architectures land hours apart): the newest IB that is, said in a note. Found 2026-11-05:
     the newest IB's whole overview, gcc14 failures only and no word about gcc16.
     Returns (question, answer when no IB at all is built there)."""
-    if IB_TAG_RE.search(question) or _latest_ib_contexts.get(session_id):
-        return question, None
-    if not re.search(r"\b(?:fail\w*|broken|wrong|problems?|errors?|status)\b", question, re.IGNORECASE):
+    if IB_TAG_RE.search(question) or _latest_ib_contexts.get(session_id) or not _is_plain_arch_overview(question):
         return question, None
     scope = _arch_scope_matches(question, session_id)
     if not scope or scope[2]:
@@ -17426,7 +17441,7 @@ def _chat(req: ChatRequest):
                               actions=_CAPABILITY_ACTIONS)
 
     shift_rewrite = _shift_question_rewrite(original_question)
-    if shift_rewrite and _rewrite_lost_arch_word(original_question, shift_rewrite):
+    if shift_rewrite and _is_plain_arch_overview(original_question) and _rewrite_lost_arch_word(original_question, shift_rewrite):
         shift_rewrite = None
     if shift_rewrite:
         original_question = shift_rewrite
