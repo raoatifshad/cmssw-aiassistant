@@ -14599,6 +14599,10 @@ _LOG_TEXT_IN_SUITE_RE = re.compile(
 def _log_text_in_suite_answer(question: str) -> str | None:
     """ "what is Bus error in 17_0 unit logs?", "Transport endpoint is not connected in 17_0 unit tests?" (found 2026-11-05:
     the list of failed packages). Where that text is in the raw logs of that suite, newest builds first."""
+    # "which IBs had a bus error in the unit logs this week?" (found 2026-11-05: "Name an IB tag")
+    which_ibs = re.match(r"\s*(?:which|what)\s+(?:ibs?|builds?)\s+(?:had|have|has|show(?:ed)?|saw)\s+(?:an?\s+)?(.{4,70}?)\s+(in\s+(?:the\s+)?(?:\S+\s+)?(?:unit|relval|add-?on)[\s-]*(?:tests?|logs?)(?:\s+logs?)?)(?:\s+(?:this|last|past)\s+\w+)?\s*[?.!]*\s*$", question, re.IGNORECASE)
+    if which_ibs:
+        question = f"{which_ibs.group(1)} {which_ibs.group(2)}"
     match = _LOG_TEXT_IN_SUITE_RE.match(question)
     if not match:
         return None
@@ -14629,8 +14633,9 @@ def _log_text_in_suite_answer(question: str) -> str | None:
         entry = builds.setdefault((r["tag"], r["arch"]), {"tests": {}, "summary": r["summary"]})
         for owner, status in zip(r["owners"] or [], r["statuses"] or []):
             entry["tests"][owner] = status
-    ordered = sorted(builds, key=lambda k: (_ib_sort_key(k[0]), k[1]), reverse=True)
-    lines = [f"`{phrase}` in {where} {suite} test logs: {len(ordered)} build(s), newest first (what the log shows, not why):", ""]
+    # builds where it hit a failing test first: a line that tests print on purpose must not push them off the list
+    ordered = sorted(builds, key=lambda k: (any(status == "failed" for status in builds[k]["tests"].values()), k[0][-15:], k[1]), reverse=True)
+    lines = [f"`{phrase}` in {where} {suite} test logs: {len(ordered)} build(s), those with a failing test first, then newest (what the log shows, not why):", ""]
     for key in ordered[:8]:
         tests = builds[key]["tests"]
         failed = sum(1 for status in tests.values() if status == "failed")
