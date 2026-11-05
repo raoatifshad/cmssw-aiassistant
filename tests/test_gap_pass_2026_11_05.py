@@ -125,6 +125,17 @@ class WorkflowOnDayTests(unittest.TestCase):
         with patch("server.api_server.get_exit_code_names", return_value={}):
             self.assertTrue(_workflow_on_day_answer("did 1.0 pass on 2026-11-02?").startswith("**Yes.**"))
 
+    @patch("server.api_server.get_exit_code_names", return_value={31744: "TimeOut"})
+    @patch("server.api_server.get_driver")
+    def test_the_verdict_answers_what_was_asked(self, get_driver, _names):
+        passed = [{"tag": "CMSSW_20_1_X_2026-11-02-2300", "arch": "a", "variant": "primary", "status": "PASSED", "exit": "0", "known": False}]
+        failed = [{"tag": "CMSSW_20_1_X_2026-11-02-2300", "arch": "a", "variant": "primary", "status": "FAILED", "exit": "31744", "known": False}]
+        for rows, question, verdict in ((passed, "did 1.0 fail on 2026-11-02?", "**No.**"), (failed, "did 1.0 fail on 2026-11-02?", "**Yes.**"),
+                                        (passed, "did 1.0 pass on 2026-11-02?", "**Yes.**"), (failed, "was 1.0 green on 2026-11-02?", "**No.**"),
+                                        (failed, "was 1.0 red on 2026-11-02?", "**Yes.**")):
+            get_driver.return_value = _driver(rows)
+            self.assertTrue(_workflow_on_day_answer(question).startswith(verdict), question)
+
     def test_only_with_a_day_and_a_verdict_word(self):
         self.assertIsNone(_workflow_on_day_answer("where is 537.0 failing"))
         self.assertIsNone(_workflow_on_day_answer("what is 537.0 on 11-02"))
