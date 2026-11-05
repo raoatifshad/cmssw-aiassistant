@@ -1790,6 +1790,11 @@ def _channel(driver, cypher: str, params: dict):
         return None
 
 
+# the run-specific start of a log line, and anything typed before it ("Is DAS broken? 2026/11/04 17:18:35 ERROR ..."):
+# the same line in another build has another time, so it can't be part of a word-for-word search
+_LOG_LINE_STAMP_RE = re.compile(r"^.{0,60}?\[?\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s*[+-]\d{4})?\]?\s*:?\s*")
+
+
 def search_test_log_problems_report(text: str, category: str | None = None, limit: int = 5) -> dict:
     """search_test_log_problems plus what was searched: {"problems": [...],
     "searched": [{"by", "key", "found"}...], "failed": [channel names]}.
@@ -1824,6 +1829,14 @@ def search_test_log_problems_report(text: str, category: str | None = None, limi
             del weights[name]
     keys = parsed.get("context_keys") or []
     pasted_core = " ".join((parsed["message"] or text).split()).lower()
+    pasted_core = _LOG_LINE_STAMP_RE.sub("", pasted_core)
+    # the text channel also looks for the paste as a phrase: a line with no identifier-shaped word ("failed to
+    # parse X509 proxy ...", "Transport endpoint is not connected") had no search terms at all, so it was
+    # reported "searched, 0 found" without being searched (found 2026-11-05)
+    text_query = " OR ".join(part for part in (
+        _lucene_terms(weights) if weights else "",
+        _lucene_terms([pasted_core[:200]]) if len(pasted_core) >= 30 else "",
+    ) if part)
     channels = {
         "signature": ("MATCH (g:ProblemSignature) WHERE g.signature_id IN $ids RETURN g.signature_id AS sid",
                       {"ids": parsed["signature_ids"]}) if parsed["signature_ids"] else None,
@@ -1832,9 +1845,9 @@ def search_test_log_problems_report(text: str, category: str | None = None, limi
                   "node.context_keys_text AS keys_text, node.category AS category",
                   {"q": _lucene_terms([t.lower() for t in list(weights) + keys])}) if weights or keys else None,
         "text": ("CALL db.index.fulltext.queryNodes('logProblemText', $q, {limit: 3000}) YIELD node "
-                 "RETURN DISTINCT node.signature_id AS sid, node.text AS text, node.owners AS owners, "
-                 "node.category AS category",
-                 {"q": _lucene_terms(weights)}) if weights else None,
+                 "RETURN DISTINCT node.signature_id AS sid, node.text AS text, node.summary AS summary, "
+                 "node.owners AS owners, node.category AS category",
+                 {"q": text_query}) if text_query else None,
         "same IB": ("MATCH (p:LogProblem) WHERE p.ib_tag IN $tags AND p.category = $category "
                     "RETURN p.signature_id AS sid, count(*) AS n ORDER BY n DESC LIMIT 3",
                     {"tags": parsed["ib_tags"], "category": category}) if category and parsed["ib_tags"] else None,
@@ -1864,7 +1877,8 @@ def search_test_log_problems_report(text: str, category: str | None = None, limi
         category_of[hit["sid"]] = hit["category"]
     contains: set[str] = set()
     for hit in rows_of.get("text", []):
-        haystack = ((hit["text"] or "") + " " + " ".join(hit["owners"] or [])).lower()
+        # the summary too: "Assertion failed: __n < this->size()" is the scanner's wording, not the log's
+        haystack = ((hit["text"] or "") + " " + (hit.get("summary") or "") + " " + " ".join(hit["owners"] or [])).lower()
         shared_by_sid.setdefault(hit["sid"], set()).update(t for t, low in lowered.items() if low in haystack)
         category_of[hit["sid"]] = hit["category"]
         if len(pasted_core) >= 30 and pasted_core in " ".join(haystack.split()):
