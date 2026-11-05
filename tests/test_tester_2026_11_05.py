@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from server import api_server
 from server.api_server import (
     _EARLY_LOG_LINE_RE, _LOG_PROBLEM_PASTE_RE, _latest_ib_contexts, _package_status_answer, _packages_named_loosely,
-    _paste_follow_up_answer, _resolve_short_follow_up, _turn_memory,
+    _paste_follow_up_answer, _resolve_short_follow_up, _turn_memory, _default_tag_notes, _with_arch_missing_from_newest,
 )
 from graph import tools
 
