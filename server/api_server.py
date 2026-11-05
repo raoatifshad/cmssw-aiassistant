@@ -14487,6 +14487,56 @@ _PASTE_FOLLOW_UP_RE = re.compile(
     r"\s*[?.!]*\s*$", re.IGNORECASE)
 
 
+_LOG_TEXT_IN_SUITE_RE = re.compile(
+    r"^\s*(?:(?:what(?:'s|\s+is)|any|is\s+there(?:\s+an?)?|show(?:\s+me)?|look\s+for|find)\s+)?['\"`]?([A-Z][^?!'\"`]{3,70}?)['\"`]?\s+(?:in|on)\s+(?:the\s+)?"
+    r"(?:(?:CMSSW_)?(\d{1,2}_\d{1,2})(?:_X)?\s+)?(unit|relval|add-?on)[\s-]*(?:tests?|logs?|test\s+logs?)(?:\s+logs?)?\s*[?.!]*\s*$", re.IGNORECASE)
+
+
+def _log_text_in_suite_answer(question: str) -> str | None:
+    """ "what is Bus error in 17_0 unit logs?", "Transport endpoint is not connected in 17_0 unit tests?" (found 2026-11-05:
+    the list of failed packages). Where that text is in the raw logs of that suite, newest builds first."""
+    match = _LOG_TEXT_IN_SUITE_RE.match(question)
+    if not match:
+        return None
+    phrase = " ".join(match.group(1).split())
+    if re.search(r"\bfail\w*\b|\b(?:errors?|problems?|exceptions?|results?)$", phrase, re.IGNORECASE) and phrase.lower() != "bus error":
+        return None
+    if len(phrase.split()) < 2 and not re.search(r"[a-z][A-Z]|[A-Z]{2}", phrase):
+        return None
+    suite = {"add-on": "addon", "addon": "addon"}.get(match.group(3).lower(), match.group(3).lower())
+    series = f"CMSSW_{match.group(2)}_" if match.group(2) else "CMSSW_"
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "CALL db.index.fulltext.queryNodes('logProblemText', $q, {limit: 2000}) YIELD node AS p "
+                "WHERE p.suite = $suite AND p.ib_tag STARTS WITH $series "
+                "RETURN p.ib_tag AS tag, p.arch AS arch, p.summary AS summary, p.owners AS owners, p.owner_statuses AS statuses, p.text AS text",
+                q='"%s"' % re.sub(r'["\\]', " ", phrase), suite=suite, series=series)]
+    finally:
+        driver.close()
+    wanted = phrase.lower()
+    rows = [r for r in rows if wanted in ((r["summary"] or "") + " " + (r["text"] or "")).lower()]
+    where = f"`{series}*`" if match.group(2) else "imported"
+    if not rows:
+        return f"`{phrase}` is not in any {where} {suite} test log imported here (a text search of the problems the log scanner kept, not of every log line)."
+    builds: dict[tuple, dict] = {}
+    for r in rows:
+        entry = builds.setdefault((r["tag"], r["arch"]), {"tests": {}, "summary": r["summary"]})
+        for owner, status in zip(r["owners"] or [], r["statuses"] or []):
+            entry["tests"][owner] = status
+    ordered = sorted(builds, key=lambda k: (_ib_sort_key(k[0]), k[1]), reverse=True)
+    lines = [f"`{phrase}` in {where} {suite} test logs: {len(ordered)} build(s), newest first (what the log shows, not why):", ""]
+    for key in ordered[:8]:
+        tests = builds[key]["tests"]
+        failed = sum(1 for status in tests.values() if status == "failed")
+        names = ", ".join(f"`{t}`" for t in sorted(tests)[:4]) + (f" +{len(tests) - 4} more" if len(tests) > 4 else "")
+        lines.append(f"- `{key[0]}` `{key[1]}`: {len(tests)} test(s), {failed} reported failed: {names}")
+    if len(ordered) > 8:
+        lines.append(f"- ... and {len(ordered) - 8} older build(s)")
+    return "\n".join(lines)
+
+
 def _paste_follow_up_answer(question: str, sid: str) -> str | None:
     """A short question about the error just pasted: "since when?", "which tests show this?", "is that on el10
     only?" (found 2026-11-05: the menu, or the whole IB's summary). Answered from the same test-log search,
@@ -16360,7 +16410,7 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
         where = _workflow_across_builds_answer(mine.group(1), f"where is {mine.group(1)} failing", sid)
         return ("**If it also fails in IBs without your PR, it isn't from your PR.** Compare the same step's error in your PR's "
                 f"test and in the IB; this shows where it fails, not the cause.\n\n{where}", "deterministic:ib_or_pr")
-    for handler, route in ((_arch_build_out_answer, "arch_build_out"), (_unknown_name_answer, "unknown_name"), (_about_the_bot_answer, "about_the_bot"), (_one_line_status_answer, "one_line_status"),
+    for handler, route in ((_arch_build_out_answer, "arch_build_out"), (_log_text_in_suite_answer, "log_text_in_suite"), (_unknown_name_answer, "unknown_name"), (_about_the_bot_answer, "about_the_bot"), (_one_line_status_answer, "one_line_status"),
                            (_series_overview_answer, "series_overview"), (_sanitizer_status_answer, "sanitizer_status"), (_both_flavours_answer, "both_flavours"),
                            (_build_progress_answer, "build_progress"), (_builds_failed_window_answer, "builds_failed_window"), (_first_failed_window_answer, "first_failed_window"),
                            (_recovered_window_answer, "recovered_window"), (_longest_failing_answer, "longest_failing"), (_workflow_last_pass_answer, "workflow_last_pass"),
