@@ -8488,6 +8488,13 @@ def _topic_phrase_answer(question: str) -> str | None:
         if words_answer:
             return words_answer
     if not rows:
+        # "is there an issue about Starlight workflows?" (found 2026-11-05: "none", with Issues #49849, #44866 and PR #49850
+        # about them): nobody writes "starlight workflows". The name alone, when the rest only says what kind of thing it is.
+        named = [w for w in topic_words if w not in {"workflow", "workflows", "relval", "relvals", "wf", "wfs", "test", "tests", "failure", "failures", "error", "errors", "problem", "problems"}]
+        if named and len(named) < len(topic_words) and len(" ".join(named)) >= 6:
+            narrower = _topic_phrase_answer(" ".join(named))
+            if narrower:
+                return narrower
         return (f"No imported CMSSW Issue or PR title/description contains \"{phrase}\". {_github_export_note()}.")
     open_issues = [r for r in rows if r["kind"] == "Issue" and str(r["state"]).lower() == "open"]
     other_issues = [r for r in rows if r["kind"] == "Issue" and r not in open_issues]
