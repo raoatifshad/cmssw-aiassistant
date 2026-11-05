@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, patch
 
 from server import api_server
 from server.api_server import (
-    _EARLY_LOG_LINE_RE, _LOG_PROBLEM_PASTE_RE, _paste_follow_up_answer, _turn_memory,
+    _EARLY_LOG_LINE_RE, _LOG_PROBLEM_PASTE_RE, _latest_ib_contexts, _package_status_answer, _packages_named_loosely,
+    _paste_follow_up_answer, _resolve_short_follow_up, _turn_memory,
 )
 from graph import tools
 
@@ -91,6 +92,85 @@ class PasteFollowUpTests(unittest.TestCase):
         self.assertIsNone(_paste_follow_up_answer("what's the latest IB?", "s"))
         _turn_memory["s"]["answer"] = "RelVal results for ..."
         self.assertIsNone(_paste_follow_up_answer("since when?", "s"))
+
+
+class PackageInReleaseSeriesTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(_latest_ib_contexts.pop, "p", None)
+
+    def _rows(self):
+        return [
+            {"tag": "CMSSW_17_0_X_2026-11-04-1100", "variant": "primary", "arch": "el8_amd64_gcc13", "status": "FAILED", "errors": 5},
+            {"tag": "CMSSW_17_0_X_2026-11-03-2300", "variant": "primary", "arch": "el8_amd64_gcc13", "status": "PASSED", "errors": 0},
+            {"tag": "CMSSW_20_1_X_2026-10-29-2300", "variant": "primary", "arch": "fc42_riscv64_gcc15", "status": "FAILED", "errors": 5},
+        ]
+
+    @patch("server.api_server._package_failing_tests_note", return_value=None)
+    def test_the_named_series_wins_over_the_session_ib(self, _):
+        driver, _session = _driver_with(self._rows())
+        _latest_ib_contexts["p"] = "CMSSW_20_1_X_2026-11-04-1100"
+        with patch("server.api_server.get_driver", return_value=driver):
+            answer = _package_status_answer("why did TauAnalysis/MCEmbeddingTools fail in 17_0?", "p")
+        self.assertIn("CMSSW_17_0 IB flavour", answer)
+        self.assertIn("failing in `CMSSW_17_0_X_2026-11-04-1100`", answer)
+        self.assertNotIn("riscv", answer)
+
+    def test_a_series_without_that_package_says_so(self):
+        driver, _session = _driver_with(self._rows())
+        with patch("server.api_server.get_driver", return_value=driver):
+            answer = _package_status_answer("is TauAnalysis/MCEmbeddingTools failing in 15_1?", "p")
+        self.assertIn("no imported unit-test record in `CMSSW_15_1`", answer)
+
+    @patch("server.api_server._package_failing_tests_note", return_value="NOTE")
+    def test_which_test_after_it_passes_again_names_the_last_failure(self, note):
+        rows = [
+            {"tag": "CMSSW_20_1_X_2026-11-03-2300", "variant": "primary", "arch": "el9_aarch64_gcc14", "status": "PASSED", "errors": 0},
+            {"tag": "CMSSW_20_1_X_2026-11-02-2300", "variant": "primary", "arch": "el9_aarch64_gcc14", "status": "FAILED", "errors": 1},
+        ]
+        driver, _session = _driver_with(rows)
+        with patch("server.api_server.get_driver", return_value=driver):
+            answer = _package_status_answer("FWCore/Integration failing on aarch64, which test?", "p")
+        self.assertIn("NOTE", answer)
+        self.assertEqual(note.call_args.args[1], [("CMSSW_20_1_X_2026-11-02-2300", "el9_aarch64_gcc14")])
+
+
+class LooseNamesTests(unittest.TestCase):
+    NAMES = ["HeterogeneousTest/ROCmDevice", "HeterogeneousTest/ROCmKernel", "RecoTracker/LSTCore", "FWIO/RNTupleTempTests",
+             "SimG4Core/Geometry", "Geometry/CommonDetUnit"]
+
+    def setUp(self):
+        patcher = patch("server.api_server._known_package_names", return_value=self.NAMES)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_exact_and_prefix(self):
+        self.assertEqual(_packages_named_loosely("did LSTCore pass on gcc16?"), ("LSTCore", ["RecoTracker/LSTCore"]))
+        self.assertEqual(_packages_named_loosely("what's up with RNTupleTempTests in ROOT6?"), ("RNTupleTempTests", ["FWIO/RNTupleTempTests"]))
+        self.assertEqual(_packages_named_loosely("why are ROCm tests failing on el10?"),
+                         ("ROCm", ["HeterogeneousTest/ROCmDevice", "HeterogeneousTest/ROCmKernel"]))
+
+    def test_left_alone(self):
+        for question in ("why is Geometry failing?", "any PR about LSTCore failing?", "is SimG4Core/Geometry failing?",
+                         "what does LSTCore do?", "why is ROOT6 failing?", "is CMSSW failing?", "why is 537.0 failing in LSTCore?"):
+            self.assertIsNone(_packages_named_loosely(question), question)
+
+
+class PackageFollowUpTests(unittest.TestCase):
+    def setUp(self):
+        _turn_memory["f"] = {"question": "why did SimG4Core/Geometry fail there?", "route": "deterministic:package_status",
+                             "answer": "`SimG4Core/Geometry` unit tests in `CMSSW_17_0_X_2026-11-04-1100`"}
+        _latest_ib_contexts["f"] = "CMSSW_17_0_X_2026-11-04-1100"
+        self.addCleanup(_turn_memory.pop, "f", None)
+        self.addCleanup(_latest_ib_contexts.pop, "f", None)
+
+    def test_rewrites(self):
+        self.assertEqual(_resolve_short_follow_up("does it fail anywhere else?", "f"), "is SimG4Core/Geometry failing anywhere?")
+        self.assertEqual(_resolve_short_follow_up("since when?", "f"), "is SimG4Core/Geometry failing? since when")
+        self.assertEqual(_resolve_short_follow_up("on aarch64 too?", "f"), "is SimG4Core/Geometry failing on aarch64?")
+
+    @patch("server.api_server._previous_primary_tag", return_value="CMSSW_17_0_X_2026-11-03-2300")
+    def test_the_build_before(self, _):
+        self.assertEqual(_resolve_short_follow_up("and in the build before?", "f"), "is SimG4Core/Geometry failing in CMSSW_17_0_X_2026-11-03-2300")
 
 
 if __name__ == "__main__":
