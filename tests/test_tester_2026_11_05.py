@@ -316,6 +316,7 @@ class ArchBuildOutTests(unittest.TestCase):
     def _ask(self, question, archs):
         driver, _session = _driver_with([{"a": a} for a in archs])
         with patch("server.api_server.get_driver", return_value=driver), \
+                patch("server.api_server._arch_results_so_far", return_value=None), \
                 patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-11-04-1100"}]):
             return api_server._arch_build_out_answer(question)
 
@@ -330,6 +331,20 @@ class ArchBuildOutTests(unittest.TestCase):
 
     def test_a_named_ib(self):
         self.assertIn("Not yet: `CMSSW_20_1_X_2026-11-04-1100`", self._ask("is aarch64 of the CMSSW_20_1_X_2026-11-04-1100 build out yet?", ["el8_amd64_gcc14"]))
+
+
+class ArchFinishedInSeriesTests(unittest.TestCase):
+    def test_says_when_a_build_has_fewer_results_than_the_one_before(self):
+        session = MagicMock()
+        session.run.side_effect = [[{"a": "el8_aarch64_gcc13"}, {"a": "el8_amd64_gcc13"}], MagicMock(single=lambda: {"n": 703}), MagicMock(single=lambda: {"n": 1274})]
+        driver = MagicMock()
+        driver.session.return_value.__enter__.return_value = session
+        with patch("server.api_server.get_driver", return_value=driver), \
+                patch("server.api_server.variant_previous_tag", return_value="CMSSW_16_0_X_2026-11-01-0000"), \
+                patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_16_0_X_2026-11-04-1100"}]):
+            answer = api_server._arch_build_out_answer("did 16_0 aarch64 finish?")
+        self.assertIn("only 703 RelVal result(s) so far", answer)
+        self.assertIn("had 1,274", answer)
 
 
 class UnitSummaryArchScopeTests(unittest.TestCase):

@@ -10922,18 +10922,46 @@ _ARCH_OUT_DATE_RE = re.compile(r"\b(\d{2})-(\d{2})[ -]+(?:at\s+)?(\d{2}):?(\d{2}
 _ARCH_OUT_WORD_RE = re.compile(r"\b(aarch64|arm64|arm|riscv\w*|el\d+|gcc\d+)\b", re.IGNORECASE)
 
 
+def _arch_results_so_far(tag: str, archs: list[str]) -> str | None:
+    """How many RelVal results a build has compared with the one before: 703 of 1,274 means it is still running, not finished."""
+    lines = []
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            for arch in archs:
+                now = session.run("MATCH (:IB {tag:$t, arch:$a})-[:RAN_RELVAL]->(r) RETURN count(r) AS n", t=tag, a=arch).single()["n"]
+                before_tag = variant_previous_tag(tag, None, arch)
+                before = session.run("MATCH (:IB {tag:$t, arch:$a})-[:RAN_RELVAL]->(r) RETURN count(r) AS n", t=before_tag, a=arch).single()["n"] if before_tag else 0
+                if before and now < before:
+                    lines.append(f"`{arch}` has only {now:,} RelVal result(s) so far (its previous build, `{before_tag}`, had {before:,}): it may still be running.")
+                elif now:
+                    lines.append(f"`{arch}` has {now:,} RelVal result(s)" + (f", as many as its previous build, `{before_tag}`." if before else "."))
+                else:
+                    lines.append(f"`{arch}` has no RelVal results yet.")
+    finally:
+        driver.close()
+    return "\n".join(lines) or None
+
+
 def _arch_build_out_answer(question: str) -> str | None:
     """ "is el10 out for the 11-04 11:00 build?", "is aarch64 of the 11-04-1100 build out yet?" (found 2026-11-05:
     a dead end). The IB named, or the primary IB of that date and time in the newest release series, or the one named."""
     named = IB_TAG_RE.search(question)
     date = None if named else _ARCH_OUT_DATE_RE.search(question)
     arch_word = _ARCH_OUT_WORD_RE.search(IB_TAG_RE.sub(" ", question))
-    if not (named or date) or not arch_word or not re.match(r"\s*(?:is|has|did|are)\b", question, re.IGNORECASE):
+    series = None if named or date else _requested_release_series(question)
+    if not (named or date or series) or not arch_word or not re.match(r"\s*(?:is|has|did|are)\b", question, re.IGNORECASE):
         return None
-    if not re.search(r"\b(?:out|ready|available|there|yet)\b", question, re.IGNORECASE) or re.search(r"\bfail|\bbroken\b", question, re.IGNORECASE):
+    if not re.search(r"\b(?:out|ready|available|there|yet|finish\w*|done|complete\w*)\b", question, re.IGNORECASE) or re.search(r"\bfail|\bbroken\b", question, re.IGNORECASE):
         return None
     if named:
         tag = named.group(1)
+    elif series:
+        # "did 16_0 aarch64 finish?" (found 2026-11-05: a dead end): that architecture's newest build of the series
+        records = _latest_ib_records(None, series)
+        if not records:
+            return None
+        tag = records[0]["tag"]
     else:
         latest = _latest_ib_records(None, _requested_release_series(question))
         parts = re.match(r"(CMSSW_\d+_\d+)_X_(\d{4})-", latest[0]["tag"]) if latest else None
@@ -10953,7 +10981,9 @@ def _arch_build_out_answer(question: str) -> str | None:
     having = [a for a in archs if wanted in a]
     listed = ", ".join(f"`{a}`" for a in archs)
     if having:
-        return f"Yes: `{tag}` has a build on " + ", ".join(f"`{a}`" for a in having) + f". All its imported architectures: {listed}."
+        partial = _arch_results_so_far(tag, having)
+        return (f"Yes: `{tag}` has a build on " + ", ".join(f"`{a}`" for a in having) + f". All its imported architectures: {listed}."
+                + (f"\n\n{partial}" if partial else ""))
     return (f"Not yet: `{tag}` has no imported `{wanted}` build. Architectures imported for it: {listed}. "
             "An IB's architectures land hours apart, and the data is refreshed twice a day.")
 
