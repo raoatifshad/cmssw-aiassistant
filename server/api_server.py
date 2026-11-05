@@ -8277,6 +8277,10 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
             or _warning_count_answer(question)
         )
         if answer:
+            if re.search(r"\bwhy\b", question, re.IGNORECASE) and re.search(r"\bbuilds?\b[^?]*\bfail|\bfail\w*\b[^?]*\bbuild", question, re.IGNORECASE) and "`error`" in answer:
+                # "why did the build fail?" (found 2026-11-05: the status table, as if it answered)
+                answer += ("\n\nWhy it failed is not in the imported data: it has one build status per architecture, not the compiler "
+                           "errors. The build log on the IB page has them.")
             return answer, []
         merged_result = _merged_prs_for_build_answer(question)
         if merged_result:
