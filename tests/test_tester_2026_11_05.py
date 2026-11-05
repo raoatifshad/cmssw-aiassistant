@@ -173,5 +173,67 @@ class PackageFollowUpTests(unittest.TestCase):
         self.assertEqual(_resolve_short_follow_up("and in the build before?", "f"), "is SimG4Core/Geometry failing in CMSSW_17_0_X_2026-11-03-2300")
 
 
+class UnitSummaryArchScopeTests(unittest.TestCase):
+    @patch("server.api_server.get_failing_unittests", return_value=[{"name": "A/B", "errors": 1}])
+    @patch("server.api_server._sub_ib_variant_tags", return_value=[{"tag": "CMSSW_20_1_ROOT6_X_2026-11-03-2300", "variant": "ROOT6"}])
+    def test_a_sub_ib_section_only_for_the_asked_architecture(self, _variants, _failing):
+        primary = [dict(tag="CMSSW_20_1_X_2026-11-03-2300", arch="el9_amd64_gcc16", failed=1, passed=379, total=380, errors=1)]
+        root6 = [dict(tag="CMSSW_20_1_ROOT6_X_2026-11-03-2300", arch="el9_aarch64_gcc14", failed=2, passed=371, total=373, errors=3)]
+        with patch("server.api_server._unittest_scope_records", side_effect=lambda tag: root6 if "ROOT6" in tag else primary):
+            scoped = api_server._unittest_summary_from_records("CMSSW_20_1_X_2026-11-03-2300", primary, arch_scoped=True)
+            whole = api_server._unittest_summary_from_records("CMSSW_20_1_X_2026-11-03-2300", primary)
+        self.assertNotIn("ROOT6", scoped)
+        self.assertIn("ROOT6", whole)
+
+
+class ThereFollowUpTests(unittest.TestCase):
+    def tearDown(self):
+        _turn_memory.pop("t", None)
+
+    def test_stays_on_the_ib_and_architecture_of_the_answer(self):
+        _turn_memory["t"] = {"question": "RelVal failures on el10 in the newest IB?", "route": "deterministic:arch_word_results",
+                             "answer": "`CMSSW_20_1_X_2026-11-04-1100` has no build on `el10` yet; this is `CMSSW_20_1_X_2026-11-03-2300`, the newest IB built on it.\n\n"
+                                       "`el10` in it: 1 build(s) on `el10_amd64_gcc15`."}
+        self.assertEqual(_resolve_short_follow_up("unit tests there?", "t"), "failed unit tests in CMSSW_20_1_X_2026-11-03-2300 on el10_amd64_gcc15")
+        self.assertEqual(_resolve_short_follow_up("how many failed there?", "t"), "failed relvals in CMSSW_20_1_X_2026-11-03-2300 on el10_amd64_gcc15")
+
+    def test_without_an_architecture_in_the_question_nothing_changes(self):
+        _turn_memory["t"] = {"question": "RelVal failures in the newest IB?", "route": "capability:relval",
+                             "answer": "`CMSSW_20_1_X_2026-11-04-1100` on `el8_amd64_gcc14`"}
+        self.assertIsNone(_resolve_short_follow_up("unit tests there?", "t"))
+
+
+class ArchMissingFromNewestTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(_default_tag_notes.pop, "a", None)
+        for name, value in (("_latest_ib_records", [{"tag": "CMSSW_20_1_X_2026-11-04-1100"}]),
+                            ("_packages_named_loosely", None),
+                            ("_newest_tag_for_arch_word", ("CMSSW_20_1_X_2026-11-03-2300", ["el9_amd64_gcc16"])),
+                            ("_arch_scope_matches", ("CMSSW_20_1_X_2026-11-04-1100", "gcc16", [], ["el8_amd64_gcc14", "el9_amd64_gcc14"]))):
+            patcher = patch(f"server.api_server.{name}", return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_uses_the_newest_ib_built_on_it_and_says_so(self):
+        question = _with_arch_missing_from_newest("what's broken on gcc16?", "a")
+        self.assertEqual(question, "what's broken on gcc16? CMSSW_20_1_X_2026-11-03-2300 el9_amd64_gcc16")
+        self.assertIn("has no `gcc16` build yet", _default_tag_notes["a"])
+
+    def test_left_alone(self):
+        for question in ("is gcc16 out yet?", "compare gcc15 and gcc16 failures", "failures on gcc16 this week",
+                         "why is 537.0 failing on gcc16?", "what failed on gcc16 in 17_1?",
+                         "what's broken in CMSSW_20_1_X_2026-11-03-2300 on gcc16?"):
+            self.assertEqual(_with_arch_missing_from_newest(question, "a"), question, question)
+        self.assertNotIn("a", _default_tag_notes)
+
+    def test_the_shift_rewrite_keeps_the_architecture(self):
+        self.assertEqual(api_server._shift_question_rewrite("what's broken on gcc16?"), "what is failing in the latest IB on gcc16")
+        self.assertEqual(api_server._shift_question_rewrite("what's broken?"), "what is failing in the latest IB")
+
+    def test_a_build_of_another_series_in_the_session_stays(self):
+        with patch("server.api_server._arch_scope_matches", return_value=("CMSSW_17_0_X_2026-11-04-1100", "aarch64", [], ["el8_amd64_gcc13"])):
+            self.assertEqual(_with_arch_missing_from_newest("what's failing on aarch64?", "a"), "what's failing on aarch64?")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1754,7 +1754,7 @@ def _unittest_arch_choice_answer(tag: str, records: list[dict]) -> str:
 _UNITTEST_SUMMARY_FAILED_PACKAGE_CAP = 10
 
 
-def _unittest_summary_from_records(tag: str, records: list[dict], include_sub_ibs: bool = True) -> str:
+def _unittest_summary_from_records(tag: str, records: list[dict], include_sub_ibs: bool = True, arch_scoped: bool = False) -> str:
     total = sum(record["total"] or 0 for record in records)
     failed = sum(record["failed"] or 0 for record in records)
     passed = sum(record["passed"] or 0 for record in records)
@@ -1821,6 +1821,11 @@ def _unittest_summary_from_records(tag: str, records: list[dict], include_sub_ib
             if not sub_records:
                 missing_variants.append(variant)
                 continue
+            if arch_scoped:
+                # "unit tests in <tag> on el9_amd64_gcc16" listed ROOT6's aarch64 failures (found 2026-11-05)
+                sub_records = [record for record in sub_records if record["arch"] in {r["arch"] for r in records}]
+                if not sub_records:
+                    continue
             sub_failed = sum(record["failed"] or 0 for record in sub_records)
             if sub_failed:
                 failure_blocks.append(f"\n### Sub-IB variant `{variant}` (`{sub_tag}`)")
@@ -1869,7 +1874,7 @@ def _unittest_summary_answer(
                     "Choose one of the architectures listed above or reply `all`."
                 )
             _pending_unittest_scopes.pop(session_id, None)
-            return _unittest_summary_from_records(tag, selected_records)
+            return _unittest_summary_from_records(tag, selected_records, arch_scoped=True)
         return _unittest_arch_choice_answer(tag, records)
 
     # "unit" alone (not just "unit test(s)") must still match -- a natural
@@ -1899,7 +1904,7 @@ def _unittest_summary_answer(
         # "on aarch64": every imported architecture of that CPU family, or say there is none
         family_records = [record for record in records if family in record["arch"]]
         if family_records:
-            return _unittest_summary_from_records(tag, family_records)
+            return _unittest_summary_from_records(tag, family_records, arch_scoped=True)
         have = ", ".join(f"`{arch}`" for arch in sorted({record["arch"] for record in records}))
         return (f"Unit-test results for `{tag}` have no imported `{family}` build (not run yet, still running, or "
                 f"not run on that architecture) -- unknown there, not passing. Imported for: {have}.")
@@ -1912,7 +1917,7 @@ def _unittest_summary_answer(
             return (f"No unit-test results are imported for `{tag}` on `{selected_arch}` (not run yet, still "
                     f"running, or not run on that architecture) -- unknown there, not passing. "
                     f"Imported for: {have}.")
-        return _unittest_summary_from_records(tag, selected_records)
+        return _unittest_summary_from_records(tag, selected_records, arch_scoped=True)
     # Every imported architecture, in a per-architecture table, as _relval_scope_or_choice does: several
     # flagged default is no reason to ask (found 2026-11-04: el10 and el8 offered, with 4 imported).
     return _unittest_summary_from_records(tag, records)
