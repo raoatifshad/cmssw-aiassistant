@@ -293,6 +293,75 @@ class SinceAndFlavourRewriteTests(unittest.TestCase):
         self.assertEqual(_resolve_short_follow_up("and compared with the primary?", "c"), "compare MULTIARCHS with the primary")
 
 
+class FlattenedTracebackTests(unittest.TestCase):
+    def test_a_traceback_on_one_line_is_read_like_the_real_one(self):
+        flat = tools.parse_pasted_error("Traceback (most recent call last): ModuleNotFoundError: No module named 'A.B'")
+        real = tools.parse_pasted_error("Traceback (most recent call last):\n  File \"a.py\", line 1, in <module>\n    import x\nModuleNotFoundError: No module named 'A.B'")
+        self.assertEqual(flat["message"], "ModuleNotFoundError: No module named 'A.B'")
+        self.assertEqual(real["message"], "ModuleNotFoundError: No module named 'A.B'")
+
+
+class TopicNameAloneTests(unittest.TestCase):
+    def test_a_kind_of_thing_next_to_a_name_does_not_hide_it(self):
+        hit = [{"kind": "Issue", "number": 49849, "title": "RelVals 180.1 failing", "state": "closed", "merged_at": None, "in_title": False, "is_open": False}]
+        def runs(query, **params):
+            if "RETURN CASE WHEN" in query:
+                return []
+            return list(hit) if params["p"] == "starlight" and "item:Issue" in query else []
+        session = MagicMock()
+        session.run.side_effect = runs
+        driver = MagicMock()
+        driver.session.return_value.__enter__.return_value = session
+        with patch("server.api_server.get_driver", return_value=driver), patch("server.api_server._topic_words_in_title_answer", return_value=None):
+            answer = api_server._topic_phrase_answer("is there an issue about Starlight workflows?")
+        self.assertIn("49849", answer)
+
+
+class UnitRankingWindowTests(unittest.TestCase):
+    def test_a_window_stays_with_the_ranking_over_time(self):
+        self.assertIsNone(api_server._shift_question_rewrite("which unit test package fails most this month?"))
+
+
+class FollowUpsRound5Tests(unittest.TestCase):
+    def tearDown(self):
+        _turn_memory.pop("h", None)
+        api_server._last_workflow_contexts.pop("h", None)
+
+    def test_any_in_a_flavour_after_hidden_problems(self):
+        _turn_memory["h"] = {"question": "hidden problems in the newest IB?", "route": "deterministic:test_log_changes", "answer": "x"}
+        driver, _session = _driver_with([{"t": "CMSSW_20_1_ASAN_X_2026-11-01-2300"}, {"t": "CMSSW_20_1_ASAN_X_2026-11-02-2300"}])
+        with patch("server.api_server.get_driver", return_value=driver):
+            self.assertEqual(_resolve_short_follow_up("any in ASAN?", "h"), "any hidden problems in passed tests in CMSSW_20_1_ASAN_X_2026-11-02-2300")
+
+    def test_what_exception_after_a_workflow(self):
+        _turn_memory["h"] = {"question": "is 136.901 failing in 17_1?", "route": "deterministic:workflow_where", "answer": "`136.901`"}
+        api_server._last_workflow_contexts["h"] = "136.901"
+        self.assertEqual(_resolve_short_follow_up("what exception?", "h"), "why is workflow 136.901 failing in 17_1")
+
+    def test_status_of_an_architecture_in_a_series(self):
+        self.assertEqual(api_server._shift_question_rewrite("status of el8_amd64_gcc13 in 17_0"), "what is failing in 17_0 on el8_amd64_gcc13")
+
+    def test_a_list_of_prs_is_searched_by_any_of_them(self):
+        _turn_memory["h"] = {"question": "which PRs went into the newest 20_1?", "route": "capability:pr_evidence",
+                             "answer": "- **cmssw #1** - Update Geant4 thing\n- **cmssw #2** - Other"}
+        answer = api_server._listed_items_follow_up("did any of them touch Geant4?", "h")
+        self.assertIn("cmssw #1", answer)
+        self.assertNotIn("cmssw #2", answer)
+        self.assertIn("No PR in that list", api_server._listed_items_follow_up("did any of them touch Ecal?", "h"))
+
+    @patch("server.api_server._ib_build_records")
+    def test_only_in_one_of_two_compared_series(self, records):
+        records.side_effect = lambda tag: [{"variant": "primary", "failed": ["10804.31"] if "17_1" in tag else [], "unit_failed": [] if "17_1" in tag else ["A/B"]}]
+        _turn_memory["h"] = {"question": "compare 17_0 and 17_1 latest", "route": "deterministic:series_compare",
+                             "answer": "| `CMSSW_17_0_X` | `2026-11-04-1100` | `el8` | x |\n| `CMSSW_17_1_X` | `2026-11-04-1100` | `el8` | x |"}
+        answer = api_server._listed_items_follow_up("which failures are only in 17_1?", "h")
+        self.assertIn("RelVals: `10804.31`", answer)
+        self.assertIn("Unit tests: none", answer)
+        _turn_memory["h"] = {"question": "which failures are only in 17_1?", "route": "deterministic:listed_items_follow_up", "answer": answer}
+        self.assertIn("Unit tests: `A/B`", api_server._listed_items_follow_up("which failures are only in 17_0?", "h"))
+        api_server._last_series_compares.pop("h", None)
+
+
 class WorkflowExitWhyTests(unittest.TestCase):
     def test_why_about_one_workflow_is_not_a_list_by_exit_code(self):
         self.assertIsNone(api_server._workflows_by_exit_answer("RelVal 10804.31 in 17_1 why exit 25600?"))
