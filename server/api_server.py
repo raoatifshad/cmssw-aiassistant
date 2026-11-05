@@ -16097,6 +16097,8 @@ def _workflows_by_exit_answer(question: str) -> str | None:
     summary -- and the exit-code answer itself tells people to ask this)."""
     if re.search(r"\bmost\b|\bmean\b", question, re.IGNORECASE) or not re.search(r"\b(?:workflows?|wfs?|relvals?)\b", question, re.IGNORECASE):
         return None
+    if re.search(r"\bwhy\b", question, re.IGNORECASE) and re.search(r"(?<![\d.])\d{1,8}\.\d{1,7}(?![\d.])", question):
+        return None  # "RelVal 10804.31 in 17_1 why exit 25600?" asks about that workflow (found 2026-11-05: a list with only it in it)
     code = re.search(r"\bexit\s*(?:code)?\s*(\d{1,6})\b", question, re.IGNORECASE)
     if code and (IB_TAG_RE.search(question) or re.search(r"\b(?:latest|newest)\b", question, re.IGNORECASE)):
         return None  # the scoped form has its own handler, with more detail (found by the replay)
