@@ -10978,6 +10978,22 @@ def _arch_family(question: str) -> str | None:
     return "aarch64" if word.startswith(("aarch", "arm")) else "riscv64" if word.startswith("riscv") else "amd64"
 
 
+def _workflow_newest_failing_primary_tag(workflow_id: str, series: tuple[int, int]) -> str | None:
+    """The primary IB of the newest build of a release series where a workflow really failed (not a known error)."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            tags = [r["t"] for r in session.run(
+                "MATCH (ib:IB)-[:RAN_RELVAL]->(r:RelVal {workflow_id:$wf, status:'FAILED'}) "
+                "WHERE ib.tag STARTS WITH $prefix AND NOT coalesce(r.known_error, false) RETURN DISTINCT ib.tag AS t",
+                wf=workflow_id, prefix=f"CMSSW_{series[0]}_{series[1]}_")]
+    finally:
+        driver.close()
+    if not tags:
+        return None
+    return re.sub(r"^(CMSSW_\d+_\d+)_(?:[A-Za-z0-9]+_)?X_", r"\1_X_", max(tags, key=_ib_sort_key))
+
+
 def _workflow_why_failing_answer(question: str, session_id: str) -> str | None:
     """"Why is workflow 512.0 failing (on aarch64)?" -- the shifter's first
     question about any red workflow. Answers from the IB in scope (explicit
@@ -10999,13 +11015,21 @@ def _workflow_why_failing_answer(question: str, session_id: str) -> str | None:
     if not re.search(r"\b(?:wf|workflow|relval|fail)", question, re.IGNORECASE) and not (
             (IB_TAG_RE.search(question) or _is_latest_ib_question(question)
              # "why is 539.0 timing out?" (found 2026-11-04: "Please provide the IB tag")
-             or re.search(r"\btim(?:ed?|ing)[\s-]*out\b|\bcrash\w*\b|\bsegfault\w*\b|\bwhy\b", question, re.IGNORECASE))
+             or re.search(r"\btim(?:ed?|ing)[\s-]*out\b|\bcrash\w*\b|\bsegfault\w*\b|\bwhy\b|\bwhat\s+happened\b", question, re.IGNORECASE))
             and re.fullmatch(r"\d{2,6}\.\d+", workflow_match.group(1))):
         return None
     workflow_id = workflow_match.group(1)
     tag_match = IB_TAG_RE.search(question)
     tag, scope_note = None, ""
-    if tag_match:
+    named_series = _requested_release_series(question) if not tag_match else None
+    if named_series:
+        # "why is 10805.31 failing in 16_1?" (found 2026-11-05: 20_1, "it passed in every record")
+        tag = _workflow_newest_failing_primary_tag(workflow_id, named_series) or (_latest_ib_records(None, named_series) or [{}])[0].get("tag")
+        if tag:
+            scope_note = f" (the newest build of `CMSSW_{named_series[0]}_{named_series[1]}` where it fails, or that series' newest)"
+    if tag:
+        pass
+    elif tag_match:
         tag = tag_match.group(1)
     elif _workflow_newest_failing_tag.get(session_id) and _last_workflow_contexts.get(session_id) == workflow_id:
         tag = _workflow_newest_failing_tag[session_id]
