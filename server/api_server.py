@@ -13654,6 +13654,13 @@ def _shift_question_rewrite(question: str) -> str | None:
     normalized = _normalize_terse_words(question)
     if normalized != question:
         return _shift_question_rewrite(normalized) or normalized
+    looks = re.fullmatch(r"\s*(?:what\s+does|how\s+does)\s+(?:the\s+)?(?:(?:latest|newest)\s+)?(?:CMSSW_)?(\d{1,2}_\d{1,2})(?:_X)?(?:\s+(?:ib|build|release|series))?\s+look(?:\s+like)?\s*(?:today|now)?\s*[?.!]*\s*", question, re.IGNORECASE)
+    if looks:
+        # "what does the 16_1 IB look like?" (found 2026-11-05: "my lookups came back empty")
+        return f"what is failing in {looks.group(1)}"
+    if re.search(r"\bshifter\s+(?:summary|digest|report)\b", question, re.IGNORECASE):
+        # "shifter summary for 11-04" (found 2026-11-05: "my lookups came back empty"; for yesterday: the IB's result table)
+        return re.sub(r"\bshifter\s+(summary|digest|report)\b", r"shift \1", question, flags=re.IGNORECASE)
     terse = _terse_question(question) if len(question) <= 60 else None
     if terse and terse.strip().lower() != question.strip().rstrip("?.! ").lower():
         # a rewrite can be the fixed point of another rule ("ib of 3 nov"): never call again with what we were given
