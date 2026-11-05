@@ -10817,6 +10817,43 @@ def _with_newest_arch_ib(question: str) -> str:
     return f"{question} {found[0]}" + (f" {found[1][0]}" if len(found[1]) == 1 else "")
 
 
+def _with_arch_missing_from_newest(question: str, session_id: str) -> str:
+    """ "what's broken on gcc16?", "RelVal failures on el10 in the newest IB?": an IB's architectures land hours apart,
+    so right after each build the newest IB has only el8/el9, and the answer silently replaced the asked architecture
+    with those (found 2026-11-05, bank N504). The newest IB that was built on it instead, saying so. Not for a follow-up
+    about a build in another release series, nor for "is it out yet?", which asks exactly that."""
+    if IB_TAG_RE.search(question) or _requested_release_series(question) or _requested_ib_arch(question) or _PACKAGE_PATH_RE.search(question):
+        return question
+    if not re.search(r"\b(?:fail\w*|broken|wrong|problems?|status|results?|relvals?|unit[\s-]*tests?)\b", question, re.IGNORECASE):
+        return question
+    if re.search(r"\b(?:compare\w*|vs|versus|both|week|month|days?|since|finish\w*|done|ready|yet|out|prs?|issues?|clang|warnings?|exit\s*codes?|only)\b|"
+                 r"(?<![\d.])\d+\.\d+(?![\d.])", question, re.IGNORECASE):
+        return question
+    try:
+        if _packages_named_loosely(question):
+            return question
+        scope = _arch_scope_matches(question, session_id)
+        if not scope or scope[2] or not scope[1]:
+            return question
+        newest = _latest_ib_records()
+        same_series = re.match(r"CMSSW_\d+_\d+", scope[0]) and newest and newest[0]["tag"].startswith(re.match(r"CMSSW_\d+_\d+", scope[0]).group(0) + "_")
+        if not same_series:
+            return question
+        words = scope[1].split()
+        found = _newest_tag_for_arch_word(words[0])
+    except Exception as exc:
+        print(f"WARNING: newest architecture IB lookup failed: {exc}")
+        return question
+    if not found:
+        return question
+    archs = [arch for arch in found[1] if all(word in arch for word in words)]
+    if not archs:
+        return question
+    _default_tag_notes[session_id] = (f"_`{scope[0]}` has no `{scope[1]}` build yet (it has {', '.join(f'`{a}`' for a in scope[3])}), "
+                                      f"so this is for `{found[0]}`, the newest IB built on it._\n\n")
+    return f"{question} {found[0]}" + (f" {archs[0]}" if len(archs) == 1 else "")
+
+
 def _with_series_change_tags(question: str) -> str:
     """ "what changed in 17_1 between the last two builds?": that series' two newest primary IBs
     (found 2026-11-04: just the newest tag). Windows ("this week") stay with the digest."""
@@ -13652,7 +13689,9 @@ def _shift_question_rewrite(question: str) -> str | None:
     if pr_in_ib:
         return f"which IB first contains PR {pr_in_ib.group(1)}?"
     if re.search(r"\bwhat(?:'s|\s+is)\s+broken\b", question, re.IGNORECASE) and not IB_TAG_RE.search(question):
-        return "what is failing in the latest IB"
+        # the architecture stays: "what's broken on gcc16?" (found 2026-11-05: el8 and el9 of the latest IB, bank N504)
+        scope = re.search(r"\bon\s+(\S+?)\s*[?.!]*\s*$", question, re.IGNORECASE)
+        return "what is failing in the latest IB" + (f" on {scope.group(1)}" if scope else "")
     if re.search(r"\bshould\s+i\s+escalate\b|\bi\s+should\s+escalate\b|\bworth\s+escalating\b", question, re.IGNORECASE):
         return "give me a shift summary"
     how_scope = re.fullmatch(rf"\s*how(?:'s|\s+is|\s+bad\s+is)\s+(?:the\s+)?({_SCOPE_WORD})(?:\s+(?:doing|situation|looking))?\s*[?.!]*\s*", question, re.IGNORECASE)
@@ -15837,11 +15876,19 @@ def _arch_word_results_answer(question: str) -> str | None:
     tag = _latest_or_named_tag(question)
     records = _ib_build_records(tag, arch, family) if tag else []
     shown = arch or family
+    lead_note = ""
+    if not records and tag and not IB_TAG_RE.search(question) and not _requested_release_series(question):
+        # "RelVal failures on el10 in the newest IB?" right after a build (found 2026-11-05): an IB's architectures land hours apart
+        newest_on_it = _newest_tag_for_arch_word(arch or family)
+        if newest_on_it and newest_on_it[0] != tag:
+            lead_note = f"`{tag}` has no build on `{shown}` yet; this is `{newest_on_it[0]}`, the newest IB built on it.\n\n"
+            tag = newest_on_it[0]
+            records = _ib_build_records(tag, arch, family)
     if not records:
         return f"`{tag}` has no build on `{shown}`." if tag else None
     wants_units = bool(re.search(r"\bunit", kind, re.IGNORECASE))
     wants_relvals = bool(re.search(r"\brelval", kind, re.IGNORECASE))
-    lines = [f"`{shown}` in `{tag}` and its sub-IBs: {len(records)} build(s) on {', '.join(f'`{a}`' for a in sorted({r['arch'] for r in records}))}."]
+    lines = [f"{lead_note}`{shown}` in `{tag}` and its sub-IBs: {len(records)} build(s) on {', '.join(f'`{a}`' for a in sorted({r['arch'] for r in records}))}."]
     broken = [r for r in records if r["build"] == "error"]
     if broken and not wants_units and not wants_relvals:
         lines.append("Build failed: " + ", ".join(f"`{r['arch']}`" for r in broken) + ".")
@@ -16312,6 +16359,8 @@ def _chat(req: ChatRequest):
     question = _with_relative_compare_tags(question)
     question = _with_variant_ib_context(question)
     question = _with_newest_arch_ib(question)
+    if not scope_only:
+        question = _with_arch_missing_from_newest(question, sid)
     question = _with_series_change_tags(question)
     question, date_message = _date_tag_context(question)
     if date_message:
