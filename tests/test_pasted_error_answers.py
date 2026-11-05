@@ -8,7 +8,7 @@ from server.api_server import (ChatRequest, _chat, _first_last_builds_text, _is_
                                _relval_by_exit_code_answer, _relval_exception_context, _relval_exception_list_answer,
                                _relval_exception_message_answer, _test_log_problem_answer, _pr_not_in_ib_text,
                                _pr_number_answer, _workflow_artifact_answer, _one_line_error_with_ib,
-                               _loose_arch_failure_scope, _rewrite_lost_arch_word, _default_tag_notes, _latest_ib_contexts)
+                               _loose_arch_failure_scope, _rewrite_lost_arch_word, _is_plain_arch_overview, _default_tag_notes, _latest_ib_contexts)
 from server.request_planner import RequestContext
 
 TAG = "CMSSW_20_1_ROOT6_X_2026-11-03-2300"
@@ -302,6 +302,18 @@ class LooseArchScopeTests(unittest.TestCase):
         _, answer = self.scope(q, words="el8 gcc16")
         self.assertEqual(self.newest.call_args.args[0], "gcc16")
         self.assertIn("`el8 gcc16`", answer)
+
+    def test_only_a_plain_overview_question_qualifies(self):
+        for q in ("what's broken on gcc16?", "what\u2019s broken on aarch64", "arm failures", "failures on arm",
+                  "what failed in the latest IB on aarch64"):
+            self.assertTrue(_is_plain_arch_overview(q), q)
+        # all found replaying real questions: each has an answer of its own
+        for q in ("why would TritonService fail on aarch64?", "why does TestIntegrationEventSetup fail on aarch64?",
+                  "show the error for SimG4Core/Geometry on el10", "did the build fail anywhere else besides el10?",
+                  "is there an issue for the el10 ROCm failures?", "how many known errors on aarch64?",
+                  "anything newly failing on aarch64?", "10805.31 on gcc15", "on el10", "gcc16"):
+            self.assertFalse(_is_plain_arch_overview(q), q)
+            self.assertEqual(self.scope(q), (q, None))
 
     def test_a_named_ib_or_session_ib_or_other_question_is_left_alone(self):
         for q in (f"what's broken on gcc16 in {self.LATEST}", "how many gcc16 builds are there"):
