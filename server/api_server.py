@@ -14386,6 +14386,11 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
             return _who_to_ask_answer(f"who is looking at workflow {named.group(1)}?")
     if re.fullmatch(r"\s*which\s+of\s+them\s+failed\s+before\s*[?.!]*\s*", question, re.IGNORECASE):
         question = "have they failed before?"
+    if re.fullmatch(r"\s*(?:which|how\s+many)\s+(?:of\s+(?:them|these|those)\s+)?(?:are|is)\s+serious\s*[?.!]*\s*", question, re.IGNORECASE) and "reported as PASSED" in answer:
+        # found 2026-11-05: the menu
+        return ("All of them: this list only counts serious kinds (fatal exceptions, sanitizer and UBSan reports, crashes, assertions, uncaught exceptions, "
+                "Python tracebacks, infrastructure errors), not plain error lines. Serious is about the kind of message, not its effect: "
+                "those tests still passed, and some raise errors on purpose.")
     if re.fullmatch(r"\s*does\s+the\s+(?:ib\s+)?dashboard\s+show\s+(?:these|them|this|those)\s*[?.!]*\s*", question, re.IGNORECASE) and "reported as PASSED" in answer:
         return "No: these are inside tests the dashboard reports as passed. They come from scanning the raw test logs, so only this chat and the Shift Console show them."
     shown_issue = re.search(r"## Issue #(\d{3,6})", answer)
