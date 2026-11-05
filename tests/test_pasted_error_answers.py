@@ -8,7 +8,7 @@ from server.api_server import (ChatRequest, _chat, _first_last_builds_text, _is_
                                _relval_by_exit_code_answer, _relval_exception_context, _relval_exception_list_answer,
                                _relval_exception_message_answer, _test_log_problem_answer, _pr_not_in_ib_text,
                                _pr_number_answer, _workflow_artifact_answer, _one_line_error_with_ib,
-                               _loose_arch_failure_scope, _rewrite_lost_arch_word, _is_plain_arch_overview, _default_tag_notes, _latest_ib_contexts)
+                               _arch_moved_to_several_answer, _arch_never_built_answer, _with_arch_missing_from_newest, _rewrite_lost_arch_word, _is_plain_arch_overview, _default_tag_notes, _latest_ib_contexts)
 from server.request_planner import RequestContext
 
 TAG = "CMSSW_20_1_ROOT6_X_2026-11-03-2300"
@@ -265,46 +265,41 @@ class OneLineErrorTests(unittest.TestCase):
         self.assertEqual(answer, "**Yes**\n\nhistory")
 
 
-class LooseArchScopeTests(unittest.TestCase):
+class ArchOverviewTests(unittest.TestCase):
     LATEST = "CMSSW_20_1_X_2026-11-04-1100"
-    BUILT = "CMSSW_20_1_X_2026-11-03-2300"
 
     def setUp(self):
-        _default_tag_notes.pop("loose", None)
-        _latest_ib_contexts.pop("loose", None)
+        _latest_ib_contexts.pop("never", None)
 
-    def scope(self, question, words="gcc16", matches=(), found=("CMSSW_20_1_X_2026-11-03-2300", ["el9_amd64_gcc16"])):
-        with patch("server.api_server._arch_scope_matches", return_value=(self.LATEST, words, list(matches), ["el9_amd64_gcc14"])), \
+    def never(self, question, words, found):
+        with patch("server.api_server._arch_scope_matches", return_value=(self.LATEST, words, [], ["el9_amd64_gcc14"])), \
                 patch("server.api_server._newest_tag_for_arch_word", return_value=found) as newest:
-            result = _loose_arch_failure_scope(question, "loose")
+            answer = _arch_never_built_answer(question, "never")
         self.newest = newest
-        return result
-
-    def test_uses_the_newest_ib_built_there_and_says_so(self):
-        question, answer = self.scope("what's broken on gcc16?")
-        self.assertIsNone(answer)
-        self.assertEqual(question, f"what's broken on gcc16? {self.BUILT} el9_amd64_gcc16")
-        self.assertIn(f"`{self.LATEST}`, the newest IB, has no `gcc16` build yet", _default_tag_notes["loose"])
-
-    def test_newest_ib_already_built_there_changes_nothing(self):
-        q = "what's broken on gcc16?"
-        self.assertEqual(self.scope(q, matches=["el9_amd64_gcc16"]), (q, None))
-        self.assertNotIn("loose", _default_tag_notes)
+        return answer
 
     def test_never_built_there_says_so_instead_of_another_compiler(self):
-        q = "what's broken on gcc99?"
-        question, answer = self.scope(q, words="gcc99", found=None)
-        self.assertEqual(question, q)
-        self.assertEqual(answer, "No imported primary IB has RelVal results on `gcc99`.")
+        self.assertEqual(self.never("what's broken on gcc99?", "gcc99", None), "No imported primary IB has RelVal results on `gcc99`.")
 
     def test_all_words_must_match_and_compiler_is_searched_first(self):
-        q = "what's broken on el8 gcc16?"
-        _, answer = self.scope(q, words="el8 gcc16")
+        answer = self.never("what's broken on el8 gcc16?", "el8 gcc16", ("CMSSW_20_1_X_2026-11-03-2300", ["el9_amd64_gcc16"]))
         self.assertEqual(self.newest.call_args.args[0], "gcc16")
         self.assertIn("`el8 gcc16`", answer)
 
+    def test_built_somewhere_is_not_never_built(self):
+        self.assertIsNone(self.never("what's broken on gcc16?", "gcc16", ("CMSSW_20_1_X_2026-11-03-2300", ["el9_amd64_gcc16"])))
+
+    def test_several_architectures_are_not_the_whole_ib(self):
+        tag = "CMSSW_20_1_X_2026-11-03-2300"
+        with patch("server.api_server._arch_word_results_answer", return_value="only gcc15") as listed:
+            _default_tag_notes["never"] = "note\n\n"
+            self.assertEqual(_arch_moved_to_several_answer("gcc15 failures", f"gcc15 failures {tag}", "never"), "note\n\nonly gcc15")
+            self.assertEqual(listed.call_args.args[0], f"failures on gcc15 in {tag}")
+            self.assertIsNone(_arch_moved_to_several_answer("gcc15 failures", "gcc15 failures", "never"))
+            self.assertIsNone(_arch_moved_to_several_answer("gcc16 failures", f"gcc16 failures {tag} el9_amd64_gcc16", "never"))
+
     def test_only_a_plain_overview_question_qualifies(self):
-        for q in ("what's broken on gcc16?", "what\u2019s broken on aarch64", "arm failures", "failures on arm",
+        for q in ("what's broken on gcc16?", "what’s broken on aarch64", "arm failures", "failures on arm",
                   "what failed in the latest IB on aarch64"):
             self.assertTrue(_is_plain_arch_overview(q), q)
         # all found replaying real questions: each has an answer of its own
@@ -313,14 +308,15 @@ class LooseArchScopeTests(unittest.TestCase):
                   "is there an issue for the el10 ROCm failures?", "how many known errors on aarch64?",
                   "anything newly failing on aarch64?", "10805.31 on gcc15", "on el10", "gcc16"):
             self.assertFalse(_is_plain_arch_overview(q), q)
-            self.assertEqual(self.scope(q), (q, None))
 
-    def test_a_named_ib_or_session_ib_or_other_question_is_left_alone(self):
-        for q in (f"what's broken on gcc16 in {self.LATEST}", "how many gcc16 builds are there"):
-            self.assertEqual(self.scope(q), (q, None))
-        _latest_ib_contexts["loose"] = self.LATEST
-        self.assertEqual(self.scope("what's broken on gcc16?"), ("what's broken on gcc16?", None))
-        _latest_ib_contexts.pop("loose")
+    def test_questions_with_their_own_answer_stay_on_the_newest_ib(self):
+        with patch("server.api_server._arch_scope_matches", return_value=(self.LATEST, "el10", [], ["el9_amd64_gcc14"])), \
+                patch("server.api_server._newest_tag_for_arch_word", return_value=("CMSSW_20_1_X_2026-11-03-2300", ["el10_amd64_gcc15"])), \
+                patch("server.api_server._packages_named_loosely", return_value=None):
+            for q in ("why would TritonService fail on aarch64?", "show the error for SimG4Core/Geometry on el10",
+                      "did the build fail anywhere else besides el10?", "is there an issue for the el10 ROCm failures?",
+                      "how many known errors on aarch64?", "10805.31 on gcc15"):
+                self.assertEqual(_with_arch_missing_from_newest(q, "never"), q)
 
 
 class RewriteKeepsArchWordTests(unittest.TestCase):

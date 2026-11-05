@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from ingestion.build_graph import github_reference_numbers
 from server.api_server import (
     _arch_on_day_answer,
+    _arch_word_results_answer,
     _backport_answer,
     _basic_term_answer,
     _build_error_answer,
@@ -375,6 +376,17 @@ class ComparisonCondenseTests(unittest.TestCase):
         self.assertIn("| `537.0` | DY | 0 | 16640 (OtherCMS) | Newly failing |", answer)
         self.assertIn("failed RelVals 1 -> 2. Newly failing: `537.0`; Still failing: `539.0`.", answer)
         self.assertIn("`ASAN`", answer)
+
+
+class ArchWordMovedTests(unittest.TestCase):
+    @patch("server.api_server._newest_tag_for_arch_word", return_value=("CMSSW_20_1_X_2026-11-03-2300", ["el9_amd64_gcc15"]))
+    @patch("server.api_server._latest_or_named_tag", return_value="CMSSW_20_1_X_2026-11-04-1100")
+    def test_explicit_results_move_to_the_newest_ib_built_there(self, _tag, _newest):
+        record = {"variant": "primary", "arch": "el9_amd64_gcc15", "build": "passed", "relvals": 0, "failed": [], "units": 380, "unit_failed": ["A/B"]}
+        with patch("server.api_server._ib_build_records", side_effect=[[], [record]]):
+            answer = _arch_word_results_answer("unit tests on gcc15")
+        self.assertIn("has no `gcc15` build yet", answer)
+        self.assertIn("`A/B`", answer)
 
 
 class EverydayWordingTests(unittest.TestCase):

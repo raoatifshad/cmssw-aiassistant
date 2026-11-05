@@ -11,7 +11,7 @@ author, ...) were taken from the graph on 2026-10-16, and re-pinned on 2026-11-0
 2026-10-29 .. 2026-11-02 after the old --reconcile had deleted the 10-13/10-14 data. Since
 2026-11-03 the daily refresh keeps RelVal/unit-test results and PRs for 90 days, so these pins
 should hold until about 2027-01-27 (N4: added by the tester on 2026-11-04, pinned to IBs of
-11-02/03). Run --check-facts after a refresh: it says which pinned
+11-02/03; N7: on 2026-11-05, pinned to IBs of 11-03/04). Run --check-facts after a refresh: it says which pinned
 facts no longer hold, i.e. which questions need new values.
 Every answer is also checked for dead ends ("I couldn't match that", "No imported local
 evidence"), a literal None, "[object Object]", raw <tags> outside code, server errors, answers
@@ -406,7 +406,55 @@ add("N6", "what's the most common exception this week?", all=[r"Category"])
 add("N6", "which release series are active?", all=[r"CMSSW_20_1_X", r"release series"])
 add("N6", "bye", all=[r"Bye"])
 
+# ---------------------------------------------------------------- N7: tester, 2026-11-05 (data to 11-04-1100)
+ROCM_PASTE = "Fatal exception 'PluginNotFound': Unable to find plugin 'ROCmTestDeviceAdditionModule' in category 'CMS EDM Framework Module'"
+add("N7", "2026/11/04 17:18:35 ERROR failed to parse X509 proxy: crypto/tls: failed to parse key: asn1: syntax error: sequence truncated", all=[r"test-das-selected-lumis", r"test logs"])
+add("N7", "Is DAS broken? 2026/11/04 17:18:35 ERROR failed to parse X509 proxy: crypto/tls: failed to parse key: asn1: syntax error: sequence truncated", all=[r"test-das-selected-lumis"])
+add("N7", "Assertion failed: __n < this->size()", all=[r"537\.0", r"test logs"], none=[r"What's failing in"])
+add("N7", "g++: internal compiler error: Bus error signal terminated program cc1plus", all=[r"RecoTrackerLSTCore-standalone-compilation"])
+add("N7", "[2026-11-04 21:31:41,747] ERROR: Caught exception when trying to connect to cms-conddb-dev.cern.ch", all=[r"testUploadConditions"], none=[r"No IB built"])
+add("N7", "[2026-11-04 07:01:41.714696 +0100][Error  ][AsyncSock         ] [st-096-hh151811.cern.ch:1095.0] Socket error", all=[r"test logs"], none=[r"No IB built"])
+add("N7", [ROCM_PASTE, "since when?"], all=[r"first in `CMSSW_20_1_X_2026-11-03-2300`"])
+add("N7", [ROCM_PASTE, "which tests show this?"], all=[r"HeterogeneousTest/ROCmDevice/testROCmTestDeviceAdditionModule"], none=[r"Failed UnitTests"])
+add("N7", [ROCM_PASTE, "on aarch64 too?"], all=[r"not on `aarch64`"])
+add("N7", "why did TauAnalysis/MCEmbeddingTools fail in 17_0?", all=[r"CMSSW_17_0"], none=[r"riscv"])
+add("N7", ["why did SimG4Core/Geometry fail in 17_0?", "on aarch64 too?"], all=[r"CMSSW_17_0", r"el8_aarch64_gcc13"], none=[r"CMSSW_20_1"])
+add("N7", ["unit test failures in CMSSW_17_0_X_2026-11-04-1100", "why did SimG4Core/Geometry fail there?", "and in the build before?"], all=[r"CMSSW_17_0_X_2026-11-03-2300"])
+add("N7", ["why did SimG4Core/Geometry fail in CMSSW_17_0_X_2026-11-04-1100?", "does it fail anywhere else?"], all=[r"CMSSW_20_1", r"CMSSW_17_0"])
+add("N7", "why are ROCm tests failing on el10?", all=[r"HeterogeneousTest/ROCmDevice"], none=[r"What's failing in"])
+add("N7", "what's up with RNTupleTempTests in ROOT6?", all=[r"FWIO/RNTupleTempTests"], none=[r"CMSDIST"])
+add("N7", "did LSTCore pass on gcc16 in the newest build that has gcc16?", all=[r"RecoTracker/LSTCore", r"gcc16"])
+add("N7", ["what's the latest IB?", "why are so many unit tests failing in 17_0?"], all=[r"CMSSW_17_0"], none=[r"for `CMSSW_20_1"])
+add("N7", "why are the unit tests failing in CMSSW_17_0_X_2026-11-04-1100?", all=[r"raw logs of the 105 failing", r"Transport endpoint"])
+add("N7", ["why are the unit tests failing in CMSSW_17_0_X_2026-11-04-1100?", "which ones?"], all=[r"TauAnalysis/MCEmbeddingTools"])
+add("N7", "unit tests in CMSSW_20_1_X_2026-11-03-2300 on el9_amd64_gcc16", all=[r"RecoTracker/LSTCore"], none=[r"ROOT6"])
+add("N7", "what is Bus error in 17_0 unit logs?", all=[r"CMSSW_17_0_X_2026-11-04-1100", r"testBottleneck"])
+add("N7", "Transport endpoint is not connected in 17_0 unit tests?", all=[r"MagneticFieldEngineTestDriver"])
+add("N7", "which IBs had a bus error in the unit logs this week?", all=[r"reported failed"], none=[r"Name an Integration Build"])
+add("N7", "which release series has the most failing unit tests right now?", all=[r"\| Release \| Failing"], none=[r"Failure rate"])
+add("N7", ["which release series has the most failing unit tests right now?", "and most failing relvals?"], all=[r"has the most failing RelVals"])
+add("N7", "why is 10805.31 failing in 16_1?", all=[r"CMSSW_16_1"], none=[r"CMSSW_20_1"])
+add("N7", "34551.85 in 16_0, what happened?", all=[r"CMSSW_16_0", r"31744"], none=[r"Work items matching"])
+add("N7", "what happened to 539.0 in 20_1?", all=[r"CMSSW_20_1", r"31744"])
+add("N7", "RelVal 10804.31 in CMSSW_17_1_X_2026-11-04-1100 why exit 25600?", all=[r"SonicCallFailed"])
+add("N7", "what's new since CMSSW_20_1_X_2026-11-03-2300?", all=[r"CMSSW_20_1_X_2026-11-03-2300 ->"])
+add("N7", "is NONLTO worse than the primary in the newest IB?", all=[r"NONLTO vs primary"])
+add("N7", ["what failed in CMSSW_20_1_MULTIARCHS_X_2026-11-04-1100?", "and compared with the primary?"], all=[r"MULTIARCHS vs primary"])
+add("N7", "shifter summary for 2026-11-04", all=[r"Shift summary"])
+add("N7", "what does the 16_1 IB look like?", all=[r"CMSSW_16_1"])
+add("N7", "did 16_0 aarch64 finish?", all=[r"aarch64"])
+add("N7", ["test log problems new in CMSSW_20_1_X_2026-11-03-2300?", "which of them are serious?"], all=[r"All of them"])
+add("N7", "why did Configuration/PyReleaseValidation fail in CMSSW_20_1_NONLTO_X_2026-11-04-1100?", all=[r"X509"])
+
 FACTS = [
+    ("N7: CMSSW_17_0_X_2026-11-04-1100 has 57 failed unit-test packages on el8",
+     "MATCH (u:UnitTest {ib_tag:'CMSSW_17_0_X_2026-11-04-1100', arch:'el8_amd64_gcc13', status:'FAILED'}) RETURN count(u) = 57 AS ok"),
+    ("N7: ROCm PluginNotFound on el10 in CMSSW_20_1_X_2026-11-03-2300",
+     "MATCH (p:LogProblem {ib_tag:'CMSSW_20_1_X_2026-11-03-2300', arch:'el10_amd64_gcc15', category:'PluginNotFound'}) WHERE p.summary CONTAINS 'ROCmTestDeviceAdditionModule' RETURN count(p) > 0 AS ok"),
+    ("N7: X509 proxy line in NONLTO 11-04-1100 unit logs",
+     "MATCH (p:LogProblem {ib_tag:'CMSSW_20_1_NONLTO_X_2026-11-04-1100', suite:'unit'}) WHERE p.summary CONTAINS 'X509 proxy' RETURN count(p) > 0 AS ok"),
+    ("N7: 10805.31 failed with SIGSEGV on el8 in CMSSW_16_1_X_2026-11-04-1100",
+     "MATCH (r:RelVal {ib_tag:'CMSSW_16_1_X_2026-11-04-1100', arch:'el8_amd64_gcc13', workflow_id:'10805.31'}) RETURN r.status = 'FAILED' AND r.exitcode = 62720 AS ok"),
     ("N4: 10805.31 failed with 25600 on el8 in CMSSW_20_1_X_2026-11-03-1100",
      "MATCH (r:RelVal {ib_tag:'CMSSW_20_1_X_2026-11-03-1100', arch:'el8_amd64_gcc14', workflow_id:'10805.31'}) "
      "RETURN r.status = 'FAILED' AND r.exitcode = 25600 AS ok"),
