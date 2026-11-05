@@ -231,6 +231,15 @@ class LogTextInSuiteTests(unittest.TestCase):
             self.assertIsNone(api_server._log_text_in_suite_answer(question), question)
 
 
+class WhichIbsHadLogTextTests(unittest.TestCase):
+    def test_which_ibs_had_it(self):
+        rows = [{"tag": "CMSSW_17_0_X_2026-11-04-1100", "arch": "a", "summary": "Process bus error", "text": "", "owners": ["A/B/t"], "statuses": ["failed"]}]
+        driver, _session = _driver_with(rows)
+        with patch("server.api_server.get_driver", return_value=driver):
+            answer = api_server._log_text_in_suite_answer("which IBs had a bus error in the unit logs this week?")
+        self.assertIn("`bus error` in imported unit test logs: 1 build(s)", answer)
+
+
 class SeriesUnitFailuresTests(unittest.TestCase):
     def test_ranks_by_failing_packages_in_each_newest_build(self):
         rows = [
