@@ -13052,7 +13052,24 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
             match = re.search(r"\*\*(?:cmssw|cmsdist) #(\d{3,6})\*\*", line)
             if match and named_one.group(1).lower() in line.lower():
                 return f"what does PR {match.group(1)} do"
+    if str(last.get("route", "")) in ("deterministic:workflow_where", "deterministic:workflow_why") and _last_workflow_contexts.get(sid) \
+            and re.fullmatch(r"\s*(?:what|which)\s+(?:exception|error|message)\s*[?.!]*\s*", question, re.IGNORECASE):
+        # "is 136.901 failing in 17_1?" then "what exception?" (found 2026-11-05: the menu)
+        named_series = _requested_release_series(previous)
+        return f"why is workflow {_last_workflow_contexts[sid]} failing" + (f" in {named_series[0]}_{named_series[1]}" if named_series else "")
     if str(last.get("route", "")) in ("deterministic:test_log_changes", "deterministic:log_overview"):
+        in_flavour = re.fullmatch(rf"\s*(?:and\s+)?(?:any\s+)?(?:in\s+|for\s+|on\s+)(?:the\s+)?({_ALL_VARIANTS_RE})(?:\s+(?:ib|build|one))?\s*[?.!]*\s*", question, re.IGNORECASE)
+        if in_flavour:
+            # "hidden problems in the newest IB?" then "any in ASAN?" (found 2026-11-05: ASAN's result table)
+            flavour_name = _ALL_VARIANTS[in_flavour.group(1).lower()]
+            driver = get_driver()
+            try:
+                with driver.session() as session:
+                    flavour_tags = [r["t"] for r in session.run("MATCH (r:TestLogRun) WHERE r.ib_tag CONTAINS $v RETURN DISTINCT r.ib_tag AS t", v=f"_{flavour_name}_X_")]
+            finally:
+                driver.close()
+            if flavour_tags:
+                return f"any hidden problems in passed tests in {max(flavour_tags, key=_ib_sort_key)}"
         if re.fullmatch(r"\s*how\s+many\s*[?.!]*\s*", question, re.IGNORECASE):
             return "how many log problems are in the latest IB?"
         if re.fullmatch(r"\s*which\s+package\s+has\s+the\s+most\s*[?.!]*\s*", question, re.IGNORECASE):
@@ -14441,6 +14458,9 @@ def _meta_conversation_answer(question: str, sid: str) -> str | None:
     return None
 
 
+_last_series_compares: dict[str, str] = {}
+
+
 def _listed_items_follow_up(question: str, sid: str) -> str | None:
     """A short follow-up about what the previous answer listed: "which ones already have an issue open?", "have they
     failed before?", and after a failed build "since when?" / "which packages?" (all found 2026-11-04 reaching the menu
@@ -14458,6 +14478,26 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
             return _who_to_ask_answer(f"who is looking at workflow {named.group(1)}?")
     if re.fullmatch(r"\s*which\s+of\s+them\s+failed\s+before\s*[?.!]*\s*", question, re.IGNORECASE):
         question = "have they failed before?"
+    only_series = re.fullmatch(r"\s*(?:which|what)\s+(?:failures?\s+|(?:ones?\s+)?)?(?:are|is|fail\w*)?\s*only\s+(?:in|on)\s+(?:CMSSW_)?(\d{1,2}_\d{1,2})(?:_X)?\s*[?.!]*\s*", question, re.IGNORECASE)
+    if str(last.get("route", "")) == "deterministic:series_compare":
+        _last_series_compares[sid] = answer
+    if only_series and sid in _last_series_compares:
+        # "compare 17_0 and 17_1 latest" then "which failures are only in 17_1?" (found 2026-11-05: "... has no results for `17_1`")
+        builds = {r: f"CMSSW_{r}_X_{when}" for r, when in re.findall(r"\| `CMSSW_(\d+_\d+)_X` \| `([\d-]+)` \|", _last_series_compares[sid])}
+        wanted = only_series.group(1)
+        if wanted in builds and len(builds) == 2:
+            other = next(r for r in builds if r != wanted)
+            records = {r: _ib_build_records(builds[r]) for r in builds}
+            def primary_failures(rows):
+                rows = [row for row in rows if row["variant"] == "primary"]
+                return {w for row in rows for w in row["failed"]}, {p for row in rows for p in row["unit_failed"]}
+            mine, theirs = primary_failures(records[wanted]), primary_failures(records[other])
+            only_rv, only_ut = sorted(mine[0] - theirs[0]), sorted(mine[1] - theirs[1])
+            lines = [f"Failing in `{builds[wanted]}` and not in `{builds[other]}`, primary builds, known errors left out:",
+                     "- RelVals: " + (", ".join(f"`{w}`" for w in only_rv[:20]) or "none"),
+                     "- Unit tests: " + (", ".join(f"`{u}`" for u in only_ut[:20]) or "none") + (f" (+{len(only_ut) - 20} more)" if len(only_ut) > 20 else ""),
+                     "\nDifferent series run different workflows and architectures, and a build may only be partly imported, so this shows where to look, not a cause."]
+            return "\n".join(lines)
     if re.fullmatch(r"\s*(?:which|how\s+many)\s+(?:of\s+(?:them|these|those)\s+)?(?:are|is)\s+serious\s*[?.!]*\s*", question, re.IGNORECASE) and "reported as PASSED" in answer:
         # found 2026-11-05: the menu
         return ("All of them: this list only counts serious kinds (fatal exceptions, sanitizer and UBSan reports, crashes, assertions, uncaught exceptions, "
@@ -14562,7 +14602,8 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
             return f"No imported PR or Issue quotes this message. {_github_export_note()}."
         quoted = [line for line in answer.split("\n") if line.lstrip().startswith("- **") and re.search(r"(?:Issue|PR) #\d+", line)]
         return "These quote it (text match only, not proof of a cause or fix):\n" + "\n".join(quoted[:8]) if quoted else None
-    touches = re.fullmatch(r"\s*which\s+(?:one|ones|pr|prs)\s+(?:touch\w*|mentions?|is\s+about|are\s+about|names?)\s+([A-Za-z0-9_/-]{2,})\s*[?.!]*\s*", question, re.IGNORECASE)
+    # "did any of them touch Geant4?" (found 2026-11-05: every PR ever about Geant4)
+    touches = re.fullmatch(r"\s*(?:which\s+(?:one|ones|pr|prs)\s+(?:touch\w*|mentions?|is\s+about|are\s+about|names?)|(?:did|do|does)\s+any(?:\s+of\s+(?:them|those|these))?\s+(?:touch|mention|name|change)|(?:is|are)\s+any(?:\s+of\s+(?:them|those|these))?\s+about)\s+([A-Za-z0-9_/-]{2,})\s*[?.!]*\s*", question, re.IGNORECASE)
     if touches and re.search(r"\*\*(?:cmssw|cmsdist) #\d+\*\*", answer):
         # "which PRs were merged in the latest IB?" then "which one touches L1T?" (found 2026-11-04: the menu)
         lines = [line for line in answer.split("\n") if line.startswith("- ") and touches.group(1).lower() in line.lower()]
