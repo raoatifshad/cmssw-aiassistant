@@ -267,6 +267,28 @@ class WhichOnesAfterAUnitAnswerTests(unittest.TestCase):
         self.assertEqual(_resolve_short_follow_up("which ones?", "w"), "list failed unit tests in CMSSW_17_0_X_2026-11-04-1100")
 
 
+class SinceAndFlavourRewriteTests(unittest.TestCase):
+    @patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-11-04-1100"}])
+    def test_new_since_a_build_starts_there(self, _):
+        self.assertEqual(api_server._shift_question_rewrite("what's new since the CMSSW_20_1_X_2026-11-03-2300 build?"),
+                         "what changed between CMSSW_20_1_X_2026-11-03-2300 and CMSSW_20_1_X_2026-11-04-1100")
+
+    def test_worse_than_the_primary(self):
+        self.assertEqual(api_server._shift_question_rewrite("is NONLTO worse than the primary in the newest IB?"), "compare NONLTO with the primary")
+        self.assertIsNone(api_server._shift_question_rewrite("is it worse than the primary?"))
+
+    def test_compared_with_the_primary_after_a_sub_ib_answer(self):
+        _turn_memory["c"] = {"question": "and in MULTIARCHS?", "route": "capability:failure_overview",
+                             "answer": "What's failing in `CMSSW_20_1_MULTIARCHS_X_2026-11-04-1100`"}
+        self.addCleanup(_turn_memory.pop, "c", None)
+        self.assertEqual(_resolve_short_follow_up("and compared with the primary?", "c"), "compare MULTIARCHS with the primary")
+
+
+class WorkflowExitWhyTests(unittest.TestCase):
+    def test_why_about_one_workflow_is_not_a_list_by_exit_code(self):
+        self.assertIsNone(api_server._workflows_by_exit_answer("RelVal 10804.31 in 17_1 why exit 25600?"))
+
+
 class WorkflowInSeriesTests(unittest.TestCase):
     def test_the_newest_failing_primary_of_that_series(self):
         driver, session = _driver_with([{"t": "CMSSW_16_1_X_2026-11-03-1100"}, {"t": "CMSSW_16_1_ROOT6_X_2026-11-04-1100"}])
