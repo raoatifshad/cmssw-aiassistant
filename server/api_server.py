@@ -8696,7 +8696,10 @@ _LOG_PROBLEM_PASTE_RE = re.compile(
     # "IndexError in Madgraph relval logs" (found 2026-11-04: dead end, GitHub only, "which architecture?")
     r"\bFatal exception '\w+|\b[A-Z]\w+Error\s+[A-Z]\w+Error\b|\b[A-Z][a-z]\w*Error\b[^?!\n]{0,40}\blogs?\b|"
     r"\b\w+::\w+\)?\s+(?:Warning|Error)\b|"
-    r"runtime error:|Traceback \(most recent call last\)|Assertion [`'].*failed|"
+    r"runtime error:|Traceback \(most recent call last\)|Assertion [`'].*failed|\bAssertion failed:\s|\binternal compiler error\b|"
+    # a timestamped log line (found 2026-11-05: GitHub noise, a dead end, or read as a date with no IB):
+    # "2026/11/04 17:18:35 ERROR failed to parse X509 proxy", "[2026-11-04 07:01:41.71 +0100][Error  ][AsyncSock ]"
+    r"\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}[^\n]{0,40}\b(?:ERROR|Error|FATAL|Fatal)\b|"
     r"terminate called after throwing|A fatal system signal has occurred|"
     # a shell's report of a killed test command, as the scanner reads it (SHELL_KILL_RE,
     # PLAIN_SIGNAL_RE): "test_x.sh: line 10: 2006489 Aborted (core dumped) ..." used to be
@@ -8717,6 +8720,11 @@ _LOG_PROBLEM_PASTE_RE = re.compile(
     # MessageLogger lines: "%MSG-e PluginNotFound: Unable to find plugin ..."
     r"%MSG-[ewf]\s+\w+"
 )
+# Log lines that mean nothing to the handlers before _pasted_exception_response, and that its date,
+# GitHub-text or overview neighbours would otherwise take (their timestamp reads as "which IB date?").
+_EARLY_LOG_LINE_RE = re.compile(
+    r"\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}[^\n]{0,40}\b(?:ERROR|Error|FATAL|Fatal)\b|"
+    r"\binternal compiler error\b|^\s*Assertion failed:\s")
 _LOG_KIND_LABELS = {
     "fatal_exception": "fatal exception", "sanitizer": "sanitizer report", "ubsan": "UBSan report",
     "crash": "crash", "assertion": "assertion failure", "uncaught_exception": "uncaught exception",
@@ -16078,6 +16086,11 @@ def _chat(req: ChatRequest):
     if scope_answer:
         return _chat_response(sid, original_question, scope_answer, "conversational:out_of_scope",
                               actions=_CAPABILITY_ACTIONS)
+
+    if _EARLY_LOG_LINE_RE.search(original_question) and not IB_TAG_RE.search(original_question):
+        pasted_line = _pasted_exception_response(sid, original_question, original_question)
+        if pasted_line:
+            return pasted_line
 
     shift_rewrite = _shift_question_rewrite(original_question)
     if shift_rewrite:
