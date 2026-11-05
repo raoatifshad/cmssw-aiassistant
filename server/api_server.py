@@ -1842,6 +1842,54 @@ def _unittest_summary_from_records(tag: str, records: list[dict], include_sub_ib
     return "\n".join(lines)
 
 
+def _failing_unit_tests_log_digest(tag: str, arch: str | None = None) -> str | None:
+    """What the raw logs of an IB's failing unit tests show, most common first -- the only place that says more than "failed",
+    and all a shifter has when dozens fail at once (found 2026-11-05: "why are so many unit tests failing in 17_0?" got the list of
+    57 packages, with 'Transport endpoint is not connected' and a bus error in their logs). What the log shows, never a cause."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            runs = [dict(r) for r in session.run(
+                "MATCH (r:TestLogRun {ib_tag:$tag, suite:'unit', run_variant:''}) WHERE $arch IS NULL OR r.arch = $arch "
+                "RETURN r.arch AS arch, r.failed_tests AS failed", tag=tag, arch=arch)]
+            rows = [dict(r) for r in session.run(
+                "MATCH (r:TestLogRun {ib_tag:$tag, suite:'unit', run_variant:''})-[:HAS_PROBLEM]->(p:LogProblem) "
+                "WHERE ($arch IS NULL OR r.arch = $arch) AND p.in_failed "
+                "AND (p.serious OR p.summary STARTS WITH '%MSG fatal' OR p.kind = 'generic_error_line') "
+                "RETURN p.kind AS kind, p.category AS category, p.summary AS summary, "
+                "[i IN range(0, size(p.owners) - 1) WHERE p.owner_statuses[i] = 'failed' | p.owners[i]] AS tests",
+                tag=tag, arch=arch)]
+    finally:
+        driver.close()
+    failed_total = {t for run in runs for t in (run["failed"] or [])}
+    if not failed_total:
+        return None
+    groups: dict[str, dict] = {}
+    # plain error lines only for a test with nothing more specific: build noise otherwise (LSTCore's compiler output is 30 lines)
+    specific = {t for row in rows if row["kind"] != "generic_error_line" for t in row["tests"]}
+    for row in rows:
+        tests = {t for t in row["tests"] if t in failed_total and (row["kind"] != "generic_error_line" or t not in specific)}
+        if not tests:
+            continue
+        summary = " ".join((row["summary"] or "").split())
+        # the message without its run-specific file or URL, so one problem on many files is one line
+        key = summary.split(" root://")[0].split(" file:")[0][:70]
+        group = groups.setdefault(key, {"tests": set(), "summary": summary})
+        group["tests"] |= tests
+    ranked = sorted(groups.values(), key=lambda g: (-len(g["tests"]), g["summary"]))
+    explained = set().union(*(g["tests"] for g in ranked)) if ranked else set()
+    lines = [f"\nWhat the raw logs of the {len(failed_total)} failing test(s) show (what the log shows, not why):"]
+    for group in ranked[:8]:
+        example = sorted(group["tests"])[0]
+        lines.append(f"- **{len(group['tests'])} test(s)**: {group['summary'][:150]} (e.g. `{example}`)")
+    if len(ranked) > 8:
+        lines.append(f"- ... and {len(ranked) - 8} other message(s)")
+    unexplained = len(failed_total - explained)
+    if unexplained:
+        lines.append(f"- **{unexplained} test(s)**: the log scanner found no error line in their logs.")
+    return "\n".join(lines)
+
+
 def _unittest_summary_answer(
     question: str, context_tag: str | None, session_id: str, context_arch: str | None = None
 ) -> str | None:
@@ -8188,6 +8236,16 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
                 question, _latest_ib_contexts.get(session_id), session_id, _latest_ib_arch_contexts.get(session_id)
             )
         )
+        if answer and re.search(r"\bwhy\b|\bwhat(?:'s|\s+is)\s+(?:wrong|going\s+on)\b|\bwhat\s+happened\b|\bcause\b", question, re.IGNORECASE):
+            asked_tag = IB_TAG_RE.search(question)
+            digest_tag = asked_tag.group(1) if asked_tag else _latest_ib_contexts.get(session_id)
+            try:
+                digest = _failing_unit_tests_log_digest(digest_tag, _requested_ib_arch(question)) if digest_tag else None
+            except Exception as exc:
+                print(f"WARNING: failing unit tests digest failed: {exc}")
+                digest = None
+            if digest:
+                answer += "\n" + digest
         return (answer, []) if answer else None
     if capability == "clang":
         answer = (
@@ -10117,6 +10175,12 @@ def _package_failing_tests_note(package: str, builds: list[tuple[str, str]]) -> 
                     summaries = [r["summary"] for r in session.run(
                         "MATCH (p:LogProblem {ib_tag:$tag, arch:$arch}) WHERE p.serious AND any(o IN p.owners WHERE o IN $tests) "
                         "RETURN DISTINCT p.summary AS summary LIMIT 2", tag=tag, arch=arch, tests=tests)]
+                    if not summaries:
+                        # "why did Configuration/PyReleaseValidation fail?" (found 2026-11-05: nothing, with a DAS X509 error line in its log)
+                        summaries = [r["summary"][:200] for r in session.run(
+                            "MATCH (p:LogProblem {ib_tag:$tag, arch:$arch, kind:'generic_error_line'}) "
+                            "WHERE p.in_failed AND any(o IN p.owners WHERE o IN $tests) "
+                            "RETURN DISTINCT p.summary AS summary LIMIT 2", tag=tag, arch=arch, tests=tests)]
                     lines.append(f"- `{tag}` `{arch}`: " + ", ".join(f"`{t}`" for t in tests[:5])
                                  + (f" +{len(tests) - 5} more" if len(tests) > 5 else "")
                                  + (f" -- {'; '.join(summaries)}" if summaries else ""))
@@ -13070,6 +13134,10 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
         if packages:
             return f"since when is {packages[0]} failing"
         return None
+    if _FOLLOW_UP_WHICH_RE.match(question) and _latest_ib_contexts.get(sid) and str(last.get("route", "")) in ("capability:unittest", "capability:relval"):
+        # "why are so many unit tests failing in 17_0?" then "which ones?" (found 2026-11-05: the menu, with "+47 more" in the answer)
+        kind = "unit tests" if str(last["route"]).endswith("unittest") else "relvals"
+        return f"list failed {kind} in {_latest_ib_contexts[sid]}"
     if _FOLLOW_UP_WHICH_RE.match(question) and re.search(r"\bhow\s+many\b", previous, re.IGNORECASE):
         # "how many relvals failed ...?" then "which ones?" (found 2026-11-03: menu)
         return re.sub(r"\bhow\s+many\b", "which", previous, count=1, flags=re.IGNORECASE)
@@ -16743,7 +16811,10 @@ def _chat(req: ChatRequest):
                 question = f"{question} {resolved_tag}"
                 _latest_ib_contexts[sid] = resolved_tag
         elif (
-            bare_context.categories & {"relval", "unittest"} and not _latest_ib_contexts.get(sid)
+            bare_context.categories & {"relval", "unittest"}
+            # "why are so many unit tests failing in 17_0?" after a turn about 20_1 (found 2026-11-05: "0 failed", for 20_1)
+            and (not _latest_ib_contexts.get(sid) or (_requested_release_series(question) and not _latest_ib_contexts[sid].startswith(
+                "CMSSW_%d_%d_" % _requested_release_series(question))))
             # the answer to a pending "which architecture?" for a ranking is not about one IB
             and sid not in _pending_frequent_failure_scopes
             and not names_workflow and not how_to and not bare_context.pr_number

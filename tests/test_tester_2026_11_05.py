@@ -173,6 +173,100 @@ class PackageFollowUpTests(unittest.TestCase):
         self.assertEqual(_resolve_short_follow_up("and in the build before?", "f"), "is SimG4Core/Geometry failing in CMSSW_17_0_X_2026-11-03-2300")
 
 
+class FailingUnitTestsDigestTests(unittest.TestCase):
+    def test_grouped_by_message_most_tests_first_and_counts_the_rest(self):
+        runs = [{"arch": "el8_amd64_gcc13", "failed": ["A/B/t1", "A/B/t2", "C/D/t3", "E/F/t4"]}]
+        rows = [
+            {"kind": "message_logger", "category": "XrdAdaptor", "summary": "%MSG fatal XrdAdaptor: Opened a file at URL root://a//x.root", "tests": ["A/B/t1"]},
+            {"kind": "message_logger", "category": "XrdAdaptor", "summary": "%MSG fatal XrdAdaptor: Opened a file at URL root://b//y.root", "tests": ["A/B/t2", "A/B/passed"]},
+            {"kind": "crash", "category": "Bus error", "summary": "Process bus error", "tests": ["C/D/t3"]},
+        ]
+        driver, _session = _driver_with(runs, rows)
+        with patch("server.api_server.get_driver", return_value=driver):
+            text = api_server._failing_unit_tests_log_digest("CMSSW_17_0_X_2026-11-04-1100")
+        self.assertIn("the 4 failing test(s)", text)
+        self.assertLess(text.index("**2 test(s)**: %MSG fatal XrdAdaptor"), text.index("**1 test(s)**: Process bus error"))
+        self.assertIn("**1 test(s)**: the log scanner found no error line", text)
+        self.assertIn("not why", text)
+
+    def test_plain_error_lines_only_for_tests_with_nothing_more_specific(self):
+        runs = [{"arch": "a", "failed": ["A/B/t1", "A/B/t2"]}]
+        rows = [{"kind": "crash", "category": "x", "summary": "Process bus error", "tests": ["A/B/t1"]},
+                {"kind": "generic_error_line", "category": None, "summary": "make: *** Error 4", "tests": ["A/B/t1"]},
+                {"kind": "generic_error_line", "category": None, "summary": "ERROR failed to parse X509 proxy", "tests": ["A/B/t2"]}]
+        driver, _session = _driver_with(runs, rows)
+        with patch("server.api_server.get_driver", return_value=driver):
+            text = api_server._failing_unit_tests_log_digest("T")
+        self.assertIn("X509", text)
+        self.assertNotIn("make:", text)
+
+    def test_no_failing_tests_or_no_logs(self):
+        driver, _session = _driver_with([], [])
+        with patch("server.api_server.get_driver", return_value=driver):
+            self.assertIsNone(api_server._failing_unit_tests_log_digest("CMSSW_17_0_X_2026-11-04-1100"))
+
+
+class LogTextInSuiteTests(unittest.TestCase):
+    ROWS = [{"tag": "CMSSW_17_0_X_2026-11-04-1100", "arch": "el8_amd64_gcc13", "summary": "Process bus error", "text": "Bus error",
+             "owners": ["A/B/t", "C/D/t"], "statuses": ["failed", "passed"]}]
+
+    def _ask(self, question, rows=None):
+        driver, session = _driver_with(self.ROWS if rows is None else rows)
+        with patch("server.api_server.get_driver", return_value=driver):
+            return api_server._log_text_in_suite_answer(question), session
+
+    def test_finds_the_text_in_that_series_and_suite(self):
+        answer, session = self._ask("what is Bus error in 17_0 unit logs?")
+        self.assertIn("`Bus error` in `CMSSW_17_0_*` unit test logs: 1 build(s)", answer)
+        self.assertIn("2 test(s), 1 reported failed", answer)
+        self.assertEqual(session.run.call_args.kwargs["series"], "CMSSW_17_0_")
+
+    def test_says_when_it_is_not_there(self):
+        answer, _ = self._ask("Transport endpoint is not connected in 17_0 unit tests?", rows=[])
+        self.assertIn("is not in any", answer)
+
+    def test_ordinary_questions_are_left_alone(self):
+        for question in ("failures in 17_0 unit tests", "Why are there failures in 17_0 unit tests?", "new problems in unit logs",
+                         "Errors in unit tests?", "unit test failures in 17_0"):
+            self.assertIsNone(api_server._log_text_in_suite_answer(question), question)
+
+
+class SeriesUnitFailuresTests(unittest.TestCase):
+    def test_ranks_by_failing_packages_in_each_newest_build(self):
+        rows = [
+            {"release": "CMSSW_17_0_X", "arch": "el8_amd64_gcc13", "tag": "CMSSW_17_0_X_2026-11-04-1100", "total": 394, "failed": 57},
+            {"release": "CMSSW_17_0_X", "arch": "el8_amd64_gcc13", "tag": "CMSSW_17_0_X_2026-11-03-2300", "total": 394, "failed": 0},
+            {"release": "CMSSW_20_1_X", "arch": "el9_amd64_gcc14", "tag": "CMSSW_20_1_X_2026-11-04-1100", "total": 381, "failed": 1},
+        ]
+        driver, _session = _driver_with(rows)
+        with patch("server.api_server.get_driver", return_value=driver):
+            answer = api_server._series_stability_answer("which release series has the most failing unit tests right now?")
+        self.assertIn("**`CMSSW_17_0_X`** has the most: 57", answer)
+        self.assertLess(answer.index("| `CMSSW_17_0_X` | 57 | 394"), answer.index("| `CMSSW_20_1_X` | 1 | 381"))
+
+    def test_most_failing_relvals_is_said_first(self):
+        rows = [{"release": "CMSSW_20_1_X", "builds": 12, "total": 35000, "failed": 1909}, {"release": "CMSSW_5_3_X", "builds": 1, "total": 201, "failed": 56}]
+        driver, _session = _driver_with(rows)
+        with patch("server.api_server.get_driver", return_value=driver):
+            answer = api_server._series_stability_answer("which release series has the most failing relvals")
+        self.assertTrue(answer.startswith("**`CMSSW_20_1_X`** has the most failing RelVals: 1,909"), answer)
+        self.assertIn("the highest rate is `CMSSW_5_3_X`", answer)
+
+    def test_the_follow_up_about_relvals(self):
+        _turn_memory["r"] = {"question": "which release series has the most failing unit tests right now?", "route": "deterministic:series_stability", "answer": "x"}
+        self.addCleanup(_turn_memory.pop, "r", None)
+        self.assertEqual(_resolve_short_follow_up("and most failing relvals?", "r"), "which release series has the most failing relvals")
+
+
+class WhichOnesAfterAUnitAnswerTests(unittest.TestCase):
+    def test_lists_them(self):
+        _turn_memory["w"] = {"question": "why are so many unit tests failing in 17_0?", "route": "capability:unittest", "answer": "57 failed"}
+        _latest_ib_contexts["w"] = "CMSSW_17_0_X_2026-11-04-1100"
+        self.addCleanup(_turn_memory.pop, "w", None)
+        self.addCleanup(_latest_ib_contexts.pop, "w", None)
+        self.assertEqual(_resolve_short_follow_up("which ones?", "w"), "list failed unit tests in CMSSW_17_0_X_2026-11-04-1100")
+
+
 class WorkflowInSeriesTests(unittest.TestCase):
     def test_the_newest_failing_primary_of_that_series(self):
         driver, session = _driver_with([{"t": "CMSSW_16_1_X_2026-11-03-1100"}, {"t": "CMSSW_16_1_ROOT6_X_2026-11-04-1100"}])
