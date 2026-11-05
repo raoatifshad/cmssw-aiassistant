@@ -7,7 +7,8 @@ from graph.tools import _split_by_result_code, result_codes
 from server.api_server import (ChatRequest, _chat, _first_last_builds_text, _is_pasted_log, _pasted_error_in_ib_lead,
                                _relval_by_exit_code_answer, _relval_exception_context, _relval_exception_list_answer,
                                _relval_exception_message_answer, _test_log_problem_answer, _pr_not_in_ib_text,
-                               _pr_number_answer, _workflow_artifact_answer)
+                               _pr_number_answer, _workflow_artifact_answer, _one_line_error_with_ib,
+                               _loose_arch_failure_scope, _rewrite_lost_arch_word, _default_tag_notes, _latest_ib_contexts)
 from server.request_planner import RequestContext
 
 TAG = "CMSSW_20_1_ROOT6_X_2026-11-03-2300"
@@ -224,6 +225,100 @@ class ExceptionHistoryTests(unittest.TestCase):
         self.assertIn("... and 3 more build/architecture pair(s)", text)
         self.assertNotIn("older", text)
         self.assertIn("First recorded in `CMSSW_20_1_X_2026-10-10-2300`, most recently in `CMSSW_12_4_X_2026-11-03-2300`.", text)
+
+
+class OneLineErrorTests(unittest.TestCase):
+    MESSAGE = "TritonService: Starting the fallback server failed with exit code 65280"
+
+    def read(self, question, known=True):
+        with patch("server.api_server.get_driver", return_value=fake_driver(lambda q, p: [dict(known=known)])):
+            return _one_line_error_with_ib(question)
+
+    def test_the_error_is_taken_out_of_the_words_around_it(self):
+        for question in (f"{self.MESSAGE} in {TAG}", f"{self.MESSAGE} in `{TAG}` on `{ARCH}`?",
+                         f"is this in {TAG} on {ARCH}: {self.MESSAGE}"):
+            self.assertEqual(self.read(question), self.MESSAGE, question)
+
+    def test_text_not_on_record_or_no_ib_or_a_failed_lookup_is_not_a_paste(self):
+        self.assertIsNone(self.read(f"Note: please compare these two builds carefully in {TAG}", known=False))
+        self.assertIsNone(self.read(self.MESSAGE))
+        self.assertIsNone(self.read(f"which relvals failed in {TAG}"))
+        broken = MagicMock()
+        broken.session.side_effect = OSError("down")
+        with patch("server.api_server.get_driver", return_value=broken):
+            self.assertIsNone(_one_line_error_with_ib(f"{self.MESSAGE} in {TAG}"))
+
+    def test_lead_uses_the_message_given_and_keeps_the_ib_and_architecture(self):
+        with patch("server.api_server.get_driver", return_value=graph(exceptions=EXC)):
+            lead = _pasted_error_in_ib_lead(f"{self.MESSAGE} in {TAG} on {ARCH}", self.MESSAGE)
+        self.assertIn(f"**Yes, this exception is in `{TAG}` on `{ARCH}`:**", lead)
+
+    @patch("server.api_server._chat_response", side_effect=lambda sid, q, answer, route, **kw: (answer, route))
+    @patch("server.api_server._test_log_problem_answer", return_value=None)
+    @patch("server.api_server._pasted_error_in_ib_lead", return_value="**Yes**")
+    @patch("server.api_server._one_line_error_with_ib", return_value=MESSAGE)
+    def test_chat_searches_by_the_error_alone(self, _one, lead, _log, _resp):
+        with patch("server.api_server._relval_exception_message_answer", return_value="history") as exact:
+            answer, route = _chat(ChatRequest(question=f"{self.MESSAGE} in {TAG}", session_id="one-line"))
+        exact.assert_called_once_with(self.MESSAGE)
+        lead.assert_called_once_with(f"{self.MESSAGE} in {TAG}", self.MESSAGE)
+        self.assertEqual(answer, "**Yes**\n\nhistory")
+
+
+class LooseArchScopeTests(unittest.TestCase):
+    LATEST = "CMSSW_20_1_X_2026-11-04-1100"
+    BUILT = "CMSSW_20_1_X_2026-11-03-2300"
+
+    def setUp(self):
+        _default_tag_notes.pop("loose", None)
+        _latest_ib_contexts.pop("loose", None)
+
+    def scope(self, question, words="gcc16", matches=(), found=("CMSSW_20_1_X_2026-11-03-2300", ["el9_amd64_gcc16"])):
+        with patch("server.api_server._arch_scope_matches", return_value=(self.LATEST, words, list(matches), ["el9_amd64_gcc14"])), \
+                patch("server.api_server._newest_tag_for_arch_word", return_value=found) as newest:
+            result = _loose_arch_failure_scope(question, "loose")
+        self.newest = newest
+        return result
+
+    def test_uses_the_newest_ib_built_there_and_says_so(self):
+        question, answer = self.scope("what's broken on gcc16?")
+        self.assertIsNone(answer)
+        self.assertEqual(question, f"what's broken on gcc16? {self.BUILT} el9_amd64_gcc16")
+        self.assertIn(f"`{self.LATEST}`, the newest IB, has no `gcc16` build yet", _default_tag_notes["loose"])
+
+    def test_newest_ib_already_built_there_changes_nothing(self):
+        q = "what's broken on gcc16?"
+        self.assertEqual(self.scope(q, matches=["el9_amd64_gcc16"]), (q, None))
+        self.assertNotIn("loose", _default_tag_notes)
+
+    def test_never_built_there_says_so_instead_of_another_compiler(self):
+        q = "what's broken on gcc99?"
+        question, answer = self.scope(q, words="gcc99", found=None)
+        self.assertEqual(question, q)
+        self.assertEqual(answer, "No imported primary IB has RelVal results on `gcc99`.")
+
+    def test_all_words_must_match_and_compiler_is_searched_first(self):
+        q = "what's broken on el8 gcc16?"
+        _, answer = self.scope(q, words="el8 gcc16")
+        self.assertEqual(self.newest.call_args.args[0], "gcc16")
+        self.assertIn("`el8 gcc16`", answer)
+
+    def test_a_named_ib_or_session_ib_or_other_question_is_left_alone(self):
+        for q in (f"what's broken on gcc16 in {self.LATEST}", "how many gcc16 builds are there"):
+            self.assertEqual(self.scope(q), (q, None))
+        _latest_ib_contexts["loose"] = self.LATEST
+        self.assertEqual(self.scope("what's broken on gcc16?"), ("what's broken on gcc16?", None))
+        _latest_ib_contexts.pop("loose")
+
+
+class RewriteKeepsArchWordTests(unittest.TestCase):
+    def test_rewrite_dropping_an_architecture_word_is_refused(self):
+        generic = "what is failing in the latest IB"
+        self.assertTrue(_rewrite_lost_arch_word("what's broken on gcc16?", generic))
+        self.assertTrue(_rewrite_lost_arch_word("what's broken on aarch64?", generic))
+        self.assertTrue(_rewrite_lost_arch_word("what's broken on el8?", generic))
+        self.assertFalse(_rewrite_lost_arch_word("what's broken?", generic))
+        self.assertFalse(_rewrite_lost_arch_word("what's broken on gcc16?", generic + " on gcc16"))
 
 
 class WorkflowIdIsNotAPrNumberTests(unittest.TestCase):
