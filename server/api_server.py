@@ -10858,8 +10858,8 @@ _NEWEST_ARCH_IB_RE = re.compile(
     r"\b(?:latest|newest|last)\s+(aarch64|arm64|arm|riscv\w*|amd64|x86_64|el\d+|slc\d+|gcc\d+)\s+(?:ib|build|release)s?\b", re.IGNORECASE)
 
 
-def _newest_tag_for_arch_word(word: str) -> tuple[str, list[str]] | None:
-    """(newest primary IB tag built on an architecture containing `word`, those architectures)."""
+def _newest_tag_for_arch_word(word: str, series: tuple[int, int] | None = None) -> tuple[str, list[str]] | None:
+    """(newest primary IB tag built on an architecture containing `word`, those architectures), of a release series if named."""
     word = {"arm": "aarch64", "arm64": "aarch64", "x86_64": "amd64", "riscv": "riscv64"}.get(word.lower(), word.lower())
     driver = get_driver()
     try:
@@ -10869,7 +10869,8 @@ def _newest_tag_for_arch_word(word: str) -> tuple[str, list[str]] | None:
                 "RETURN DISTINCT ib.tag AS tag, ib.arch AS arch", w=word)]
     finally:
         driver.close()
-    rows = [r for r in rows if _PRIMARY_IB_TAG_RE.match(r["tag"])]
+    rows = [r for r in rows if _PRIMARY_IB_TAG_RE.match(r["tag"])
+            and (not series or r["tag"].startswith(f"CMSSW_{series[0]}_{series[1]}_"))]
     if not rows:
         return None
     tag = max((r["tag"] for r in rows), key=_ib_sort_key)
@@ -10909,6 +10910,17 @@ def _with_arch_missing_from_newest(question: str, session_id: str) -> str:
     try:
         if _packages_named_loosely(question):
             return question
+        if series:
+            # "is 14_1 el8 also seeing many unit test failures?" (found 2026-11-05: el9 only, "0 failed", with 47 failing on el8)
+            word = (_arch_family(question) or (_OS_FAMILY_RE.search(question) or _ARCH_COMPILER_RE.search(question) or [None, None])[1])
+            found_in_series = _newest_tag_for_arch_word(word, series) if word else None
+            if not found_in_series:
+                return question
+            newest_of_series = (_latest_ib_records(None, series) or [{}])[0].get("tag")
+            if newest_of_series and newest_of_series != found_in_series[0]:
+                _default_tag_notes[session_id] = (f"_`{newest_of_series}` has no `{word.lower()}` build yet, so this is for `{found_in_series[0]}`, "
+                                                  "the newest build of that series on it._\n\n")
+            return f"{question} {found_in_series[0]}" + (f" {found_in_series[1][0]}" if len(found_in_series[1]) == 1 else "")
         scope = _arch_scope_matches(question, session_id)
         if not scope or scope[2] or not scope[1]:
             return question
@@ -13823,6 +13835,10 @@ def _shift_question_rewrite(question: str) -> str | None:
         newest = _latest_ib_records(None, (int(series.group(1)), int(series.group(2)))) if series else []
         if newest and newest[0]["tag"] != since_tag.group(1):
             return f"what changed between {since_tag.group(1)} and {newest[0]['tag']}"
+    arch_status = re.fullmatch(r"\s*(?:what(?:'s|\s+is)\s+the\s+)?status\s+(?:of|on|for)\s+((?:el|fc|slc)\d+_\w+?_gcc\d+)\s+(?:in|for|on)\s+(?:CMSSW_)?(\d{1,2}_\d{1,2})(?:_X)?\s*[?.!]*\s*", question, re.IGNORECASE)
+    if arch_status:
+        # "status of el8_amd64_gcc13 in 17_0" (found 2026-11-05: PRs and Issues mentioning the architecture)
+        return f"what is failing in {arch_status.group(2)} on {arch_status.group(1)}"
     looks = re.fullmatch(r"\s*(?:what\s+does|how\s+does)\s+(?:the\s+)?(?:(?:latest|newest)\s+)?(?:CMSSW_)?(\d{1,2}_\d{1,2})(?:_X)?(?:\s+(?:ib|build|release|series))?\s+look(?:\s+like)?\s*(?:today|now)?\s*[?.!]*\s*", question, re.IGNORECASE)
     if looks:
         # "what does the 16_1 IB look like?" (found 2026-11-05: "my lookups came back empty")

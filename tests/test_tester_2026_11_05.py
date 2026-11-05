@@ -473,11 +473,19 @@ class ArchMissingFromNewestTests(unittest.TestCase):
 
     def test_left_alone(self):
         for question in ("is gcc16 out yet?", "compare gcc15 and gcc16 failures", "failures on gcc16 this week",
-                         "why is 537.0 failing on gcc16?", "what failed on gcc16 in 17_1?",
+                         "why is 537.0 failing on gcc16?",
                          "what's broken in CMSSW_20_1_X_2026-11-03-2300 on gcc16?", "why would TritonService fail on aarch64?",
                          "why does TestIntegrationEventSetup fail on aarch64?"):
             self.assertEqual(_with_arch_missing_from_newest(question, "a"), question, question)
         self.assertNotIn("a", _default_tag_notes)
+
+    def test_in_a_named_series_the_newest_build_of_that_series_on_it(self):
+        with patch("server.api_server._newest_tag_for_arch_word", return_value=("CMSSW_14_1_X_2026-11-02-1100", ["el8_amd64_gcc12"])) as newest, \
+                patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_14_1_X_2026-11-02-2300"}]):
+            question = _with_arch_missing_from_newest("is 14_1 el8 also seeing many unit test failures?", "a")
+        self.assertEqual(newest.call_args.args, ("el8", (14, 1)))
+        self.assertTrue(question.endswith("CMSSW_14_1_X_2026-11-02-1100 el8_amd64_gcc12"), question)
+        self.assertIn("has no `el8` build yet", _default_tag_notes["a"])
 
     def test_the_shift_rewrite_keeps_the_architecture(self):
         self.assertEqual(api_server._shift_question_rewrite("what's broken on gcc16?"), "what is failing in the latest IB on gcc16")
