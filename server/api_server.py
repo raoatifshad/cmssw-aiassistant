@@ -10854,6 +10854,46 @@ def _with_arch_missing_from_newest(question: str, session_id: str) -> str:
     return f"{question} {found[0]}" + (f" {archs[0]}" if len(archs) == 1 else "")
 
 
+_ARCH_OUT_DATE_RE = re.compile(r"\b(\d{2})-(\d{2})[ -]+(?:at\s+)?(\d{2}):?(\d{2})\b")
+_ARCH_OUT_WORD_RE = re.compile(r"\b(aarch64|arm64|arm|riscv\w*|el\d+|gcc\d+)\b", re.IGNORECASE)
+
+
+def _arch_build_out_answer(question: str) -> str | None:
+    """ "is el10 out for the 11-04 11:00 build?", "is aarch64 of the 11-04-1100 build out yet?" (found 2026-11-05:
+    a dead end). The IB named, or the primary IB of that date and time in the newest release series, or the one named."""
+    named = IB_TAG_RE.search(question)
+    date = None if named else _ARCH_OUT_DATE_RE.search(question)
+    arch_word = _ARCH_OUT_WORD_RE.search(IB_TAG_RE.sub(" ", question))
+    if not (named or date) or not arch_word or not re.match(r"\s*(?:is|has|did|are)\b", question, re.IGNORECASE):
+        return None
+    if not re.search(r"\b(?:out|ready|available|there|yet)\b", question, re.IGNORECASE) or re.search(r"\bfail|\bbroken\b", question, re.IGNORECASE):
+        return None
+    if named:
+        tag = named.group(1)
+    else:
+        latest = _latest_ib_records(None, _requested_release_series(question))
+        parts = re.match(r"(CMSSW_\d+_\d+)_X_(\d{4})-", latest[0]["tag"]) if latest else None
+        if not parts:
+            return None
+        month, day, hour, minute = date.groups()
+        tag = f"{parts.group(1)}_X_{parts.group(2)}-{month}-{day}-{hour}{minute}"
+    wanted = {"arm": "aarch64", "arm64": "aarch64"}.get(arch_word.group(1).lower(), arch_word.group(1).lower())
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            archs = sorted({r["a"] for r in session.run("MATCH (ib:IB {tag:$t}) RETURN ib.arch AS a", t=tag)})
+    finally:
+        driver.close()
+    if not archs:
+        return f"`{tag}` is not imported. The data is refreshed twice a day, so the newest builds can be missing."
+    having = [a for a in archs if wanted in a]
+    listed = ", ".join(f"`{a}`" for a in archs)
+    if having:
+        return f"Yes: `{tag}` has a build on " + ", ".join(f"`{a}`" for a in having) + f". All its imported architectures: {listed}."
+    return (f"Not yet: `{tag}` has no imported `{wanted}` build. Architectures imported for it: {listed}. "
+            "An IB's architectures land hours apart, and the data is refreshed twice a day.")
+
+
 def _with_series_change_tags(question: str) -> str:
     """ "what changed in 17_1 between the last two builds?": that series' two newest primary IBs
     (found 2026-11-04: just the newest tag). Windows ("this week") stay with the digest."""
@@ -16252,7 +16292,7 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
         where = _workflow_across_builds_answer(mine.group(1), f"where is {mine.group(1)} failing", sid)
         return ("**If it also fails in IBs without your PR, it isn't from your PR.** Compare the same step's error in your PR's "
                 f"test and in the IB; this shows where it fails, not the cause.\n\n{where}", "deterministic:ib_or_pr")
-    for handler, route in ((_unknown_name_answer, "unknown_name"), (_about_the_bot_answer, "about_the_bot"), (_one_line_status_answer, "one_line_status"),
+    for handler, route in ((_arch_build_out_answer, "arch_build_out"), (_unknown_name_answer, "unknown_name"), (_about_the_bot_answer, "about_the_bot"), (_one_line_status_answer, "one_line_status"),
                            (_series_overview_answer, "series_overview"), (_sanitizer_status_answer, "sanitizer_status"), (_both_flavours_answer, "both_flavours"),
                            (_build_progress_answer, "build_progress"), (_builds_failed_window_answer, "builds_failed_window"), (_first_failed_window_answer, "first_failed_window"),
                            (_recovered_window_answer, "recovered_window"), (_longest_failing_answer, "longest_failing"), (_workflow_last_pass_answer, "workflow_last_pass"),
