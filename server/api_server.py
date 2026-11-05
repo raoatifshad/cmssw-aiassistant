@@ -10900,7 +10900,7 @@ _NEWEST_ARCH_IB_RE = re.compile(
     r"\b(?:latest|newest|last)\s+(aarch64|arm64|arm|riscv\w*|amd64|x86_64|el\d+|slc\d+|gcc\d+)\s+(?:ib|build|release)s?\b", re.IGNORECASE)
 
 
-def _newest_tag_for_arch_word(word: str) -> tuple[str, list[str]] | None:
+def _newest_tag_for_arch_word(word: str, series: tuple[int, int] | None = None) -> tuple[str, list[str]] | None:
     """(newest primary IB tag built on an architecture containing `word`, those architectures)."""
     word = {"arm": "aarch64", "arm64": "aarch64", "x86_64": "amd64", "riscv": "riscv64"}.get(word.lower(), word.lower())
     driver = get_driver()
@@ -10911,11 +10911,48 @@ def _newest_tag_for_arch_word(word: str) -> tuple[str, list[str]] | None:
                 "RETURN DISTINCT ib.tag AS tag, ib.arch AS arch", w=word)]
     finally:
         driver.close()
-    rows = [r for r in rows if _PRIMARY_IB_TAG_RE.match(r["tag"])]
+    rows = [r for r in rows if _PRIMARY_IB_TAG_RE.match(r["tag"])
+            and (series is None or r["tag"].startswith(f"CMSSW_{series[0]}_{series[1]}_"))]
     if not rows:
         return None
     tag = max((r["tag"] for r in rows), key=_ib_sort_key)
     return tag, sorted({r["arch"] for r in rows if r["tag"] == tag})
+
+
+def _rewrite_lost_arch_word(question: str, rewrite: str) -> bool:
+    """ "what's broken on gcc16?" rewritten to "what is failing in the latest IB" answered about every
+    architecture (found 2026-11-05)."""
+    words = [m.group(1).lower() for regex in (_ARCH_COMPILER_RE, _ARCH_FAMILY_RE, _OS_FAMILY_RE) for m in regex.finditer(question)]
+    return any(word not in rewrite.lower() for word in words)
+
+
+def _loose_arch_failure_scope(question: str, session_id: str) -> tuple[str, str | None]:
+    """ "what's broken on gcc16?" with no IB named, when the newest IB isn't built there yet
+    (architectures land hours apart): the newest IB that is, said in a note. Found 2026-11-05:
+    the newest IB's whole overview, gcc14 failures only and no word about gcc16.
+    Returns (question, answer when no IB at all is built there)."""
+    if IB_TAG_RE.search(question) or _latest_ib_contexts.get(session_id):
+        return question, None
+    if not re.search(r"\b(?:fail\w*|broken|wrong|problems?|errors?|status)\b", question, re.IGNORECASE):
+        return question, None
+    scope = _arch_scope_matches(question, session_id)
+    if not scope or scope[2]:
+        return question, None
+    latest_tag, words = scope[0], scope[1].split()
+    series = _requested_release_series(question)
+    try:
+        # the most specific word, then every word must hold ("el9 gcc16")
+        found = _newest_tag_for_arch_word(sorted(words, key=lambda w: not w.startswith("gcc"))[0], series)
+    except Exception as exc:
+        print(f"WARNING: newest architecture IB lookup failed: {exc}")
+        return question, None
+    archs = [arch for arch in (found[1] if found else []) if all(word in arch for word in words)]
+    if not archs:
+        where = f" in `{series[0]}_{series[1]}_X`" if series else ""
+        return question, f"No imported primary IB{where} has RelVal results on `{' '.join(words)}`."
+    _default_tag_notes[session_id] = (f"_`{latest_tag}`, the newest IB, has no `{' '.join(words)}` build yet, "
+                                      f"so this is for `{found[0]}`, the newest one that has._\n\n")
+    return f"{question} {found[0]}" + (f" {archs[0]}" if len(archs) == 1 else ""), None
 
 
 def _with_newest_arch_ib(question: str) -> str:
@@ -16301,6 +16338,8 @@ def _chat(req: ChatRequest):
                               actions=_CAPABILITY_ACTIONS)
 
     shift_rewrite = _shift_question_rewrite(original_question)
+    if shift_rewrite and _rewrite_lost_arch_word(original_question, shift_rewrite):
+        shift_rewrite = None
     if shift_rewrite:
         original_question = shift_rewrite
         question = _normalize_deterministic_question(shift_rewrite)
@@ -16319,6 +16358,9 @@ def _chat(req: ChatRequest):
     question = _with_relative_compare_tags(question)
     question = _with_variant_ib_context(question)
     question = _with_newest_arch_ib(question)
+    question, no_arch_build = _loose_arch_failure_scope(question, sid)
+    if no_arch_build:
+        return _chat_response(sid, original_question, no_arch_build, "deterministic:arch_unavailable")
     question = _with_series_change_tags(question)
     question, date_message = _date_tag_context(question)
     if date_message:
