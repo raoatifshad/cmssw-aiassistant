@@ -12967,6 +12967,11 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
         before = _previous_primary_tag(context_ib)
         if before:
             return f"compare {before} with {context_ib}"
+    if str(last.get("route", "")) == "deterministic:series_stability":
+        # "and most failing relvals?" (found 2026-11-05: "my lookup used an IB tag ... not in the imported data")
+        also = re.fullmatch(r"\s*(?:and\s+|what\s+about\s+)?(?:the\s+)?(?:most\s+failing\s+|most\s+)?(relvals?|unit[\s-]*tests?)\s*[?.!]*\s*", question, re.IGNORECASE)
+        if also:
+            return f"which release series has the most failing {'unit tests' if re.match('unit', also.group(1), re.IGNORECASE) else 'relvals'}"
     if str(last.get("route", "")).endswith("failures_by_dimension") and re.fullmatch(r"\s*why\s*[?.!]*\s*", question, re.IGNORECASE):
         ranked_first = re.search(r"\*\*`([a-z0-9]+_[a-z0-9]+_gcc\d+)`\*\*", last["answer"])
         if ranked_first:
@@ -14101,10 +14106,47 @@ def _relval_pass_rate_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+def _series_unit_failures_answer() -> str | None:
+    """ "which release series has the most failing unit tests right now?" (found 2026-11-05: a table of RelVal failure rates,
+    in which 17_0, with 57 failing unit tests, reads 0.00%). Failing packages in each series' newest build per architecture."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB)-[:RAN_UNITTEST]->(u:UnitTest) WHERE ib.variant IS NULL AND right(ib.tag, 15) >= $since "
+                "RETURN ib.release AS release, ib.arch AS arch, ib.tag AS tag, count(u) AS total, "
+                "sum(CASE WHEN u.status = 'FAILED' THEN 1 ELSE 0 END) AS failed", since=_cutoff_stamp(14))]
+    finally:
+        driver.close()
+    newest: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["release"], r["arch"])
+        if key not in newest or _ib_sort_key(r["tag"]) > _ib_sort_key(newest[key]["tag"]):
+            newest[key] = r
+    per_series: dict[str, dict] = {}
+    for (release, arch), r in newest.items():
+        entry = per_series.setdefault(release, {"failed": 0, "total": 0, "where": []})
+        entry["failed"] += r["failed"]
+        entry["total"] += r["total"]
+        if r["failed"]:
+            entry["where"].append(f"`{arch}` {r['failed']} in `{r['tag']}`")
+    if not per_series:
+        return None
+    ranked = sorted(per_series.items(), key=lambda item: (-item[1]["failed"], item[0]))
+    lines = [f"**`{ranked[0][0]}`** has the most: {ranked[0][1]['failed']} failing unit-test package result(s)." if ranked[0][1]["failed"]
+             else "No release series has a failing unit test in its newest builds.",
+             "", "Primary IBs, the newest build of each architecture in the last 14 days, so a series whose newest builds are partly imported counts what is there:", "",
+             "| Release | Failing | Total | Where |", "| --- | ---: | ---: | --- |"]
+    lines += [f"| `{release}` | {e['failed']:,} | {e['total']:,} | {'; '.join(sorted(e['where'])[:4]) or 'none'} |" for release, e in ranked[:20]]
+    return "\n".join(lines)
+
+
 def _series_stability_answer(question: str) -> str | None:
     """ "which release is the most stable?" (found 2026-11-04: dead end). Failure rate per series, primary builds."""
     if not re.search(r"\b(?:most|least)\s+(?:stable|reliable|broken)\b|\b(?:best|worst)\s+(?:release|series|cycle)\b|\b(?:release|series|cycle)s?\b[^?]*\b(?:most|fewest|least)\s+fail", question, re.IGNORECASE):
         return None
+    if re.search(r"\bunit[\s-]*tests?\b", question, re.IGNORECASE):
+        return _series_unit_failures_answer()
     driver = get_driver()
     try:
         with driver.session() as session:
@@ -14121,7 +14163,14 @@ def _series_stability_answer(question: str) -> str | None:
     for r in rows:
         r["rate"] = 100 * r["failed"] / r["total"]
     rows.sort(key=lambda r: (r["rate"], r["release"]))
-    lines = ["RelVal failure rate per release series, primary IBs of the last 7 days (lowest first; known errors excluded). "
+    lead = []
+    if re.search(r"\bmost\s+fail|\bworst\b|\bmost\s+broken\b", question, re.IGNORECASE):
+        # the table is lowest first, so the answer to "most" was its last rows (found 2026-11-05)
+        most = max(rows, key=lambda r: r["failed"])
+        highest = max(rows, key=lambda r: r["rate"])
+        lead = [f"**`{most['release']}`** has the most failing RelVals: {most['failed']:,} in {most['builds']} build(s)"
+                + (f"; the highest rate is `{highest['release']}`, {highest['rate']:.2f}%." if highest is not most else "."), ""]
+    lines = lead + ["RelVal failure rate per release series, primary IBs of the last 7 days (lowest first; known errors excluded). "
              "It counts failures only: series run different workflows and architectures, and an exotic architecture can "
              "dominate one, so read it as a pointer, not a ranking of quality.", "",
              "| Release | Builds | RelVal results | Failed | Failure rate |", "| --- | ---: | ---: | ---: | ---: |"]
