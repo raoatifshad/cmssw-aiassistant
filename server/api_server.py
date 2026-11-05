@@ -9324,12 +9324,44 @@ def _is_pasted_log(question: str) -> bool:
                 or ("\n" in question.strip() and _LOG_PROBLEM_PASTE_RE.search(question)))
 
 
-def _pasted_error_in_ib_lead(question: str) -> str | None:
+def _one_line_error_with_ib(question: str) -> str | None:
+    """The error in "TritonService: Starting ... failed with exit code 65280 in <tag> on <arch>" or
+    "is this in <tag>: <error>", only when that text is really on record: a sentence with a colon
+    must not get a "No, not in that IB". Found 2026-11-05: the IB's whole overview."""
+    if "\n" in question.strip() or not IB_TAG_RE.search(question):
+        return None
+    text = IB_TAG_RE.sub(" ", question.replace("`", " "))
+    text = re.sub(r"\b(?:el\d+|fc\d+|slc\d+|cc\d+|cs\d+)[_\s-]+(?:amd64|aarch64|riscv64|ppc64le)[_\s-]+gcc\d+\b", " ", text, flags=re.IGNORECASE)
+    match = re.search(r"\b([A-Z][A-Za-z0-9_:]*:\s+[^?\n]{20,})", text)
+    if not match:
+        return None
+    message = re.sub(r"(?:\s+(?:in|on|for|at))*\s*[.?!]*\s*$", "", " ".join(match.group(1).split())).strip()
+    needle = message.lower().replace("'", "").replace('"', "")[:200]
+    if len(needle) < 25:
+        return None
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                known = session.run(
+                    "OPTIONAL MATCH (e:RelValException) WHERE replace(replace(toLower(e.message), \"'\", ''), '\"', '') CONTAINS $needle "
+                    "WITH count(e) AS exceptions "
+                    "RETURN exceptions > 0 OR EXISTS { MATCH (p:LogProblem) WHERE toLower(p.text) CONTAINS $needle } AS known",
+                    needle=needle).single()["known"]
+        finally:
+            driver.close()
+    except Exception as exc:
+        print(f"WARNING: one-line error lookup failed: {exc}")
+        return None
+    return message if known is True else None
+
+
+def _pasted_error_in_ib_lead(question: str, message: str | None = None) -> str | None:
     """ "is this exception in <tag> on <arch>?" with the error pasted: the direct answer, from the
     RelVal exceptions and the test logs of that IB and its sub-IBs. None when no IB is named, or
     when it could not be looked up (never a "no" from a failed search)."""
     tags = list(dict.fromkeys(IB_TAG_RE.findall(question)))
-    parsed = _pasted_error_message(question)
+    parsed = (None, message) if message else _pasted_error_message(question)
     if not tags or len(tags) > 3 or not parsed:
         return None
     needle = " ".join(parsed[1].split()).lower().replace("'", "").replace('"', "")[:200]
@@ -9337,7 +9369,7 @@ def _pasted_error_in_ib_lead(question: str) -> str | None:
         return None
     arch = _requested_ib_arch(question)
     try:
-        signature_ids = parse_pasted_error(question).get("signature_ids") or []
+        signature_ids = parse_pasted_error(message or question).get("signature_ids") or []
     except Exception:
         signature_ids = []
     pasted_codes = result_codes(parsed[1])
@@ -9429,12 +9461,15 @@ def _ib_presence_text(tag: str, arch: str | None, builds: list[dict], found: dic
     return text
 
 
-def _pasted_log_response(sid: str, original_question: str, question: str):
-    """Every answer to a pasted error, led by the direct answer when the question names an IB."""
-    lead = _pasted_error_in_ib_lead(original_question)
+def _pasted_log_response(sid: str, original_question: str, question: str, message: str | None = None):
+    """Every answer to a pasted error, led by the direct answer when the question names an IB.
+    `message`: the error alone, when the question has other words around it on one line."""
+    lead = _pasted_error_in_ib_lead(original_question, message)
     prefix = f"{lead}\n\n" if lead else ""
+    pasted = message or original_question
+    question = message or question
     try:
-        exact_error_answer = _relval_exception_message_answer(original_question)
+        exact_error_answer = _relval_exception_message_answer(pasted)
     except Exception as exc:  # supplementary lookup -- never break the paste handling below
         print(f"WARNING: RelVal exception message lookup failed: {exc}")
         exact_error_answer = None
@@ -9446,7 +9481,7 @@ def _pasted_log_response(sid: str, original_question: str, question: str):
                            or "problems whose log text contains your pasted text" in log_answer):
             exact_error_answer += "\n\n" + log_answer
         return _chat_response(sid, original_question, prefix + exact_error_answer, "deterministic:relval_exception_message")
-    error_line = _error_line_answer(original_question)
+    error_line = _error_line_answer(pasted)
     if error_line:
         return _chat_response(sid, original_question, prefix + error_line, "deterministic:error_line_github")
     return _pasted_exception_response(sid, original_question, question, prefix)
@@ -16317,6 +16352,12 @@ def _chat(req: ChatRequest):
         pasted_log = _pasted_log_response(sid, original_question, question)
         if pasted_log:
             return pasted_log
+    else:
+        one_line_error = _one_line_error_with_ib(original_question)
+        if one_line_error:
+            pasted_log = _pasted_log_response(sid, original_question, question, one_line_error)
+            if pasted_log:
+                return pasted_log
 
     scope_only = bool(_FOLLOW_UP_SCOPE_RE.match(original_question))
     bare_number = re.fullmatch(r"\s*(?:(?:what\s+is|what's|show(?:\s+me)?|tell\s+me\s+about|details\s+of)\s+)?"
