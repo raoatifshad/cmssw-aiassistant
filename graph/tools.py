@@ -1776,6 +1776,35 @@ _FRAMEWORK_NAMES = {"eventprocessor", "edproducer", "edanalyzer", "edfilter", "e
                     "parametersetdescriptions", "inputsource", "eventsetup", "runtocompletion", "streamid"}
 
 
+_RESULT_CODE_RE = re.compile(r"\b(?:exit\s*code|exit\s*status|return\s*code)\s*[:=]?\s*(-?\d+)\b", re.IGNORECASE)
+
+
+def result_codes(text: str | None) -> set[str]:
+    """The result codes a message states ("failed with exit code 65280"). A signature replaces
+    every number with <N>, which is right for run-specific numbers but also joins exit code 65280
+    with exit code 256, and those are not the same error (found 2026-11-04)."""
+    return set(_RESULT_CODE_RE.findall(text or ""))
+
+
+def _split_by_result_code(sids: list[str], pasted_codes: set[str]) -> dict[str, dict]:
+    """Per signature: which stored problems state another code than the paste. A problem that
+    states no code (cut text) stays with the paste: only a different code separates them."""
+    rows = _run_query_all(
+        "MATCH (p:LogProblem) WHERE p.signature_id IN $sids "
+        "RETURN p.signature_id AS sid, p.key AS key, p.ib_tag AS tag, p.text AS text", {"sids": sids})
+    split = {sid: {"excluded": [], "other": {}, "same": 0} for sid in sids}
+    for row in rows:
+        entry = split[row["sid"]]
+        codes = result_codes(row["text"])
+        if codes and not codes & pasted_codes:
+            entry["excluded"].append(row["key"])
+            for code in codes:
+                entry["other"].setdefault(code, set()).add(row["tag"])
+        else:
+            entry["same"] += 1
+    return split
+
+
 def _lucene_terms(terms) -> str:
     return " OR ".join('"%s"' % re.sub(r'["\\]', " ", t) for t in terms)
 
@@ -1916,9 +1945,20 @@ def search_test_log_problems_report(text: str, category: str | None = None, limi
                              found=len(rows_of.get("same IB", []))))
     if not match:
         return {"problems": [], "searched": searched, "failed": failed}
+    code_split: dict[str, dict] = {}
+    pasted_codes = result_codes(parsed["message"])
+    exact_sids = [sid for sid, m in match.items() if m[0] == "exact"]
+    if pasted_codes and exact_sids:
+        try:
+            code_split = _split_by_result_code(exact_sids, pasted_codes)
+        except Exception as exc:
+            print(f"WARNING: result-code split failed: {exc}")
+        for sid, split in code_split.items():
+            if split["other"] and not split["same"]:
+                match[sid] = ("related", match[sid][1], [])  # same wording, only with other codes: not this error
     rank = {level: i for i, level in enumerate(MATCH_LEVELS)}
     chosen = sorted(match, key=lambda sid: (rank[match[sid][0]], -match[sid][1]))[:limit]
-    return {"problems": _log_problem_details(chosen, match), "searched": searched, "failed": failed}
+    return {"problems": _log_problem_details(chosen, match, code_split), "searched": searched, "failed": failed}
 
 
 def search_test_log_problems(text: str, category: str | None = None, limit: int = 5) -> list[dict]:
@@ -1935,9 +1975,13 @@ def search_test_log_problems(text: str, category: str | None = None, limit: int 
     return search_test_log_problems_report(text, category, limit)["problems"]
 
 
-def _log_problem_details(chosen: list[str], match: dict) -> list[dict]:
+def _log_problem_details(chosen: list[str], match: dict, code_split: dict | None = None) -> list[dict]:
+    code_split = code_split or {}
+    # problems stating another code than the paste are left out of the counts when some state the
+    # same code; when none does, they are all that is known about this wording and stay
+    excluded = [key for split in code_split.values() if split["same"] for key in split["excluded"]]
     rows = _run_query(
-        "MATCH (p:LogProblem) WHERE p.signature_id IN $sids "
+        "MATCH (p:LogProblem) WHERE p.signature_id IN $sids AND NOT p.key IN $excluded "
         "WITH p ORDER BY p.ib_tag DESC "
         "WITH p.signature_id AS sid, collect(p) AS ps "
         "RETURN sid, ps[0].kind AS kind, ps[0].category AS category, ps[0].summary AS summary, "
@@ -1946,23 +1990,23 @@ def _log_problem_details(chosen: list[str], match: dict) -> list[dict]:
         "ps[0].example_line AS example_line, "
         "[x IN ps | {tag:x.ib_tag, arch:x.arch, variant:coalesce(x.run_variant, ''), suite:x.suite}] AS places, "
         "head([x IN ps WHERE x.intentional_hint IS NOT NULL | x.intentional_hint]) AS intentional_hint",
-        {"sids": chosen},
+        {"sids": chosen, "excluded": excluded},
     )
     # owners and modules are counted by the database: a common message ("%MSG-e ...") has
     # ~1k problems with 600k owners, and concatenating those lists in Cypher took 40 s per paste
     owner_rows = _run_query_all(  # one row per test: never cut at MAX_ROWS
-        "MATCH (p:LogProblem) WHERE p.signature_id IN $sids "
+        "MATCH (p:LogProblem) WHERE p.signature_id IN $sids AND NOT p.key IN $excluded "
         "UNWIND range(0, size(p.owners) - 1) AS i "
         "RETURN p.signature_id AS sid, p.suite AS suite, p.owners[i] AS owner, p.owner_statuses[i] AS status, "
         "count(*) AS n",
-        {"sids": chosen},
+        {"sids": chosen, "excluded": excluded},
     )
     module_rows = _run_query_all(
-        "MATCH (p:LogProblem) WHERE p.signature_id IN $sids "
+        "MATCH (p:LogProblem) WHERE p.signature_id IN $sids AND NOT p.key IN $excluded "
         "WITH p ORDER BY p.ib_tag DESC UNWIND coalesce(p.modules, []) AS m "
         "WITH p.signature_id AS sid, m, count(*) AS n ORDER BY n DESC "
         "RETURN sid, collect(m)[0..10] AS modules",
-        {"sids": chosen},
+        {"sids": chosen, "excluded": excluded},
     )
     owners_of: dict[str, list] = {}
     for r in owner_rows:
@@ -2003,6 +2047,10 @@ def _log_problem_details(chosen: list[str], match: dict) -> list[dict]:
                     for p in places],
             series_total=len(series_last),
             series_gone=[dict(r) for r in newer if r["newer_builds"]],
+            other_result_codes=sorted(
+                ({"code": code, "ib_count": len(ib_tags), "example": max(ib_tags, key=_ib_when)}
+                 for code, ib_tags in code_split.get(row["sid"], {}).get("other", {}).items()),
+                key=lambda item: -item["ib_count"]),
         )
         results.append(row)
     return results

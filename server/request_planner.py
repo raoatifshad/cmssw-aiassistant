@@ -16,7 +16,7 @@ IB_TAG_RE = re.compile(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b")
 ARCH_RE = re.compile(
     r"\b(el\d+|fc\d+|slc\d+|cc\d+|cs\d+)[_\s-]+(amd64|aarch64|riscv64|ppc64le)[_\s-]+(gcc\d+)\b", re.IGNORECASE
 )
-PR_RE = re.compile(r"(?:\b(?:pr|mr|pull request|merge request)\s*#?|#)(\d+)\b", re.IGNORECASE)
+PR_RE = re.compile(r"(?:\b(?:pr|mr|pull request|merge request)\s*#?|#)(\d+)\b(?!\.\d)", re.IGNORECASE)
 WORKFLOW_RE = re.compile(r"\bworkflow\s*#?(\d+(?:\.\d+)?)\b", re.IGNORECASE)
 SHIFT_SUMMARY_RE = re.compile(
     r"\bshift\s*summary\b|\bshift\s*report\b|\bvirtual\s*shift(?:er)?\b|"
