@@ -13017,6 +13017,11 @@ def _resolve_short_follow_up(question: str, sid: str) -> str | None:
         return "known errors list for the latest IB"
     if re.fullmatch(r"\s*(?:which\s+ones?(?:\s+exist)?|list\s+them)\s*[?.!]*\s*", question, re.IGNORECASE) and re.search(r"\bsub[\s-]*ib", previous, re.IGNORECASE):
         return "list the sub-IBs of the latest IB"
+    if re.fullmatch(r"\s*(?:and\s+)?(?:how\s+does\s+(?:it|that)\s+)?compared?\s+(?:with|to|against)\s+(?:the\s+)?(?:primary|default)(?:\s+(?:one|ib|build))?\s*[?.!]*\s*", question, re.IGNORECASE):
+        # "what failed in PY314 latest?", "and in MULTIARCHS?" then this (found 2026-11-05: the whole IB's overview)
+        flavour_in_answer = re.search(r"\bCMSSW_\d+_\d+_([A-Za-z0-9]+)_X_", last["answer"][:300])
+        if flavour_in_answer and flavour_in_answer.group(1).lower() in _ALL_VARIANTS:
+            return f"compare {flavour_in_answer.group(1)} with the primary"
     only_flavour = re.fullmatch(rf"\s*(?:only|just)\s+(?:in\s+|the\s+)?({_ALL_VARIANTS_RE})\s*[?.!]*\s*", question, re.IGNORECASE)
     if only_flavour:
         # "what failed in [tag]?" then "only ASAN" (found 2026-11-04: the LLM said no ASAN problems exist)
