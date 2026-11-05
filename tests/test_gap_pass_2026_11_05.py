@@ -11,7 +11,10 @@ from server.api_server import (
     _build_error_answer,
     _clang_detail_answer,
     _condense_one_arch_comparison,
+    _dashboard_hidden_answer,
     _digest_filter_answer,
+    _everyday_wording_rewrite,
+    _turn_memory,
     _exit_code_meaning_answer,
     _failure_sets_answer,
     _flavours_by_time_answer,
@@ -372,6 +375,30 @@ class ComparisonCondenseTests(unittest.TestCase):
         self.assertIn("| `537.0` | DY | 0 | 16640 (OtherCMS) | Newly failing |", answer)
         self.assertIn("failed RelVals 1 -> 2. Newly failing: `537.0`; Still failing: `539.0`.", answer)
         self.assertIn("`ASAN`", answer)
+
+
+class EverydayWordingTests(unittest.TestCase):
+    def test_rewrites(self):
+        for question, expected in (("show me 539.0", "where is workflow 539.0 failing"), ("does 25.0 pass on all architectures?", "where is workflow 25.0 failing"),
+                                   ("show the exit code of 537.0 on el8_amd64_gcc14", "why is workflow 537.0 failing on el8_amd64_gcc14"), ("no I mean 17_0", "and 17_0?"),
+                                   ("is the IB ok?", "is the latest IB ok"), ("any DAS errors right now?", "how many DAS errors in the latest IB"),
+                                   ("what got merged between 11-03 and 11-04?", "which PRs were merged between 11-03 and 11-04"),
+                                   ("worst workflow of the week on el9_amd64_gcc14", "which workflow failed the most this week on el9_amd64_gcc14")):
+            self.assertEqual(_everyday_wording_rewrite(question, "every-empty"), expected, question)
+
+    def test_other_questions_are_left_alone(self):
+        for question in ("why is 539.0 failing", "where is 539.0 failing", "does 537.0 fail in the same step everywhere?", "which PRs were merged in the latest IB", "Fatal Exception\nshow me 539.0"):
+            self.assertIsNone(_everyday_wording_rewrite(question, "every-empty"), question)
+
+    def test_follow_ups_name_the_workflow_shown(self):
+        _turn_memory["every-1"] = {"question": "q", "answer": "- `el9_amd64_gcc14`: `539.0` DY (exit 31744)", "route": "capability:failure_overview"}
+        self.assertEqual(_everyday_wording_rewrite("pick one and explain it", "every-1"), "why is 539.0 failing")
+        self.assertEqual(_everyday_wording_rewrite("is it new?", "every-1"), "where is 539.0 failing")
+        self.assertEqual(_everyday_wording_rewrite("has anyone reported it?", "every-1"), "is there an issue for 539.0")
+        self.assertIsNone(_everyday_wording_rewrite("is it new?", "every-empty"))
+
+    def test_dashboard(self):
+        self.assertTrue(_dashboard_hidden_answer("does the IB dashboard show hidden problems?").startswith("No:"))
 
 
 if __name__ == "__main__":

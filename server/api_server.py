@@ -11054,6 +11054,8 @@ def _loose_arch_failure_scope(question: str, session_id: str) -> tuple[str, str 
     Returns (question, answer when no IB at all is built there)."""
     if IB_TAG_RE.search(question) or _latest_ib_contexts.get(session_id):
         return question, None
+    if _PACKAGE_PATH_RE.search(question) or re.search(r"(?<![\d.\w-])\d{1,8}\.\d{1,7}(?![\d.])", question):
+        return question, None  # a package or workflow has its own answer across builds (the replay, 2026-11-05)
     if not re.search(r"\b(?:fail\w*|broken|wrong|problems?|errors?|status)\b", question, re.IGNORECASE):
         return question, None
     scope = _arch_scope_matches(question, session_id)
@@ -11405,7 +11407,8 @@ def _workflow_where_failing_answer(question: str, session_id: str) -> str | None
             return None  # PR/Issue evidence, exception/log/command/step lookups, "why": other handlers
         # a short ID ("1.0", "7.0") only when the question says it is a workflow, anywhere
         # ("where is 7.0 workflow failing", "where this workflow is failing 1.0")
-        says_workflow = re.search(r"\b(?:wf|workflow|relval)s?\b", question, re.IGNORECASE)
+        # "where is 25.0 failing" can only be a workflow (found 2026-11-05: the whole IB's failures, with 293 records of 25.0)
+        says_workflow = re.search(r"\b(?:wf|workflow|relval)s?\b|^\s*where\s+(?:is|does|did)\s+\d{1,8}\.\d{1,7}\s+fail", question, re.IGNORECASE)
         match = re.search(r"(?<![\d.\w-])(\d{3,8}\.\d{1,7})(?![\d.])", question) or (
             says_workflow and re.search(r"(?<![\d.\w-])(\d{1,8}\.\d{1,7})(?![\d.])", question))
         if not match:
@@ -14430,6 +14433,10 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
         narrowed = _digest_filter_answer(answer, question)
         if narrowed:
             return narrowed
+    one_of_list = re.fullmatch(r"\s*what\s+(?:did|does)\s+the\s+([A-Za-z0-9_-]+)\s+one\s+(?:change|do|fix)\s*[?.!]*\s*", question, re.IGNORECASE)
+    if one_of_list and "PR(s)" in answer and not re.search(rf"(?mi)^- \*\*.*\b{re.escape(one_of_list.group(1))}\b", answer):
+        # after a list without one (found 2026-11-05: an LLM answer about warnings)
+        return f"None of the PRs in that list mentions \"{one_of_list.group(1)}\" in its title."
     code_shown = re.match(r"Exit code `\d+` means \*\*(\w+)\*\*", answer)
     if code_shown and re.fullmatch(r"\s*(?:is\s+there|are\s+there|any)\s+(?:an?\s+|any\s+)?(issues?|prs?|tickets?)\s*(?:for|about|on)?\s*(?:it|this|that)?\s*[?.!]*\s*", question, re.IGNORECASE):
         # "is there an issue?" after what an exit code means (found 2026-11-05: the menu)
@@ -16056,7 +16063,7 @@ def _arch_word_results_answer(question: str) -> str | None:
     """ "gcc15 failures", "what is failing in the latest IB on amd64", "el8 unit tests" (found 2026-11-04: all architectures' results,
     without saying the word was ignored)."""
     word = r"(gcc\s*\d+|amd64|aarch64|arm64|riscv\w*|x86(?:_64)?|el\d+\s+amd(?:64)?\s+gcc\s*\d+|el\d+)"
-    if re.search(r"\b(?:compare|vs|versus|both|only|why|prs?|issues?|workflow|new|newly|regress\w*)\b|(?<![\d.])\d+\.\d+(?![\d.])", question, re.IGNORECASE) or _PACKAGE_PATH_RE.search(question):
+    if re.search(r"\b(?:compare|vs|versus|both|only|why|prs?|issues?|workflow|new|newly|regress\w*|anyone|anybody|known?|reported)\b|(?<![\d.])\d+\.\d+(?![\d.])", question, re.IGNORECASE) or _PACKAGE_PATH_RE.search(question):
         return None
     leading = re.fullmatch(rf"\s*{word}\s+(failures?|failing|relvals?|unit\s*tests?)\s*[?.!]*\s*", question, re.IGNORECASE)
     on_word = re.search(rf"\b(failures?|failing|fails?|relvals?|unit\s*tests?)\b[^?]*\bon\s+{word}(?![\w])", question, re.IGNORECASE)
@@ -16655,6 +16662,9 @@ def _workflow_step_answer(question: str, sid: str) -> str | None:
 
 def _exit_code_not_a_number_answer(question: str) -> str | None:
     """ "exit code abc" (found 2026-11-05: the LLM's "lookups came back empty")."""
+    long_number = re.fullmatch(r"\s*exit\s+code\s+(\d{6,})\s*[?.!]*\s*", question, re.IGNORECASE)
+    if long_number and int(long_number.group(1)) not in (get_exit_code_names() or {}):
+        return f"`{long_number.group(1)}` isn't a RelVal exit code: they are at most five digits, e.g. `34304`."
     if re.fullmatch(r"\s*exit\s+code\s+[A-Za-z][\w-]*\s*[?.!]*\s*", question, re.IGNORECASE) and not re.search(r"\b(?:" + "|".join(re.escape(n) for n in (get_exit_code_names() or {}).values()) + r")\b", question, re.IGNORECASE):
         return "Exit codes are numbers, e.g. `exit code 34304`. You can also ask by name, e.g. \"what is the exit code for SIGSEGV\"."
     return None
@@ -16992,7 +17002,7 @@ def _flavours_by_time_answer(question: str) -> str | None:
 def _ibs_for_arch_answer(question: str) -> str | None:
     """ "which IB has el9_amd64_gcc16?", "list the IBs built for el10_amd64_gcc15" (found 2026-11-05: an LLM answer, in no useful order)."""
     full = re.search(r"\b((?:el|fc|slc)\d+_[a-z0-9]+_gcc\d+)\b", question, re.IGNORECASE)
-    if (not full or IB_TAG_RE.search(question) or re.search(r"\b(?:fail\w*|warnings?|why|compare|prs?|issues?|latest\s+ib\s+on|last|green|pass\w*|clean|everything|good)\b", question, re.IGNORECASE)
+    if (not full or IB_TAG_RE.search(question) or re.search(r"\b(?:fail\w*|warnings?|why|compare|prs?|issues?|latest\s+ib\s+on|last|green|pass\w*|clean|everything|good|results?)\b", question, re.IGNORECASE)
             or not re.search(r"\b(?:which|what|list|show)\s+(?:the\s+)?(?:ibs?|builds?)\b[^?]*\b(?:ha(?:s|ve)|built\s+(?:for|on)|for|on|with)\b", question, re.IGNORECASE)):
         return None
     arch = full.group(1).lower()
@@ -17016,7 +17026,7 @@ def _ibs_for_arch_answer(question: str) -> str | None:
 
 
 _ITEMS_MENTIONING_RE = re.compile(
-    r"^\s*(?:(?:show|list|find|give|which|what)(?:\s+me)?\s+|only\s+|any\s+)?(?:the\s+)?(open\s+|closed\s+)?(issues?|prs?|pull\s+requests?)\s+(only\s+)?(?:that\s+)?"
+    r"^\s*(?:(?:show|list|find|give|which|what)(?:\s+me)?\s+|only\s+|any\s+)?(?:the\s+)?(open\s+|closed\s+)?(?:cmsdist\s+)?(issues?|prs?|pull\s+requests?)\s+(only\s+)?(?:that\s+)?"
     r"(mention(?:ing|s)?|touching|touch|about|naming|regarding)\s+(?:the\s+)?(.{2,60}?)\s*[?.!]*\s*$", re.IGNORECASE)
 
 
@@ -17026,9 +17036,15 @@ def _items_mentioning_answer(question: str) -> str | None:
     if not match or IB_TAG_RE.search(question):
         return None
     state_word, kind_word, only, verb, term = match.groups()
-    if verb.lower() == "about" and not only and not re.match(r"\s*only\b", question, re.IGNORECASE) and kind_word.lower().startswith("issue"):
+    repo = "cmsdist" if re.search(r"\bcmsdist\b", question, re.IGNORECASE) else "cmssw"
+    span = re.search(r"\s+this\s+(week|month)$", term, re.IGNORECASE)
+    since = None
+    if span:
+        since = (datetime.now() - timedelta(days=7 if span.group(1).lower() == "week" else 30)).strftime("%Y-%m-%d")
+        term = term[:span.start()]
+    if verb.lower() == "about" and not only and not re.match(r"\s*only\b", question, re.IGNORECASE) and kind_word.lower().startswith("issue") and repo == "cmssw":
         return None  # "open issues about X" has its own answer
-    if verb.lower() == "about" and not state_word and not only and not re.match(r"\s*only\b", question, re.IGNORECASE):
+    if verb.lower() == "about" and not state_word and not only and not re.match(r"\s*only\b", question, re.IGNORECASE) and repo == "cmssw":
         return None
     if re.search(r"(?<![\d.])\d{1,8}\.\d{1,7}(?![\d.])", term):
         return None
@@ -17040,29 +17056,34 @@ def _items_mentioning_answer(question: str) -> str | None:
         condition = "x.state = 'closed'" if label == "Issue" else "(x.github_state = 'closed' OR x.merged_at IS NOT NULL)"
     else:
         condition = "true"
+    if since:
+        condition += " AND coalesce(x.merged_at, x.github_updated_at, x.updated_at, '') >= $since"
     driver = get_driver()
     try:
         with driver.session() as session:
             rows = [dict(r) for r in session.run(
-                f"MATCH (x:{label} {{repo:'cmssw'}}) WHERE {condition} AND (toLower(x.title) CONTAINS $t OR toLower(x.body) CONTAINS $t) "
+                f"MATCH (x:{label} {{repo:$repo}}) WHERE {condition} AND (toLower(x.title) CONTAINS $t OR toLower(x.body) CONTAINS $t) "
                 "RETURN x.number AS n, x.title AS title, toLower(x.title) CONTAINS $t AS in_title, x.state AS state, x.github_state AS pr_state, x.merged_at AS merged",
-                t=term.lower())]
+                t=term.lower(), repo=repo, since=since)]
             words = [w for w in term.lower().split() if len(w) > 2]
             all_words = False
             if not rows and len(words) > 1:
                 # "edm::Wrapper<int> dictionary": the words in any order (found 2026-11-05: the title says "No dictionary for edm::Wrapper<int>")
                 all_words = True
                 rows = [dict(r) for r in session.run(
-                    f"MATCH (x:{label} {{repo:'cmssw'}}) WHERE {condition} AND all(w IN $words WHERE toLower(x.title) CONTAINS w OR toLower(x.body) CONTAINS w) "
+                    f"MATCH (x:{label} {{repo:$repo}}) WHERE {condition} AND all(w IN $words WHERE toLower(x.title) CONTAINS w OR toLower(x.body) CONTAINS w) "
                     "RETURN x.number AS n, x.title AS title, all(w IN $words WHERE toLower(x.title) CONTAINS w) AS in_title, x.state AS state, x.github_state AS pr_state, x.merged_at AS merged",
-                    words=words)]
+                    words=words, repo=repo, since=since)]
     finally:
         driver.close()
     named = f"{state} " if state else ""
+    if repo != "cmssw":
+        named = f"{named}{repo} "
+    span_note = f" (updated or merged since {since})" if since else ""
     if not rows:
-        return f"No imported {named}{label} has \"{term}\" in its title or description. {_github_export_note()}."
+        return f"No imported {named}{label}{span_note} has \"{term}\" in its title or description. {_github_export_note()}."
     rows.sort(key=lambda r: (not r["in_title"], -r["n"]))
-    lines = [f"**{len(rows)} {named}{label}(s)** with " + ("all the words of " if all_words else "") + f"\"{term}\" in the title or description, title matches first, newest first:"]
+    lines = [f"**{len(rows)} {named}{label}(s)**{span_note} with " + ("all the words of " if all_words else "") + f"\"{term}\" in the title or description, title matches first, newest first:"]
     for r in rows[:10]:
         status = f"merged {r['merged'][:10]}" if r["merged"] else (r["state"] or r["pr_state"] or "")
         lines.append(f"- **{label} #{r['n']}** - {r['title']}" + (f" ({status})" if status else ""))
@@ -17284,6 +17305,171 @@ def _with_named_flavour_tag(question: str) -> str | None:
     return question.replace(match.group(0), sub_tag) if exists else None
 
 
+_WF_ID = r"(?<![\d.\w-])(\d{1,8}\.\d{1,7})(?![\d.])"
+
+
+def _everyday_wording_rewrite(question: str, sid: str) -> str | None:
+    """Everyday wording of questions that already have an answer (found 2026-11-05, first run of a fresh question set). Whole-question shapes only;
+    nothing here looks at results, apart from finding the newest PR or a build's tag."""
+    if "\n" in question or len(question) > 160:
+        return None
+    text = question.strip().rstrip("?.! ")
+    wf = re.search(_WF_ID, text)
+    if wf:
+        number = wf.group(1)
+        if re.fullmatch(rf"(?:show(?:\s+me)?|details\s+(?:of|for)|status\s+of|tell\s+me\s+about|info\s+on|how\s+is|how's)\s+(?:workflow\s+|wf\s+)?{re.escape(number)}", text, re.IGNORECASE):
+            return f"where is workflow {number} failing"
+        if re.search(r"\b(?:pass|fail)\w*\b[^?]*\b(?:all|every)\s+arch\w*|\beverywhere\b", text, re.IGNORECASE) and not re.search(r"\bstep\b", text, re.IGNORECASE):
+            return f"where is workflow {number} failing"
+        if re.search(rf"\bexit\s+codes?\s+(?:of|for)\s+(?:workflow\s+)?{re.escape(number)}\b", text, re.IGNORECASE):
+            arch = _requested_ib_arch(text)
+            return f"why is workflow {number} failing" + (f" on {arch}" if arch else "")
+        return None
+    hours = re.findall(r"\b(11|23)[:.]?00\b", text)
+    day = _named_day(re.sub(r"\b(?:11|23)[:.]?00\b", " ", text)) if len(set(hours)) == 2 and re.search(r"\b(?:better|worse|compare|vs|versus|than)\b", text, re.IGNORECASE) else None
+    if day:
+        first, second = _primary_tag_on(day, "1100"), _primary_tag_on(day, "2300")
+        if first and second:
+            return f"compare {first} and {second}"
+    if re.search(r"\b(?:healthiest|cleanest)\b", text, re.IGNORECASE) and re.search(r"\b(?:build\s+types?|flavou?rs?|sub[\s-]*ibs?)\b", text, re.IGNORECASE):
+        return "which flavour is best today"
+    if re.fullmatch(r"(?:is|are)\s+the\s+ibs?\s+(?:ok(?:ay)?|fine|good|healthy|green)", text, re.IGNORECASE):
+        return "is the latest IB ok"
+    meant = re.fullmatch(r"(?:no[,\s]+)?i\s+(?:mean|meant)\s+(?:the\s+)?(\S.*)", text, re.IGNORECASE)
+    if meant:
+        return f"and {meant.group(1)}?"
+    if re.search(r"\bwhat\s+(?:got|was|were)\s+merged\s+(?:between|from)\b", text, re.IGNORECASE):
+        return re.sub(r"\bwhat\s+(?:got|was|were)\s+merged\b", "which PRs were merged", text, flags=re.IGNORECASE)
+    went_in = re.search(r"\bprs?\b[^?]*\b(?:went|got|came)\s+in(?:to)?\b[^?]*?(CMSSW_\S+|\d{2}-\d{2}-\d{4})", text, re.IGNORECASE)
+    if went_in:
+        return f"which PRs were merged in {went_in.group(1)}"
+    from_newest = re.fullmatch(r"show\s+(\S+)\s+from\s+the\s+(?:most\s+recent|newest|latest|last)\s+build\s+(?:that\s+has\s+it|with\s+it)", text, re.IGNORECASE)
+    if from_newest:
+        return f"failures on {from_newest.group(1)}"
+    if re.search(r"\bred\s+relvals?\b", text, re.IGNORECASE) and re.search(r"\barm\b|\baarch64\b", text, re.IGNORECASE):
+        return "relval failures on aarch64"
+    if re.fullmatch(r"(?:are\s+there\s+)?any\s+das\s+errors?(?:\s+(?:right\s+)?now)?", text, re.IGNORECASE):
+        return "how many DAS errors in the latest IB"
+    worst = re.fullmatch(r"(?:give\s+me\s+|show\s+me\s+)?(?:the\s+)?worst\s+workflow\s+(?:of\s+the|this)\s+week(\s+on\s+\S+)?", text, re.IGNORECASE)
+    if worst:
+        return f"which workflow failed the most this week{worst.group(1) or ''}"
+    if re.search(r"\b(?:what|which)\b[^?]*\bbroke\b[^?]*\b(?:two|2)\s+(?:most\s+recent|latest|newest|last)\s+(?:ibs?|builds?)\b", text, re.IGNORECASE):
+        return "show shift summary"
+    seen = re.fullmatch(r"have\s+we\s+seen\s+(\S+)\s+(?:errors?|exceptions?)\s+before", text, re.IGNORECASE)
+    if seen:
+        return f"which IBs have {seen.group(1)} exception"
+    if re.search(r"\b(?:log|test[\s-]*log)\s+problems?\b[^?]*\bnew\b|\bnew\s+(?:log|test[\s-]*log)\s+problems?\b", text, re.IGNORECASE):
+        return "test-log problems in the latest IB"
+    if re.search(r"\bclang\s+backlog\b", text, re.IGNORECASE):
+        return "clang warnings in the latest IB"
+    many = re.fullmatch(r"does\s+([A-Z][A-Za-z0-9/]+)\s+have\s+(?:many|any|a\s+lot\s+of)\s+(?:clang|static[\s-]*analy[sz]er)\s+warnings", text)
+    if many:
+        return f"clang warnings in {many.group(1)}"
+    ran = re.fullmatch(r"how\s+many\s+(?:workflows|relvals)\s+ran\s+in\s+the\s+(?:newest|latest|last)\s+(\w+)\s+(?:build|ib)", text, re.IGNORECASE)
+    if ran and _flavour_in(ran.group(1).upper()):
+        tag = _newest_flavour_tag(_flavour_in(ran.group(1).upper()))
+        if tag:
+            return f"relvals in {tag}"
+    author = re.fullmatch(r"what\s+prs\s+did\s+(\S+)\s+(?:get\s+)?merged?(?:\s+recently)?", text, re.IGNORECASE)
+    if author:
+        return f"PRs by {author.group(1)}"
+    if re.fullmatch(r"(?:the\s+)?(?:latest|newest|last)\s+pr", text, re.IGNORECASE):
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                newest = session.run("MATCH (p:PR {repo:'cmssw'}) WHERE p.merged_at IS NOT NULL RETURN p.number AS n ORDER BY p.merged_at DESC LIMIT 1").single()
+        finally:
+            driver.close()
+        if newest:
+            return f"PR {newest['n']}"
+    last = _turn_memory.get(sid)
+    named = _last_workflow_contexts.get(sid)
+    listed = re.search(r"`(\d{1,8}\.\d{1,7})[` ]", last["answer"]) if last else None
+    subject = named or (listed.group(1) if listed else None)
+    if last and last.get("route") == "deterministic:ib_variant_glossary" and re.fullmatch(r"is\s+it\s+(?:passing|ok(?:ay)?|clean|green|healthy|failing)", text, re.IGNORECASE):
+        shown_flavour = re.search(r"\*\*(\w+)\*\*", last["answer"])
+        if shown_flavour:
+            return f"is {shown_flavour.group(1)} ok"  # "is it passing?" after "what is ROOT6?" (found 2026-11-05: the LLM said no failures, about the primary)
+    if subject:
+        day_only = re.fullmatch(r"(?:and\s+|what\s+about\s+|how\s+about\s+)?((?:the\s+day\s+before\s+)?yesterday|today|on\s+\S+)", text, re.IGNORECASE)
+        if day_only and named and _named_day(day_only.group(1)):
+            return f"did workflow {named} pass {day_only.group(1)}"
+        if re.fullmatch(r"(?:pick\s+one|choose\s+one|any\s+one)(?:\s+and\s+explain(?:\s+it)?)?|explain\s+(?:the\s+)?first(?:\s+one)?", text, re.IGNORECASE) and listed:
+            return f"why is {listed.group(1)} failing"
+        if re.fullmatch(r"is\s+(?:it|this|that)\s+new|how\s+new\s+is\s+(?:it|this|that)", text, re.IGNORECASE):
+            return f"where is {subject} failing"
+        if re.fullmatch(r"(?:has\s+)?(?:anyone|anybody|someone)\s+reported\s+(?:it|this|that)|is\s+(?:it|this|that)\s+reported", text, re.IGNORECASE):
+            return f"is there an issue for {subject}"
+    return None
+
+
+def _pending_label_answer(question: str) -> str | None:
+    """ "PRs waiting for signatures from core" (found 2026-11-05: a text search for "waiting signatures core"; the labels say it, e.g. core-pending)."""
+    match = re.search(r"\bprs?\b[^?]*\b(?:waiting|pending|need\w*)\b[^?]*\b(?:signatures?|sign[\s-]*offs?|approvals?)\s+(?:from|of|by)\s+(?:the\s+)?([a-z0-9-]+)", question, re.IGNORECASE)
+    if not match:
+        return None
+    label = f"{match.group(1).lower()}-pending"
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (p:PR {repo:'cmssw'})-[:HAS_LABEL]->(:Label {name:$l}) WHERE p.github_state = 'open' AND p.merged_at IS NULL RETURN p.number AS n, p.title AS title, p.release AS release ORDER BY n DESC", l=label)]
+    finally:
+        driver.close()
+    if not rows:
+        return f"No imported open PR has the label `{label}`. {_github_export_note()}."
+    lines = [f"**{len(rows)} open PR(s)** have the label `{label}`, newest first:"] + [f"- **PR #{r['n']}** `{r['release'] or '?'}` - {r['title']}" for r in rows[:15]]
+    if len(rows) > 15:
+        lines.append(f"\nFirst 15 of {len(rows)}.")
+    lines.append(f"\n{_github_export_note()}.")
+    return "\n".join(lines)
+
+
+def _top_issue_openers_answer(question: str) -> str | None:
+    """ "who opened the most issues this year?" (found 2026-11-05: a text search for "most year")."""
+    if not re.search(r"\bwho\b[^?]*\b(?:opened|filed|created|reported)\b[^?]*\bmost\s+issues\b", question, re.IGNORECASE):
+        return None
+    since = f"{datetime.now().year}-01-01" if re.search(r"\bthis\s+year\b", question, re.IGNORECASE) else (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d") if re.search(r"\bthis\s+month\b", question, re.IGNORECASE) else "0"
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (i:Issue {repo:'cmssw'})-[:AUTHORED_BY]->(a:Author) WHERE i.created_at >= $s RETURN a.name AS who, count(i) AS n ORDER BY n DESC LIMIT 8", s=since)]
+    finally:
+        driver.close()
+    if not rows:
+        return None
+    scope = f" since {since}" if since != "0" else ""
+    return f"Authors of the most imported cmssw Issues{scope}:\n" + "\n".join(f"- `{r['who']}`: {r['n']}" for r in rows) + f"\n\n{_github_export_note()}."
+
+
+def _dashboard_hidden_answer(question: str) -> str | None:
+    """ "does the IB dashboard show hidden problems?" (found 2026-11-05: the list of problems, not the answer)."""
+    if re.search(r"\bdashboard\b[^?]*\b(?:hidden|log)\s+problems?\b|\b(?:hidden|log)\s+problems?\b[^?]*\bdashboard\b", question, re.IGNORECASE):
+        return "No: hidden problems are inside tests the dashboard reports as passed. They come from scanning the raw test logs, so only this chat and the Shift Console show them."
+    return None
+
+
+def _flavour_not_on_date_answer(question: str) -> str | None:
+    """ "unit tests in UBSAN for CMSSW_20_1_X_2026-11-03-2300" when UBSAN wasn't built then (found 2026-11-05: the primary's failures, without saying so)."""
+    match = re.search(r"\bCMSSW_(\d+)_(\d+)_X_(\d{4}-\d{2}-\d{2}-\d{4})\b", question)
+    if not match or re.search(r"\b(?:compare|vs|versus|diff\w*|mean|why)\b|\bclang\s+(?:warnings?|checkers?|findings?)\b", question, re.IGNORECASE):
+        return None
+    flavour = _flavour_in(question.replace(match.group(0), " "))
+    if not flavour:
+        return None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            exists = session.run("MATCH (ib:IB {tag:$t}) RETURN count(ib) AS n", t=f"CMSSW_{match.group(1)}_{match.group(2)}_{flavour}_X_{match.group(3)}").single()["n"]
+    finally:
+        driver.close()
+    if exists:
+        return None
+    newest = _newest_flavour_tag(flavour, (int(match.group(1)), int(match.group(2))), with_results=False)
+    return f"`{flavour}` has no build at {match.group(3)}, so I can't answer for it there." + (f" Its newest `CMSSW_{match.group(1)}_{match.group(2)}` build is `{newest}`." if newest else "")
+
+
 def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     """Answers the 2026-11-04 test pass found missing; each returns None unless its phrasing matches."""
     if "\n" in question or len(question) > 200:
@@ -17303,7 +17489,7 @@ def _shift_direct_answer(question: str, sid: str) -> tuple[str, str] | None:
     step = _workflow_step_answer(question, sid)
     if step:
         return step, "deterministic:workflow_step"
-    for handler, route in ((_unknown_name_answer, "unknown_name"), (_about_the_bot_answer, "about_the_bot"), (_github_small_number_answer, "github_number"), (_exit_code_not_a_number_answer, "exit_code"), (_backport_answer, "backport"),
+    for handler, route in ((_unknown_name_answer, "unknown_name"), (_about_the_bot_answer, "about_the_bot"), (_flavour_not_on_date_answer, "flavour_not_on_date"), (_dashboard_hidden_answer, "dashboard_hidden"), (_pending_label_answer, "pending_label"), (_top_issue_openers_answer, "top_issue_openers"), (_github_small_number_answer, "github_number"), (_exit_code_not_a_number_answer, "exit_code"), (_backport_answer, "backport"),
                            (_workflow_on_day_answer, "workflow_on_day"), (_arch_on_day_answer, "arch_on_day"), (_arch_missing_why_answer, "arch_missing_why"),
                            (_prs_between_days_answer, "prs_between_days"), (_recent_prs_answer, "recent_prs"), (_most_commented_answer, "most_commented"),
                            (_clang_detail_answer, "clang_detail"), (_log_problem_filter_answer, "log_problem_filter"), (_flavours_by_time_answer, "flavours_by_time"), (_ibs_for_arch_answer, "ibs_for_arch"),
@@ -17415,6 +17601,10 @@ def _chat(req: ChatRequest):
     listed_follow_up = _listed_items_follow_up(original_question, sid)
     if listed_follow_up:
         return _chat_response(sid, original_question, listed_follow_up, "deterministic:listed_items_follow_up")
+    everyday = _everyday_wording_rewrite(original_question, sid)
+    if everyday:
+        original_question = everyday
+        question = _normalize_deterministic_question(everyday)
     rewritten = _resolve_short_follow_up(original_question, sid)
     if rewritten:
         original_question = rewritten
@@ -17429,6 +17619,10 @@ def _chat(req: ChatRequest):
     if shift_rewrite and _rewrite_lost_arch_word(original_question, shift_rewrite):
         shift_rewrite = None
     if shift_rewrite:
+        named_arch = _requested_ib_arch(original_question)
+        if named_arch and named_arch not in shift_rewrite:
+            # "which workflow failed the most this week on el9_amd64_gcc14" asked which architecture (found 2026-11-05)
+            shift_rewrite = f"{shift_rewrite} on {named_arch}"
         original_question = shift_rewrite
         question = _normalize_deterministic_question(shift_rewrite)
     flavour_tag = _with_named_flavour_tag(original_question)
