@@ -173,6 +173,49 @@ class PackageFollowUpTests(unittest.TestCase):
         self.assertEqual(_resolve_short_follow_up("and in the build before?", "f"), "is SimG4Core/Geometry failing in CMSSW_17_0_X_2026-11-03-2300")
 
 
+class WorkflowInSeriesTests(unittest.TestCase):
+    def test_the_newest_failing_primary_of_that_series(self):
+        driver, session = _driver_with([{"t": "CMSSW_16_1_X_2026-11-03-1100"}, {"t": "CMSSW_16_1_ROOT6_X_2026-11-04-1100"}])
+        with patch("server.api_server.get_driver", return_value=driver):
+            tag = api_server._workflow_newest_failing_primary_tag("10805.31", (16, 1))
+        self.assertEqual(tag, "CMSSW_16_1_X_2026-11-04-1100")
+        self.assertEqual(session.run.call_args.kwargs["prefix"], "CMSSW_16_1_")
+
+    def test_no_failure_there_is_none(self):
+        driver, _session = _driver_with([])
+        with patch("server.api_server.get_driver", return_value=driver):
+            self.assertIsNone(api_server._workflow_newest_failing_primary_tag("10805.31", (16, 1)))
+
+
+class ShifterSummaryWordingTests(unittest.TestCase):
+    def test_shifter_summary_means_shift_summary(self):
+        self.assertEqual(api_server._shift_question_rewrite("shifter summary for 11-04"), "shift summary for 11-04")
+        self.assertEqual(api_server._shift_question_rewrite("shifter digest for yesterday"), "shift digest for yesterday")
+
+    def test_what_a_series_looks_like(self):
+        self.assertEqual(api_server._shift_question_rewrite("what does the 16_1 IB look like?"), "what is failing in 16_1")
+
+
+class ArchBuildOutTests(unittest.TestCase):
+    def _ask(self, question, archs):
+        driver, _session = _driver_with([{"a": a} for a in archs])
+        with patch("server.api_server.get_driver", return_value=driver), \
+                patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-11-04-1100"}]):
+            return api_server._arch_build_out_answer(question)
+
+    def test_not_yet_and_yes(self):
+        self.assertIn("Not yet: `CMSSW_20_1_X_2026-11-04-1100` has no imported `el10`", self._ask("is el10 out for the 11-04 11:00 build?", ["el8_amd64_gcc14"]))
+        self.assertIn("Not yet", self._ask("is aarch64 of the 11-04-1100 build out yet?", ["el8_amd64_gcc14"]))
+        self.assertIn("Yes: `CMSSW_20_1_X_2026-11-03-2300`", self._ask("is aarch64 ready for 11-03 23:00?", ["el9_aarch64_gcc14"]))
+
+    def test_left_alone(self):
+        self.assertIsNone(api_server._arch_build_out_answer("is el10 failing on 11-04?"))
+        self.assertIsNone(api_server._arch_build_out_answer("is aarch64 failing in CMSSW_20_1_X_2026-11-04-1100?"))
+
+    def test_a_named_ib(self):
+        self.assertIn("Not yet: `CMSSW_20_1_X_2026-11-04-1100`", self._ask("is aarch64 of the CMSSW_20_1_X_2026-11-04-1100 build out yet?", ["el8_amd64_gcc14"]))
+
+
 class UnitSummaryArchScopeTests(unittest.TestCase):
     @patch("server.api_server.get_failing_unittests", return_value=[{"name": "A/B", "errors": 1}])
     @patch("server.api_server._sub_ib_variant_tags", return_value=[{"tag": "CMSSW_20_1_ROOT6_X_2026-11-03-2300", "variant": "ROOT6"}])
