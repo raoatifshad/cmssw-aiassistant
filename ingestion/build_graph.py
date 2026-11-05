@@ -997,10 +997,20 @@ def github_issue_from_issue(issue: dict) -> dict | None:
     }
 
 
+# Not references to GitHub items: stack frames quoted in bodies ("#7  0x0000150c in foo () from /lib") -- found 2026-11-05 when
+# Issue #52323 "linked" PRs #6 and #7, about 6% of the numbers in bodies -- and counters such as "thread #3".
+GITHUB_NOT_A_REFERENCE_PATTERN = re.compile(
+    r"#\d{1,3}\s+(?:0x[0-9a-fA-F]+|<signal\b)"
+    r"|(?m:^[\s>`|]*#\d{1,3}\s+[\w:~<>,*&. -]+\(.*\)(?:\s+(?:at|from)\s.*)?$)"
+    r"|\b(?:thread|frame|event|lumi|stream|step|run|job|module|record|entry|item)\s+#\d+",
+    re.IGNORECASE)
+
+
 def github_reference_numbers(text: str) -> list[int]:
-    text = text or ""
+    text = GITHUB_NOT_A_REFERENCE_PATTERN.sub(" ", text or "")
     return sorted({
-        *(int(number) for number in GITHUB_REFERENCE_PATTERN.findall(text)),
+        # "#3" under 100 is a counter ("tested with whiteRabbit #3"), not one of cmssw's first PRs; a full URL still counts
+        *(int(number) for number in GITHUB_REFERENCE_PATTERN.findall(text) if int(number) >= 100),
         *(int(number) for number in GITHUB_ITEM_URL_PATTERN.findall(text)),
     })
 
