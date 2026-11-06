@@ -5,6 +5,9 @@ from openai import OpenAI
 
 load_dotenv()
 DEFAULT_MODEL = os.environ.get("CERN_MODEL", "hf-qwen3-32b-awq")
+# A second opinion from a different model: it checks what DEFAULT_MODEL concluded (user, 2026-11-05: "don't blindly trust the results"). Measured on
+# pasted errors: glm-5.3-flash-int4 says "same problem" too easily, gpt-oss-20b too rarely, and they rarely err on the same item.
+REVIEW_MODEL = os.environ.get("CERN_REVIEW_MODEL", "gpt-oss-20b")
 
 
 # The openai SDK's own default timeout is very long (10 minutes) -- under
@@ -22,4 +25,5 @@ def get_client() -> OpenAI:
     api_key = os.environ.get("CERN_API_KEY")
     if not base_url or not api_key:
         raise RuntimeError("Set CERN_API_BASE and CERN_API_KEY in .env")
-    return OpenAI(base_url=base_url, api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS)
+    # the SDK retries twice by default, which turned a 15 s limit into 45 s of silence (found 2026-11-05); each caller has its own way to go on without the reply
+    return OpenAI(base_url=base_url, api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=0)

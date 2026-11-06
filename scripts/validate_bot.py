@@ -20,6 +20,7 @@ as the graph is refreshed.
 """
 from __future__ import annotations
 
+import os
 import argparse
 import re
 import sys
@@ -322,7 +323,7 @@ def build_answer_verification_scenarios(tag: str) -> list[Scenario]:
 
 
 def run(base_url: str, with_capability_fallback: bool = False, with_answer_verification: bool = False) -> int:
-    client = httpx.Client(base_url=base_url, timeout=30.0)
+    client = httpx.Client(base_url=base_url, timeout=float(os.environ.get("VALIDATE_TIMEOUT", "30")))
 
     health = client.get("/api/health")
     health.raise_for_status()
