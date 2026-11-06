@@ -45,11 +45,10 @@ from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # n
 from server.llm_client import DEFAULT_MODEL, REVIEW_MODEL, get_client  # noqa: E402
 from server.cmssw_source import check_names, source_excerpts, source_version  # noqa: E402
 from server.question_catalog import KNOWN_QUESTIONS  # noqa: E402
-from graph.analytics import newest_complete_primary, partial_builds, pr_origin  # noqa: E402
+from graph.analytics import neighbour_build, newest_complete_primary, partial_builds, pr_origin, relval_counts  # noqa: E402
 from server.agent import (  # noqa: E402
     parse_json_reply,
     judge_answer_fit,
-    choose_better_answer,
     route_to_known_question,
     resolve_follow_up,
     verify_answer_against_evidence,
@@ -76,7 +75,7 @@ from log_rag.retriever import HybridRetriever  # noqa: E402
 SYSTEM_PROMPT = f"""You are the CMSSDT AI Chatbot (knowledge graph edition). \
 People quote these answers. A RelVal with status FAILED and known_error=true is a known error, not a failure: in query_graph add coalesce(r.known_error,false)=false when counting failures. "Reported" means a PR or an Issue, never a warning. Never say a problem is expected or intentional: give what the logs show, say a person has to confirm that. Never say what caused a failure, that it is or isn't a code bug, that it is flaky, external or infrastructure, or whether to open an issue, unless a result says so: give what the results show and say the cause isn't established. Give usernames only, never a person's real name. If no architecture was named, cover every architecture of that build, not only one. \
 Prefer the filtered lookups (relval_counts, ib_coverage, release_health, compare_relvals, workflow_history, flaky_workflows, search_github, warning_counts, log_problem_counts, exception_counts, unit_test_changes, build_status_list): one call usually answers, and they already leave out known errors and flag partly imported builds. Use query_graph only for what they can't express, and answer as soon as you have the result. \
-A workflow or test with no row in a build has no result there yet: never call it passed, fixed or resolved. An IB may be only partly imported (far fewer RelVals than the same architecture's previous build), so check that before calling a comparison complete, and compare only what has rows in both builds. \
+Never say a build, a package or a result isn't imported unless a lookup for exactly that came back empty: a package missing from a list of failures passed, it has not "no result". When a question says primary, pass primary_only=true. "Timed out" means exit code 31744 (TimeOut): use relval_counts with that exit_code, not a search of the logs. A flavour is a sub-IB variant such as ASAN or ROOT6, never an architecture. unit_test_changes looks at primary builds by default: name anything in also_failed_in_sub_ibs, and never say a package has no failures when it is listed there. Failure counts leave out DAS_ERROR results (input files not found, nothing ran), and the IB dashboard counts those as failed: when relval_counts reports das_errors_left_out, name them as DAS errors next to the count, for example "2 failed, plus 1 DAS error". A primary tag in relval_counts includes its sub-IBs: when the total does, say "the primary and its sub-IBs" and give primary_builds_only too; never write a total including sub-IBs as if it were the primary build. Say how many of the wanted items a figure covers when a field such as additions is missing on some: "biggest" among 3 of 18 is not the biggest. A workflow or test with no row in a build has no result there yet: never call it passed, fixed or resolved. An IB may be only partly imported (far fewer RelVals than the same architecture's previous build), so check that before calling a comparison complete, and compare only what has rows in both builds. \
 You answer questions about CMSSW Integration Build data — clang warnings, \
 RelVals, unit tests, and PRs — using ONLY the tools provided. The data \
 lives in a Neo4j knowledge graph. Never guess at numbers.
@@ -672,6 +671,42 @@ def _plain_hyphens(text: str) -> str:
     return re.sub("[\u2010\u2011\u2012]", "-", text).replace("\u202f", " ").replace("\u00a0", " ")
 
 
+_NOT_IMPORTED_CLAIM_RE = re.compile(r"[^.\n]*\b(?:isn't|is\s+not|aren't|are\s+not|wasn't|not)\b[^.\n]{0,40}\b(?:in\s+the\s+graph|imported|in\s+the\s+(?:imported\s+)?data)\b[^.\n]*", re.IGNORECASE)
+
+
+def _existing_builds_denied(answer: str) -> list[str]:
+    """Builds an answer calls missing that do exist. A statement about one architecture can be true, so those are left alone."""
+    tags = IB_TAG_RE.findall(answer)
+    named: set[str] = set()
+    for claim in _NOT_IMPORTED_CLAIM_RE.findall(answer):
+        if _ARCH_CLAIM_RE.search(claim):
+            continue
+        stamps = re.findall(r"(?<![\d-])(\d{2}-\d{2}-\d{4})(?![\d-])", IB_TAG_RE.sub(" ", claim))
+        if stamps and tags:  # "the 11-03-1100 primary slot"; a full tag next to it is only context
+            head, year = tags[0].rsplit("_X_", 1)[0], tags[0][-15:-11]
+            head = re.sub(r"^(CMSSW_\d+_\d+)_[A-Za-z0-9]+$", r"\1", head)
+            named.update(f"{head}_X_{year}-{stamp}" for stamp in stamps)
+        else:
+            named.update(IB_TAG_RE.findall(claim))
+    if not named:
+        return []
+    return sorted(tag for tag in named if _identifiers_exist({tag}))
+
+
+def _identifiers_exist(identifiers: set[str]) -> bool:
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                found = session.run("MATCH (ib:IB) WHERE ib.tag IN $ids OR ib.arch IN $ids RETURN collect(DISTINCT ib.tag) + collect(DISTINCT ib.arch) AS found", ids=sorted(identifiers)).single()["found"]
+        finally:
+            driver.close()
+    except Exception as exc:
+        print(f"WARNING: identifier check failed: {exc}")
+        return False
+    return set(identifiers) <= set(found)
+
+
 def _identifiers_grounded(answer: str, tool_evidence: list[dict], question: str = "") -> bool:
     """Every IB tag and architecture an LLM answer names must appear in the question or
     in what the tools returned.
@@ -682,7 +717,12 @@ def _identifiers_grounded(answer: str, tool_evidence: list[dict], question: str 
     # would otherwise be "in the evidence" (the live case above did exactly that)
     evidence_text = question + json.dumps([item.get("result") for item in tool_evidence], default=str)
     claimed = set(IB_TAG_RE.findall(answer)) | set(_ARCH_CLAIM_RE.findall(answer))
-    return all(identifier in evidence_text for identifier in claimed)
+    missing = {identifier for identifier in claimed if identifier not in evidence_text}
+    if not missing:
+        return True
+    # A tool's results needn't repeat the build it was asked about (found 2026-11-06: the PRs of CMSSW_20_1_X_2026-11-04-1100 ended in "I couldn't answer"): fine if it was looked up and does exist
+    arguments = json.dumps([item.get("arguments") for item in tool_evidence], default=str)
+    return all(identifier in arguments for identifier in missing) and _identifiers_exist(missing)
 
 
 # List/step numbering ("1. Open a PR", "**2. Review**", "Step 3:") is layout,
@@ -1133,6 +1173,7 @@ def _normalize_deterministic_question(question: str) -> str:
         (r"(?<!relval )(?<!relvals )\bexceptions?\s+(in|for|of)\s+(?=CMSSW_\d)", r"relval exceptions \1 "),
         # "which PRs went into <tag>" = merged in (found in a held-out pass 2026-10-15)
         (r"\b(?:went|got|go|come|came)\s+into\b|\b(?:are|were)\s+included\s+in\b", "were merged in"),
+        (r"\b(prs?)\s+(?:were|are|was|is)\s+in\b", r"\1 were merged in"),  # found 2026-11-06: "which PRs were in the ... build?" became a word search
         (r"\bnumber\s+of\b", "number"),
         # (?<![\w-]) / (?![\w-]) instead of \b on both sides: \b alone treats
         # a hyphen as a word boundary, so this used to also fire inside an
@@ -7401,6 +7442,8 @@ def _architectures_answer(question: str) -> str | None:
     match = _ARCH_LIST_RE.search(question)
     if not match or re.search(r"\bfail\w*|\bbroken|\berrors?\b|\bwarnings?\b", question, re.IGNORECASE):
         return None
+    if re.fullmatch(r"\s*(?:(?:the\s+)?\w+\s+one,?\s+)?(?:on|in)\s+(?:which|what)\s+arch\w*\s*[?.!]*\s*", question, re.IGNORECASE):
+        return None  # about what was just said, not the release (found 2026-11-06: the list of all architectures, twice)
     tag_match = IB_TAG_RE.search(question)
     if tag_match:
         # "which architectures does <tag> have?" is about that build, not its whole release
@@ -9056,6 +9099,22 @@ def _run_llm_investigation(
             answer = _format_raw_evidence(evidence)
             return _respond(answer, f"{route_prefix}llm_ungrounded_fallback", citations)
         answer = _plain_hyphens(answer)
+        if not _identifiers_grounded(answer, evidence, question):
+            # found 2026-11-06: three follow-ups ended in "name the IB tag" because the model guessed last night's tag, which isn't imported
+            looked_up = question + json.dumps([item.get("result") for item in evidence], default=str)
+            unknown = sorted(i for i in set(IB_TAG_RE.findall(answer)) | set(_ARCH_CLAIM_RE.findall(answer)) if i not in looked_up)[:8]
+            print(f"LLM answer named identifiers outside its results: {unknown} for {question[:80]!r}")
+            retried = session.ask(f"These builds or architectures aren't in the tool results: {unknown}. They may not exist. Find which do with list_ib_tags or relval_counts if you need to, then write the complete answer for the user again, naming only builds and architectures the tools returned; if the build asked about isn't imported, say so and give the newest one that is. "
+                                  "Write it as if for the first time: don't mention this message, a correction or a previous answer.")
+            if retried and not retried.startswith("API error"):
+                answer = _plain_hyphens(retried)
+        denied = _existing_builds_denied(answer)
+        if denied:
+            print(f"LLM answer says builds aren't imported that are: {denied} for {question[:80]!r}")
+            retried = session.ask(f"These builds are imported, with results: {denied}. Look them up with ib_coverage or relval_counts, then write the complete answer for the user again. "
+                                  "Write it as if for the first time: don't mention this message, a correction or a previous answer.")
+            if retried and not retried.startswith("API error"):
+                answer = _plain_hyphens(retried)
         if not _evidence_grounded(answer, evidence):
             # raw records are a poor answer: one chance to correct it (found 2026-11-05: "is tonight's build usable?" got a dump because of one count the model added up itself)
             wrong = sorted(_extract_numbers(_strip_enumerations(answer)) - _extract_numbers(json.dumps(evidence, default=str)))[:8]
@@ -11207,6 +11266,49 @@ def _not_failing_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+_WINDOW_DAYS_RE = re.compile(r"\b(?:this|past|last)\s+week\b|\b(?:last|past)\s+(\d+|two|three|four|five|six|seven)\s+days\b|\bthis\s+month\b", re.IGNORECASE)
+_DAY_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7}
+
+
+def _exit_code_window_answer(question: str) -> str | None:
+    """ "which workflows timed out in 20_1 in the last three days?" (found 2026-11-06: the newest build only, or a search of the logs that missed 539.0 and its 58 timeouts)."""
+    window = _WINDOW_DAYS_RE.search(question)
+    written = window.group(1)
+    now = datetime.now(timezone.utc)
+    if "month" in window.group(0).lower():
+        since = now.strftime("%Y-%m-01")
+    else:
+        days = 7 if not written else _DAY_WORDS.get(written.lower()) or int(written)
+        since = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+    number = re.search(r"\bexit\s*(?:code|status)?\s*(\d{1,6})\b", question, re.IGNORECASE)
+    try:
+        names = get_exit_code_names()
+    except Exception:
+        names = {}
+    code = int(number.group(1)) if number else next((c for c, n in names.items() if re.search(rf"\b{re.escape(str(n))}\b", question, re.IGNORECASE)), None)
+    if code is None:
+        return None
+    series = _requested_release_series(question)
+    if not series:
+        latest = _latest_ib_records()
+        match = re.match(r"CMSSW_(\d+)_(\d+)_", latest[0]["tag"]) if latest else None
+        series = (int(match.group(1)), int(match.group(2))) if match else None
+    if not series:
+        return None
+    release = f"{series[0]}_{series[1]}"
+    arch = _requested_ib_arch(question)
+    result = relval_counts("workflow", release=release, arch=arch, since=since, exit_code=str(code))
+    label = f"exit code {code}" + (f" ({names[code]})" if names.get(code) else "")
+    where = f"`CMSSW_{release}` builds since {since}" + (f" on `{arch}`" if arch else "")
+    if not result["rows"]:
+        return f"No RelVal failed with {label} in {where}, known errors left out."
+    lines = [f"**{result['distinct']} RelVal workflow(s)** failed with {label} in {where}, primary and sub-IBs, known errors left out "
+             f"({result['total_results']} results, {result['primary_builds_only']} of them in primary builds):", "",
+             "| Workflow | Name | Results | Builds | Architectures | Last failed |", "| --- | --- | ---: | ---: | --- | --- |"]
+    lines += [f"| `{r['workflow']}` | {r.get('name') or ''} | {r['results']} | {r['builds']} | {', '.join(f'`{a}`' for a in r['archs'])} | {r['last']} |" for r in result["rows"][:20]]
+    return "\n".join(lines)
+
+
 def _relval_by_exit_code_answer(question: str) -> str | None:
     """ "How many workflows failed with LogicError in <tag>?" / "which relvals failed with exit
     code 256 in <tag>" -- held-out pass 2026-10-15 answered with all 938 failures, not the 885
@@ -11221,6 +11323,8 @@ def _relval_by_exit_code_answer(question: str) -> str | None:
     if not re.search(r"\bfail(?:ed|ing|s)?\s+with\b|\b(?:with|have|has|had|having|got|get)\s+(?:an?\s+|the\s+)?exit\s*code\b",
                      question, re.IGNORECASE):
         return None
+    if not IB_TAG_RE.search(question) and _WINDOW_DAYS_RE.search(question):
+        return _exit_code_window_answer(question)
     tag_match = IB_TAG_RE.search(question)
     if not tag_match:
         if not _is_latest_ib_question(question):
@@ -11252,7 +11356,7 @@ def _relval_by_exit_code_answer(question: str) -> str | None:
                 "MATCH (ib:IB) WHERE (ib.tag = $t OR ib.parent_tag = $t) AND ($arch IS NULL OR ib.arch = $arch) "
                 "MATCH (ib)-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE r.exitcode = $code "
                 "AND NOT coalesce(r.known_error, false) "
-                "RETURN ib.tag AS tag, ib.arch AS arch, count(r) AS n, collect(r.workflow_id)[0..5] AS examples "
+                "RETURN ib.tag AS tag, ib.arch AS arch, count(r) AS n, collect(r.workflow_id)[0..5] AS examples, collect(DISTINCT r.workflow_id) AS workflows "
                 "ORDER BY n DESC", t=tag, arch=arch, code=code)]
             total_failed = session.run(
                 "MATCH (ib:IB) WHERE (ib.tag = $t OR ib.parent_tag = $t) AND ($arch IS NULL OR ib.arch = $arch) "
@@ -11266,8 +11370,10 @@ def _relval_by_exit_code_answer(question: str) -> str | None:
         return (f"No RelVal in `{tag}` or its sub-IBs{scope} failed with exit code {label} "
                 f"({total_failed:,} failed with other exit codes).")
     n = sum(r["n"] for r in rows)
-    lines = [f"**{n:,} RelVal workflow(s)** failed with exit code {label} in `{tag}` and its sub-IBs{scope} "
-             f"(of {total_failed:,} failing):", ""]
+    # one workflow in three flavours is one workflow (found 2026-11-06: "3 RelVal workflows", all 537.0)
+    workflows = {w for r in rows for w in r.get("workflows", r["examples"])}
+    lines = [f"**{len(workflows):,} RelVal workflow(s)** failed with exit code {label} in `{tag}` and its sub-IBs{scope}: "
+             f"{n:,} result(s) of {total_failed:,} failing:", ""]
     for r in rows[:10]:
         lines.append(f"- `{r['tag']}` on `{r['arch']}`: **{r['n']:,}**, e.g. " + ", ".join(f"`{w}`" for w in r["examples"]))
     return "\n".join(lines)
@@ -13945,7 +14051,9 @@ def _pr_broke_answer(question: str) -> str | None:
                 return session.run(
                     "MATCH (ib:IB {tag:$t}) "
                     "RETURN collect(DISTINCT ib.build_status) AS build, "
-                    "sum(COUNT { (ib)-[:RAN_RELVAL]->(:RelVal {status:'FAILED'}) }) AS relvals, "
+                    # known errors left out (found 2026-11-06: "3 failing, then 62 with the PR", 50 of them known errors on architectures the build before didn't have)
+                    "sum(COUNT { (ib)-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE NOT coalesce(r.known_error, false) }) AS relvals, "
+                    "count(DISTINCT CASE WHEN COUNT { (ib)-[:RAN_RELVAL]->() } > 0 THEN ib.arch END) AS relval_archs, "
                     "sum(COUNT { (ib)-[:RAN_UNITTEST]->(:UnitTest {status:'FAILED'}) }) AS units, "
                     "sum(COUNT { (ib)-[:RAN_RELVAL]->() }) AS relval_total, "
                     "sum(COUNT { (ib)-[:RAN_UNITTEST]->() }) AS unit_total", t=tag).single()
@@ -13977,6 +14085,9 @@ def _pr_broke_answer(question: str) -> str | None:
                 return f"build `{build}`, {relvals}, {units}"
             lines.append(f"- Before (`{previous}`): {fmt(before)}")
             lines.append(f"- With the PR (`{first}`): {fmt(after)}")
+            lines.append("  (known errors left out)")
+            if after["relval_archs"] != before["relval_archs"]:
+                lines.append(f"- These cover different architectures: {before['relval_archs']} before and {after['relval_archs']} with the PR, so the two counts can't be compared directly.")
             if before and after and (after["relval_total"] or 0) < 0.9 * (before["relval_total"] or 0):
                 lines.append("- Its RelVal results are only partly imported so far, so these numbers can still change.")
         if others:
@@ -14091,7 +14202,7 @@ def _relval_step_failures_answer(question: str, sid: str) -> str | None:
     try:
         with driver.session() as session:
             failing = session.run(
-                "MATCH (ib:IB {tag:$t})-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE ($a IS NULL OR ib.arch = $a) "
+                "MATCH (ib:IB {tag:$t})-[:RAN_RELVAL]->(r:RelVal {status:'FAILED'}) WHERE ($a IS NULL OR ib.arch = $a) AND NOT coalesce(r.known_error, false) "
                 "RETURN count(r) AS n", t=tag, a=arch).single()["n"]
             rows = [dict(r) for r in session.run(
                 "MATCH (e:RelValException {ib_tag:$t}) WHERE ($a IS NULL OR e.arch = $a) "
@@ -15876,6 +15987,8 @@ def _listed_items_follow_up(question: str, sid: str) -> str | None:
     if not last or len(question) > 70 or IB_TAG_RE.search(question) or re.search(r"\d+\.\d+|\b#?\d{4,6}\b", question):
         return None
     answer = last["answer"]
+    if re.search(r"\bprs?\b[^?]*\b(?:between|went\s+in|came\s+in|got\s+in|merged)\b", question, re.IGNORECASE):
+        return None  # asks about builds, not about what was listed (found 2026-11-06: 101 s and a list of Issues for "which PRs went in between them?")
     if re.fullmatch(r"\s*who(?:'s|\s+is)\s+(?:looking\s+at|working\s+on)\s+(?:it|this|that)\s*[?.!]*\s*", question, re.IGNORECASE):
         named = re.search(r"`(\d{1,8}\.\d{1,7})`", answer)
         if named:
@@ -16611,7 +16724,34 @@ def _latest_or_named_tag(question: str) -> str | None:
 _PER_DIMENSION_RE = re.compile(
     r"\b(?:which|what)\s+(?:is\s+the\s+)?(?:worst\s+|best\s+)?(arch\w*|sub[\s-]*ibs?|flavou?rs?|variants?)\b[^?]*\b(?:most|worst|fewest|least|best|healthiest|cleanest)\b|"
     r"\b(?:worst|best)\s+(arch\w*|sub[\s-]*ibs?|flavou?rs?)\b|"
-    r"\b(?:failures?|fails?|failing\s+\w+|relvals?\s+failures?)(?:\s+counts?)?\s+(?:per|by|for\s+each|in\s+each)\s+(arch\w*|sub[\s-]*ibs?|flavou?rs?|variants?)\b", re.IGNORECASE)
+    r"\b(?:failures?|fails?|failed|failing\s+\w+|relvals?\s+failures?)(?:\s+counts?)?\s+(?:per|by|for\s+each|in\s+each)\s+(arch\w*|sub[\s-]*ibs?|flavou?rs?|variants?)\b", re.IGNORECASE)
+
+
+_FLAVOURS_OF_BUILD_RE = re.compile(r"\bhow\s+many\s+(?:sub[\s-]*ib\s+)?(?:flavou?rs?|sub[\s-]*ibs?|variants?)\b|\bwhich\s+(?:sub[\s-]*ib\s+)?(?:flavou?rs?|sub[\s-]*ibs?|variants?)\s+(?:does|did|has|have|had|are\s+in|were\s+in)\b", re.IGNORECASE)
+
+
+def _flavours_of_build_answer(question: str) -> str | None:
+    """ "how many sub-IB flavours does the 2026-11-03-2300 20_1 build have?" (found 2026-11-06: "imported as a primary IB, not a sub-IB variant", and the newest build for another phrasing)."""
+    if not _FLAVOURS_OF_BUILD_RE.search(question):
+        return None
+    written = _dated_primary_question(question) or question
+    tag = _latest_or_named_tag(written)
+    if not tag:
+        return None
+    records = _ib_build_records(tag)
+    if not records:
+        return None
+    archs: dict[str, list[str]] = {}
+    for r in records:
+        archs.setdefault(r["variant"], []).append(r["arch"])
+    subs = sorted(v for v in archs if v != "primary")
+    listed = ", ".join(f"`{v}` ({', '.join(f'`{a}`' for a in sorted(archs[v]))})" for v in subs)
+    return (f"`{tag}` has **{len(subs)} sub-IB flavour(s)** imported besides the primary build" + (f": {listed}." if subs else ".")
+            + (f" The primary runs on {len(archs.get('primary', []))} architecture(s)." if archs.get("primary") else "")
+            + " A flavour's results can land hours later, and the data is refreshed twice a day.")
+
+
+_PER_FLAVOUR_RE = re.compile(r"\b(?:fail\w*)\b[^?]*\b(?:per|by|for\s+each|in\s+each)\s+(?:flavou?r|sub[\s-]*ib|variant|build\s+type)s?\b", re.IGNORECASE)
 
 
 def _failures_by_dimension_answer(question: str) -> str | None:
@@ -19254,6 +19394,8 @@ _ai_supervisor_history: dict[str, list[dict]] = {}
 
 
 # "which issue was updated most recently?" -> 'No imported CMSSW Issue or PR title/description contains "updated most"': ordinary words searched as text, and the judge let it pass (found 2026-11-05)
+_ARCH_CHOICE_START = "RelVal failures over this period span several architectures"
+_ASKS_ABOUT_FAILURES_RE = re.compile(r"\b(?:fail\w*|relvals?|workflows?|recurring|frequent|top)\b", re.IGNORECASE)  # "in which tests?" and "is it new?" got this menu (found 2026-11-06)
 _WORD_SEARCH_DEAD_END_RE = re.compile(r"\s*No\s+(?:imported\s+)?(?:CMSSW\s+)?(?:Issue|PR)\b[^\n]{0,60}\bcontains\b")
 _SAYS_PARTIAL_RE = re.compile(r"\b(?:partly|partial\w*|incomplete|still\s+(?:being\s+)?(?:import\w*|running|arriving)|not\s+imported\s+yet|may\s+still\s+be\s+running|results?\s+imported|of\s+\d[\d,]*\s+imported|\d[\d,]*\s+of\s+(?:about\s+|the\s+usual\s+|~)?\d[\d,]*\s+RelVal)\b", re.IGNORECASE)
 
@@ -19401,6 +19543,35 @@ def _without_invented_names(answer: str, evidence: list[dict]) -> str:
     return _REAL_NAME_RE.sub(lambda m: m.group(0) if m.group(2) in known else m.group(1), answer)
 
 
+_RELATIVE_BUILD_RE = re.compile(r"\bthe\s+(?:build|ib)\s+(after|before)\s+`?(CMSSW_\w+?_X_\d{4}-\d{2}-\d{2}-\d{4})`?", re.IGNORECASE)
+
+
+def _resolve_relative_builds(text: str) -> str:
+    """Which build is next is a fact, not for the model to work out (found 2026-11-06: "the build after 11-04-1100" read as 11-05-1100, and "the 11-03-1100 slot isn't in the graph", when it is)."""
+    if not text or not _RELATIVE_BUILD_RE.search(text):
+        return text
+    arch = _requested_ib_arch(text)
+    def replace(match):
+        try:
+            found = neighbour_build(match.group(2), match.group(1).lower(), arch)
+        except Exception as exc:
+            print(f"WARNING: next build lookup failed: {exc}")
+            return match.group(0)
+        return f"`{found}`" if found else match.group(0)
+    return _RELATIVE_BUILD_RE.sub(replace, text)
+
+
+_WITHOUT_KNOWN_RE = re.compile(r"\b(?:without|excluding|not\s+counting|ignoring|no)\s+(?:the\s+)?known[\s-]+errors?\b", re.IGNORECASE)
+_WITH_KNOWN_RE = re.compile(r",?\s*\(?\b(?:including|counting|with)\s+(?:the\s+)?known[\s-]+errors?\b[^?.]*", re.IGNORECASE)
+
+
+def _keeps_known_error_condition(question: str, standalone: str) -> str:
+    """Found 2026-11-06: "no, on all architectures but without known errors" was rewritten as "counting known errors as failures", and answered 132 instead of 28."""
+    if _WITHOUT_KNOWN_RE.search(question) and _WITH_KNOWN_RE.search(standalone):
+        return _WITH_KNOWN_RE.sub(" without known errors", standalone, count=1)
+    return standalone
+
+
 def _ai_routed(question: str, history: list[dict]) -> dict:
     """{"standalone", "known"}, with the question itself when the model can't be reached."""
     for model in dict.fromkeys((DEFAULT_MODEL, REVIEW_MODEL)):
@@ -19408,7 +19579,7 @@ def _ai_routed(question: str, history: list[dict]) -> dict:
             routed = route_to_known_question(_llm_client, model, question, history, KNOWN_QUESTIONS)
             if routed:
                 # with no conversation there is nothing to resolve, and a rewrite can only change the question ("top clang checker" became "which package", found 2026-11-05)
-                return {"standalone": (routed["standalone"] or question) if history else question, "known": routed["known"]}
+                return {"standalone": _resolve_relative_builds(_keeps_known_error_condition(question, routed["standalone"] or question)) if history else question, "known": _resolve_relative_builds(routed["known"])}
         except Exception as exc:
             print(f"WARNING: AI routing failed on {model}: {exc}")
     return {"standalone": question, "known": ""}
@@ -19430,7 +19601,7 @@ def _ai_supervise(req: ChatRequest, first: "ChatResponse", sid: str, history: li
             return first, ""
         scope_problem = _scope_mismatch(question, first.answer)
         # however the search went: a failed text search is never the answer to a question the AI hasn't tried (an IB date in the question also read as a "name")
-        word_search_dead_end = _WORD_SEARCH_DEAD_END_RE.match(first.answer)
+        word_search_dead_end = _WORD_SEARCH_DEAD_END_RE.match(first.answer) or (first.answer.startswith(_ARCH_CHOICE_START) and not _ASKS_ABOUT_FAILURES_RE.search(question))
         if word_search_dead_end:
             print(f"AI supervisor: {question[:80]!r} became a search for ordinary words")
         if scope_problem:
@@ -19467,6 +19638,16 @@ def _ai_supervise(req: ChatRequest, first: "ChatResponse", sid: str, history: li
         except Exception as exc:
             print(f"WARNING: AI supervisor retry failed: {exc}")
     rewritten = standalone.strip().lower() != question.strip().lower()
+    if rewritten:
+        # written out in full, these are questions the rules already answer (found 2026-11-06: "show me its log" and "and the rntuple ones?" sent to an investigation that can't know)
+        wants_log = _WORKFLOW_LOG_RE.search(question) and re.search(r"(?<![\d.])\d{1,8}\.\d{1,7}(?![\d.])", IB_TAG_RE.sub(" ", standalone))
+        if wants_log or _not_imported_answer(standalone):
+            try:
+                direct = _chat(req.model_copy(update={"question": standalone, "session_id": sid}))
+                if direct.route != _NEEDS_AI_ROUTE and not direct.route.startswith(("clarification", "error")):
+                    return direct.model_copy(update={"route": f"ai_known:{direct.route}"}), standalone
+            except Exception as exc:
+                print(f"WARNING: AI supervisor direct rule failed: {exc}")
     if nothing_yet:
         return _ai_investigated(sid, question, standalone, None), standalone if rewritten else ""
     try:
@@ -19478,13 +19659,9 @@ def _ai_supervise(req: ChatRequest, first: "ChatResponse", sid: str, history: li
     # what is shown to a person never hides that it is about something else than they named
     flagged = first if not scope_problem else first.model_copy(update={"answer": f"**This doesn't cover {scope_problem}, which you asked about; what follows is the closest I found:**\n\n{first.answer}", "route": f"{first.route}:scope_flagged"})
     if not investigated.route.endswith("llm_validated") or _scope_mismatch(question, investigated.answer, investigated=True):
+        if word_search_dead_end:  # a failed word search or an unrelated menu isn't the answer either (found 2026-11-06: "in which tests?" got a menu of architectures after 77 s)
+            return first.model_copy(update={"answer": "I couldn't work this out reliably from the imported data. Please ask it in full, naming the build and what you want to know, for example \"which tests had problems in CMSSW_20_1_X_2026-11-03-2300 on el9_amd64_gcc14?\"", "route": "ai:no_reliable_answer"}), ""
         return flagged, ""
-    try:
-        if not scope_problem and not word_search_dead_end and REVIEW_MODEL != DEFAULT_MODEL and choose_better_answer(_llm_client, REVIEW_MODEL, standalone, first.answer, investigated.answer) == "first":
-            print(f"AI supervisor: kept the first answer to {question[:60]!r}")
-            return first, ""
-    except Exception as exc:
-        print(f"WARNING: comparing the two answers failed: {exc}")
     return investigated, standalone if rewritten else ""
 
 
@@ -19500,6 +19677,14 @@ def _chat(req: ChatRequest):
     resolved_build = _dated_flavour_question(question) or _last_complete_question(question)
     if resolved_build:
         question = original_question = resolved_build
+    flavours = _flavours_of_build_answer(question)
+    if flavours:
+        return _chat_response(sid, original_question, flavours, "deterministic:flavours_of_build")
+    if _PER_FLAVOUR_RE.search(question) and not re.search(r"\b(?:week|month|days?)\b", question, re.IGNORECASE):
+        # before the RelVal summary, which only tells the primary build apart (found 2026-11-06)
+        per_flavour = _failures_by_dimension_answer(_dated_primary_question(question) or question)
+        if per_flavour:
+            return _chat_response(sid, original_question, per_flavour, "deterministic:failures_by_dimension")
     clang_change = _clang_package_change_answer(original_question)
     if clang_change:
         return _chat_response(sid, original_question, clang_change, "deterministic:clang_package_change")

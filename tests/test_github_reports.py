@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import MagicMock, patch
 
-from server.agent import choose_better_answer, draft_fix_suggestion, judge_answer_fit, route_to_known_question, judge_github_matches, parse_json_reply, review_fix_draft, verify_answer_against_evidence
+from server.agent import draft_fix_suggestion, judge_answer_fit, route_to_known_question, judge_github_matches, parse_json_reply, review_fix_draft, verify_answer_against_evidence
 from graph.tools import count_warnings_by_package
 from server.cmssw_source import check_names, code_names, source_excerpts
 from server.api_server import (
@@ -245,10 +245,9 @@ class AiSupervisorTests(unittest.TestCase):
     def misfit(self, standalone="is 537.0 new?"):
         return dict(fits=False, problem="p", standalone_question=standalone)
 
-    def run_chat(self, chats, verdicts, investigated=None, question="is it new?", routed=None, better="second"):
+    def run_chat(self, chats, verdicts, investigated=None, question="is it new?", routed=None):
         with patch("server.api_server._llm_client", new_callable=MagicMock), patch("server.api_server.DEFAULT_MODEL", "a"), patch("server.api_server.REVIEW_MODEL", "b"), \
                 patch("server.api_server.route_to_known_question", return_value=routed or {"standalone": "is 537.0 new?", "known": ""}), \
-                patch("server.api_server.choose_better_answer", return_value=better), \
                 patch("server.api_server._chat", side_effect=chats) as inner, patch("server.api_server.judge_answer_fit", side_effect=verdicts) as judge, \
                 patch("server.api_server._run_llm_investigation", return_value=investigated) as agent, patch("server.api_server._store_chat_turns") as store:
             final = _ai_supervised_chat(ChatRequest(question=question, session_id="s1"))
@@ -279,10 +278,6 @@ class AiSupervisorTests(unittest.TestCase):
         _ai_supervisor_history["s1"] = [{"question": "q", "answer": "a", "route": "deterministic"}]
         final, inner, _judge, agent, _store = self.run_chat([self.response("A")], [self.misfit()], self.response("found", "ai:llm_validated"))
         self.assertEqual(agent.call_args.args[2], "is 537.0 new?")
-
-    def test_a_worse_replacement_loses_to_the_first_answer(self):
-        final, *_ = self.run_chat([self.response("run this command")], [self.misfit()], self.response("not stored", "ai:llm_validated"), better="first")
-        self.assertEqual(final.answer, "run this command")
 
     def test_a_known_answer_that_does_not_fit_is_not_shown(self):
         final, _inner, _judge, agent, _store = self.run_chat([self.response("A"), self.response("B")], [self.misfit(), self.misfit()], self.response("found", "ai:llm_validated"),
@@ -376,12 +371,6 @@ class AiSupervisorTests(unittest.TestCase):
         self.assertTrue(_evidence_grounded("The 23:00 build", [{"result": "CMSSW_20_1_X_2026-11-04-2300"}]))
         self.assertFalse(_evidence_grounded("It has 23 failures", [{"result": "nothing"}]))
 
-    def test_router_and_chooser_replies_are_read_safely(self):
-        self.assertEqual(route_to_known_question(llm_reply('{"standalone": "s", "known": "k"} We need'), "m", "q", [], "list"), {"standalone": "s", "known": "k"})
-        self.assertIsNone(route_to_known_question(llm_reply("no idea"), "m", "q", [], "list"))
-        self.assertEqual(choose_better_answer(llm_reply('{"better": "first"}'), "m", "q", "a", "b"), "first")
-        self.assertIsNone(choose_better_answer(llm_reply('{"better": "both"}'), "m", "q", "a", "b"))
-
     def test_the_conversation_remembers_the_answer_without_our_notes(self):
         tag = "CMSSW_20_1_X_2026-11-05-1100"
         with patch("server.api_server.partial_builds", return_value=[dict(tag=tag, arch="el9", results=3, usual=954)]):
@@ -392,6 +381,20 @@ class AiSupervisorTests(unittest.TestCase):
                 patch("server.api_server._chat", return_value=self.response(f"failures in `{tag}`", "capability:relval")), patch("server.api_server.judge_answer_fit", return_value=self.FITS), patch("server.api_server._store_chat_turns"):
             _ai_supervised_chat(ChatRequest(question="what is failing?", session_id="s1"))
         self.assertEqual(_ai_supervisor_history.pop("s1")[-1]["answer"], f"failures in `{tag}`")
+
+    def test_router_replies_are_read_safely(self):
+        self.assertEqual(route_to_known_question(llm_reply('{"standalone": "s", "known": "k"} We need'), "m", "q", [], "list"), {"standalone": "s", "known": "k"})
+        self.assertIsNone(route_to_known_question(llm_reply("no idea"), "m", "q", [], "list"))
+
+    def test_a_dead_end_is_not_shown_as_the_answer_when_the_investigation_fails(self):
+        menu = self.response("RelVal failures over this period span several architectures, which I don't combine unless you ask. Choose one", "deterministic")
+        final, *_ = self.run_chat([menu], [self.misfit()], self.response("x", "ai:llm_ungrounded_fallback"), question="in which tests?")
+        self.assertEqual(final.route, "ai:no_reliable_answer")
+        self.assertNotIn("Choose one", final.answer)
+
+    def test_the_second_model_doesnt_bring_back_an_answer_the_judge_rejected(self):
+        final, *_ = self.run_chat([self.response("run this command")], [self.misfit()], self.response("not stored", "ai:llm_validated"))
+        self.assertEqual(final.answer, "not stored")
 
     def test_judge_reply_is_read_safely(self):
         self.assertIsNone(judge_answer_fit(llm_reply("I think it fits"), "m", "q", "a"))

@@ -108,6 +108,7 @@ EDGES:
   (IB)-[:HAS_TEST_LOG]->(TestLogRun)
   (TestLogRun)-[:HAS_PROBLEM]->(LogProblem)
   (LogProblem)-[:HAS_SIGNATURE]->(ProblemSignature)
+  // PR.additions, deletions and changed_files exist only on PRs from the dashboard's files, so most have none: say how many of the PRs a "biggest" covers
   (PR)-[:AUTHORED_BY]->(Author)  // who opened it on GitHub: cmsbuild is a bot and ghost a deleted account, so use pr_origin to say who is behind one of those
     (Issue)-[:AUTHORED_BY]->(Author)
     ((PR|Issue))-[:HAS_COMMENT]->(GitHubComment)
@@ -2406,6 +2407,7 @@ def _with_int_limit(fn):
     return wrapper
 
 
-from graph.analytics import ANALYTICS_TOOLS  # noqa: E402
+from graph.analytics import ANALYTICS_TOOLS, find_prs_merged_between as _prs_between_with_merge_times  # noqa: E402
 
 TOOLS = {**ANALYTICS_TOOLS, **{name: _with_int_limit(fn) for name, fn in TOOLS.items()}}
+TOOLS["find_prs_merged_between"] = _with_int_limit(_prs_between_with_merge_times)  # the rules keep this module's own, which the shift digest depends on
