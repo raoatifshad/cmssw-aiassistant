@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import backfill_relval_status
 from build_graph import relval_status
-from server.api_server import _relval_scope_summary, _workflow_where_failing_answer
+from server.api_server import _relval_scope_summary, _release_extreme_answer, _workflow_where_failing_answer
 
 
 class RelvalStatusTests(unittest.TestCase):
@@ -98,6 +98,37 @@ class WorkflowWhereTests(unittest.TestCase):
         self.assertIn("`CMSSW_20_1` primary on `el9_amd64_gcc14` (failing since `CMSSW_20_1_X_2026-10-13-2300`)", answer)
         self.assertIn("Runs: 🔴 1 failed · 🟢 2 passed", answer)
         self.assertIn("Never failed in 1 other release series (`CMSSW_17_0`).", answer)
+
+    def test_since_is_per_architecture_and_an_old_last_run_is_named(self):
+        """Found live 2026-11-06 on 539.0: the primary row said "since 10-29-1100", taken from riscv
+        (last run 10-29); el9 passed until 11-02-1100 and failed from 11-02-2300."""
+        def run(tag, arch, status):
+            return _rows(tag, [arch], status=status, exitcode=0 if status == "PASSED" else 31744, name="W")
+        relvals = (run("CMSSW_20_1_X_2026-10-29-1100", "fc42_riscv64_gcc15", "FAILED")
+                   + run("CMSSW_20_1_X_2026-10-29-2300", "fc42_riscv64_gcc15", "FAILED")
+                   + run("CMSSW_20_1_X_2026-11-02-1100", "el9_amd64_gcc14", "PASSED")
+                   + run("CMSSW_20_1_X_2026-11-02-2300", "el9_amd64_gcc14", "FAILED")
+                   + run("CMSSW_20_1_X_2026-11-05-2300", "el9_amd64_gcc14", "FAILED"))
+        with self._patch_graph(relvals), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is 539.0 failing", "s")
+        self.assertIn("`el9_amd64_gcc14` (failing since `CMSSW_20_1_X_2026-11-02-2300`)", answer)
+        self.assertIn("`fc42_riscv64_gcc15` (last run 2026-10-29) (failing since `CMSSW_20_1_X_2026-10-29-1100`)", answer)
+        self.assertNotIn("`el9_amd64_gcc14` (last run", answer)
+
+    def test_table_has_one_row_per_start_date(self):
+        def run(tag, arch, status="FAILED"):
+            return _rows(tag, [arch], status=status, exitcode=0 if status == "PASSED" else 31744, name="W")
+        relvals = (run("CMSSW_20_1_X_2026-11-01-2300", "el9_amd64_gcc14", "PASSED")
+                   + run("CMSSW_20_1_X_2026-11-02-2300", "el9_amd64_gcc14")
+                   + run("CMSSW_20_1_X_2026-11-02-2300", "el8_amd64_gcc14")
+                   + run("CMSSW_20_1_X_2026-11-03-2300", "el10_amd64_gcc15"))
+        for flavour in ("ASAN", "CLANG", "DBG", "DEVEL", "ROOT6"):
+            relvals += _rows(f"CMSSW_20_1_{flavour}_X_2026-11-02-2300", ["el9_amd64_gcc14"], variant=flavour,
+                             status="FAILED", exitcode=31744, name="W")
+        with self._patch_graph(relvals), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is 539.0 failing", "s")
+        self.assertIn("| `CMSSW_20_1` | primary | `el8_amd64_gcc14`, `el9_amd64_gcc14` | failing | `CMSSW_20_1_X_2026-11-02-2300` |", answer)
+        self.assertIn("| `CMSSW_20_1` | primary | `el10_amd64_gcc15` | failing | `CMSSW_20_1_X_2026-11-03-2300` |", answer)
 
     def test_recovered_workflow_says_so_and_ignores_other_names_and_stale_exceptions(self):
         """Found live 2026-10-15 on 1349.0: failed only in the 10-09..10-11 builds, passing
@@ -193,3 +224,47 @@ class WorkflowWhereTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseExtremeTests(unittest.TestCase):
+    """Found 2026-11-06: 20_1 named as having the newest build with 16_1 newer, and 10_6 as the oldest with 16_1 older."""
+    ROWS = [
+        {"tag": "CMSSW_20_1_X_2026-11-05-2300", "arch": "el9_amd64_gcc14", "relvals": 954, "unittests": 381},
+        {"tag": "CMSSW_16_1_X_2026-11-06-1100", "arch": "el8_amd64_gcc13", "relvals": 0, "unittests": 308},
+        {"tag": "CMSSW_12_4_HLT_X_2026-11-06-1100", "arch": "el8_amd64_gcc10", "relvals": 1, "unittests": 0},
+        {"tag": "CMSSW_10_6_X_2026-07-26-0000", "arch": "el7_amd64_gcc7", "relvals": 0, "unittests": 0},
+        {"tag": "CMSSW_16_1_X_2026-07-23-2300", "arch": "el8_amd64_gcc13", "relvals": 0, "unittests": 0},
+        {"tag": "CMSSW_20_1_X_2026-07-23-2300", "arch": "el9_amd64_gcc14", "relvals": 0, "unittests": 0},
+        {"tag": "CMSSW_20_1_X_2026-10-26-2300", "arch": "el9_amd64_gcc14", "relvals": 954, "unittests": 381},
+    ]
+
+    def _ask(self, question, session="s1"):
+        driver = MagicMock()
+        driver.session.return_value.__enter__.return_value.run.return_value = self.ROWS
+        with patch("server.api_server.get_driver", return_value=driver):
+            return _release_extreme_answer(question, session)
+
+    def test_newest_goes_by_date_and_says_what_latest_ib_means(self):
+        answer = self._ask("which release has the newest build?", "n1")
+        self.assertIn("`2026-11-06-1100`, in **2 release series**: `CMSSW_12_4`, `CMSSW_16_1`", answer)
+        self.assertIn("may still be importing", answer)
+        self.assertIn("highest release series is `CMSSW_20_1`", answer)
+        self.assertNotIn("| `CMSSW_20_1_X_2026-11-05-2300`", answer)
+
+    def test_oldest_lists_every_series_and_the_oldest_with_results(self):
+        answer = self._ask("which release series has the oldest imported build", "o1")
+        self.assertIn("`2026-07-23-2300`, in **2 release series**: `CMSSW_16_1`, `CMSSW_20_1`", answer)
+        self.assertNotIn("CMSSW_10_6", answer)
+        self.assertIn("oldest build with RelVal results is from `2026-10-26-2300`", answer)
+
+    def test_short_follow_up_only_straight_after_this_answer(self):
+        self.assertIsNone(self._ask("which has the oldest?", "f1"))
+        self.assertIsNotNone(self._ask("which release has the newest build?", "f2"))
+        self.assertIn("Oldest imported", self._ask("which has the oldest?", "f2"))
+        self.assertIsNone(self._ask("failed relvals for CMSSW_20_1_X_2026-11-05-2300", "f2"))
+        self.assertIsNone(self._ask("and the newest?", "f2"))
+
+    def test_other_questions_are_left_alone(self):
+        for question in ("which release has the most failures?", "what is the latest IB?",
+                         "which release has the newest failing workflow?", "which flavour has the oldest build?"):
+            self.assertIsNone(self._ask(question, "x"), question)
