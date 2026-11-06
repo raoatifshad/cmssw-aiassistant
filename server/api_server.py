@@ -12897,6 +12897,7 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
         tracks.setdefault((r["series"], r["variant"], r["arch"]), []).append(r)
     still_bad: list[tuple] = []   # (series, variant, arch, since_tag, kind)
     recovered: list[tuple] = []   # (series, variant, arch)
+    last_runs: dict[tuple, str] = {}
     for (series, variant, track_arch), track in tracks.items():
         track.sort(key=lambda r: _ib_sort_key(r["tag"]))
         if all(r["kind"] == "passed" for r in track):
@@ -12908,6 +12909,7 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
         while start > 0 and track[start - 1]["kind"] != "passed":
             start -= 1
         still_bad.append((series, variant, track_arch, track[start]["tag"], track[-1]["kind"]))
+        last_runs[(series, variant, track_arch)] = track[-1]["tag"]
 
     kind_label = {"failed": "failing", "das": "DAS error", "known": "known error"}
 
@@ -12923,11 +12925,26 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
     real_places = group_places([x for x in still_bad if x[4] != "known"])
     known_places = group_places([x for x in still_bad if x[4] == "known"])
 
+    def since_groups(series: str, variant: str, entries: list[tuple]) -> list[tuple[str, str, str]]:
+        """(architectures, status, since) per start date, oldest first. One date for a whole row was the earliest of
+        any architecture (found 2026-11-06: 539.0 "since 10-29-1100" came from riscv, which last ran on 10-29; the
+        rest flipped at 11-02-2300, the first build after the herwig merge, which is what had been asked)."""
+        newest_day = max(last_runs[(series, variant, arch)][-15:-5] for arch, _, _ in entries)
+
+        def arch_text(arch: str) -> str:
+            day = last_runs[(series, variant, arch)][-15:-5]
+            old = datetime.fromisoformat(newest_day) - datetime.fromisoformat(day) >= timedelta(days=3)
+            return f"`{arch}` (last run {day})" if old else f"`{arch}`"
+        by_since: dict[str, list[tuple]] = {}
+        for entry in entries:
+            by_since.setdefault(entry[1], []).append(entry)
+        return [(", ".join(arch_text(a) for a, _, _ in sorted(by_since[since])),
+                 "/".join(sorted({kind_label[kind] for _, _, kind in by_since[since]})), since)
+                for since in sorted(by_since, key=_ib_sort_key)]
+
     def place_text(series: str, variant: str, entries: list[tuple]) -> str:
-        archs_text = ", ".join(f"`{a}`" for a, _, _ in sorted(entries))
-        since = min((since for _, since, _ in entries), key=_ib_sort_key)
-        kinds = sorted({kind_label[kind] for _, _, kind in entries})
-        return f"`{series}` {variant} on {archs_text} ({'/'.join(kinds)} since `{since}`)"
+        parts = [f"{archs} ({kinds} since `{since}`)" for archs, kinds, since in since_groups(series, variant, entries)]
+        return f"`{series}` {variant} on {', '.join(parts)}"
 
     def places(items: list[tuple]) -> str:
         return "; ".join(place_text(series, variant, entries) for (series, variant), entries in items)
@@ -13001,10 +13018,8 @@ def _workflow_across_builds_answer(workflow_id: str, question: str, session_id: 
     if table_items:
         lines += ["", "| Release | Build type | Architectures | Status | Since |", "| --- | --- | --- | --- | --- |"]
         for (series, variant), entries in table_items[:20]:
-            since = min((since for _, since, _ in entries), key=_ib_sort_key)
-            kinds = "/".join(sorted({kind_label[kind] for _, _, kind in entries}))
-            archs_text = ", ".join(f"`{a}`" for a, _, _ in sorted(entries))
-            lines.append(f"| `{series}` | {variant} | {archs_text} | {kinds} | `{since}` |")
+            for archs_text, kinds, since in since_groups(series, variant, entries):
+                lines.append(f"| `{series}` | {variant} | {archs_text} | {kinds} | `{since}` |")
         if len(table_items) > 20:
             lines.append(f"| ... | {len(table_items) - 20} more | | | |")
 
@@ -16730,6 +16745,67 @@ _PER_DIMENSION_RE = re.compile(
 _FLAVOURS_OF_BUILD_RE = re.compile(r"\bhow\s+many\s+(?:sub[\s-]*ib\s+)?(?:flavou?rs?|sub[\s-]*ibs?|variants?)\b|\bwhich\s+(?:sub[\s-]*ib\s+)?(?:flavou?rs?|sub[\s-]*ibs?|variants?)\s+(?:does|did|has|have|had|are\s+in|were\s+in)\b", re.IGNORECASE)
 
 
+_RELEASE_EXTREME_WORD = r"(newest|latest|most\s+recent|oldest|earliest)"
+_RELEASE_EXTREME_RE = re.compile(
+    r"\b(?:which|what)\s+(?:cmssw\s+)?(?:release(?:\s+series)?|series|cycle)s?\s+(?:has|have|had|got)\s+(?:the\s+)?"
+    + _RELEASE_EXTREME_WORD + r"(?:\s+(?:imported\s+)?(?:builds?|ibs?|integration\s+builds?|data))?(?:\s+imported)?\s*\??\s*$",
+    re.IGNORECASE)
+_RELEASE_EXTREME_FOLLOW_UP_RE = re.compile(
+    r"^\s*(?:and\s+)?(?:(?:which|what)(?:\s+one)?\s+(?:has|have)\s+)?(?:the\s+)?" + _RELEASE_EXTREME_WORD
+    + r"(?:\s+(?:one|builds?|ibs?))?\s*\??\s*$", re.IGNORECASE)
+_RELEASE_EXTREME_TAG_RE = re.compile(r"^CMSSW_(\d+_\d+)_.*(\d{4}-\d{2}-\d{2}-\d{4})$")
+_release_extreme_sessions: set[str] = set()
+
+
+def _release_extreme_answer(question: str, session_id: str) -> str | None:
+    """ "which release has the newest build?" / "which has the oldest?". Asks across releases by build date, so not the
+    "latest IB" rule, where the highest release outranks a newer build of a lower one (found 2026-11-06: named 20_1 at
+    11-05-2300 with 16_1 at 11-06-1100, and the AI named 10_6 at 07-26 as the oldest with 16_1 at 07-23). The short
+    follow-up only counts straight after this answer."""
+    match = _RELEASE_EXTREME_RE.search(question)
+    if not match and session_id in _release_extreme_sessions:
+        match = _RELEASE_EXTREME_FOLLOW_UP_RE.search(question)
+    _release_extreme_sessions.discard(session_id)
+    if not match:
+        return None
+    oldest = match.group(1).lower() in ("oldest", "earliest")
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) RETURN ib.tag AS tag, ib.arch AS arch, COUNT { (ib)-[:RAN_RELVAL]->() } AS relvals, "
+                "COUNT { (ib)-[:RAN_UNITTEST]->() } AS unittests")]
+    finally:
+        driver.close()
+    parsed = [(m.group(1), m.group(2), r) for r in rows for m in [_RELEASE_EXTREME_TAG_RE.match(r["tag"] or "")] if m]
+    if not parsed:
+        return "No Integration Build records are imported in the graph."
+    pick = min if oldest else max
+    stamp = pick(when for _, when, _ in parsed)
+    found = sorted((x for x in parsed if x[1] == stamp), key=lambda x: x[2]["tag"])
+    series = sorted({s for s, _, _ in found}, key=lambda s: tuple(int(n) for n in s.split("_")))
+    word = "Oldest" if oldest else "Newest"
+    lines = [f"{word} imported build date: `{stamp}`, in **{len(series)} release series**: "
+             + ", ".join(f"`CMSSW_{s}`" for s in series) + ".", "",
+             "| Build | Architecture | RelVal results | Unit-test results |", "| --- | --- | ---: | ---: |"]
+    lines += [f"| `{r['tag']}` | `{r['arch']}` | {r['relvals']:,} | {r['unittests']:,} |" for _, _, r in found[:15]]
+    if len(found) > 15:
+        lines.append(f"| ... | {len(found) - 15} more | | |")
+    with_results = [when for _, when, r in parsed if r["relvals"]]
+    if oldest:
+        if with_results and min(with_results) != stamp:
+            lines += ["", f"The oldest build with RelVal results is from `{min(with_results)}`."]
+        lines += ["", "This is how far the imported data goes back, not how old the release is."]
+    else:
+        if not all(r["relvals"] for _, _, r in found):
+            lines += ["", "A build with few or no results may still be importing; the data is refreshed twice a day."]
+        highest = max(parsed, key=lambda x: (tuple(int(n) for n in x[0].split("_")), x[1]))[0]
+        lines += ["", f"This goes by build date. The highest release series is `CMSSW_{highest}`, and that is what "
+                      f"\"the latest IB\" means here."]
+    _release_extreme_sessions.add(session_id)
+    return "\n".join(lines)
+
+
 def _flavours_of_build_answer(question: str) -> str | None:
     """ "how many sub-IB flavours does the 2026-11-03-2300 20_1 build have?" (found 2026-11-06: "imported as a primary IB, not a sub-IB variant", and the newest build for another phrasing)."""
     if not _FLAVOURS_OF_BUILD_RE.search(question):
@@ -19677,6 +19753,9 @@ def _chat(req: ChatRequest):
     resolved_build = _dated_flavour_question(question) or _last_complete_question(question)
     if resolved_build:
         question = original_question = resolved_build
+    release_extreme = _release_extreme_answer(question, sid)
+    if release_extreme:
+        return _chat_response(sid, original_question, release_extreme, "deterministic:release_extreme")
     flavours = _flavours_of_build_answer(question)
     if flavours:
         return _chat_response(sid, original_question, flavours, "deterministic:flavours_of_build")
