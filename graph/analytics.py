@@ -501,5 +501,52 @@ def newest_complete_primary(prefix: str, count: int = 1) -> list[str]:
     return complete
 
 
-ANALYTICS_TOOLS = {f.__name__: f for f in (relval_counts, ib_coverage, release_health, compare_relvals, workflow_history, flaky_workflows, search_github, warning_counts,
+_AUTOMATIC_OPENER = "cmsbuild"
+_DELETED_ACCOUNT = "ghost"  # GitHub's name for a deleted account: never a person
+_PORT_OF_RE = re.compile(r"(?:automatically\s+ported\s+from\s+\S+\s+|back-?port(?:ed)?\s+(?:of|from)\s+|forward[\s-]port(?:ed)?\s+(?:of|from)\s+)(?:\S+\s+)?#(\d+)", re.IGNORECASE)
+
+
+def _pr_authors(repo: str, number: int) -> dict | None:
+    rows = _rows("MATCH (p:PR {repo:$repo, number:$number}) OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
+                 "RETURN p.body AS body, collect(a.name) AS names", repo=repo, number=int(number))
+    return rows[0] if rows else None
+
+
+def pr_origin(number: int, repo: str = "cmssw") -> dict:
+    """Who is behind a PR: who opened it on GitHub, and for one the bot cmsbuild opened, the person who opened the original it was ported from. A deleted account shows as ghost, which is not a person."""
+    pr = _pr_authors(repo, number)
+    if not pr:
+        return {"found": False, "repo": repo, "number": int(number)}
+    names = pr["names"]
+    # Two names are the GitHub opener plus the owner of the branch, which the older imports recorded as an author too
+    opener = next((n for n in names if n in (_AUTOMATIC_OPENER, _DELETED_ACCOUNT)), names[0] if len(names) == 1 else None)
+    result = {"found": True, "repo": repo, "number": int(number), "opened_by": opener, "names": names,
+              "opened_automatically": opener == _AUTOMATIC_OPENER, "opener_account_deleted": opener == _DELETED_ACCOUNT,
+              "branch_owner": next((n for n in names if n != opener), None) if opener else None,
+              "ported_from": [], "original_opened_by": None, "original_account_deleted": False}
+    if opener != _AUTOMATIC_OPENER:
+        return result
+    current, seen = pr, {int(number)}
+    while len(seen) < 6:  # a port of a port; the text is free-form, so never follow it for long
+        link = _PORT_OF_RE.search(current["body"] or "")
+        if not link or int(link.group(1)) in seen:
+            break
+        original = int(link.group(1))
+        seen.add(original)
+        result["ported_from"].append(original)
+        current = _pr_authors(repo, original)
+        if not current:
+            break  # only say who if the original was imported
+        names = current["names"]
+        if _DELETED_ACCOUNT in names:
+            result["original_account_deleted"] = True
+            break
+        if _AUTOMATIC_OPENER not in names:
+            result["original_opened_by"] = names[0] if len(names) == 1 else None
+            break
+    return result
+
+
+ANALYTICS_TOOLS = {
+    f.__name__: f for f in (pr_origin, relval_counts, ib_coverage, release_health, compare_relvals, workflow_history, flaky_workflows, search_github, warning_counts,
                                            log_problem_counts, exception_counts, unit_test_changes, build_status_list)}

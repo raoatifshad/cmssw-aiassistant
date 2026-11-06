@@ -108,7 +108,7 @@ EDGES:
   (IB)-[:HAS_TEST_LOG]->(TestLogRun)
   (TestLogRun)-[:HAS_PROBLEM]->(LogProblem)
   (LogProblem)-[:HAS_SIGNATURE]->(ProblemSignature)
-  (PR)-[:AUTHORED_BY]->(Author)
+  (PR)-[:AUTHORED_BY]->(Author)  // who opened it on GitHub: cmsbuild is a bot and ghost a deleted account, so use pr_origin to say who is behind one of those
     (Issue)-[:AUTHORED_BY]->(Author)
     ((PR|Issue))-[:HAS_COMMENT]->(GitHubComment)
     ((PR|Issue))-[:HAS_LABEL]->(Label)
