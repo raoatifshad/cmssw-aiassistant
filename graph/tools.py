@@ -23,12 +23,14 @@ from neo4j_conn import get_driver  # noqa: E402
 
 GRAPH_SCHEMA = """
 NODES:
-    (:IB {ib_key, tag, release, arch, parent_tag, variant})
+    (:IB {ib_key, tag, release, arch, parent_tag, variant, build_status, comp_warnings, ignored_warnings})
+      -- build_status is 'passed', 'warning' (built, with compilation warnings) or 'error'. Whether a build had compilation warnings is build_status='warning': a warnings count of 0 doesn't mean none. Use build_status_list(status='warning').
   (:Package {name})
   (:Warning {hash, file, line, message, flag, count, package})
   (:SourceFile {path})
   (:Checker {name})           — e.g. 'threadsafety.ConstCast', 'cms.FunctionChecker'
-    (:PR {repo, number, title, body, merged_at, release, changed_files, additions, deletions, sha, labels})
+    (:PR {repo, number, title, body, merged_at, github_state, github_created_at, github_updated_at, release, changed_files, additions, deletions, sha, labels})
+      -- github_state is 'open' or 'closed'; open PRs have no merged_at, and most PR questions about "open" use github_state
     (:Issue {issue_key, repo, number, title, body, state, github_url, created_at, updated_at, closed_at, labels})
     (:GitHubComment {key, body, created_at, updated_at, author, source_id})
     (:Label {key, name})
@@ -227,9 +229,12 @@ def _ib_sort_key(tag: str) -> tuple:
 def list_ib_tags(release: str | None = None, arch: str | None = None, limit: int = 20) -> list[dict]:
     """List known IB tags, most recent release series first, newest build within a series first."""
     limit = min(limit, MAX_ROWS)
+    # any spelling of a release: an exact match on "17_1" found nothing and the model reported "no CMSSW_17_1 data at all" (found 2026-11-05)
+    series = re.search(r"(\d+)[._](\d+)", str(release or ""))
+    prefix = f"CMSSW_{series.group(1)}_{series.group(2)}_" if series else None
     cypher = (
-        "MATCH (ib:IB) WHERE ($rel IS NULL OR ib.release = $rel) "
-        "AND ($arch IS NULL OR ib.arch = $arch) "
+        "MATCH (ib:IB) WHERE ($rel IS NULL OR ib.release = $rel OR ib.tag STARTS WITH $prefix) "
+        "AND ($arch IS NULL OR ib.arch CONTAINS $arch) "
         "RETURN ib.tag AS tag, ib.arch AS arch, ib.release AS release"
     )
     # Fetch unsliced: _run_query truncates to MAX_ROWS before we can sort, which
@@ -237,7 +242,7 @@ def list_ib_tags(release: str | None = None, arch: str | None = None, limit: int
     driver = get_driver()
     try:
         with driver.session() as s:
-            rows = [dict(r) for r in s.run(cypher, {"rel": release, "arch": arch})]
+            rows = [dict(r) for r in s.run(cypher, {"rel": release, "prefix": prefix, "arch": arch})]
     finally:
         driver.close()
     # same series and time: the primary IB first, or the LLM reports a sub-IB as "the latest IB" (found 2026-11-04: CLANG, by alphabet)
@@ -565,6 +570,15 @@ def count_warnings_by_package(package: str, ib_tag: str | None = None, arch: str
         )
     row = result[0] if result else {"distinct_locations": 0, "total_occurrences": 0}
     row["package"] = package
+    if not row.get("distinct_locations") and "/" not in package:
+        # "HLTrigger" is a subsystem, its warnings are under HLTrigger/*: an exact match said 0 for 212 locations (found 2026-11-05)
+        where = "WHERE pkg.name STARTS WITH $prefix " + ("AND ($arch IS NULL OR ib.arch = $arch) " if ib_tag else "")
+        head = "MATCH (ib:IB {tag:$t})-[:REPORTED]->(w:Warning)-[:IN_PACKAGE]->(pkg:Package) " if ib_tag else "MATCH (w:Warning)-[:IN_PACKAGE]->(pkg:Package) "
+        rows = _run_query(head + where + "RETURN pkg.name AS package, count(w) AS distinct_locations, sum(w.count) AS total_occurrences ORDER BY total_occurrences DESC",
+                          {"t": ib_tag, "prefix": f"{package}/", "arch": arch})
+        if rows:
+            row.update(distinct_locations=sum(r["distinct_locations"] for r in rows), total_occurrences=sum(r["total_occurrences"] for r in rows),
+                       scope=f"all {len(rows)} packages under {package}/", subpackages=rows[:10])
     return row
 
 
@@ -1244,6 +1258,53 @@ def search_issues_by_text(term: str, include_comments: bool = False, limit: int 
         {"term": term, "include_comments": include_comments, "limit": limit},
     )
     return rows[0] if rows else {"total_matches": 0, "open_matches": 0, "issues": []}
+
+
+def search_github_mentions(term: str) -> list[dict]:
+    """Every PR/Issue (all repos) whose title, description or comments contain the text, and where: one row per
+    item with in_title, in_body, human_comments and bot_comments (cmsbuild's automated ones are no report)."""
+    needle = term.lower()
+    common = ("CASE WHEN item:Issue THEN 'Issue' ELSE 'PR' END AS kind, item.repo AS repo, item.number AS number, item.title AS title, "
+              "coalesce(item.state, item.github_state) AS state, item.merged_at AS merged_at, "
+              "coalesce(item.created_at, item.github_created_at) AS created_at, head(author) AS author")
+    rows = _run_query_all(
+        "MATCH (item) WHERE (item:PR OR item:Issue) AND (toLower(coalesce(item.title, '')) CONTAINS $t OR toLower(coalesce(item.body, '')) CONTAINS $t) "
+        "OPTIONAL MATCH (item)-[:AUTHORED_BY]->(a:Author) WITH item, collect(a.name) AS author "
+        f"RETURN {common}, toLower(coalesce(item.title, '')) CONTAINS $t AS in_title, toLower(coalesce(item.body, '')) CONTAINS $t AS in_body", {"t": needle})
+    comments = _run_query_all(
+        "MATCH (item)-[:HAS_COMMENT]->(c:GitHubComment) WHERE (item:PR OR item:Issue) AND toLower(c.body) CONTAINS $t "
+        "WITH item, sum(CASE WHEN c.author = 'cmsbuild' THEN 0 ELSE 1 END) AS human_comments, sum(CASE WHEN c.author = 'cmsbuild' THEN 1 ELSE 0 END) AS bot_comments "
+        "OPTIONAL MATCH (item)-[:AUTHORED_BY]->(a:Author) WITH item, human_comments, bot_comments, collect(a.name) AS author "
+        f"RETURN {common}, human_comments, bot_comments", {"t": needle})
+    merged = {(r["kind"], r["repo"], r["number"]): {**r, "human_comments": 0, "bot_comments": 0} for r in rows}
+    for row in comments:
+        entry = merged.setdefault((row["kind"], row["repo"], row["number"]), {**row, "in_title": False, "in_body": False})
+        entry["human_comments"], entry["bot_comments"] = row["human_comments"], row["bot_comments"]
+    return list(merged.values())
+
+
+def get_github_item_excerpts(items: list[dict], terms: list[str], chars: int = 700) -> list[dict]:
+    """What a PR/Issue says around the given terms: its title, the description's opening and matching part, and people's comments that match. For reading, not searching."""
+    needles = [term.lower() for term in terms]
+
+    def around(text: str) -> str:
+        lowered = text.lower()
+        hit = min((lowered.find(n) for n in needles if n in lowered), default=-1)
+        start = max(0, hit - chars // 2) if hit >= 0 else 0
+        return " ".join(text[start:start + chars].split())
+
+    excerpts = []
+    for item in items:
+        label = "Issue" if item["kind"] == "Issue" else "PR"
+        row = _run_query_all(
+            f"MATCH (x:{label} {{repo:$repo, number:$number}}) OPTIONAL MATCH (x)-[:HAS_COMMENT]->(c:GitHubComment) "
+            "WHERE coalesce(c.author, '') <> 'cmsbuild' AND any(n IN $needles WHERE toLower(c.body) CONTAINS n) "
+            "WITH x, collect(c.body)[0..2] AS comments RETURN x.title AS title, coalesce(x.body, '') AS body, comments",
+            {"repo": item["repo"], "number": item["number"], "needles": needles})
+        if row:
+            excerpts.append({"id": f"{label} #{item['number']}", "title": row[0]["title"], "description_start": " ".join(row[0]["body"][:250].split()),
+                             "description_match": around(row[0]["body"]), "comment_matches": [around(c) for c in row[0]["comments"]]})
+    return excerpts
 
 
 def find_prs_for_error(error: str, ib_tag: str | None = None, limit: int = 20) -> list[dict]:
@@ -2345,4 +2406,6 @@ def _with_int_limit(fn):
     return wrapper
 
 
-TOOLS = {name: _with_int_limit(fn) for name, fn in TOOLS.items()}
+from graph.analytics import ANALYTICS_TOOLS  # noqa: E402
+
+TOOLS = {**ANALYTICS_TOOLS, **{name: _with_int_limit(fn) for name, fn in TOOLS.items()}}

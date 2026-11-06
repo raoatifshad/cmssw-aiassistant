@@ -11,6 +11,7 @@ import json
 import re
 import sys
 import tarfile
+from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
@@ -132,6 +133,17 @@ def to_iso(unix_ts) -> str | None:
         return None
     try:
         return datetime.fromtimestamp(int(unix_ts), tz=timezone.utc).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
+def dashboard_time_to_iso(unix_ts) -> str | None:
+    """A time from cms-sw.github.io's data/prs files. They are written as if UTC clock time were local: all 87 merged PRs comparable on 2026-11-05 were exactly 3600 s behind GitHub
+    (CET). Reading the number back on that local clock gives GitHub's time. Summer time (CEST) couldn't be checked, the files keep recent PRs only; GitHub's own value always wins in the import."""
+    if not unix_ts:
+        return None
+    try:
+        return datetime.fromtimestamp(int(unix_ts), tz=ZoneInfo("Europe/Zurich")).replace(tzinfo=timezone.utc).isoformat()
     except (ValueError, TypeError):
         return None
 
@@ -772,7 +784,9 @@ def _ingest_pr_file(driver, path: Path, force: bool, reconcile: bool) -> tuple[i
                     continue
                 session.run(
                     "MERGE (pr:PR {repo:$repo, number:$number}) "
-                    "SET pr.pr_key=$pr_key, pr.title=$title, pr.body=$body, pr.merged_at=$merged_at, "
+                    "SET pr.pr_key=$pr_key, pr.title=$title, pr.body=$body, "
+                    # GitHub's own time ends in Z and comes from the export or the web fetch: it wins over the dashboard's
+                    "pr.merged_at=CASE WHEN pr.merged_at ENDS WITH 'Z' THEN pr.merged_at ELSE $merged_at END, "
                     "pr.release=$release, pr.changed_files=$changed_files, pr.additions=$additions, "
                     "pr.deletions=$deletions, pr.sha=$sha, pr.labels=$labels, "
                     "pr.github_state=$github_state, "
@@ -784,7 +798,7 @@ def _ingest_pr_file(driver, path: Path, force: bool, reconcile: bool) -> tuple[i
                     pr_key=pr_key,
                     title=pr.get("title"),
                     body=pr.get("body") or "",
-                    merged_at=to_iso(pr.get("merged_at")),
+                    merged_at=dashboard_time_to_iso(pr.get("merged_at")),
                     release=release,
                     changed_files=pr.get("changed_files"),
                     additions=pr.get("additions"),
@@ -794,7 +808,8 @@ def _ingest_pr_file(driver, path: Path, force: bool, reconcile: bool) -> tuple[i
                     github_state=pr.get("state") or ("closed" if pr.get("merged_at") else "unknown"),
                     content_hash=content_hash,
                     source_id=source_id,
-                    author=pr.get("author", "unknown"),
+                    # "user" is who opened the PR; "author" in these files is the owner of the branch's repository, such as cms-sw or cms-tau-pog (found 2026-11-05: 921 PRs credited wrongly)
+                    author=pr.get("user") or pr.get("author", "unknown"),
                 )
                 imported += 1
         if reconcile:
@@ -843,8 +858,7 @@ def ingest_pr_cache(driver, path: Path, force: bool = False) -> list[dict]:
                 "pr.body='', pr.github_state='unknown' "
                 "SET pr.cache_branch=raw.branch, pr.cache_user_ref=raw.user_ref, "
                 "pr.cache_source_id=$source_id "
-                "MERGE (author:Author {name:raw.author}) "
-                "MERGE (pr)-[:AUTHORED_BY]->(author) "
+                # no author from this file: its "author" is the branch's owner, not who opened the PR, and it gave 902 PRs a second, wrong author (found 2026-11-05)
                 "MERGE (commit:Commit {sha:raw.sha}) "
                 "SET commit.source_id=$source_id "
                 "MERGE (pr)-[:MERGED_AS {source:'cmsrepo-pr-cache'}]->(commit)",
