@@ -45,7 +45,7 @@ from alerts import create_rule, deactivate_rule, evaluate_rules, list_rules  # n
 from server.llm_client import DEFAULT_MODEL, REVIEW_MODEL, get_client  # noqa: E402
 from server.cmssw_source import check_names, source_excerpts, source_version  # noqa: E402
 from server.question_catalog import KNOWN_QUESTIONS  # noqa: E402
-from graph.analytics import newest_complete_primary, partial_builds  # noqa: E402
+from graph.analytics import newest_complete_primary, partial_builds, pr_origin  # noqa: E402
 from server.agent import (  # noqa: E402
     parse_json_reply,
     judge_answer_fit,
@@ -2777,6 +2777,27 @@ def _pr_not_in_ib_text(merged_at: str) -> str:
     return "no imported IB lists it as newly merged"
 
 
+def _pr_opener_sentence(repo: str, number: int, stored_author: str | None) -> str:
+    """Who opened a PR, without calling a bot or a deleted account its author (user, 2026-11-06: a person is behind what cmsbuild opens)."""
+    origin = pr_origin(number, repo=repo or "cmssw")
+    if origin.get("opener_account_deleted"):
+        clue = f" Its branch belongs to `{origin['branch_owner']}`, which is a clue to who it was, not proof." if origin.get("branch_owner") else ""
+        return f"PR #{number} was opened by a GitHub account that has since been deleted (GitHub shows it as `ghost`).{clue}"
+    if origin.get("opened_automatically"):
+        chain = origin["ported_from"]
+        if origin["original_opened_by"]:
+            return (f"PR #{number} was opened automatically by `cmsbuild`. It is a port of #{chain[-1]}, "
+                    f"which was opened by **{origin['original_opened_by']}**.")
+        if origin["original_account_deleted"]:
+            return (f"PR #{number} was opened automatically by `cmsbuild`. It is a port of #{chain[-1]}, "
+                    f"which was opened by a GitHub account that has since been deleted (GitHub shows it as `ghost`).")
+        if chain:
+            return (f"PR #{number} was opened automatically by `cmsbuild`. It is a port of #{chain[-1]}, "
+                    f"but the imported data doesn't say who opened that one.")
+        return f"PR #{number} was opened automatically by `cmsbuild`; the imported data doesn't name a person behind it."
+    return f"PR #{number} was created by **{origin.get('opened_by') or stored_author or 'unknown'}**."
+
+
 def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
     """Return graph facts directly when the question includes a PR number."""
     match = re.search(r"\b(?:pr|pull\s+request)s?\s*(?:(?:for|about|number|no\.?)\s+)?#?\s*(\d{3,9})\b(?!\.\d)",
@@ -2832,7 +2853,7 @@ def _pr_number_answer(question: str) -> tuple[str, list[dict]] | None:
     pr = rows[0]
     question_lower = question.lower()
     if re.search(r"\b(who|author|created|creator)\b", question_lower):
-        return f"PR #{pr['pr_number']} was created by **{pr['author'] or 'unknown'}**.", [pr]
+        return _pr_opener_sentence(pr["repo"], pr["pr_number"], pr["author"]), [pr]
     if re.search(r"\bcomments?\b", question_lower):
         note = ""
         if pr.get("fetched_via") or int(pr["pr_number"]) > 51822:

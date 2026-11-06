@@ -6,11 +6,73 @@ from unittest.mock import MagicMock, patch
 from graph import analytics
 from graph.tools import TOOLS, list_ib_tags
 from server.agent import _function_to_openai_schema
-from server.api_server import _WORD_SEARCH_DEAD_END_RE, _DATE_RANGE_RE, _with_partial_build_note, _known_question_invents, _scope_mismatch, _without_invented_names, _clang_package_in_tag_answer, _named_month_window
+from server.api_server import _pr_opener_sentence, _WORD_SEARCH_DEAD_END_RE, _DATE_RANGE_RE, _with_partial_build_note, _known_question_invents, _scope_mismatch, _without_invented_names, _clang_package_in_tag_answer, _named_month_window
 
 
 def relval(tag, arch, workflow, status="FAILED", known=False, code=256):
     return dict(tag=tag, arch=arch, workflow=workflow, name=f"wf{workflow}", status=status, exit_code=code, known=known)
+
+
+class PrOriginTests(unittest.TestCase):
+    """Fake PRs by number; what each says about who opened it."""
+
+    PRS = {
+        1: dict(body="", names=["alice"]),
+        2: dict(body="Automatically ported from CMSSW_8_0_X #1 (original by @some-group).", names=["cmsbuild", "some-group"]),
+        3: dict(body="Automatically ported from CMSSW_8_0_X #2 (original by @some-group).", names=["cmsbuild"]),
+        4: dict(body="Running code-format for dqm", names=["cmsbuild"]),
+        5: dict(body="", names=["fork-owner", "ghost"]),
+        6: dict(body="Automatically ported from CMSSW_7_2_X #5", names=["cmsbuild"]),
+        7: dict(body="backport of #999", names=["cmsbuild"]),
+        8: dict(body="Automatically ported from CMSSW_7_2_X #8", names=["cmsbuild"]),
+        9: dict(body="backport of #1", names=["alice"]),
+    }
+
+    def origin(self, number):
+        with patch.object(analytics, "_pr_authors", side_effect=lambda repo, n: self.PRS.get(int(n))):
+            return analytics.pr_origin(number)
+
+    def test_a_person_is_just_the_opener(self):
+        origin = self.origin(1)
+        self.assertEqual(origin["opened_by"], "alice")
+        self.assertFalse(origin["opened_automatically"])
+
+    def test_the_person_comes_from_the_original_not_the_group_in_the_description(self):
+        origin = self.origin(2)
+        self.assertEqual((origin["opened_by"], origin["branch_owner"], origin["ported_from"], origin["original_opened_by"]), ("cmsbuild", "some-group", [1], "alice"))
+
+    def test_a_port_of_a_port_is_followed(self):
+        origin = self.origin(3)
+        self.assertEqual((origin["ported_from"], origin["original_opened_by"]), ([2, 1], "alice"))
+
+    def test_no_link_names_nobody(self):
+        origin = self.origin(4)
+        self.assertEqual((origin["opened_by"], origin["ported_from"], origin["original_opened_by"]), ("cmsbuild", [], None))
+
+    def test_a_deleted_account_is_not_a_person(self):
+        origin = self.origin(5)
+        self.assertEqual((origin["opener_account_deleted"], origin["branch_owner"]), (True, "fork-owner"))
+        self.assertTrue(self.origin(6)["original_account_deleted"])
+        self.assertIsNone(self.origin(6)["original_opened_by"])
+
+    def test_an_original_not_imported_or_a_loop_names_nobody(self):
+        self.assertEqual((self.origin(7)["ported_from"], self.origin(7)["original_opened_by"]), ([999], None))
+        self.assertEqual((self.origin(8)["ported_from"], self.origin(8)["original_opened_by"]), ([], None))
+
+    def test_a_person_who_opened_a_backport_stays_its_opener(self):
+        origin = self.origin(9)
+        self.assertEqual((origin["opened_by"], origin["ported_from"]), ("alice", []))
+
+    def test_missing_pr(self):
+        self.assertFalse(self.origin(12345)["found"])
+
+    def test_sentences(self):
+        with patch.object(analytics, "_pr_authors", side_effect=lambda repo, n: self.PRS.get(int(n))):
+            self.assertEqual(_pr_opener_sentence("cmssw", 2, "cmsbuild"), "PR #2 was opened automatically by `cmsbuild`. It is a port of #1, which was opened by **alice**.")
+            self.assertIn("doesn't name a person", _pr_opener_sentence("cmssw", 4, "cmsbuild"))
+            self.assertIn("`fork-owner`, which is a clue", _pr_opener_sentence("cmssw", 5, "ghost"))
+            self.assertIn("doesn't say who opened", _pr_opener_sentence("cmssw", 7, "cmsbuild"))
+            self.assertEqual(_pr_opener_sentence("cmssw", 1, "alice"), "PR #1 was created by **alice**.")
 
 
 class RelvalCountsTests(unittest.TestCase):
