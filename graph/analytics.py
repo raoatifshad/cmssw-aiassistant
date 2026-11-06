@@ -99,6 +99,12 @@ def relval_counts(group_by: str = "workflow", release: str | None = None, tag: s
                  "RETURN ib.tag AS tag, ib.arch AS arch, r.workflow_id AS workflow, r.name AS name, r.status AS status, r.exitcode AS exit_code, coalesce(r.known_error, false) AS known",
                  **params, wanted=wanted, code=code, workflow=workflow_id or None)
     known = sum(1 for r in rows if r["known"] and r["status"] == "FAILED")
+    das = []
+    if wanted == "FAILED":
+        # what relval_counts leaves out has to be said (found 2026-11-06: "2 RelVals failed" where the dashboard shows 3)
+        das = _rows(f"MATCH (ib:IB) WHERE {_IB_WHERE} MATCH (ib)-[:RAN_RELVAL]->(r:RelVal {{status:'DAS_ERROR'}}) "
+                    "WHERE ($code IS NULL OR r.exitcode = $code) AND ($workflow IS NULL OR r.workflow_id = $workflow) RETURN r.workflow_id AS workflow",
+                    **params, code=code, workflow=workflow_id or None)
     if not _flag(include_known_errors):
         rows = [r for r in rows if not (r["known"] and r["status"] == "FAILED")]
     keys = {"workflow": lambda r: r["workflow"], "exit_code": lambda r: r["exit_code"], "arch": lambda r: r["arch"], "tag": lambda r: r["tag"], "status": lambda r: r["status"],
@@ -120,6 +126,9 @@ def relval_counts(group_by: str = "workflow", release: str | None = None, tag: s
             item.pop("name")
         output.append(item)
     return {"scope": {**_scope(params), "status": wanted or "ALL"}, "total_results": len(rows), "distinct": len(groups), "known_errors_left_out": 0 if _flag(include_known_errors) else known, "rows": output,
+            "primary_builds_only": sum(1 for r in rows if _variant_of(r["tag"]) == "primary"),
+            "sub_ibs_included": sorted({_variant_of(r["tag"]) for r in rows} - {"primary"}),  # "12 DAS errors on the primary" was 1 plus 11 in its sub-IBs (found 2026-11-06)
+            "das_errors_left_out": {"results": len(das), "workflows": sorted({r["workflow"] for r in das})[:10]},
             "note": "Each build on each architecture counts once; known errors are excluded unless asked for."}
 
 
@@ -197,6 +206,7 @@ def release_health(releases: str | None = None, arch: str | None = None, primary
 def compare_relvals(tag_a: str, tag_b: str, arch_a: str | None = None, arch_b: str | None = None, include_sub_ibs: str | None = "true") -> dict:
     """Compare RelVal failures of two builds (by date, whichever order they are given in: new_failure_in_later, fixed_in_later, failed_in_both, and failures with NO RESULT on the other side) or of two architectures or flavours of one build (failed_only_in_first, failed_only_in_second, failed_in_both). Use for 'which failures are new', 'what got fixed', 'is aarch64 failing anything amd64 isn't', 'are those the same workflows'. Sub-IBs count when both tags are primary, each flavour against itself; report primary and sub-IB results separately (each row has flavour)."""
     subs = _flag(include_sub_ibs) is not False and _variant_of(tag_a) == "primary" and _variant_of(tag_b) == "primary"  # ROOT6 against the primary means just those two
+    across_archs = bool(arch_a and arch_b and arch_a != arch_b)
 
     def side(tag, arch):
         rows = _rows("MATCH (ib:IB) WHERE (ib.tag = $tag OR ($subs AND ib.parent_tag = $tag)) AND ($arch IS NULL OR ib.arch CONTAINS $arch) MATCH (ib)-[:RAN_RELVAL]->(r:RelVal) "
@@ -207,7 +217,8 @@ def compare_relvals(tag_a: str, tag_b: str, arch_a: str | None = None, arch_b: s
             flavour = _variant_of(row["tag"])
             row["flavour"] = flavour
             # the same workflow in the same place on both sides: across flavours only the workflow can match, across architectures the flavour must (539.0 in primary and ROOT6 is two results, found 2026-11-05)
-            key = row["workflow"] if cross else (row["workflow"], flavour) if arch else (row["workflow"], row["arch"], flavour)
+            # Never less than that, or results overwrite each other (found 2026-11-06: primary against ASAN keyed on the workflow alone reported 2 failures where there were 12)
+            key = (row["workflow"], None if across_archs else row["arch"], None if cross else flavour)
             results[key] = row
         return results, len(rows)
 
@@ -347,6 +358,9 @@ def search_github(kind: str = "both", text: str | None = None, state: str | None
         item.pop("labels", None)
         if not item.get("fetched_via"):
             item.pop("fetched_via", None)
+    if want_pr and date_field not in ("merged", "updated") and (begin or until):
+        # found 2026-11-06: "smuzaffar opened 19 PRs", and 11 cmsdist ones couldn't be counted
+        note += " cmsdist PRs have no creation date imported, so a window on the creation date misses them; use date_field='merged' for those."
     return {"total": len(found), "rows": found[:_limit(limit)], "note": note}
 
 
@@ -433,6 +447,20 @@ def exception_counts(group_by: str = "message", text: str | None = None, categor
             "note": "Coverage is what the export has, from August 2026, and it includes known-error workflows. 'first' can't be earlier than the first imported build, so it doesn't show when something really started. A problem with no record after 'last' may also be an architecture that stopped running: check with ib_coverage."}
 
 
+def _sub_ib_unit_failures(release, arch, begin, until, package) -> list[dict]:
+    """What a primary-only look misses (found 2026-11-06: "no failures for FWIO/RNTupleTempTests", which failed 13 times in ROOT6 and ROOT642)."""
+    params = _ib_params(release, None, arch, begin, until, None, None, default_days=None)
+    rows = _rows(f"MATCH (ib:IB) WHERE {_IB_WHERE} MATCH (ib)-[:RAN_UNITTEST]->(u:UnitTest {{status:'FAILED'}}) WHERE $package IS NULL OR u.name = $package OR u.name STARTS WITH $package + '/' "
+                 "RETURN ib.tag AS tag, ib.arch AS arch, u.name AS package", **params, package=(package or "").strip("/") or None)
+    counts: dict = {}
+    for row in rows:
+        if _variant_of(row["tag"]) == "primary":  # a primary build's parent_tag can be its own tag
+            continue
+        key = (row["package"], _variant_of(row["tag"]), row["arch"])
+        counts[key] = counts.get(key, 0) + 1
+    return [{"package": k[0], "flavour": k[1], "arch": k[2], "builds_failed": n} for k, n in sorted(counts.items(), key=lambda kv: -kv[1])[:20]]
+
+
 def unit_test_changes(release: str | None = "20_1", arch: str | None = None, since: str | None = None, until: str | None = None, variant: str | None = None, primary_only: str | None = "true", package: str | None = None, limit: str | None = None) -> dict:
     """Unit-test packages that failed in a window, per architecture: builds_failed (how many builds) with their tags in failed_builds, first and last failed build, whether they passed before the window (new) and whether they pass in the newest build (fixed). Use for 'started failing', 'broke since', 'still failing', 'since when', 'how many builds had X failing'. package: one package or subsystem. Default release 20_1, primary builds, last 7 days."""
     begin = _when(since) or _days_ago(7)
@@ -455,7 +483,8 @@ def unit_test_changes(release: str | None = "20_1", arch: str | None = None, sin
     for track in failed:
         track["new_in_window"] = not track.pop("failed_before_window")
     failed.sort(key=lambda t: (not t["new_in_window"], t["newest_status"] != "FAILED", t["package"]))
-    return {"scope": {**_scope(params), "window_from": begin}, "packages_failed": len(failed), "new_in_window": sum(1 for t in failed if t["new_in_window"]), "still_failing": sum(1 for t in failed if t["newest_status"] == "FAILED"), "rows": failed[:_limit(limit)],
+    elsewhere = _sub_ib_unit_failures(release, arch, begin, until, package) if params["primary"] else []
+    return {"scope": {**_scope(params), "window_from": begin}, "also_failed_in_sub_ibs": elsewhere, "packages_failed": len(failed), "new_in_window": sum(1 for t in failed if t["new_in_window"]), "still_failing": sum(1 for t in failed if t["newest_status"] == "FAILED"), "rows": failed[:_limit(limit)],
             "note": "Unit-test results are per package, not per test. Earlier data decides 'new': nothing before the oldest import is known."}
 
 
@@ -499,6 +528,36 @@ def newest_complete_primary(prefix: str, count: int = 1) -> list[str]:
             if len(complete) == count:
                 break
     return complete
+
+
+def find_prs_merged_between(before_tag: str, after_tag: str, limit: int = 20) -> dict:
+    """PRs merged between two builds of a series: in_dashboard_list from the dashboard's own list per build, and by_merge_time from their merge times, which is the only way cmsdist and builds without a list are covered. Timing only, never proof of a cause."""
+    from zoneinfo import ZoneInfo
+    from graph import tools
+    listed = tools.find_prs_merged_between(before_tag, after_tag, limit)
+    parts = [re.fullmatch(r"(CMSSW_\d+_\d+)(?:_[A-Za-z0-9]+)?_X_(\d{4}-\d{2}-\d{2}-\d{4})", t or "") for t in (before_tag, after_tag)]
+    if not all(parts):
+        return {"in_dashboard_list": listed, "by_merge_time": [], "note": "Merge times could not be used: these aren't IB tags."}
+    def utc(stamp):
+        return datetime.strptime(stamp, "%Y-%m-%d-%H%M").replace(tzinfo=ZoneInfo("Europe/Zurich")).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+    start, end = sorted((utc(parts[0].group(2)), utc(parts[1].group(2))))
+    shown = {(r["repo"], r["pr_number"]) for r in listed}
+    # found 2026-11-06: "0 cmsdist PRs" where 3 were merged, because the list per build has no cmsdist
+    timed = _rows("MATCH (p:PR) WHERE p.merged_at >= $start AND p.merged_at < $end AND p.release STARTS WITH $head OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
+                  "RETURN p.repo AS repo, p.number AS pr_number, p.title AS title, p.merged_at AS merged_at, a.name AS author ORDER BY p.merged_at DESC", start=start, end=end, head=parts[1].group(1))
+    timed = [r for r in timed if (r["repo"], r["pr_number"]) not in shown]
+    return {"in_dashboard_list": listed, "by_merge_time": timed[:_limit(limit)], "by_merge_time_total": len(timed),
+            "note": f"by_merge_time: merged between {start} and {end} UTC with release {parts[1].group(1)}; a PR merged in the window can still reach the build later. Count both lists."}
+
+
+def neighbour_build(tag: str, direction: str, arch: str | None = None) -> str | None:
+    """The next or previous build of the same series and flavour, from what is imported; on one architecture if named."""
+    stamp = tag[-15:]
+    head = tag[:-15]
+    tags = sorted({r["tag"] for r in _rows("MATCH (ib:IB) WHERE ib.tag STARTS WITH $head AND ($arch IS NULL OR ib.arch = $arch) RETURN DISTINCT ib.tag AS tag", head=head, arch=arch)}, key=lambda x: x[-15:])
+    if direction == "after":
+        return next((x for x in tags if x[-15:] > stamp), None)
+    return next((x for x in reversed(tags) if x[-15:] < stamp), None)
 
 
 _AUTOMATIC_OPENER = "cmsbuild"

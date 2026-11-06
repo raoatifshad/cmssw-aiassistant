@@ -6,11 +6,159 @@ from unittest.mock import MagicMock, patch
 from graph import analytics
 from graph.tools import TOOLS, list_ib_tags
 from server.agent import _function_to_openai_schema
-from server.api_server import _pr_opener_sentence, _WORD_SEARCH_DEAD_END_RE, _DATE_RANGE_RE, _with_partial_build_note, _known_question_invents, _scope_mismatch, _without_invented_names, _clang_package_in_tag_answer, _named_month_window
+from server.api_server import _existing_builds_denied, _flavours_of_build_answer, _resolve_relative_builds, _PER_FLAVOUR_RE, _architectures_answer, _identifiers_grounded, _relval_by_exit_code_answer, _keeps_known_error_condition, _pr_opener_sentence, _WORD_SEARCH_DEAD_END_RE, _DATE_RANGE_RE, _with_partial_build_note, _known_question_invents, _scope_mismatch, _without_invented_names, _clang_package_in_tag_answer, _named_month_window
 
 
 def relval(tag, arch, workflow, status="FAILED", known=False, code=256):
     return dict(tag=tag, arch=arch, workflow=workflow, name=f"wf{workflow}", status=status, exit_code=code, known=known)
+
+
+class BuildsAreFactsTests(unittest.TestCase):
+    TAGS = [dict(tag=f"CMSSW_20_1_X_2026-11-0{d}") for d in ("2-2300", "3-1100", "3-2300")]
+
+    def test_neighbours_come_from_the_data(self):
+        with patch.object(analytics, "_rows", return_value=self.TAGS):
+            self.assertEqual(analytics.neighbour_build("CMSSW_20_1_X_2026-11-02-2300", "after"), "CMSSW_20_1_X_2026-11-03-1100")
+            self.assertEqual(analytics.neighbour_build("CMSSW_20_1_X_2026-11-03-1100", "before"), "CMSSW_20_1_X_2026-11-02-2300")
+            self.assertIsNone(analytics.neighbour_build("CMSSW_20_1_X_2026-11-03-2300", "after"))
+
+    def test_a_relative_build_is_written_out(self):
+        with patch("server.api_server.neighbour_build", return_value="CMSSW_20_1_X_2026-11-03-1100") as look:
+            self.assertEqual(_resolve_relative_builds("what failed in the build after CMSSW_20_1_X_2026-11-02-2300 on el9_amd64_gcc14?"), "what failed in `CMSSW_20_1_X_2026-11-03-1100` on el9_amd64_gcc14?")
+        look.assert_called_once_with("CMSSW_20_1_X_2026-11-02-2300", "after", "el9_amd64_gcc14")
+        self.assertEqual(_resolve_relative_builds("what failed?"), "what failed?")
+
+    def test_a_build_that_exists_cant_be_called_missing(self):
+        answer = "In the next primary build after CMSSW_20_1_X_2026-11-02-2300, the 11-03-1100 primary slot isn't in the graph."
+        with patch("server.api_server._identifiers_exist", return_value=True):
+            self.assertEqual(_existing_builds_denied(answer), ["CMSSW_20_1_X_2026-11-03-1100"])
+        with patch("server.api_server._identifiers_exist", return_value=False):
+            self.assertEqual(_existing_builds_denied(answer), [])
+
+    def test_a_statement_about_one_architecture_can_be_true(self):
+        with patch("server.api_server._identifiers_exist", return_value=True) as check:
+            self.assertEqual(_existing_builds_denied("CMSSW_20_1_X_2026-11-03-1100 isn't imported on el9_aarch64_gcc14."), [])
+        check.assert_not_called()
+
+    def test_flavours_of_a_build(self):
+        records = [dict(variant="primary", arch="el8"), dict(variant="primary", arch="el9"), dict(variant="ROOT6", arch="el9"), dict(variant="CLANG", arch="el9")]
+        with patch("server.api_server._dated_primary_question", return_value="how many CMSSW_20_1_X_2026-11-03-2300"), patch("server.api_server._latest_or_named_tag", return_value="CMSSW_20_1_X_2026-11-03-2300"), patch("server.api_server._ib_build_records", return_value=records):
+            answer = _flavours_of_build_answer("how many sub-IB flavours does the 2026-11-03-2300 20_1 build have?")
+        self.assertIn("**2 sub-IB flavour(s)**", answer)
+        self.assertIn("`CLANG` (`el9`), `ROOT6` (`el9`)", answer)
+        self.assertIsNone(_flavours_of_build_answer("which flavour failed most?"))
+
+    def test_sub_ibs_in_a_count_are_named(self):
+        rows = [relval("CMSSW_20_1_X_2026-11-03-2300", "el9", "1.0"), relval("CMSSW_20_1_ASAN_X_2026-11-03-2300", "el9", "2.0")]
+        with patch.object(analytics, "_rows", side_effect=[rows, []]):
+            self.assertEqual(analytics.relval_counts("workflow", tag="CMSSW_20_1_X_2026-11-03-2300")["sub_ibs_included"], ["ASAN"])
+
+
+class RuleGapsFoundInConversationsTests(unittest.TestCase):
+    COUNTS = dict(distinct=1, total_results=58, primary_builds_only=20, rows=[dict(workflow="539.0", name="DY", results=58, builds=30, archs=["el9_amd64_gcc14"], last="2026-11-05-1100")])
+
+    def test_a_timeout_over_days_is_counted_over_those_days(self):
+        with patch("server.api_server.get_exit_code_names", return_value={31744: "TimeOut"}), patch("server.api_server.relval_counts", return_value=self.COUNTS) as counts:
+            answer = _relval_by_exit_code_answer("which workflows timed out in 20_1 in the last three days?")
+        self.assertIn("`539.0`", answer)
+        self.assertIn("31744 (TimeOut)", answer)
+        self.assertEqual((counts.call_args.kwargs["release"], counts.call_args.kwargs["exit_code"]), ("20_1", "31744"))
+        self.assertEqual(counts.call_args.kwargs["since"], (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d"))
+
+    def test_none_found_says_what_was_searched(self):
+        with patch("server.api_server.get_exit_code_names", return_value={}), patch("server.api_server.relval_counts", return_value=dict(rows=[])):
+            self.assertIn("No RelVal failed with exit code 62720 in `CMSSW_20_1` builds", _relval_by_exit_code_answer("which workflows failed with exit code 62720 this week in 20_1?"))
+
+    def test_on_which_architectures_is_a_follow_up(self):
+        for question in ("on which architectures?", "the first one, on which architecture?"):
+            self.assertIsNone(_architectures_answer(question))
+
+    def test_per_flavour_is_recognised(self):
+        self.assertTrue(_PER_FLAVOUR_RE.search("how many relvals failed per flavour in the 2026-11-04-2300 20_1 build?"))
+        self.assertFalse(_PER_FLAVOUR_RE.search("which flavour is worst?"))
+
+    def test_sub_ib_failures_are_reported_next_to_primary_ones(self):
+        rows = [dict(tag="CMSSW_20_1_ROOT6_X_2026-11-04-2300", arch="el9", package="FWIO/RNTupleTempTests")] * 5
+        with patch.object(analytics, "_rows", side_effect=[[], rows]):
+            result = analytics.unit_test_changes("20_1", package="FWIO/RNTupleTempTests", since="2026-10-30")
+        self.assertEqual(result["packages_failed"], 0)
+        self.assertEqual(result["also_failed_in_sub_ibs"], [dict(package="FWIO/RNTupleTempTests", flavour="ROOT6", arch="el9", builds_failed=5)])
+
+    def test_a_build_that_was_looked_up_and_exists_is_not_invented(self):
+        tag = "CMSSW_20_1_X_2026-11-04-1100"
+        evidence = [dict(arguments=dict(tag=tag), result=[dict(pr=1)])]
+        with patch("server.api_server._identifiers_exist", return_value=True):
+            self.assertTrue(_identifiers_grounded(f"PRs in `{tag}`", evidence, "which PRs in 2026-11-04-1100?"))
+        with patch("server.api_server._identifiers_exist", return_value=False):
+            self.assertFalse(_identifiers_grounded(f"PRs in `{tag}`", evidence, "which PRs?"))
+        self.assertFalse(_identifiers_grounded(f"PRs in `{tag}`", [dict(arguments={}, result=[])], "which PRs?"))
+
+
+class CompareAcrossFlavoursTests(unittest.TestCase):
+    def rows(self, tag, archs, workflows):
+        return [dict(workflow=w, name="n", status="FAILED", exit_code=1, known=False, arch=a, tag=tag) for a in archs for w in workflows]
+
+    def compare(self, a_rows, b_rows, **kwargs):
+        with patch.object(analytics, "_rows", side_effect=[a_rows, b_rows]), patch.object(analytics, "_usual_relval_counts", return_value={}):
+            return analytics.compare_relvals(kwargs.pop("a", "CMSSW_20_1_X_2026-11-03-2300"), kwargs.pop("b", "CMSSW_20_1_ASAN_X_2026-11-04-2300"), **kwargs)
+
+    def test_architectures_dont_overwrite_each_other_across_flavours(self):
+        result = self.compare(self.rows("CMSSW_20_1_X_2026-11-03-2300", ["a1", "a2", "a3"], ["1.0", "2.0"]), self.rows("CMSSW_20_1_ASAN_X_2026-11-04-2300", ["a1"], ["1.0"]))
+        self.assertEqual((result["earlier"]["failed"], result["later"]["failed"]), (6, 1))
+        self.assertEqual(len(result["failed_in_both"]), 1)
+
+    def test_an_architecture_family_doesnt_collapse_either(self):
+        tag = "CMSSW_20_1_X_2026-11-03-2300"
+        result = self.compare(self.rows(tag, ["el9_a", "el9_b"], ["1.0"]), self.rows("CMSSW_20_1_X_2026-11-04-2300", ["el9_a", "el9_b"], ["1.0"]), a=tag, b="CMSSW_20_1_X_2026-11-04-2300", arch_a="el9", arch_b="el9")
+        self.assertEqual(result["earlier"]["failed"], 2)
+
+    def test_two_architectures_still_compare_the_same_workflow(self):
+        tag = "CMSSW_20_1_X_2026-11-03-2300"
+        result = self.compare(self.rows(tag, ["el8"], ["1.0"]), self.rows(tag, ["el9"], ["1.0"]), a=tag, b=tag, arch_a="el8", arch_b="el9")
+        self.assertEqual(len(result["failed_in_both"]), 1)
+
+
+class KeepsTheConditionTests(unittest.TestCase):
+    def test_without_stays_without(self):
+        q = "no, on all architectures but without known errors"
+        turned = "how many relvals failed in CMSSW_20_1_X_2026-11-02-2300 on all architectures, counting known errors as failures (i.e. not excluding known errors)?"
+        fixed = _keeps_known_error_condition(q, turned)
+        self.assertIn("without known errors", fixed)
+        self.assertNotIn("counting known", fixed)
+
+    def test_nothing_else_is_touched(self):
+        self.assertEqual(_keeps_known_error_condition("list the known errors", "list the known errors in X"), "list the known errors in X")
+        self.assertEqual(_keeps_known_error_condition("without known errors", "failures in X without known errors"), "failures in X without known errors")
+
+
+class ReplyRepeatsTests(unittest.TestCase):
+    def test_every_model_call_has_a_seed(self):
+        source = open("server/agent.py").read()
+        self.assertEqual(source.count("temperature=0,"), source.count("seed=LLM_SEED,"))
+        self.assertIn('request["seed"] = LLM_SEED', source)
+
+
+class WhatCountsLeaveOutTests(unittest.TestCase):
+    TAG = "CMSSW_20_1_X_2026-11-03-2300"
+
+    def test_das_errors_and_the_primary_share_are_reported(self):
+        rows = [relval(self.TAG, "el9", "537.0"), relval("CMSSW_20_1_ASAN_X_2026-11-03-2300", "el9", "539.0")]
+        with patch.object(analytics, "_rows", side_effect=[rows, [dict(workflow="38551.85"), dict(workflow="38551.85")]]):
+            result = analytics.relval_counts("workflow", tag=self.TAG)
+        self.assertEqual((result["total_results"], result["primary_builds_only"]), (2, 1))
+        self.assertEqual(result["das_errors_left_out"], {"results": 2, "workflows": ["38551.85"]})
+
+    def test_merge_times_cover_what_the_list_per_build_doesnt(self):
+        listed = [dict(repo="cmssw", pr_number=1, title="a", merged_at="2026-11-02T12:00:00Z", author="x")]
+        timed = listed + [dict(repo="cmsdist", pr_number=10974, title="b", merged_at="2026-11-02T21:30:39+00:00", author="y")]
+        with patch("graph.tools.find_prs_merged_between", return_value=listed), patch.object(analytics, "_rows", return_value=timed) as rows:
+            result = analytics.find_prs_merged_between("CMSSW_20_1_X_2026-11-02-1100", "CMSSW_20_1_X_2026-11-03-1100")
+        self.assertEqual([r["pr_number"] for r in result["by_merge_time"]], [10974])
+        self.assertEqual(rows.call_args.kwargs["start"], "2026-11-02T10:00")  # 11:00 at CERN, in winter
+        self.assertEqual(rows.call_args.kwargs["head"], "CMSSW_20_1")
+
+    def test_the_tool_the_ai_gets_uses_merge_times(self):
+        self.assertIn("by_merge_time", TOOLS["find_prs_merged_between"].__doc__)
 
 
 class PrOriginTests(unittest.TestCase):
