@@ -1,0 +1,147 @@
+"""Scan an unpacked IB test-log zip where cms-bot already unpacked it, and
+write the result next to the zip.
+
+Meant to be called from cms-bot's es_ibs_log.py, right after it unzips
+unitTestLogs.zip into UT/ or addOnTests.zip into AO/:
+
+    scan_unit_test_dir(utdir + "/UT", zip_path=logFile)
+    scan_addon_dir(utdir + "/AO", zip_path=logFile)
+
+Each call writes one file in the zip's folder (the build folder):
+
+    unitTestLogs.zip -> unitTestLogs-scan.json.gz
+    addOnTests.zip   -> addOnTests-scan.json.gz
+
+The file holds every test with its status, every problem found in the logs
+(ib_test_log_scanner.py does the detection), and a `source` block saying which
+build it belongs to (IB tag, architecture, variant, queue), read from the zip
+path. It is the same format as the cmssdt-kg-chatbot results files, so its
+importer (ingest_test_logs.py) reads it unchanged.
+
+Rules this file keeps, because it runs inside someone else's job:
+  * standard library only, Python 3.8+;
+  * no network, no database, no credentials -- it only reads the unpacked
+    logs and writes one file;
+  * never writes inside the unpacked folder (cms-bot zips that folder again);
+  * the result is written to "<name>.tmp" and renamed, so nobody ever sees a
+    half-written file;
+  * a zip path that does not look like a build folder raises ValueError and
+    writes nothing, rather than guessing which build it is. The caller wraps
+    each call in try/except, so an error here never stops cms-bot's own work.
+
+Calling it again for the same zip simply rewrites the same file.
+"""
+from __future__ import annotations
+
+import gzip
+import json
+import os
+import re
+import sys
+import time
+
+import ib_test_log_scanner as scanner
+
+# <arch>/www/<day>/<queue>/<IB tag>/[gpu/<card>/|other/<name>/]<zip>, anywhere in the path
+# (/data/sdt/buildlogs/... on cmssdt9-02, or a copy of that layout elsewhere)
+PATH_RE = re.compile(
+    r"(?:^|/)(?P<arch>[^/]+)/www/(?P<day>[^/]+)/(?P<queue>[^/]+)/(?P<tag>CMSSW_[^/]+)/(?P<rest>[^/].*)$")
+ZIP_KINDS = {"unitTestLogs.zip": "unit", "addOnTests.zip": "addon"}
+EVIDENCE_LINES_QUIET = 8  # evidence lines kept for message_logger / generic records (as the chatbot's fetcher)
+
+
+def describe_zip_path(zip_path: str) -> dict:
+    """Which build a zip belongs to, from its path. Raises ValueError if the
+    path does not have the build-folder shape."""
+    path = os.path.abspath(zip_path).replace(os.sep, "/")
+    m = PATH_RE.search(path)
+    name = path.rsplit("/", 1)[-1]
+    if not m or name not in ZIP_KINDS:
+        raise ValueError(f"not an IB test-log zip path: {zip_path}")
+    rest = m.group("rest")
+    parts = rest.split("/")
+    if len(parts) == 1:
+        variant = ""
+    elif len(parts) == 3 and parts[0] in ("gpu", "other"):
+        variant = "/".join(parts[:2])
+    else:
+        raise ValueError(f"unexpected folder below the IB tag in {zip_path}")
+    rel = path[m.start("arch"):]
+    return dict(kind=ZIP_KINDS[name], arch=m.group("arch"), tag=m.group("tag"), variant=variant,
+                queue=m.group("queue"), path=rel)
+
+
+def scan_file_path(zip_path: str) -> str:
+    """unitTestLogs.zip -> unitTestLogs-scan.json.gz, in the same folder."""
+    folder, name = os.path.split(zip_path)
+    return os.path.join(folder, name[: -len(".zip")] + "-scan.json.gz")
+
+
+def _trim(problem: dict) -> dict:
+    if problem["kind"] not in scanner.SERIOUS_KINDS:
+        problem = dict(problem, block=problem["block"][:EVIDENCE_LINES_QUIET])
+    return problem
+
+
+def _write(result: dict, source: dict, zip_path: str, out_path: str | None) -> str:
+    st = os.stat(zip_path)
+    result["problems"] = [_trim(p) for p in result["problems"]]
+    result["source"] = dict(source, size=st.st_size, mtime=st.st_mtime,
+                            scanned_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            scanner_version=scanner.SCANNER_VERSION, scanned_by="ib_test_log_problems")
+    out_path = out_path or scan_file_path(zip_path)
+    tmp = out_path + ".tmp"
+    with gzip.open(tmp, "wt", encoding="utf-8") as fh:
+        json.dump(result, fh, default=str)
+    os.replace(tmp, out_path)
+    return out_path
+
+
+def _check_dir(unpacked_dir: str) -> None:
+    if not os.path.isdir(unpacked_dir):
+        raise ValueError(f"unpacked folder does not exist: {unpacked_dir}")
+
+
+def scan_unit_test_dir(unpacked_dir: str, zip_path: str, out_path: str | None = None) -> str:
+    """Scans the unpacked unitTestLogs.zip in `unpacked_dir` (cms-bot's UT/).
+    Returns the path of the file written."""
+    source = describe_zip_path(zip_path)
+    if source["kind"] != "unit":
+        raise ValueError(f"not a unit-test zip: {zip_path}")
+    _check_dir(unpacked_dir)
+    return _write(scanner.scan_unit_test_dir(unpacked_dir), source, zip_path, out_path)
+
+
+def scan_addon_dir(unpacked_dir: str, zip_path: str, addon_log: str | None = None,
+                   out_path: str | None = None) -> str:
+    """Scans the unpacked addOnTests.zip in `unpacked_dir` (cms-bot's AO/).
+    Each test's pass/fail comes from addOnTests.log, by default the one next
+    to the zip. Returns the path of the file written."""
+    source = describe_zip_path(zip_path)
+    if source["kind"] != "addon":
+        raise ValueError(f"not an addOn zip: {zip_path}")
+    _check_dir(unpacked_dir)
+    addon_log = addon_log or os.path.join(os.path.dirname(zip_path), "addOnTests.log")
+    with open(addon_log, encoding="utf-8", errors="replace") as fh:
+        addon_log_text = fh.read()
+    return _write(scanner.scan_addon_dir(unpacked_dir, addon_log_text), source, zip_path, out_path)
+
+
+def main(argv: list[str]) -> int:
+    """By hand: ib_test_log_problems.py <unpacked dir> <zip path> [<out path>]"""
+    if len(argv) not in (3, 4):
+        print(main.__doc__)
+        return 2
+    unpacked_dir, zip_path = argv[1], argv[2]
+    out_path = argv[3] if len(argv) == 4 else None
+    started = time.time()
+    if describe_zip_path(zip_path)["kind"] == "unit":
+        out = scan_unit_test_dir(unpacked_dir, zip_path, out_path=out_path)
+    else:
+        out = scan_addon_dir(unpacked_dir, zip_path, out_path=out_path)
+    print(f"wrote {out} in {time.time() - started:.1f} s")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
