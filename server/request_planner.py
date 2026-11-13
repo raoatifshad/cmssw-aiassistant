@@ -100,6 +100,12 @@ class PlanKind(StrEnum):
     LLM = "llm"
 
 
+# "what failed in the 2026-10-30-1100 20_1 build?": here "build" is the IB, not its compilation (found 2026-11-06: only the
+# build status, or "no build-status record", for an IB with RelVal and unit-test results).
+_BUILD_MEANS_THE_IB_RE = re.compile(
+    r"\bwhat(?:'s|\s+is|\s+was|\s+are)?\s+(?:fail\w*|broken|wrong|red)\b(?:(?!\bwarnings?\b).)*\b(?:in|on|of|for)\s+(?:the\s+|that\s+|this\s+)?(?:[\w.:-]+\s+){0,4}build\b(?!\s+(?:status|logs?|errors?|warnings?))")
+
+
 @dataclass(frozen=True)
 class RequestContext:
     """Stable facts extracted from a user message before routing."""
@@ -145,7 +151,7 @@ class RequestContext:
             categories.add("unittest")
         if re.search(r"\bclang\b", lowered):
             categories.add("clang")
-        if re.search(r"(?<![\w-])(?:build|warnings?)(?![\w-])", lowered):
+        if re.search(r"(?<![\w-])(?:build|warnings?)(?![\w-])", lowered) and not _BUILD_MEANS_THE_IB_RE.search(lowered):
             categories.add("build")
         if re.search(r"\b(?:prs?|mrs?|pull\s+requests?|merge\s+requests?|issues?)\b", lowered):
             categories.add("pr_evidence")

@@ -351,8 +351,9 @@ class PastedErrorRoutingTests(unittest.TestCase):
 
     @patch("server.api_server._pasted_exception_search_answer", return_value=("Imported GitHub matches ...", []))
     @patch("server.api_server._test_log_problem_answer", return_value=None)
+    @patch("server.api_server._github_reports_section", return_value=None)  # else it reads the real graph
     @patch("server.api_server.get_driver")
-    def test_without_log_matches_the_github_answer_is_unchanged(self, get_driver, _log, github_answer):
+    def test_without_log_matches_the_github_answer_is_unchanged(self, get_driver, _names, _log, github_answer):
         session = get_driver.return_value.session.return_value.__enter__.return_value
         session.run.return_value.__iter__.return_value = iter([])
         session.run.return_value.single.return_value = None

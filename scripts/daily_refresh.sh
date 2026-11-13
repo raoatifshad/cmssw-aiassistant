@@ -188,15 +188,27 @@ if want docs; then
     else status docs "SKIPPED (no shifter-wiki clone)"; fi
 else status docs SKIPPED; fi
 
-# ---------------------------------------------------------------- 4b. GitHub Issues/PRs (stopgap)
-# Only while the backup on cmssdt9-02 is stuck (since 2026-09-04): delete this step when it works again.
-# No comments; never --reconcile (the store holds only what was fetched, not all of GitHub).
+# ---------------------------------------------------------------- 4b. GitHub backup: Issues, PRs, comments, patches
+# Copied from cmssdt9-02 and imported only when its issues/latest.txt moved. Never --reconcile, and never --delete on the copy.
+# The importer keeps whichever copy has the newer updated_at. A failure leaves the marker alone, so the next run tries again.
 if want github; then
-    GH_STORE=/home/rao/CHAT-BOT-AI/GITHUB-ISSUES/web-update/store
-    if run github-fetch 15m venv/bin/python ingestion/fetch_github_web_updates.py \
-       && run github-import 1h env PYTHONPATH=ingestion venv/bin/python ingestion/build_graph.py \
-              --cmsrepo cmsrepo --github-issues "$GH_STORE"; then
-        status github OK
+    GH_DIR=/home/rao/CHAT-BOT-AI/GITHUB-ISSUES/issues
+    GH_MARK=/home/rao/CHAT-BOT-AI/GITHUB-ISSUES/imported-latest.txt
+    if ! klist -s 2>/dev/null || ! timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 root@cmssdt9-02.cern.ch true 2>/dev/null; then
+        status github "FAILED (no login to cmssdt9-02, kept the copy from $(date -d @"$(cat "$GH_MARK" 2>/dev/null || echo 0)" '+%F %H:%M'))"
+        FAILED=$((FAILED + 1))
+    elif run github-copy 2h rsync -a root@cmssdt9-02.cern.ch:/data/sdt/SDT/public/github/cms-sw/cmssw/issues/ "$GH_DIR/"; then
+        GH_LATEST=$(cat "$GH_DIR/latest.txt" 2>/dev/null)
+        GH_WHEN=$(date -d @"${GH_LATEST:-0}" '+%F %H:%M')
+        if [ "$GH_LATEST" = "$(cat "$GH_MARK" 2>/dev/null)" ]; then
+            status github "OK (backup unchanged, $GH_WHEN)"
+        elif run github-import 3h env PYTHONPATH=ingestion venv/bin/python ingestion/build_graph.py \
+                 --cmsrepo cmsrepo --github-issues "$GH_DIR" \
+             && run github-patches 2h env PYTHONPATH=ingestion venv/bin/python ingestion/ingest_github_patches.py \
+                 --github-issues "$GH_DIR"; then
+            echo "$GH_LATEST" > "$GH_MARK"
+            status github "OK (imported backup of $GH_WHEN)"
+        fi
     fi
 else status github SKIPPED; fi
 
@@ -246,7 +258,8 @@ echo "$(date -Is) $([ $FAILED -eq 0 ] && echo OK || echo "$FAILED problem(s)") -
 find "$LOG_DIR" -name '20*.log' -mtime +45 -delete
 log "===== done, $FAILED problem(s)"
 # then the bot tester, detached so this refresh's lock is released (TESTER=0 to skip)
-if [ "${TESTER:-1}" = 1 ] && [ -x "$REPO/scripts/daily_tester.sh" ]; then
+# off by default since 2026-11-11 (owner: tokens; it failed every night on a merge conflict); TESTER=1 runs it
+if [ "${TESTER:-0}" = 1 ] && [ -x "$REPO/scripts/daily_tester.sh" ]; then
     log "starting scripts/daily_tester.sh (reports in /home/rao/CHAT-BOT-AI/daily-test-reports)"
     setsid nohup "$REPO/scripts/daily_tester.sh" >/dev/null 2>&1 < /dev/null &
 fi

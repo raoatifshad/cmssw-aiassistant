@@ -446,10 +446,16 @@ def ingest_es_exceptions(driver, path: Path, force: bool = False) -> int:
             })
 
     with driver.session() as session:
+        # The export is a rolling window (the last 7 days), and the refresh imports the same
+        # dated file twice a day. Deleting everything this path imported before would remove the
+        # exceptions that left the window between the two runs (most of a 23:00 build's, every
+        # day): replace only the exceptions of the RelVals the new export still has.
         session.run(
-            "MATCH (:RelVal)-[:HAS_EXCEPTION]->(exception:RelValException {source_id:$source_id}) "
+            "MATCH (relval:RelVal)-[:HAS_EXCEPTION]->(exception:RelValException {source_id:$source_id}) "
+            "WHERE relval.key IN $relval_keys "
             "DETACH DELETE exception",
             source_id=source_id,
+            relval_keys=sorted({record["ib_key"] + ":" + record["workflow_id"] for record in records}),
         )
         session.run(
             "UNWIND $records AS record "
@@ -723,11 +729,13 @@ def _ingest_build_status_file(driver, path: Path, force: bool) -> tuple[int, str
         return 0, source_id
     records = build_status_records(json.loads(path.read_text()))
     with driver.session() as session:
+        # Only the IBs this file still lists: the source keeps about 10 days, and an IB that rolled off it keeps its status
+        # (found 2026-11-06: every status older than that was gone, "no build-status record" for builds with results).
         session.run(
-            "MATCH (ib:IB {build_status_source_id:$source_id}) "
+            "MATCH (ib:IB {build_status_source_id:$source_id}) WHERE ib.tag IN $tags "
             "REMOVE ib.build_status, ib.comp_warnings, ib.ignored_warnings, ib.addon_status, "
             "ib.build_status_source_id",
-            source_id=source_id,
+            source_id=source_id, tags=sorted({record["tag"] for record in records}),
         )
         session.run(
             "UNWIND $records AS raw "
@@ -1076,7 +1084,10 @@ def _import_raw_pr_batch(session, records: list[dict], force: bool) -> int:
         "WITH pr, raw WHERE coalesce(pr.github_updated_at, '') <= coalesce(raw.updated_at, '') "
         "SET pr.pr_key='cmssw:' + toString(raw.number), pr.title=raw.title, pr.body=raw.body, "
         "pr.fetched_via=raw.fetched_via, "
-        "pr.merged_at=raw.merged_at, pr.release=coalesce(pr.release, raw.release), "
+        # the release a PR targets is its GitHub milestone, which moves (open PRs are retargeted to the new master):
+        # a newer milestone replaces an older GitHub value; only the dashboard's own value (source_id set) is kept
+        "pr.merged_at=raw.merged_at, pr.release=CASE WHEN pr.source_id IS NULL "
+        "THEN coalesce(raw.release, pr.release) ELSE coalesce(pr.release, raw.release) END, "
         "pr.labels=raw.labels, pr.github_state=raw.state, pr.github_url=raw.url, "
         "pr.github_created_at=raw.created_at, pr.github_updated_at=raw.updated_at, "
         "pr.raw_content_hash=raw.content_hash, pr.raw_source_id=raw.source_id "
@@ -1136,6 +1147,9 @@ def _import_raw_issue_batch(session, records: list[dict], force: bool) -> int:
     return len(changed)
 
 
+GITHUB_COMMENT_FILE_CAP = 100
+
+
 def _import_raw_comment_batch(session, records: list[dict], force: bool) -> int:
     source_ids = [record["source_id"] for record in records]
     hashes = {
@@ -1149,9 +1163,12 @@ def _import_raw_comment_batch(session, records: list[dict], force: bool) -> int:
     changed = [record for record in records if force or hashes.get(record["source_id"]) != record["content_hash"]]
     if not changed:
         return 0
+    # The backup keeps only the first 100 comments of some long threads (found 2026-11-06: issue.json says 135, the file has
+    # 100), so a file of exactly 100 must not wipe a longer copy: its comments are added, nothing is removed.
+    replaced = [record["source_id"] for record in changed if len(record["comments"]) != GITHUB_COMMENT_FILE_CAP]
     session.run(
         "MATCH (comment:GitHubComment) WHERE comment.source_id IN $source_ids DETACH DELETE comment",
-        source_ids=[record["source_id"] for record in changed],
+        source_ids=replaced,
     )
     comments = [comment for record in changed for comment in record["comments"]]
     if comments:

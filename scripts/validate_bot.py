@@ -267,6 +267,18 @@ def build_scenarios(tag: str, arch: str) -> list[Scenario]:
                                  "producer `Test|BusyWaitIntProducer`"],
             ),
         ]),
+        # Found live 2026-11-11 (owner): "open" in the question let the unit-test rule take the test name, GitHub was never
+        # searched, and the follow-up got "Choose a scope". Issue #51089 is open and has "testVolumes crashes" in its title.
+        # Owner's demo chain, found 2026-11-12: the AI path put an unrelated PR first and followed up on it (80-95 s a turn). Holds while
+        # 36434.0 keeps failing since 11-06-1100 with the BTL plugin error; check the window if it stops.
+        Scenario("failure -> which PR caused it -> what code did it touch", [
+            Turn("which PR caused workflow 36434.0 to fail?", expect_contains=["Most likely: PR #51861", "BTLBaseRecHitSoAProducer"]),
+            Turn("what code did that PR touch?", expect_contains=["PR #51861", "Files matching the error"]),
+        ]),
+        Scenario("PR/Issue ask about a named unit test, then 'related to this'", [
+            Turn('is there any issue or PR open for "testVolumes crashes"', expect_contains=["#51089", "Open: "]),
+            Turn("did you find any issue or PR open related to this", expect_contains=["#51089"], must_not_contain=["Choose a scope"]),
+        ]),
     ]
 
 

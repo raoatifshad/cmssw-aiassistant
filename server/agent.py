@@ -198,6 +198,7 @@ def judge_github_matches(client, model: str, error_text: str, candidates: list[d
     prompt = (
         "You check search results for a CMSSW developer. Given an error and PRs/Issues whose text matched words of it, decide for EACH candidate:\n"
         "same: it reports or fixes this same problem (same failing component and same kind of failure; run-specific values such as an exit code number, IB tag, file name or address may differ)\n"
+        "The same error in another RelVal workflow, release, architecture or IB flavour is still the same problem: an Issue about this error recurring in other workflows is same, not related.\n"
         "related: same component or a similar failure, useful to read, but not clearly this problem\n"
         "unrelated: it only shares common words, or the error is quoted while discussing something else\n"
         "A PR whose comments only quote this error while discussing the CI results of a change about something else is related at most: it is same only if its title or description is about this failure. "

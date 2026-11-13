@@ -62,6 +62,9 @@ services:
       OPENSEARCH_INDEX: ${OPENSEARCH_INDEX:-cmssdt-log-events}
       LOG_RAG_ARCHIVE_DIR: /data/log-rag
       CLANG_LOG_ROOT: /data/clang-logs
+      # as tested on :8004 all week (owner approved the deploy 2026-11-11): GLM answers + the AI supervisor over the rules
+      CERN_MODEL: glm-5.3-flash-int4
+      ENABLE_AI_SUPERVISOR: "true"
     ports:
       - "${LOG_RAG_API_PORT:-8002}:8001"
     volumes:
