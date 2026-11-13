@@ -247,6 +247,9 @@ def _subject(question: str, sid: str) -> dict | None:
     paste = s._session_pastes.get(sid)
     if paste:
         return _paste_failure(s._split_paste_and_ask(paste)[0], arch)
+    listed = _listed_workflows(last)
+    if listed:
+        return {"multi": listed, "arch": arch}
     if s._last_workflow_contexts.get(sid):
         return _workflow_failure(s._last_workflow_contexts[sid], arch)
     # "is workflow 36434.0 failing reported?" then "which PR caused it?": the reported-route doesn't set the workflow context
@@ -256,6 +259,90 @@ def _subject(question: str, sid: str) -> dict | None:
     named = _PACKAGE_RE.search(last.get("answer") or "") if last.get("route") in ("deterministic:package_status", "capability:unittest",
                                                                                  "deterministic:named_test", "deterministic:github_named_ask") else None
     return _package_failure(named.group(1), arch) if named else None
+
+
+_LISTED_WF_RE = re.compile(r"(?:\bwf\s+|`)(\d{1,8}\.\d{1,7})(?:`|\b)")
+
+
+def _listed_workflows(last: dict) -> list[str]:
+    """Failing workflows listed by the previous answer about a whole build ("are the RelVals ok there?", a comparison): 2 or more of them.
+    'which PR could have caused it?' after such a list went to the AI (34 s), which only looked at the newest build's PRs and missed
+    #51861 for 36434.0/36834.0, failing since 11-06 (found live 2026-11-13)."""
+    if not last or last.get("superseded") or last.get("route") in ("deterministic:pr_cause", "deterministic:pr_cause_files"):
+        return []
+    s = _api()
+    if s._WORKFLOW_ID_RE.search(s.IB_TAG_RE.sub(" ", last.get("question") or "")):
+        return []  # the previous question named one workflow: that one is the subject
+    answer = last.get("answer") or ""
+    if not re.search(r"\bfail", answer, re.IGNORECASE):
+        return []
+    # only the failing part: a comparison's "Resolved" list names workflows that pass now
+    answer = re.split(r"\*\*Resolved[^*]*\*\*|^#+\s*Resolved", answer, maxsplit=1, flags=re.IGNORECASE | re.MULTILINE)[0]
+    ids = list(dict.fromkeys(_LISTED_WF_RE.findall(answer)))
+    return ids[:6] if len(ids) >= 2 else []
+
+
+def _rank(failure: dict) -> tuple[list[dict], list[str]]:
+    """The PRs merged in the failure's window (or the last 14 days without one), best file match first."""
+    if failure.get("no_window"):
+        rows, tags = _recent_prs()
+    else:
+        if not failure.get("last_good") and failure.get("first_run"):
+            failure["before"] = _previous_build(failure["first_bad"], failure.get("arch"), "unit" if failure.get("package") else "relval")
+        rows, tags = _window_prs(failure["first_bad"], failure.get("last_good") or failure.get("before"))
+    names, packages = failure.get("names") or [], failure.get("packages") or []
+    ranked = []
+    for row in rows:
+        known = row.get("patch_status") == "ok" or bool(row["files"])
+        ranked.append({**row, "known": known, **_match(row["files"], row["title"] or "", names, packages, failure.get("package_weight", 3))})
+    ranked.sort(key=lambda r: (-r["score"], -(r["number"] or 0)))
+    return ranked, tags
+
+
+def _multi_cause_answer(ids: list[str], arch: str | None, sid: str) -> str | None:
+    """One block per failure start: workflows that started failing in the same build with the same top PR are shown together."""
+    s = _api()
+    groups: dict[tuple, dict] = {}
+    for wf in ids:
+        failure = _workflow_failure(wf, arch)
+        if not failure or failure.get("not_failing"):
+            continue
+        ranked, _tags = _rank(failure)
+        top = ranked[0] if ranked and ranked[0]["score"] > 0 else None
+        key = (failure["first_bad"], failure.get("last_good"), top["number"] if top else None)
+        group = groups.setdefault(key, {"failures": [], "ranked": ranked, "top": top})
+        group["failures"].append(failure)
+    if not groups:
+        return None
+    order = sorted(groups.values(), key=lambda g: (g["top"] is None, g["failures"][0]["first_bad"][-15:]))
+    lines = [f"**Which PR may have caused them: the {len(ids)} failing workflow(s) of the previous answer**, each traced from where it started failing"
+             + (f" on `{arch}`" if arch else "") + ":"]
+    for group in order:
+        first = group["failures"][0]
+        names = ", ".join(f"`{f['workflow']}`" for f in group["failures"])
+        title = first["subject"].split("(", 1)[-1].rstrip(")") if "(" in first["subject"] else ""
+        if first.get("last_good"):
+            when = f"started failing in `{first['first_bad']}` on `{first['arch']}` (last pass `{first['last_good']}`)"
+        elif first.get("before"):
+            when = f"new in `{first['first_bad']}` on `{first['arch']}` (not run in `{first['before']}`)"
+        else:
+            when = f"failing since our oldest build `{first['first_bad']}` on `{first['arch']}`, so its start is older than our data"
+        lines.append(f"\n- {names}{f' ({title})' if title else ''}: {when}.")
+        if first.get("error"):
+            lines.append(f"  Error: `{first['error'].get('category') or 'exception'}`: {first['error']['message'][:160]}")
+        top = group["top"]
+        if top:
+            label = "Possible match" if not first.get("last_good") and not first.get("before") else "Most likely"
+            lines.append(f"  **{label}: PR #{top['number']}** - {top['title']} (merged {str(top.get('merged_at') or '')[:10]}): {_evidence(top)}")
+        else:
+            lines.append(f"  **No clear candidate:** none of the {len(group['ranked'])} PR(s) merged in that window touched a file named in its error.")
+    tops = [g["top"]["number"] for g in order if g["top"]]
+    lines.append("\n" + _caveat(s) + (f" Ask \"which PR caused {order[0]['failures'][0]['workflow']}?\" for one workflow in detail"
+                                       + (f", or \"what code did that PR touch?\" for PR #{tops[0]}." if tops else ".")))
+    first_failure = order[0]["failures"][0]
+    _state[sid] = {"top": tops[0] if tops else None, "failure": first_failure, "names": first_failure.get("names") or [],
+                   "packages": first_failure.get("packages") or [], "candidates": tops}
+    return "\n".join(lines)
 
 
 def cause_answer(question: str, sid: str) -> str | None:
@@ -272,29 +359,25 @@ def cause_answer(question: str, sid: str) -> str | None:
         return None
     if not failure:
         return None
+    if failure.get("multi"):
+        try:
+            return _multi_cause_answer(failure["multi"], failure.get("arch"), sid)
+        except Exception as exc:
+            print(f"WARNING: cause lookup for the listed workflows failed: {exc}")
+            return None
     if failure.get("not_failing"):
         return (f"{failure['subject'][0].upper()}{failure['subject'][1:]} is not failing in the newest imported builds of its release series, "
                 "so there is no failure to trace to a PR. Name the build or architecture where you saw it fail.")
     try:
-        if failure.get("no_window"):
-            rows, tags = _recent_prs()
-        else:
-            if not failure.get("last_good") and failure.get("first_run"):
-                failure["before"] = _previous_build(failure["first_bad"], failure.get("arch"), "unit" if failure.get("package") else "relval")
-            rows, tags = _window_prs(failure["first_bad"], failure.get("last_good") or failure.get("before"))
+        ranked, tags = _rank(failure)
     except Exception as exc:
         print(f"WARNING: PR window lookup failed: {exc}")
         return None
     names, packages = failure.get("names") or [], failure.get("packages") or []
-    ranked = []
-    for row in rows:
-        known = row.get("patch_status") == "ok" or bool(row["files"])
-        ranked.append({**row, "known": known, **_match(row["files"], row["title"] or "", names, packages, failure.get("package_weight", 3))})
-    ranked.sort(key=lambda r: (-r["score"], -(r["number"] or 0)))
     lines = [f"**Which PR may have caused it: {failure['subject']}**"]
     if failure.get("no_window"):
         lines.append("I found no failing build with this error in the imported results, so there is no last-good/first-bad window. "
-                     f"Below: PRs merged into the newest release series in the last 14 days ({len(rows)}), ranked by the files they touched.")
+                     f"Below: PRs merged into the newest release series in the last 14 days ({len(ranked)}), ranked by the files they touched.")
     else:
         where = f" on `{failure['arch']}`" if failure.get("arch") else ""
         if failure.get("last_good"):

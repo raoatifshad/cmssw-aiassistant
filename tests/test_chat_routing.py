@@ -4070,7 +4070,8 @@ class ChatRoutingTests(unittest.TestCase):
     def test_help_request_lists_what_can_be_asked(self, store_chat_turns):
         result = chat(ChatRequest(question="what can you help me with?", session_id="help"))
         self.assertEqual(result.route, "conversational:help")
-        self.assertIn("why is workflow 512.0 failing", result.answer)
+        self.assertIn("which PR could have caused it?", result.answer)
+        self.assertIn("what code did that PR touch?", result.answer)
 
     def test_recurrence_intent_covers_recurrence_pattern(self):
         from server.api_server import _RECURRING_FAILURE_INTENT_RE
