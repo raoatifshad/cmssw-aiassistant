@@ -50,12 +50,15 @@ Self-contained, same spirit as clang_parser.py / relval_log_parser.py: no
 Neo4j, no network, no shared state. Zip members are streamed line by line and
 never extracted to disk, so a multi-GB DBG log never has to fit in memory.
 """
+from __future__ import annotations  # runs on Python 3.8+ (cms-bot's nodes), not only 3.10+
+
 import argparse
 import bisect
 import collections
 import hashlib
 import io
 import json
+import os
 import re
 import zipfile
 from collections import deque
@@ -734,6 +737,39 @@ class _ZipMemberLines:
         return _member_lines(self.zf, self.info)
 
 
+def _file_lines(path: str):
+    with open(path, "rb", buffering=1 << 20) as raw:
+        yield from _bounded_lines(raw)
+
+
+class _FileLines:
+    """Re-iterable view of one file on disk (an unpacked zip member)."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def __iter__(self):
+        return _file_lines(self.path)
+
+
+def _zip_members(zf: zipfile.ZipFile):
+    """(member name, re-iterable lines) for every file in a zip, in zip order."""
+    for info in zf.infolist():
+        if not info.is_dir():
+            yield info.filename, _ZipMemberLines(zf, info)
+
+
+def _dir_members(root: str):
+    """(member name, re-iterable lines) for every file under an unpacked zip
+    folder. Names are relative to `root` with "/" separators, i.e. exactly the
+    names the files had inside the zip, so results match a zip scan."""
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames.sort()
+        for name in sorted(files):
+            path = os.path.join(dirpath, name)
+            yield os.path.relpath(path, root).replace(os.sep, "/"), _FileLines(path)
+
+
 # ---- unit tests ------------------------------------------------------------
 
 def unit_test_spans(lines) -> list[dict]:
@@ -789,17 +825,26 @@ def scan_unit_test_log(lines, package: str, member: str = "") -> tuple[list[dict
     return tests, list(aggregate(iter_issues(lines), owner_of=owner_of).values())
 
 
-def scan_unit_test_zip(path: str) -> dict:
+def _scan_unit_test_members(members) -> dict:
     tests, problems = [], []
-    with zipfile.ZipFile(path) as zf:
-        for info in zf.infolist():
-            if not info.filename.endswith("/unitTest.log"):
-                continue
-            package = "/".join(info.filename.split("/")[1:-1])
-            t, p = scan_unit_test_log(_ZipMemberLines(zf, info), package, info.filename)
-            tests.extend(t)
-            problems.extend(p)
+    for member, lines in members:
+        if not member.endswith("/unitTest.log"):
+            continue
+        package = "/".join(member.split("/")[1:-1])
+        t, p = scan_unit_test_log(lines, package, member)
+        tests.extend(t)
+        problems.extend(p)
     return dict(kind="unit", tests=tests, problems=problems)
+
+
+def scan_unit_test_zip(path: str) -> dict:
+    with zipfile.ZipFile(path) as zf:
+        return _scan_unit_test_members(_zip_members(zf))
+
+
+def scan_unit_test_dir(root: str) -> dict:
+    """Same as scan_unit_test_zip, for the zip already unpacked into `root`."""
+    return _scan_unit_test_members(_dir_members(root))
 
 
 # ---- addOn tests -----------------------------------------------------------
@@ -818,24 +863,32 @@ def parse_addon_statuses(addon_log_text: str) -> dict[str, dict]:
     return statuses
 
 
-def scan_addon_zip(path: str, addon_log_text: str) -> dict:
+def _scan_addon_members(members, addon_log_text: str) -> dict:
     statuses = parse_addon_statuses(addon_log_text)
     tests, problems = [], []
-    with zipfile.ZipFile(path) as zf:
-        for info in zf.infolist():
-            name = info.filename.rsplit("/", 1)[-1]
-            if not name.endswith(".log"):
-                continue
-            status = statuses.get(name)
-            if status is None:
-                m = re.match(r"cmsDriver-(?P<test>.+)_step(?P<step>\d+)\.log$", name)
-                status = dict(test=m.group("test") if m else name, step=int(m.group("step")) if m else None,
-                              status=None, raw_status=None)
-            tests.append(dict(status, member=info.filename))
-            owner = dict(test=status["test"], step=status["step"], test_status=status["status"],
-                         member=info.filename)
-            problems.extend(aggregate(iter_issues(_member_lines(zf, info)), owner).values())
+    for member, lines in members:
+        name = member.rsplit("/", 1)[-1]
+        if not name.endswith(".log"):
+            continue
+        status = statuses.get(name)
+        if status is None:
+            m = re.match(r"cmsDriver-(?P<test>.+)_step(?P<step>\d+)\.log$", name)
+            status = dict(test=m.group("test") if m else name, step=int(m.group("step")) if m else None,
+                          status=None, raw_status=None)
+        tests.append(dict(status, member=member))
+        owner = dict(test=status["test"], step=status["step"], test_status=status["status"], member=member)
+        problems.extend(aggregate(iter_issues(iter(lines)), owner).values())
     return dict(kind="addon", tests=tests, problems=problems)
+
+
+def scan_addon_zip(path: str, addon_log_text: str) -> dict:
+    with zipfile.ZipFile(path) as zf:
+        return _scan_addon_members(_zip_members(zf), addon_log_text)
+
+
+def scan_addon_dir(root: str, addon_log_text: str) -> dict:
+    """Same as scan_addon_zip, for the zip already unpacked into `root`."""
+    return _scan_addon_members(_dir_members(root), addon_log_text)
 
 
 # ---- RelVals ---------------------------------------------------------------
