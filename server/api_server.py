@@ -46,6 +46,7 @@ from server.llm_client import DEFAULT_MODEL, REVIEW_MODEL, get_client  # noqa: E
 from server.cmssw_source import check_names, source_excerpts, source_version  # noqa: E402
 from server.paste_diagnosis import diagnosis_answer  # noqa: E402
 from server.github_ask import github_named_ask_answer  # noqa: E402
+from server.sample_questions import help_markdown as sample_help_markdown, next_suggestions, sample_groups, PASTE_HINT  # noqa: E402
 from server.pr_cause import cause_answer as pr_cause_answer, cause_hint as pr_cause_hint, files_answer as pr_cause_files_answer  # noqa: E402
 from server.question_catalog import KNOWN_QUESTIONS  # noqa: E402
 from graph.analytics import _github_data_reach, neighbour_build, newest_complete_primary, partial_builds, pr_files, pr_origin, relval_counts  # noqa: E402
@@ -334,6 +335,8 @@ class ChatResponse(BaseModel):
     citations: list[dict] = []
     github_matches: list[GitHubMatch] | None = None
     actions: list[ChatAction] = []
+    # "ask next" questions (server/sample_questions.py): unlike actions, which are scope choices for a clarification
+    suggestions: list[ChatAction] = []
 
 
 def _load_chat_history(session_id: str, limit: int = 12) -> list[dict]:
@@ -3225,7 +3228,8 @@ def _touched_path_answer(question: str) -> str | None:
         re.search(r"\bwho\b|\bcontributors?\b|\bauthors?\b|\bpeople\b", question, re.IGNORECASE))
     from graph.analytics import prs_touching_path
     try:
-        found = prs_touching_path(paths[0], since=since, until=until, date_field="merged" if merged else "created", state=state,
+        opened = bool(re.search(r"\b(?:opened|created|submitted|made)\b", question, re.IGNORECASE))
+        found = prs_touching_path(paths[0], since=since, until=until, date_field="merged" if merged else "created" if opened or not since else "any", state=state,
                                   group_by="author" if ranking else None, limit=15, release=build[0] if build else None)
         newest_before = None
         if build and not ranking and not found.get("total_prs"):
@@ -3235,7 +3239,7 @@ def _touched_path_answer(question: str) -> str | None:
         print(f"WARNING: touched-path lookup failed: {exc}")
         return None
     where = f"`{found['path']}`" + (" (a file name, any directory)" if found["matched_as"] == "file name" else " (matched anywhere in the path)" if "anywhere" in found["matched_as"] else "")
-    period = (f" {'merged' if merged else 'opened'} " + (f"on {since}" if since and since == until else f"between {since} and {until}" if since and until
+    period = (f" {'merged' if merged else 'opened' if opened else 'opened or merged'} " + (f"on {since}" if since and since == until else f"between {since} and {until}" if since and until
               else f"since {since}" if since else "")).rstrip() if since else (" (merged)" if merged else "")
     if build:
         period = f" of `{build[0]}` merged between {since} and the build of `{tags[0]}` ({build[3]})"
@@ -14293,6 +14297,14 @@ _CAPABILITY_ACTIONS = [
 ]
 
 
+_HELP_RE = re.compile(
+    r"\s*(?:(?:please\s+)?help(?:\s+me)?|\?|what\s+can\s+(?:you|i)\s+(?:do|ask|help(?:\s+me)?\s+with)(?:\s+(?:you|here|for\s+me|about))?"
+    r"|what\s+(?:kind\s+of\s+|sort\s+of\s+)?(?:questions|things)\s+(?:can|should|could)\s+i\s+ask(?:\s+(?:you|here))?"
+    r"|what\s+do\s+you\s+(?:know|do)|how\s+(?:do|can|should)\s+i\s+use\s+(?:you|this(?:\s+(?:chat|bot|tool))?)|who\s+are\s+you"
+    r"|(?:show\s+me\s+|give\s+me\s+)?(?:some\s+)?(?:sample|example)\s+questions|examples?)\s*[?!.]*\s*",
+    re.IGNORECASE)
+
+
 def _conversational_response(sid: str, original_question: str):
     """Greetings, thanks, and requests to *change* something get a direct,
     honest reply instead of the generic "couldn't match" menu. Full-match only
@@ -14304,22 +14316,9 @@ def _conversational_response(sid: str, original_question: str):
             "and CMSSDT shifter documentation. What would you like to check?"
         )
         return _chat_response(sid, original_question, message, "conversational:greeting", actions=_CAPABILITY_ACTIONS)
-    if re.fullmatch(
-        r"\s*(?:help|\?|what\s+can\s+(?:you|i)\s+(?:do|ask|help(?:\s+me)?\s+with)|what\s+do\s+you\s+(?:know|do)|"
-        r"how\s+(?:do|can)\s+i\s+use\s+(?:you|this)|who\s+are\s+you)\s*[?!.]*\s*",
-        original_question, re.IGNORECASE,
-    ):
-        message = (
-            "I answer from imported CMSSW Integration Build data -- read-only, never from the web. For example:\n"
-            "- **Latest / availability:** \"what is the latest IB\", \"is yesterday's 23:00 IB out?\", \"latest 20_0_X IB\"\n"
-            "- **What's failing:** \"what is failing in the latest IB\", \"failed RelVals for [IB tag] el9_amd64_gcc14\", "
-            "\"which unit tests are failing\"\n"
-            "- **One workflow:** \"why is workflow 512.0 failing on aarch64\", \"has 140.051 failed before\"\n"
-            "- **Changes:** \"give me a shift summary\", \"compare the last two IBs\", \"which PRs were merged in [IB tag]\"\n"
-            "- **Evidence:** \"any PR or open issue about [error or package]\", \"what does exit code 65 mean\"\n"
-            "- **Procedures:** \"what does the build-any-ib Jenkins job do\""
-        )
-        return _chat_response(sid, original_question, message, "conversational:help", actions=_CAPABILITY_ACTIONS)
+    if _HELP_RE.fullmatch(original_question):
+        # one list with the widget's sample questions (server/sample_questions.py); "what can I ask you?" went to the AI, 19 s (found 2026-11-13)
+        return _chat_response(sid, original_question, sample_help_markdown(), "conversational:help")
     if re.fullmatch(r"\s*(?:bye|good\s*bye|see\s+you|cya|ciao|that'?s\s+all|done(?:\s+for\s+now)?)\b[\s!.,]*(?:thanks?)?[\s!.]*",
                     original_question, re.IGNORECASE):
         return _chat_response(sid, original_question, "Bye! Ask any time.", "conversational:thanks")
@@ -21307,6 +21306,43 @@ def _package_since_answer(package: str, tag: str | None) -> str | None:
 
 
 def _clang_detail_answer(question: str) -> str | None:
+    """_clang_answer_body, led by a plain line when the newest parsed Clang logs are days older than the newest IB and no build was named:
+    "any new clang warnings in the latest IB?" answered for CMSSW_20_1_X_2026-08-12-2300 with the age only in a footnote (found live 2026-11-13)."""
+    answer = _clang_answer_body(question)
+    if not answer or IB_TAG_RE.search(question):
+        return answer
+    lead = _clang_stale_lead()
+    return f"{lead}\n\n{answer}" if lead else answer
+
+
+def _clang_stale_lead() -> str | None:
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                tags = [r["tag"] for r in session.run("MATCH (ib:IB)-[:REPORTED]->(:Warning) RETURN DISTINCT ib.tag AS tag")]
+        finally:
+            driver.close()
+        latest = _latest_ib_records(None, None)
+    except Exception as exc:
+        print(f"WARNING: Clang data age check failed: {exc}")
+        return None
+    if not tags or not latest:
+        return None
+    clang_tag = max(tags, key=lambda t: t.rsplit("_X_", 1)[-1])
+    newest_tag = latest[0]["tag"]
+    try:
+        from datetime import datetime
+        age = (datetime.strptime(newest_tag.rsplit("_X_", 1)[-1][:10], "%Y-%m-%d") - datetime.strptime(clang_tag.rsplit("_X_", 1)[-1][:10], "%Y-%m-%d")).days
+    except ValueError:
+        return None
+    if age < 2:
+        return None
+    return (f"⚠️ **The Clang warning data is old:** the newest build with parsed Clang logs is `{clang_tag}`, {age} days before the newest IB "
+            f"(`{newest_tag}`). The answer below is about that older build, not the latest IB.")
+
+
+def _clang_answer_body(question: str) -> str | None:
     """Clang warnings by file, over time, new in a build, top checker, on an architecture (found 2026-11-05: dead ends, or a shift summary for "new clang warnings in [tag]")."""
     if "\n" in question or re.search(r"\bwarning:|\bwhat(?:'s|\s+is)\s+an?\b", question, re.IGNORECASE):
         return None
@@ -21705,7 +21741,8 @@ def chat(req: ChatRequest):
     and answered with a short message (found 2026-10-16: a closed DB session in one search
     helper failed the whole request)."""
     try:
-        return _ai_supervised_chat(req) if AI_SUPERVISOR_ENABLED and _llm_client is not None else _chat(req)
+        response = _ai_supervised_chat(req) if AI_SUPERVISOR_ENABLED and _llm_client is not None else _chat(req)
+        return _with_suggestions(response)
     except Exception:
         import traceback
         traceback.print_exc()
@@ -21714,6 +21751,24 @@ def chat(req: ChatRequest):
             answer=("Something went wrong while looking this up, sorry -- the error is logged. Please try again or "
                     "rephrase, e.g. name the IB tag, workflow number or PR number directly."),
             session_id=sid, route="error", citations=[], github_matches=None, actions=_CAPABILITY_ACTIONS)
+
+
+def _with_suggestions(response: ChatResponse) -> ChatResponse:
+    """'Ask next' buttons (server/sample_questions.py), only when the answer offers no scope choices of its own."""
+    if not isinstance(response, ChatResponse) or response.actions or response.suggestions:
+        return response
+    try:
+        suggestions = next_suggestions(response.route, response.answer)
+    except Exception as exc:
+        print(f"WARNING: suggestions failed: {exc}")
+        return response
+    return response.model_copy(update={"suggestions": [ChatAction(**s) for s in suggestions]}) if suggestions else response
+
+
+@app.get("/api/sample-questions")
+def sample_questions():
+    """Questions to show people new to the chat (the widget's empty state); the same list as the "help" reply."""
+    return {"groups": sample_groups(), "paste_hint": PASTE_HINT}
 
 
 # already read by the LLM, or answers that aren't lookups: nothing for the supervisor to check

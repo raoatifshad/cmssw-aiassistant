@@ -710,11 +710,16 @@ def _touched_rows(kind: str, value: str, begin, end, date: str, state_filter: st
 
 def prs_touching_path(path: str | None = None, since: str | None = None, until: str | None = None, date_field: str = "created", state: str | None = None,
                       group_by: str | None = None, limit: str | None = None, release: str | None = None) -> dict:
-    """Which cmssw PRs touched a file, a package or directory ('FWCore/Framework'), or a file name ('autoCond.py'), from the PRs' patches: newest first, or group_by=author ('who changes X most'), package or file ('which files/packages were changed most', path optional then). since/until 'YYYY-MM-DD' on date_field created or merged (until may be an exact UTC time 'YYYY-MM-DDTHH:MM'); state open, closed or merged; release 'CMSSW_20_1' keeps one release series. Also says how many PRs in the same window have unknown files. Relevance only, never a cause."""
+    """Which cmssw PRs touched a file, a package or directory ('FWCore/Framework'), or a file name ('autoCond.py'), from the PRs' patches: newest first, or group_by=author ('who changes X most'), package or file ('which files/packages were changed most', path optional then). since/until 'YYYY-MM-DD' on date_field created, merged or any (opened or merged in the window) (until may be an exact UTC time 'YYYY-MM-DDTHH:MM'); state open, closed or merged; release 'CMSSW_20_1' keeps one release series. Also says how many PRs in the same window have unknown files. Relevance only, never a cause."""
     begin = since[:10] if since else None
     # until: a day ('YYYY-MM-DD', whole day) or an exact UTC time ('YYYY-MM-DDTHH:MM', e.g. an IB's build time)
     end = (until[:16] if re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d.*", str(until)) else until[:10] + "T99") if until else None
     date = {"merged": "p.merged_at", "updated": "p.github_updated_at"}.get(str(date_field).lower(), "p.github_created_at")
+    if str(date_field).lower() == "any":
+        # opened OR merged in the window: "which PRs touched X last week?" counted only PRs opened then and missed #51861, merged 11-06
+        # after weeks open (found live 2026-11-13); the merge date counts when it falls in the window, else the opening date
+        date = ("(CASE WHEN p.merged_at IS NOT NULL AND ($begin IS NULL OR p.merged_at >= $begin) AND ($end IS NULL OR p.merged_at <= $end) "
+                "THEN p.merged_at ELSE p.github_created_at END)")
     wanted = str(state).lower() if state else None
     state_filter = {"open": "p.github_state = 'open'", "closed": "p.github_state = 'closed' AND p.merged_at IS NULL",
                     "merged": "p.merged_at IS NOT NULL"}.get(wanted, "true")
