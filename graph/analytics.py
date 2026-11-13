@@ -257,7 +257,7 @@ def compare_relvals(tag_a: str, tag_b: str, arch_a: str | None = None, arch_b: s
 
 
 def workflow_history(workflow_id: str, release: str | None = None, arch: str | None = None, since: str | None = None, variant: str | None = None, primary_only: str | None = None) -> dict:
-    """One workflow over time, per release, flavour and architecture: runs, failed, known errors, passed, first and last failure, last pass, current status, exit codes, how many times it flipped. Use for 'since when', 'has it failed before', 'is it new', 'is it in other releases', 'which architectures'. Data goes back about 2 weeks or more; default all imported."""
+    """One workflow over time, per release, flavour and architecture: runs, failed, known errors, passed, first and last failure, last pass, current status, exit codes, how many times it flipped, the build where the current failing streak started (failing_since) or where it passed again after its last failure (passing_again_since; last_passed is only the newest pass, not when it recovered), and the failed builds. Use for 'since when', 'when did it stop', 'has it failed before', 'is it new', 'is it in other releases', 'which architectures'. Data goes back about 2 weeks or more; default all imported."""
     params = _ib_params(release, None, arch, since, None, variant, primary_only, default_days=None)
     rows = _rows(f"MATCH (ib:IB) WHERE {_IB_WHERE} MATCH (ib)-[:RAN_RELVAL]->(r:RelVal {{workflow_id:$workflow}}) "
                  "RETURN ib.tag AS tag, ib.arch AS arch, r.name AS name, r.status AS status, r.exitcode AS exit_code, coalesce(r.known_error,false) AS known ORDER BY right(ib.tag, 15)", **params, workflow=workflow_id)
@@ -265,7 +265,8 @@ def workflow_history(workflow_id: str, release: str | None = None, arch: str | N
     for row in rows:
         release_name = "_".join(row["tag"].split("_")[:3])
         track = tracks.setdefault((release_name, _variant_of(row["tag"]), row["arch"]), {"release": release_name, "flavour": _variant_of(row["tag"]), "arch": row["arch"], "runs": 0, "failed": 0, "known_error": 0, "passed": 0,
-                                                                                       "first_failed": None, "last_failed": None, "last_passed": None, "newest": None, "newest_status": None, "exit_codes": set(), "flips": 0, "_previous": None})
+                                                                                       "first_failed": None, "last_failed": None, "last_passed": None, "newest": None, "newest_status": None, "exit_codes": set(), "flips": 0, "_previous": None,
+                                                                                       "failing_since": None, "passing_again_since": None, "failed_builds": []})
         track["runs"] += 1
         status = "known_error" if row["known"] and row["status"] == "FAILED" else row["status"]
         if status == "FAILED":
@@ -281,8 +282,22 @@ def workflow_history(workflow_id: str, release: str | None = None, arch: str | N
             track["known_error"] += 1
         if track["_previous"] in ("FAILED", "PASSED") and status in ("FAILED", "PASSED") and status != track["_previous"]:
             track["flips"] += 1
+        # where the current streak began: "when did it stop failing?" was answered with last_passed (the newest pass),
+        # one build late (found 2026-11-10, item E3: 1047.0 passed again in 11-09-1100, the AI said 11-09-2300)
+        if status == "FAILED":
+            track["failed_builds"].append(row["tag"])
+            if track["_previous"] != "FAILED":
+                track["failing_since"] = row["tag"]
+            track["passing_again_since"] = None
+        elif status == "PASSED":
+            if track["_previous"] != "PASSED" and track["failed"]:
+                track["passing_again_since"] = row["tag"]
+            track["failing_since"] = None
         track["_previous"] = status
         track["newest"], track["newest_status"] = row["tag"], status
+    for track in tracks.values():
+        builds = track["failed_builds"]
+        track["failed_builds"] = builds if len(builds) <= 12 else builds[:2] + [f"... {len(builds) - 6} more ..."] + builds[-4:]
     output = [{**{k: v for k, v in t.items() if k != "_previous"}, "exit_codes": sorted(t["exit_codes"])} for t in tracks.values()]
     output.sort(key=lambda t: (-t["failed"], t["release"], t["flavour"]))
     return {"workflow": workflow_id, "name": rows[-1]["name"] if rows else None, "tracks_total": len(output), "failing_now": sum(1 for t in output if t["newest_status"] == "FAILED"), "tracks": output[:_MAX_ROWS],
@@ -305,14 +320,40 @@ def flaky_workflows(release: str | None = "20_1", arch: str | None = None, since
     return {"scope": _scope(params), "flipped_at_least_twice": len(flaky), "failed_then_passed_or_reverse_once": sum(1 for t in tracks.values() if t["flips"] == 1), "rows": flaky[:_limit(limit, 20)]}
 
 
+_GITHUB_REACH: dict = {}
+
+
+def _github_data_reach() -> str | None:
+    """Day the imported GitHub backup reaches (newest comment or PR update from it; cached 10 min)."""
+    if _GITHUB_REACH and time.time() - _GITHUB_REACH["at"] < 600:
+        return _GITHUB_REACH["day"]
+    rows = _rows("OPTIONAL MATCH (c:GitHubComment) WITH max(c.created_at) AS tc "
+                 "OPTIONAL MATCH (p:PR {repo:'cmssw'}) WHERE p.fetched_via IS NULL "
+                 "RETURN tc, max(p.github_updated_at) AS tp")
+    days = [str(v)[:10] for v in (rows[0].values() if rows else []) if v]
+    _GITHUB_REACH.update(day=max(days) if days else None, at=time.time())
+    return _GITHUB_REACH["day"]
+
+
+def _window_past_reach_note(begin: str | None, until: str | None) -> str:
+    """found 2026-11-09: "any PRs opened today?" -> "No PRs were opened today": the GitHub data ends days earlier."""
+    reach = _github_data_reach()
+    if not reach or (until and until[:10] <= reach) or not (begin or until):
+        return ""
+    return (f" Our GitHub data (PRs, Issues, comments) reaches {reach}: nothing after that day is imported, so a count or an empty "
+            "result for the days after it does not mean none on GitHub; say so. (PRs merged into imported IBs after it come from the IB data.)")
+
+
 def search_github(kind: str = "both", text: str | None = None, state: str | None = None, author: str | None = None, label: str | None = None, repo: str | None = None, since: str | None = None,
                   until: str | None = None, date_field: str = "created", order: str = "newest", group_by: str | None = None, count_only: str | None = None, title_only: str | None = None, limit: str | None = None) -> dict:
     """Filter imported PRs and Issues by any mix of: kind (PR, Issue, both), whole-word text in title or description, state (open, closed, merged), author, label part ('hlt'), repo (cmssw, cmsdist), since/until ('YYYY-MM-DD'), date_field (created, merged, updated). title_only=true when they say 'in the title' (otherwise text also matches descriptions, so say which you counted). order: newest, oldest, most_comments. group_by: author or label gives a ranking. count_only=true gives only the number. Comments are not searched: for an error text use find_prs_for_error."""
     want_pr = str(kind).lower() in ("pr", "prs", "both")
     want_issue = str(kind).lower() in ("issue", "issues", "both")
-    pattern = "(?is).*\\b" + re.escape(text.strip()) + "(?:s|es)?\\b.*" if text and text.strip() else None
+    # whole word, but "_" is a separator: found 2026-11-11 (item R3), "open issues mention aarch64" gave 23, the 8 more said "el8_aarch64_gcc12" / "el9_aarch64_gcc14"
+    pattern = "(?is).*(?<![A-Za-z0-9])" + re.escape(text.strip()) + "(?:s|es)?(?![A-Za-z0-9]).*" if text and text.strip() else None
     begin = since[:10] if since else None
-    end = (until[:10] + "T99") if until else None
+    # until: a day ('YYYY-MM-DD', whole day) or an exact UTC time ('YYYY-MM-DDTHH:MM', e.g. an IB's build time)
+    end = (until[:16] if re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d.*", str(until)) else until[:10] + "T99") if until else None
     wanted_state = str(state).lower() if state else None
     found: list[dict] = []
     common = ("WHERE ($pattern IS NULL OR x.title =~ $pattern OR (NOT $title_only AND x.body =~ $pattern)) AND ($repo IS NULL OR x.repo = $repo) "
@@ -331,7 +372,18 @@ def search_github(kind: str = "both", text: str | None = None, state: str | None
         found += _rows(f"MATCH (x:Issue) {common} AND {state_filter} AND ($begin IS NULL OR {date} >= $begin) AND ($end IS NULL OR {date} <= $end) "
                        f"OPTIONAL MATCH (x)-[:AUTHORED_BY]->(a2:Author) RETURN 'Issue' AS kind, x.repo AS repo, x.number AS number, x.title AS title, x.state AS state, null AS merged_at, "
                        f"x.created_at AS created_at, {date} AS date, a2.name AS author, x.labels AS labels, x.fetched_via AS fetched_via", **base, begin=begin, end=end)
-    note = "Comments were not searched; newer items have no comments imported."
+    note = "Comments were not searched." + _window_past_reach_note(begin, until)
+    if want_pr and (repo or "").lower() == "cmsdist" and wanted_state in (None, "open"):
+        # found 2026-11-11 (item R3): "how many PRs are open for cmsdist?" -> "0 open PRs for cmsdist"; the 36 imported cmsdist PRs all came from the IB pages' merged lists
+        note += (" cmsdist PRs are imported only when they appear in an IB's merged-PR list, so every imported cmsdist PR is merged: an open cmsdist PR is never "
+                 "imported. Do not answer '0 open'; say the open cmsdist PRs are not in the imported data.")
+    reach = _github_data_reach() if want_pr else None
+    later = sum(1 for r in found if r["kind"] == "PR" and str(r.get("merged_at") or "")[:10] > reach) if reach else 0
+    if later:
+        # found 2026-11-11 (item R1): "164 PRs merged in November ... the data only reaches 11-06, later merges are not included",
+        # while 75 of the 164 were merged after 11-06 (from the IB pages)
+        note += (f" {later} of these {len(found)} were merged after {reach}: they are known from the IB pages' merged-PR lists, so the count "
+                 f"does include merges after {reach} (only PRs that reached an imported IB; a later merge in no imported IB yet is missing).")
     if _flag(count_only):
         return {"total": len(found), "note": note}
     if group_by in ("author", "label"):
@@ -575,6 +627,15 @@ def pr_origin(number: int, repo: str = "cmssw") -> dict:
     """Who is behind a PR: who opened it on GitHub, and for one the bot cmsbuild opened, the person who opened the original it was ported from. A deleted account shows as ghost, which is not a person."""
     pr = _pr_authors(repo, number)
     if not pr:
+        # people say "PR" for any GitHub number; the AI then answered "no data at all" for Issues it has
+        # (found 2026-11-09: Issues #52093, #44968, #47275), so say what the number is
+        issue = _rows("MATCH (i:Issue {repo:$repo, number:$number}) OPTIONAL MATCH (i)-[:AUTHORED_BY]->(a:Author) "
+                      "RETURN i.title AS title, i.state AS state, i.created_at AS created_at, i.closed_at AS closed_at, "
+                      "i.labels AS labels, collect(a.name) AS opened_by, COUNT { (i)-[:HAS_COMMENT]->() } AS comments_imported",
+                      repo=repo, number=int(number))
+        if issue:
+            return {"found": False, "repo": repo, "number": int(number), "is_issue": True, "issue": issue[0],
+                    "note": f"#{int(number)} is an Issue, not a PR. Use search_issues_by_text or query_graph on (:Issue) for its comments."}
         return {"found": False, "repo": repo, "number": int(number)}
     names = pr["names"]
     # Two names are the GitHub opener plus the owner of the branch, which the older imports recorded as an author too
@@ -606,6 +667,152 @@ def pr_origin(number: int, repo: str = "cmssw") -> dict:
     return result
 
 
+_TOUCH_NOTE = ("Touched = the path is in one of the PR's commits, read from the PR's patch in the GitHub backup (a change reverted later in the same PR "
+               "still counts). Relevance evidence only: never say a PR caused, broke or fixed something because it touched a file. "
+               "cmssw PRs only: cmsdist PRs have no file lists here.")
+_UNKNOWN_FILES = "unknown: the backup saved an error page instead of this PR's patch, so which files it changed is not known (never say it changed no files)"
+
+
+def _pr_opener(names: list) -> str | None:
+    """Same rule as pr_origin: one name is the opener; with two, the bot or deleted account among them opened it."""
+    names = [n for n in names or [] if n]
+    if len(names) == 1:
+        return names[0]
+    return next((n for n in names if n in (_AUTOMATIC_OPENER, _DELETED_ACCOUNT)), names[0] if names else None)
+
+
+def _touch_target(path: str) -> tuple[str, str, str]:
+    """(kind, exact Cypher value, name) for a path as people write it: a file path, a package or directory, or a bare file name."""
+    text = re.sub(r"^(?:\./)?(?:src/)?", "", str(path or "").strip().strip("`'\" ").lstrip("/")).rstrip("/")
+    last = text.rsplit("/", 1)[-1]
+    is_file = bool(re.search(r"\.[A-Za-z0-9]{1,5}$", last))
+    if "/" not in text and is_file:
+        return "file name", "/" + text, last
+    return ("file" if is_file else "directory"), "src/" + text + ("" if is_file else "/"), last
+
+
+def _touched_rows(kind: str, value: str, begin, end, date: str, state_filter: str) -> tuple[list[dict], str]:
+    match = {"file": "sf.path = $value", "directory": "sf.path STARTS WITH $value", "file name": "sf.path ENDS WITH $value"}
+    loose = {"file": "sf.path ENDS WITH '/' + substring($value, 4)", "directory": "sf.path CONTAINS '/' + substring($value, 4)"}
+    query = ("MATCH (sf:SourceFile) WHERE {cond} MATCH (p:PR)-[:TOUCHED_FILE]->(sf) "
+             f"WITH p, collect(sf.path) AS hit WHERE {state_filter} AND ($begin IS NULL OR {date} >= $begin) AND ($end IS NULL OR {date} <= $end) "
+             "OPTIONAL MATCH (p)-[:AUTHORED_BY]->(a:Author) "
+             f"RETURN p.repo AS repo, p.number AS number, p.title AS title, p.github_state AS state, p.merged_at AS merged_at, p.github_created_at AS created_at, "
+             f"{date} AS date, size(hit) AS files_touched, hit[..3] AS example_files, collect(a.name) AS names ORDER BY {date} DESC, number DESC")
+    rows = _rows(query.format(cond=match[kind]), value=value, begin=begin, end=end)
+    how = kind
+    if not rows and kind in loose and not _rows(f"MATCH (sf:SourceFile) WHERE {match[kind]} RETURN 1 AS x LIMIT 1", value=value):
+        # "L1TParticleFlow/interface/layer1_emulator.h" or "XrdAdaptor" without the package in front
+        rows = _rows(query.format(cond=loose[kind]), value=value, begin=begin, end=end)
+        how = f"{kind} (matched anywhere in the path)"
+    return rows, how
+
+
+def prs_touching_path(path: str | None = None, since: str | None = None, until: str | None = None, date_field: str = "created", state: str | None = None,
+                      group_by: str | None = None, limit: str | None = None, release: str | None = None) -> dict:
+    """Which cmssw PRs touched a file, a package or directory ('FWCore/Framework'), or a file name ('autoCond.py'), from the PRs' patches: newest first, or group_by=author ('who changes X most'), package or file ('which files/packages were changed most', path optional then). since/until 'YYYY-MM-DD' on date_field created or merged (until may be an exact UTC time 'YYYY-MM-DDTHH:MM'); state open, closed or merged; release 'CMSSW_20_1' keeps one release series. Also says how many PRs in the same window have unknown files. Relevance only, never a cause."""
+    begin = since[:10] if since else None
+    # until: a day ('YYYY-MM-DD', whole day) or an exact UTC time ('YYYY-MM-DDTHH:MM', e.g. an IB's build time)
+    end = (until[:16] if re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d.*", str(until)) else until[:10] + "T99") if until else None
+    date = {"merged": "p.merged_at", "updated": "p.github_updated_at"}.get(str(date_field).lower(), "p.github_created_at")
+    wanted = str(state).lower() if state else None
+    state_filter = {"open": "p.github_state = 'open'", "closed": "p.github_state = 'closed' AND p.merged_at IS NULL",
+                    "merged": "p.merged_at IS NOT NULL"}.get(wanted, "true")
+    if str(date_field).lower() == "merged" and wanted is None:
+        state_filter = "p.merged_at IS NOT NULL"
+    series = re.match(r"CMSSW_\d+_\d+", str(release or ""))
+    if series:  # PRs of one release series ('CMSSW_20_1'; stored as CMSSW_20_1 or CMSSW_20_1_X)
+        state_filter = f"({state_filter}) AND (p.release = '{series.group(0)}' OR p.release STARTS WITH '{series.group(0)}_')"
+    grouping = str(group_by).lower() if group_by else None
+    reach = _github_data_reach()
+    note = _TOUCH_NOTE + _window_past_reach_note(begin, until) + (f" GitHub data reaches {reach}." if reach else "")
+    if not path:
+        if grouping not in ("package", "file"):
+            return {"error": "Give a path (file, package or file name), or group_by=package or file for a ranking."}
+        rows = _rows(f"MATCH (p:PR {{repo:'cmssw'}}) WHERE {state_filter} AND ($begin IS NULL OR {date} >= $begin) AND ($end IS NULL OR {date} <= $end) "
+                     "MATCH (p)-[:TOUCHED_FILE]->(sf:SourceFile) "
+                     + ("WITH p, collect(DISTINCT split(sf.path, '/')[1] + '/' + split(sf.path, '/')[2]) AS keys UNWIND keys AS key "
+                        if grouping == "package" else "WITH p, sf.path AS key ")
+                     + "RETURN key, count(DISTINCT p) AS prs ORDER BY prs DESC, key LIMIT $limit", begin=begin, end=end, limit=_limit(limit, 15))
+        scanned = _rows(f"MATCH (p:PR {{repo:'cmssw'}}) WHERE {state_filter} AND ($begin IS NULL OR {date} >= $begin) AND ($end IS NULL OR {date} <= $end) "
+                        "RETURN count(p) AS prs, count(CASE WHEN p.patch_status = 'ok' THEN 1 END) AS known", begin=begin, end=end)[0]
+        return {"ranking_by": grouping, "rows": [{grouping: (r["key"] or "").removeprefix("src/"), "prs": r["prs"]} for r in rows],
+                "prs_in_window": scanned["prs"], "prs_with_known_files": scanned["known"],
+                "note": f"Counted over the {scanned['known']} of {scanned['prs']} cmssw PRs in the window whose files are known; the others' files are unknown. " + note}
+    kind, value, name = _touch_target(path)
+    rows, how = _touched_rows(kind, value, begin, end, date, state_filter)
+    for row in rows:
+        row["author"] = _pr_opener(row.pop("names"))
+        row["example_files"] = [f.removeprefix("src/") for f in row["example_files"]]
+    stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", name)
+    if kind == "directory" and not re.search(r"[A-Z].*[A-Z]|\d|_", stem):
+        stem = ""  # "Geometry", "Framework": too common in titles to point at this package (XrdAdaptor, TruthInfo, Phase2L1GT are not)
+    # unknown = an error page saved as the patch, or no patch at all: PRs newer than the GitHub backup come only from the IB pages' merged lists
+    unknown = _rows(f"MATCH (p:PR {{repo:'cmssw'}}) WHERE coalesce(p.patch_status, '') <> 'ok' AND {state_filter} AND ($begin IS NULL OR {date} >= $begin) AND ($end IS NULL OR {date} <= $end) "
+                    "WITH p, toLower(p.title) CONTAINS toLower($stem) AS names_it ORDER BY p.number DESC "
+                    "RETURN count(p) AS total, count(CASE WHEN p.patch_status IS NULL THEN 1 END) AS not_in_backup, [x IN collect(CASE WHEN names_it THEN {number: p.number, title: p.title, merged_at: p.merged_at} END) WHERE x IS NOT NULL][..10] AS naming",
+                    stem=stem if len(stem) >= 4 else "\u0000", begin=begin, end=end)[0]
+    result = {"path": value.removeprefix("src/"), "matched_as": how, "total_prs": len(rows),
+              "prs_with_unknown_files_in_window": unknown["total"], "of_which_newer_than_backup": unknown.get("not_in_backup") or 0,
+              "unknown_files_but_title_names_it": unknown["naming"],
+              "note": ("The PRs with unknown files may have touched it too: say how many (of_which_newer_than_backup: merged or opened after our GitHub backup, so no patch at all), and name the ones whose title names it (title text only, not a file match). " if unknown["total"] else "") + note}
+    if grouping == "author":
+        counts: dict = {}
+        for row in rows:
+            counts[row["author"]] = counts.get(row["author"], 0) + 1
+        result["rows"] = [{"author": a, "prs": n} for a, n in sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[:_limit(limit, 10)]]
+        result["note"] += f" Authors are who opened the PR on GitHub; {_AUTOMATIC_OPENER} is the bot opening backports and forward ports."
+    elif grouping in ("file", "package"):
+        files = _rows(f"MATCH (sf:SourceFile) WHERE sf.path {'STARTS WITH' if kind == 'directory' else '='} $value MATCH (p:PR)-[:TOUCHED_FILE]->(sf) "
+                      f"WHERE {state_filter} AND ($begin IS NULL OR {date} >= $begin) AND ($end IS NULL OR {date} <= $end) "
+                      "RETURN sf.path AS file, count(DISTINCT p) AS prs ORDER BY prs DESC, file LIMIT $limit", value=value, begin=begin, end=end, limit=_limit(limit, 15))
+        result["rows"] = [{"file": r["file"].removeprefix("src/"), "prs": r["prs"]} for r in files]
+    else:
+        result["prs"] = rows[:_limit(limit, 30)]
+    return result
+
+
+def pr_files(number: int, repo: str = "cmssw", path: str | None = None) -> dict:
+    """Which files and packages one cmssw PR touched, from its patch in the GitHub backup; with path ('SimG4Core/Geometry' or 'autoCond.py'), whether it touched that. Files can be unknown (patch not saved): then say unknown, never 'no files'."""
+    rows = _rows("MATCH (p:PR {repo:$repo, number:$number}) OPTIONAL MATCH (p)-[:TOUCHED_FILE]->(sf:SourceFile) "
+                 "RETURN p.title AS title, p.patch_status AS patch_status, p.github_state AS state, p.merged_at AS merged_at, "
+                 "p.changed_files AS dashboard_changed_files, collect(sf.path) AS files", repo=str(repo or "cmssw").lower(), number=int(number))
+    reach = _github_data_reach()
+    as_of = f"As of our GitHub data (reaches {reach}): commits pushed later are not in it." if reach else ""
+    if not rows:
+        issue = _rows("MATCH (i:Issue {repo:$repo, number:$number}) RETURN i.title AS title", repo=str(repo or "cmssw").lower(), number=int(number))
+        return {"found": False, "number": int(number), "is_issue": bool(issue),
+                "note": "This number is an Issue, which has no files." if issue else f"PR {int(number)} is not imported. {as_of}"}
+    pr = rows[0]
+    base = {"found": True, "repo": repo, "number": int(number), "title": pr["title"], "state": pr["state"], "merged_at": pr["merged_at"]}
+    if pr["patch_status"] != "ok":
+        why = (_UNKNOWN_FILES if pr["patch_status"] == "unavailable"
+               else "unknown: file lists are imported for cmssw PRs only" if str(repo).lower() != "cmssw"
+               else f"unknown: this PR is newer than our GitHub backup{' (reaches ' + reach + ')' if reach else ''}, so its patch is not in it (never say it changed no files)")
+        return {**base, "files": None, "files_status": why, "dashboard_changed_files": pr["dashboard_changed_files"],
+                "note": "Do not guess files from the title; the title and description are text only. " + as_of}
+    files = sorted(f.removeprefix("src/") for f in pr["files"])
+    packages: dict = {}
+    for f in files:
+        key = "/".join(f.split("/")[:2])
+        packages[key] = packages.get(key, 0) + 1
+    result = {**base, "files_status": "known", "files_touched": len(files), "packages": packages, "files": files[:80],
+              "files_listed": min(len(files), 80),
+              "note": ("Touched = in any of the PR's commits; the dashboard's changed_files (if set) counts the net change, so it can differ. "
+                       "Relevance evidence only, never a cause. " + as_of)}
+    if pr["dashboard_changed_files"] is not None:
+        result["dashboard_changed_files"] = pr["dashboard_changed_files"]
+    if path:
+        kind, value, _ = _touch_target(path)
+        test = {"file": lambda f: "src/" + f == value or f.endswith("/" + value[4:]), "file name": lambda f: f.endswith(value),
+                "directory": lambda f: ("src/" + f).startswith(value) or ("/" + value[4:]) in "/" + f}[kind]
+        hits = [f for f in files if test(f)]
+        result["asked_path"] = value.removeprefix("src/")
+        result["touched_asked_path"] = bool(hits)
+        result["matching_files"] = hits[:20]
+    return result
+
+
 ANALYTICS_TOOLS = {
-    f.__name__: f for f in (pr_origin, relval_counts, ib_coverage, release_health, compare_relvals, workflow_history, flaky_workflows, search_github, warning_counts,
+    f.__name__: f for f in (pr_files, prs_touching_path, pr_origin,relval_counts, ib_coverage, release_health, compare_relvals, workflow_history, flaky_workflows, search_github, warning_counts,
                                            log_problem_counts, exception_counts, unit_test_changes, build_status_list)}

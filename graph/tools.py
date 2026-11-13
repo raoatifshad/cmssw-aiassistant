@@ -29,10 +29,14 @@ NODES:
   (:Warning {hash, file, line, message, flag, count, package})
   (:SourceFile {path})
   (:Checker {name})           — e.g. 'threadsafety.ConstCast', 'cms.FunctionChecker'
-    (:PR {repo, number, title, body, merged_at, github_state, github_created_at, github_updated_at, release, changed_files, additions, deletions, sha, labels})
+    (:PR {repo, number, title, body, merged_at, github_state, github_created_at, github_updated_at, release, changed_files, additions, deletions, sha, labels, patch_status, patch_files})
+      -- patch_status 'ok': the PR's files are known (TOUCHED_FILE edges, patch_files = how many); 'unavailable' (about 7,200 PRs, many recent): the backup saved an error page, so its files are UNKNOWN, never zero or "no files"; unset: not imported (all cmsdist PRs). Use pr_files and prs_touching_path for file questions
       -- github_state is 'open' or 'closed'; open PRs have no merged_at, and most PR questions about "open" use github_state
+      -- release is written two ways: 'CMSSW_15_0' (from the IB pages) or 'CMSSW_15_0_X' (the GitHub milestone; old ones 'Next CMSSW_8_1_X'): to filter one series use p.release IN ['CMSSW_15_0', 'CMSSW_15_0_X'], never one form only
     (:Issue {issue_key, repo, number, title, body, state, github_url, created_at, updated_at, closed_at, labels})
+      -- PRs and Issues share one number space in cmssw: a bare number ('52323') may be either. If no PR has it, look for an Issue before saying it isn't imported
     (:GitHubComment {key, body, created_at, updated_at, author, source_id})
+      -- the GitHub backup keeps only the first 100 comments of a thread: an item with 100 (or more) imported comments may have more on GitHub, so never state its total or its last/newest comment as fact; say it may have more
     (:Label {key, name})
   (:Author {name})
     (:RelVal {key, ib_key, ib_tag, arch, workflow_id, name, status, errors, warnings, exitcode})
@@ -120,7 +124,10 @@ EDGES:
         list the CMSSDT dashboard shows per tag). Sourced from cms-sw.github.io's
         merged_prs_summary.json (ingest_merged_prs); a PR only attaches if it's
         already imported and the target tag matches an already-imported IB.
-    (PR)-[:CHANGED_FILE {evidence:'github_changed_file'}]->(SourceFile)
+    (PR)-[:TOUCHED_FILE {evidence:'github_patch'}]->(SourceFile)
+        -- the file is in one of the PR's commits (from its patch; SourceFile.path 'src/<Package>/<Sub>/...'; 836,000 edges, query by
+        a path or path prefix, never by scanning every PR). Relevance evidence only, never proof a PR caused or fixed anything
+    (PR)-[:CHANGED_FILE {evidence:'github_changed_file'}]->(SourceFile)  -- almost never set: for which files a PR changed use TOUCHED_FILE
     (PR)-[:MATCHES_WARNING {evidence:'changed_file'}]->(Warning)
 
 MATCHES_WARNING means a PR changed the warning's source file. It is a
@@ -281,7 +288,7 @@ def search_concepts(question: str, limit: int = 5) -> list[dict]:
     )
 
 
-def get_relval_recurrence(workflow_id: str) -> dict:
+def get_relval_recurrence(workflow_id: str, name: str | None = None) -> dict:
     """How often has this workflow failed across every imported IB, not just
     the one currently being discussed? Computed at query time from data
     already ingested -- no scheduled job needed, always current.
@@ -355,7 +362,9 @@ def get_relval_recurrence(workflow_id: str) -> dict:
         driver.close()
     if not rows:
         return {"workflow_id": workflow_id, "total_appearances": 0}
-    current_name = max(rows, key=lambda r: _ib_sort_key(r["tag"]))["name"]
+    # name: the workflow as the caller shows it. Found 2026-11-11 (item R3): 29751.85 is "...2026D110_hi" in 14_1 (failing now) and "...Run4D110_hi" in 20_1
+    # (newest, passing), so "History: failed in 0 of 31" sat under a table of failures of the 14_1 one
+    current_name = name if name and any(r["name"] == name for r in rows) else max(rows, key=lambda r: _ib_sort_key(r["tag"]))["name"]
     current = [r for r in rows if r["name"] == current_name]
     genuine_failures = [r for r in current if r["status"] == "FAILED" and not r["known_error"]]
     known_error_failures = [r for r in current if r["status"] == "FAILED" and r["known_error"]]
@@ -1928,6 +1937,7 @@ def search_test_log_problems_report(text: str, category: str | None = None, limi
     keys = parsed.get("context_keys") or []
     pasted_core = " ".join((parsed["message"] or text).split()).lower()
     pasted_core = _LOG_LINE_STAMP_RE.sub("", pasted_core)
+    pasted_tail = re.sub(r"^[a-z][\w:]*[a-z]:\s+", "", pasted_core) if not parsed["category"] else pasted_core
     # the text channel also looks for the paste as a phrase: a line with no identifier-shaped word ("failed to
     # parse X509 proxy ...", "Transport endpoint is not connected") had no search terms at all, so it was
     # reported "searched, 0 found" without being searched (found 2026-11-05)
@@ -1979,7 +1989,9 @@ def search_test_log_problems_report(text: str, category: str | None = None, limi
         haystack = ((hit["text"] or "") + " " + (hit.get("summary") or "") + " " + " ".join(hit["owners"] or [])).lower()
         shared_by_sid.setdefault(hit["sid"], set()).update(t for t, low in lowered.items() if low in haystack)
         category_of[hit["sid"]] = hit["category"]
-        if len(pasted_core) >= 30 and pasted_core in " ".join(haystack.split()):
+        flat = " ".join(haystack.split())
+        # "UnavailableAccelerator: Module x has ...": the log has the message without the category in front (found 2026-11-11, item E4)
+        if len(pasted_core) >= 30 and (pasted_core in flat or (len(pasted_tail) >= 30 and pasted_tail in flat)):
             contains.add(hit["sid"])
 
     match: dict[str, tuple[str, int, list[str]]] = {}  # sid -> (level, score, shared names)

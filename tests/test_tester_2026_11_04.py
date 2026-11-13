@@ -321,13 +321,18 @@ class ComparisonPhrasingTests(unittest.TestCase):
         self.assertIn("**RelVals failing in both:** `539.0`", text)
 
     @patch("server.api_server.get_driver")
-    def test_cross_flavour_asks_only_for_architectures_both_have(self, get_driver):
-        record = lambda arch: {"arch": arch, "relval_total": 1, "relvals": [], "unit_total": 1, "units": []}
-        driver, _ = _driver_with([record("a"), record("b"), record("c")], [record("b"), record("c")])
+    def test_cross_flavour_answers_every_architecture_both_have(self, get_driver):
+        # was a "which architecture?" question; R1-10 (2026-11-11): both answered, one section each
+        record = lambda arch, ids=(): {"arch": arch, "relval_total": 1, "relvals": [{"id": i, "name": "wf", "exitcode": 1} for i in ids],
+                                       "unit_total": 1, "units": []}
+        driver, _ = _driver_with([record("a"), record("b", ["1.0", "2.0"]), record("c")], [record("b"), record("c", ["3.0"])])
         get_driver.return_value = driver
         text, actions = _cross_flavour_comparison_answer(["CMSSW_20_1_ROOT6_X_2026-11-02-2300", "CMSSW_20_1_X_2026-11-02-2300"], None)
-        self.assertIn("Both have: `b`, `c`", text)
-        self.assertEqual(len(actions), 2)
+        self.assertTrue(text.startswith("**Failed RelVals per architecture, ROOT6 / primary:** `b` 2 / 0; `c` 0 / 1"), text[:120])
+        self.assertIn("## ROOT6 vs primary on `b`", text)
+        self.assertIn("## ROOT6 vs primary on `c`", text)
+        self.assertNotIn("on `a`", text)
+        self.assertEqual(actions, [])
 
 
 class MoreRoutingTests(unittest.TestCase):

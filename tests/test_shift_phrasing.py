@@ -247,7 +247,8 @@ class GitHubHourFourTests(unittest.TestCase):
         self.assertEqual(_resolve_short_follow_up("show the newest one", "s-4"), "issue 52097")
         _turn_memory["s-4"] = {"question": "q", "answer": "- **cmssw #52372** - [L1T] Update\n- **cmssw #52366** - Define GT", "route": "x"}
         self.assertIn("#52372", _listed_items_follow_up("which one touches L1T?", "s-4"))
-        self.assertNotIn("#52366", _listed_items_follow_up("which one touches L1T?", "s-4"))
+        # E2-3 (2026-11-09): the answer may add the touched files and name #52366 as a PR whose files are unknown, never as a match by title
+        self.assertNotIn("#52366", _listed_items_follow_up("which one touches L1T?", "s-4").split("\n\n")[0])
 
     @patch("server.api_server.get_driver")
     def test_external_update_matches_the_whole_name(self, get_driver):

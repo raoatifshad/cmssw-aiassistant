@@ -4481,8 +4481,9 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server._chat_response", side_effect=lambda *args, **kwargs: args[2])
     @patch("server.api_server._execute_planned_capability", return_value=("relval evidence", []))
     @patch("server.api_server._latest_ib_records")
+    @patch("server.api_server._with_results_or_newest_complete", side_effect=lambda tag, *args: tag)  # R1-5: no graph in this test
     def test_latest_ib_phrase_resolves_to_a_tag_before_routing(
-        self, latest_ib_records, execute, chat_response, restore, store_decision, clear_pending
+        self, _with_results, latest_ib_records, execute, chat_response, restore, store_decision, clear_pending
     ):
         # "the latest IB" with no explicit tag must resolve to a concrete tag
         # before capability dispatch, or relval/build/unittest questions phrased
@@ -4504,8 +4505,9 @@ class ChatRoutingTests(unittest.TestCase):
     @patch("server.api_server._store_chat_turns")
     @patch("server.api_server._failure_overview_answer", return_value=("overview", []))
     @patch("server.api_server._latest_ib_records")
+    @patch("server.api_server._with_results_or_newest_complete", side_effect=lambda tag, *args: tag)  # R1-2: no graph in this test
     def test_bare_failure_request_resolves_to_latest_tag_before_routing(
-        self, latest_ib_records, overview, store_chat_turns, restore, store_decision, store_pending, clear_pending
+        self, _with_results, latest_ib_records, overview, store_chat_turns, restore, store_decision, store_pending, clear_pending
     ):
         # "what are failing" names no tag, no category, and doesn't even say
         # "latest"/"IB" -- it must still resolve to the latest IB and answer.
@@ -4765,6 +4767,12 @@ class LatestTypoToleranceTests(unittest.TestCase):
 
 
 class ShiftSummaryCapabilityTests(unittest.TestCase):
+    def setUp(self):
+        # kept off the live graph: R1-15 (2026-11-11) checks whether the newest build has results before using the newest pair (tested in test_tester_r1)
+        patcher = patch("server.api_server._shift_pair_with_results", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_trigger_regex_recognizes_shift_summary_phrasing(self):
         for question in [
             "give me a shift summary",
@@ -5004,6 +5012,12 @@ class LatestAndDaysAgoIbTagsTests(unittest.TestCase):
 
 
 class ShiftSummaryDayWindowTests(unittest.TestCase):
+    def setUp(self):
+        # kept off the live graph: R1-15 (2026-11-11) checks whether the newest build has results before using the newest pair (tested in test_tester_r1)
+        patcher = patch("server.api_server._shift_pair_with_results", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_trigger_regex_recognizes_day_window_phrasings(self):
         for question in [
             "list all the new failing workflows for the past one week",

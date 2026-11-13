@@ -99,5 +99,30 @@ class EsExceptionIngestionTests(unittest.TestCase):
         self.assertEqual(by_workflow["999999.0"]["category"], "Unknown")
 
 
+class EsExceptionReimportTests(unittest.TestCase):
+    @patch("build_graph.source_needs_import", return_value=True)
+    @patch("build_graph.mark_source_imported")
+    @patch("build_graph.file_hash", return_value="deadbeef")
+    def test_reimport_of_the_same_path_keeps_exceptions_that_left_the_export_window(self, file_hash, mark, needs_import):
+        # G2-1 (2026-11-12): the 12:30 refresh imports the same dated file as the 00:30 one; the
+        # delete before the import must only cover RelVals the new export still contains.
+        sys.path.insert(0, str(Path(__file__).parent.parent / "ingestion"))
+        import build_graph
+
+        doc = {"release": "CMSSW_20_1_X_2026-11-10-2300", "architecture": "el9_amd64_gcc14", "workflow": "537.0",
+               "step": "step1", "exception": "An exception of category 'OtherCMS' occurred while\nException Message:\nx\n"}
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_path = Path(tmp) / "exceptions-2026-11-11.json"
+            fake_path.write_text(json.dumps({"hits": {"hits": [{"_source": doc}]}}))
+            driver = MagicMock()
+            build_graph.ingest_es_exceptions(driver, fake_path, force=True)
+
+        session = driver.session.return_value.__enter__.return_value
+        deletes = [c for c in session.run.call_args_list if "DELETE" in c.args[0]]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn("relval.key IN $relval_keys", deletes[0].args[0])
+        self.assertEqual(deletes[0].kwargs["relval_keys"], ["CMSSW_20_1_X_2026-11-10-2300:el9_amd64_gcc14:537.0"])
+
+
 if __name__ == "__main__":
     unittest.main()

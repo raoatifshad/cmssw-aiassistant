@@ -233,17 +233,18 @@ additionally deletes graph records whose backing source file is gone
 - `--github-issues` — optional raw CMSSW GitHub Issues export
   (dir or `.tar`/`.tar.gz`), imports PR/Issue bodies, labels, comments, and
   explicit `#number`/URL cross-references. Never calls GitHub live.
-  **Stopgap since 2026-11-04:** the backup on cmssdt9-02 is stuck at 2026-09-04
-  (`issues/latest.txt`), so `ingestion/fetch_github_web_updates.py` fetches the
-  Issues/PRs updated since then from the GitHub REST API into
-  `GITHUB-ISSUES/web-update/store` (same layout as the backup), and
-  `build_graph.py --github-issues` imports that (no `--reconcile`); the `github`
-  step of `scripts/daily_refresh.sh` does both on every refresh. Those nodes
-  carry `fetched_via` and have no new comments (existing ones are kept); answers
-  say so through `_github_export_note`. The bot never reads these files or GitHub
-  while answering, only the database. The importer keeps whichever copy has the
-  newer `updated_at`; when the real backup works again, its copies replace these
-  and clear `fetched_via`, and that step should be deleted.
+  The backup on cmssdt9-02 was stuck at 2026-09-04 until 2026-11-06; the `github` step of
+  `scripts/daily_refresh.sh` now copies it (rsync, no --delete) and imports it when `issues/latest.txt` moved,
+  without `--reconcile`. The importer keeps whichever copy has the newer `updated_at`. Nodes from the earlier web
+  stopgap (`ingestion/fetch_github_web_updates.py`, `GITHUB-ISSUES/web-update/`, no longer run) carry `fetched_via`
+  and have no new comments until the backup replaces them; answers say so through `_github_export_note`.
+- **PR patches** -- `ingestion/ingest_github_patches.py` reads each PR's `patch.txt` from the same backup into
+  `(PR)-[:TOUCHED_FILE {evidence:'github_patch'}]->(SourceFile)`, `PR.patch_files` and `PR.patch_status`. Only paths are
+  stored, not the 21 GB of diffs. About 7,200 patches are saved error pages (`patch_status='unavailable'`): unknown,
+  never "no files". Not `CHANGED_FILE`: `find_prs_for_error` joins that against every failed unit test.
+  Chat side (item E2, 2026-11-10): AI tools `pr_files` / `prs_touching_path` (graph/analytics.py), the PR card's "Files touched" line, and
+  `_touched_path_answer` ("which PRs / who touched <path>", with a window, open/merged, "most" ranking, or one IB tag = that series' PRs merged
+  in the 30 days before the build). Unknown files = patch_status not 'ok' (error page, or a PR newer than the backup); always say how many.
 
 **IB identity is always the pair `(tag, architecture)`** — never merge or
 dedupe across architectures. `CMSSW_<major>_<minor>_X_<timestamp>` is a
