@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "ingestion"))
 sys.path.insert(0, str(Path(__file__).parent))
@@ -261,6 +262,17 @@ class RelvalDirTests(unittest.TestCase):
     def test_command_line_used_by_process_relval_logs(self):
         self.assertEqual(problems.main(["x", "relval", str(self.partial)]), 0)
         self.assertTrue((self.build / "pyRelValMatrixLogs-scan.json.gz").exists())
+
+    def test_dbg_relvals_are_skipped_unless_switched_on(self):
+        dbg = Path(self.tmp.name) / "buildlogs" / "el9_amd64_gcc14/www/fri/20.1.DBG-fri-23/CMSSW_20_1_DBG_X_2026-11-13-2300"
+        (dbg / "pyRelValPartialLogs").mkdir(parents=True)
+        out = dbg / "pyRelValMatrixLogs-scan.json.gz"
+        with patch.dict(os.environ, {problems.DBG_RELVAL_ENV: ""}):
+            self.assertEqual(problems.main(["x", "relval", str(dbg / "pyRelValPartialLogs")]), 0)
+        self.assertFalse(out.exists())
+        with patch.dict(os.environ, {problems.DBG_RELVAL_ENV: "1"}):
+            self.assertEqual(problems.main(["x", "relval", str(dbg / "pyRelValPartialLogs")]), 0)
+        self.assertTrue(out.exists())
 
 
 if __name__ == "__main__":

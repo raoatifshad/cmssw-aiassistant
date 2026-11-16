@@ -18,8 +18,10 @@ Each call writes one file in the zip's folder (the build folder):
     addOnTests.zip                       -> addOnTests-scan.json.gz
     pyRelValPartialLogs/ (before the zip) -> pyRelValMatrixLogs-scan.json.gz
 
-DBG RelVals are never zipped (cms-bot, 2026-10-16) but still reach that point,
-so they are scanned too.
+DBG RelVals are never zipped (cms-bot, 2026-10-16) but still reach that point.
+They are SKIPPED for now: one DBG RelVal folder is ~220 GB (each step log twice,
+~117 GB unique), hours of reading inside their job. Set TEST_LOG_SCAN_DBG_RELVAL=1
+to scan them (a later step). DBG unit tests / addOn are still scanned.
 
 The file holds every test with its status, every problem found in the logs
 (ib_test_log_scanner.py does the detection), and a `source` block saying which
@@ -56,6 +58,7 @@ import ib_test_log_scanner as scanner
 PATH_RE = re.compile(
     r"(?:^|/)(?P<arch>[^/]+)/www/(?P<day>[^/]+)/(?P<queue>[^/]+)/(?P<tag>CMSSW_[^/]+)/(?P<rest>[^/].*)$")
 ZIP_KINDS = {"unitTestLogs.zip": "unit", "addOnTests.zip": "addon", "pyRelValMatrixLogs.zip": "relval"}
+DBG_RELVAL_ENV = "TEST_LOG_SCAN_DBG_RELVAL"   # =1 scans DBG RelVals too (off for now, ~220 GB each)
 RELVAL_DIR = "pyRelValPartialLogs"   # what process-relval-logs zips into pyRelValMatrixLogs.zip
 RELVAL_DONE_RE = re.compile(r"^done\.")
 RELVAL_TOTAL_RE = re.compile(r"^done\.\d+of(\d+)$")
@@ -176,6 +179,9 @@ def main(argv: list[str]) -> int:
     ib_test_log_problems.py <unpacked dir> <zip path> [<out path>]   unit tests / addOn
     ib_test_log_problems.py relval <pyRelValPartialLogs dir> [<out path>]"""
     if len(argv) in (3, 4) and argv[1] == "relval":
+        if "_DBG_X_" in os.path.abspath(argv[2]) and os.environ.get(DBG_RELVAL_ENV) != "1":
+            print(f"skipped DBG RelVals {argv[2]} (off for now; {DBG_RELVAL_ENV}=1 scans them)")
+            return 0
         started = time.time()
         out = scan_relval_dir(argv[2], out_path=argv[3] if len(argv) == 4 else None)
         print(f"wrote {out} in {time.time() - started:.1f} s")
