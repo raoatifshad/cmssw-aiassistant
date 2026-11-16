@@ -239,6 +239,36 @@ class RelvalDirTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.build.iterdir()),
                          ["pyRelValMatrixLogs-scan.json.gz", "pyRelValPartialLogs"])
 
+    def test_a_job_that_comes_back_after_the_zip_completes_the_run(self):
+        # 2 of 3 jobs, zipped after the 10-hour wait; cms-bot renames the folder to .tmp
+        for name in ("done.1of3", "done.2of3"):
+            (self.partial / name).touch()
+        out = problems.scan_relval_dir(str(self.partial))
+        self.partial.rename(self.partial.with_name("pyRelValPartialLogs.tmp"))
+        # job 3 comes back: a new folder with only its workflows (one of them also ran before)
+        wf = self.partial / "11634.0_TTbar"
+        wf.mkdir(parents=True)
+        (wf / "workflow.log").write_text("11634.0_TTbar Step0-PASSED ; exit: 0\n")
+        (wf / "step1_TTbar.log").write_text("all good\n")
+        new = self.partial / "999.0_New"
+        new.mkdir()
+        (new / "workflow.log").write_text("999.0_New Step0-PASSED ; exit: 0\n")
+        (self.partial / "done.3of3").touch()
+
+        self.assertEqual(problems.scan_relval_dir(str(self.partial)), out)
+
+        with gzip.open(out, "rt") as fh:
+            data = json.load(fh)
+        src = data["source"]
+        self.assertEqual((src["jobs_done"], src["jobs_total"], src["complete"]), (3, 3, True))
+        self.assertEqual(src["jobs"], ["done.1of3", "done.2of3", "done.3of3"])
+        self.assertTrue(src["merged_with_scan_of"])
+        self.assertEqual([w["workflow"] for w in data["workflows"]],
+                         ["11634.0_TTbar", "140.051_RunMuonEG2022C", "999.0_New"])        # kept + rerun + new
+        owners = {p["workflow"] for p in data["problems"]}
+        self.assertIn("140.051_RunMuonEG2022C", owners)       # earlier problems kept
+        self.assertNotIn("11634.0_TTbar", owners)             # rerun log is clean now: old problem replaced
+
     def test_timed_out_run_is_marked_incomplete(self):
         (self.partial / "done.1of3").touch()
 

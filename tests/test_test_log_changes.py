@@ -1,7 +1,7 @@
 """GET /api/test-log-problems and get_test_log_changes: what changed inside tests the
 dashboard reports as PASSED between the two builds the Shift Console compares."""
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -12,7 +12,7 @@ TO, FROM = "CMSSW_20_1_X_2026-10-12-1100", "CMSSW_20_1_X_2026-10-11-2300"
 
 TO_RUNS = [
     dict(key="T1", tag=TO, arch="el9_amd64_gcc14", suite="relval", run_variant="",
-         ran=["1.0", "2.0", "3.0", "4.0", "5.0"]),
+         ran=["1.0", "2.0", "3.0", "4.0", "5.0"], jobs_done=2, jobs_total=3, complete=False),
     dict(key="T2", tag="CMSSW_20_1_PY314_X_2026-10-12-1100", arch="el9_amd64_gcc14", suite="unit",
          run_variant="", ran=["Pkg/testX"]),
     dict(key="T3", tag=TO, arch="el8_amd64_gcc14", suite="addon", run_variant="", ran=["hlt"]),
@@ -126,6 +126,25 @@ class TestLogChangesTests(unittest.TestCase):
             result = get_test_log_changes("CMSSW_20_1_X_2026-10-12-2300", TO)
         self.assertFalse(result["coverage"]["to_imported"])
         self.assertIn("not the same as zero problems", result["coverage"]["message"])
+
+    def test_an_unfinished_relval_run_is_said_not_hidden(self):
+        # cms-bot zips a RelVal run after 10 hours without news, jobs missing (R5, 2026-11-16)
+        primary = next(t for t in self.archs["el9_amd64_gcc14"]["tracks"] if t["suite"] == "relval")
+        self.assertIn("only 2 of 3 RelVal jobs", primary["incomplete_note"])
+        self.assertIn("unknown, not clean", primary["incomplete_note"])
+        self.assertEqual([(r["tag"], r["jobs_done"], r["jobs_total"]) for r in self.result["coverage"]["incomplete"]],
+                         [(TO, 2, 3)])
+        unit = next(t for t in self.archs["el9_amd64_gcc14"]["tracks"] if t["suite"] == "unit")
+        self.assertNotIn("incomplete_note", unit)            # unit/addOn: not known, nothing said
+
+    def test_the_chat_answer_says_which_relval_run_is_unfinished(self):
+        from server.api_server import _test_log_question_answer
+        driver = MagicMock()
+        driver.session.return_value.__enter__.return_value.run.return_value = [{"tag": TO}, {"tag": FROM}]
+        with patch("server.api_server.get_driver", return_value=driver), \
+                patch("server.api_server.get_test_log_changes", return_value=self.result):
+            answer = _test_log_question_answer(f"any hidden problems in passed tests in {TO}?", "r5")
+        self.assertIn(f"⚠️ `{TO}` on `el9_amd64_gcc14`: only 2 of 3 RelVal jobs reported back", answer)
 
     def test_bad_tags_are_rejected(self):
         with self.assertRaises(ValueError):

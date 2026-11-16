@@ -44,6 +44,14 @@ class RunRecordTests(unittest.TestCase):
         run = itl.run_record(data)
         self.assertTrue(run["key"].endswith(":relval:gpu/nvidia_t4"))
         self.assertEqual(run["failed_details"], ["140.051_RunMuonEG2022C: step1=PASSED step2=FAILED; exit 0 256"])
+        self.assertEqual((run["jobs_done"], run["jobs_total"], run["complete"]), (None, None, None))  # copied zip: not known
+
+    def test_relval_scanned_in_cms_bot_keeps_how_many_jobs_reported_back(self):
+        data = dict(kind="relval", problems=[], workflows=[],
+                    source=dict(SOURCE, kind="relval", jobs=["done.1of3", "done.2of3"], jobs_done=2, jobs_total=3,
+                                complete=False))
+        run = itl.run_record(data)
+        self.assertEqual((run["jobs_done"], run["jobs_total"], run["complete"]), (2, 3, False))
 
 
 class ProblemRecordTests(unittest.TestCase):

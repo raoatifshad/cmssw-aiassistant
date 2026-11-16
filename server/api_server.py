@@ -14117,6 +14117,11 @@ def _test_log_question_answer(question: str, session_id: str, original_question:
         f"build (intermittent)",
         f"- ✅ {t['gone_problems']} gone ({t['gone_tests']} test(s))" + ("" if flavour else f"; {t['still_present']} still present"),
     ]
+    for run in coverage.get("incomplete") or []:
+        if flavour and f"_{flavour}_X_" not in run["tag"]:
+            continue
+        where = f" ({run['run_variant']})" if run.get("run_variant") else ""
+        lines.append(f"- ⚠️ `{run['tag']}` on `{run['arch']}`{where}: {run['note']}.")
     if flavour and flavour_present:
         lines.append(f"- **{flavour_present} serious problem(s)** in passed tests in this build's logs in total "
                      "(ask \"sanitizer problems\" for the sanitizer ones).")

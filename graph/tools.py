@@ -69,12 +69,16 @@ NODES:
         directly (it's indexed by a fulltext index, not a property match).
     (:ImportState {source_id, content_hash, source_type, source_path, last_ingested_at})
     (:TestLogRun {key, ib_key, ib_tag, arch, suite, run_variant, queue, server_path, total, passed,
-        failed, other, passed_tests, failed_tests, other_tests, failed_details, scanned_at})
+        failed, other, passed_tests, failed_tests, other_tests, failed_details, scanned_at,
+        jobs_done, jobs_total, complete})
         — one scanned test-log zip of one IB: suite is 'unit' (unitTestLogs.zip), 'addon'
         (addOnTests.zip) or 'relval' (pyRelValMatrixLogs.zip); run_variant is '' or e.g.
         'gpu/nvidia_t4', 'other/rntuple' (NOT the same as IB.variant). passed_tests etc. are
         lists of names: unit 'Package/Sub/testName', addon 'test:stepN', relval workflow
-        folder '<number>_<name>'. Statuses come from the logs themselves.
+        folder '<number>_<name>'. Statuses come from the logs themselves. RelVal runs only:
+        jobs_done of jobs_total RelVal jobs reported back; complete=false means cms-bot zipped
+        it after its 10-hour wait, so workflows of the missing jobs are unknown (not clean);
+        null = not known.
     (:LogProblem {key, ib_key, ib_tag, arch, suite, run_variant, kind, category, severity, origin,
         serious, summary, message, evidence, signature_id, count, owners, owner_statuses,
         in_passed, in_failed, intentional_hint, example_member, example_line, server_path,
@@ -2176,6 +2180,14 @@ def _test_log_owner_ran(owner: str, suite: str, ran: set[str]) -> bool:
     return owner in ran
 
 
+def _incomplete_run_note(run: dict) -> str:
+    """A RelVal run cms-bot zipped after its 10-hour wait, with jobs missing."""
+    done, total = run.get("jobs_done"), run.get("jobs_total")
+    counts = f"only {done} of {total}" if done is not None and total else "not all"
+    return (f"{counts} RelVal jobs reported back (cms-bot stopped waiting after 10 hours): "
+            "workflows of the missing jobs are unknown, not clean")
+
+
 def get_test_log_changes(to_tag: str, from_tag: str, arch: str | None = None) -> dict:
     """Serious problems inside PASSED tests/RelVal steps (raw IB test logs) that are
     new, gone or still present between two builds of a release series: the primary
@@ -2201,7 +2213,8 @@ def get_test_log_changes(to_tag: str, from_tag: str, arch: str | None = None) ->
                 "AND ($arch IS NULL OR r.arch = $arch) "
                 "RETURN r.key AS key, r.ib_tag AS tag, r.arch AS arch, r.suite AS suite, "
                 "coalesce(r.run_variant, '') AS run_variant, "
-                "r.passed_tests + r.failed_tests + r.other_tests AS ran",
+                "r.passed_tests + r.failed_tests + r.other_tests AS ran, "
+                "r.jobs_done AS jobs_done, r.jobs_total AS jobs_total, r.complete AS complete",
                 prefix=release + "_", when=to_when, arch=arch)]
             to_runs = {}
             for row in run_rows:
@@ -2255,6 +2268,8 @@ def get_test_log_changes(to_tag: str, from_tag: str, arch: str | None = None) ->
         base = baselines.get(key)
         track = dict(variant=run["flavor"] or "primary", run_variant=run["run_variant"], suite=run["suite"],
                      tag=run["tag"], baseline_tag=base["tag"] if base else None, baseline_note=None)
+        if run.get("complete") is False:
+            track["incomplete_note"] = _incomplete_run_note(run)
         entry["tracks"].append(track)
         place = dict(variant=track["variant"], run_variant=run["run_variant"], suite=run["suite"], tag=run["tag"])
         if base is None:
@@ -2330,6 +2345,9 @@ def get_test_log_changes(to_tag: str, from_tag: str, arch: str | None = None) ->
     return dict(
         to=to_tag, **{"from": from_tag}, arch=arch,
         coverage=dict(to_imported=bool(to_runs), runs=len(to_runs), newest_imported=coverage.get("last"),
+                      incomplete=[dict(tag=r["tag"], arch=r["arch"], suite=r["suite"], run_variant=r["run_variant"],
+                                       jobs_done=r["jobs_done"], jobs_total=r["jobs_total"], note=_incomplete_run_note(r))
+                                  for _, r in sorted(to_runs.items()) if r.get("complete") is False],
                       message=None if to_runs else (
                           f"No test logs imported yet for {to_tag}"
                           + (f" on {arch}" if arch else "")
