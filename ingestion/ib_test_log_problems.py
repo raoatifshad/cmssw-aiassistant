@@ -145,15 +145,43 @@ def scan_addon_dir(unpacked_dir: str, zip_path: str, addon_log: str | None = Non
     return _write(scanner.scan_addon_dir(unpacked_dir, addon_log_text), source, zip_path, out_path)
 
 
-def relval_progress(partial_logs_dir: str) -> dict:
-    """How many RelVal jobs reported back, counted exactly like
-    process-relval-logs: every done.* file counts, the total is N of the
-    last done.<i>of<N> in `ls` order. complete=False means the folder is
-    being zipped after cms-bot's 10-hour timeout, with jobs missing."""
-    names = sorted(n for n in os.listdir(partial_logs_dir) if RELVAL_DONE_RE.match(n))
+def relval_progress(partial_logs_dir: str, earlier_jobs: list[str] | None = None) -> dict:
+    """How many RelVal jobs reported back, counted like process-relval-logs:
+    every done.* file is one job, the total is N of the last done.<i>of<N> in
+    `ls` order. complete=False means cms-bot zips it after its 10-hour wait
+    with jobs missing. `earlier_jobs` (from an earlier scan of the same build)
+    are counted too, so a job that came back later completes the run."""
+    names = sorted(set(n for n in os.listdir(partial_logs_dir) if RELVAL_DONE_RE.match(n)) | set(earlier_jobs or []))
     totals = [m.group(1) for m in map(RELVAL_TOTAL_RE.match, names) if m]
     total = int(totals[-1]) if totals else None
-    return dict(jobs_done=len(names), jobs_total=total, complete=total is not None and len(names) == total)
+    return dict(jobs=names, jobs_done=len(names), jobs_total=total,
+                complete=total is not None and len(names) == total)
+
+
+def _earlier_relval_scan(out_path: str, tag: str) -> dict | None:
+    """The scan file an earlier run of process-relval-logs wrote for this build,
+    if any. It only exists when cms-bot processed the build twice: a job came
+    back after the folder was zipped and renamed, so the new folder holds only
+    that job's workflows."""
+    try:
+        with gzip.open(out_path, "rt", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    source = data.get("source") or {}
+    if data.get("kind") != "relval" or source.get("tag") != tag or not source.get("jobs"):
+        return None
+    return data
+
+
+def _merge_relval(new: dict, old: dict) -> dict:
+    """Workflows scanned now replace the same workflows from the earlier scan;
+    the earlier scan's other workflows and their problems are kept."""
+    now = {w["workflow"] for w in new["workflows"]}
+    new["workflows"] = sorted([w for w in old["workflows"] if w["workflow"] not in now] + new["workflows"],
+                              key=lambda w: w["workflow"])
+    new["problems"] = [p for p in old["problems"] if p.get("workflow") not in now] + new["problems"]
+    return new
 
 
 def scan_relval_dir(partial_logs_dir: str, out_path: str | None = None) -> str:
@@ -166,12 +194,19 @@ def scan_relval_dir(partial_logs_dir: str, out_path: str | None = None) -> str:
         raise ValueError(f"not a {RELVAL_DIR} folder: {partial_logs_dir}")
     _check_dir(folder)
     zip_path = os.path.join(os.path.dirname(folder), "pyRelValMatrixLogs.zip")   # where cms-bot puts the zip
-    source = dict(describe_zip_path(zip_path), scanned_from=RELVAL_DIR, **relval_progress(folder))
+    source = describe_zip_path(zip_path)
+    earlier = _earlier_relval_scan(out_path or scan_file_path(zip_path), source["tag"])
+    source = dict(source, scanned_from=RELVAL_DIR,
+                  **relval_progress(folder, earlier["source"]["jobs"] if earlier else None))
     size = 0
     for dirpath, _, files in os.walk(folder):
         size += sum(os.path.getsize(os.path.join(dirpath, f)) for f in files)
-    return _write(scanner.scan_relval_dir(folder), source, zip_path, out_path,
-                  size=size, mtime=os.stat(folder).st_mtime)
+    result = scanner.scan_relval_dir(folder)
+    if earlier:
+        result = _merge_relval(result, earlier)
+        source["merged_with_scan_of"] = earlier["source"].get("scanned_at")
+        size += earlier["source"].get("size") or 0
+    return _write(result, source, zip_path, out_path, size=size, mtime=os.stat(folder).st_mtime)
 
 
 def main(argv: list[str]) -> int:
