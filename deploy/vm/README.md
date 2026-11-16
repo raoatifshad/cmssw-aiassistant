@@ -72,3 +72,8 @@ Stack as `kg-vm-test` on ports 8006/7690/7477 beside the live bot: health OK,
 empty database, a record written, `down` (containers deleted), `up` -- record
 still there. Backup (dump 3 s), database folder deleted, `restore.sh` --
 record back, checksum OK.
+
+Real data: the live database (12.8 GB store) dumped in 8 s -- live Neo4j down
+16 s -- to a 1.3 GB dump; `restore.sh` loaded it in 30 s. Node counts for all
+32 labels, 8,206,830 relationships and 70 indexes identical to live; the same
+chat questions gave the same answers on both.
