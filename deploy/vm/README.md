@@ -51,10 +51,24 @@ podman unshare rm -rf $DATA_DIR/neo4j/*           # only with Neo4j stopped, and
 
 ## Backups
 
-*(next step: `backup.sh` -- nightly stop, dump, start, copy to EOS; `restore.sh`)*
+```bash
+./backup.sh                     # stop neo4j -> dump -> start -> DATA_DIR/backups/neo4j-<date>.dump + .sha256
+./restore.sh <dump file>        # check .sha256 -> stop -> load (replaces the database) -> start -> count nodes
+```
+
+* Community edition can only dump a **stopped** database, so the API gets errors
+  for the few minutes the dump takes. Run it at night, e.g. a systemd timer at 03:00.
+* Never copy the files in `DATA_DIR/neo4j` while Neo4j runs: such a copy may not load.
+* The newest `BACKUP_KEEP` (14) dumps are kept.
+* EOS copy is built in but **off** (`BACKUP_EOS_ENABLED=0`). To switch it on, mount
+  EOS (or make the folder reachable), set `BACKUP_EOS_ENABLED=1` and
+  `BACKUP_EOS_DIR=/eos/...`; each copy is checked against its .sha256.
+* `stop_grace_period: 2m`: podman's default 10 s ends in SIGKILL for Neo4j, which
+  a database should never get.
 
 ## Tested (on the developer PC, 2026-11-16)
 
 Stack as `kg-vm-test` on ports 8006/7690/7477 beside the live bot: health OK,
 empty database, a record written, `down` (containers deleted), `up` -- record
-still there.
+still there. Backup (dump 3 s), database folder deleted, `restore.sh` --
+record back, checksum OK.

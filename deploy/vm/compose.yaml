@@ -12,6 +12,7 @@ services:
   neo4j:
     image: docker.io/library/neo4j:5.26.29   # pinned: a dump loads cleanly into the same version
     restart: always
+    stop_grace_period: 2m      # a database must never be SIGKILLed after podman's default 10 s
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
       NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-512m}
