@@ -8,7 +8,7 @@ rebuilt at any time without losing anything.
 |---|---|---|
 | `neo4j` | Neo4j 5.26.29 Community | `DATA_DIR/neo4j`, dumps in `DATA_DIR/backups` |
 | `api` | chat API (`/api/chat`, `/api/health`, ...) | `DATA_DIR/results`, `DATA_DIR/log-rag`, `DATA_DIR/clang-logs` (read-only) |
-| `worker` | imports + daily refresh | *(next step, not here yet)* |
+| `worker` | test-log import every 30 min; cmsrepo, exceptions, docs at 00:30/12:30 (`worker.py`) | `DATA_DIR/sources` (checkouts), `DATA_DIR/worker` (state.json, logs) |
 
 Not included on purpose: OpenSearch and Logstash (only ever held one smoke-test
 event; no chat answer used them). The nightly tester stays on the developer PC.
@@ -19,7 +19,7 @@ event; no chat answer used them). The nightly tester stays on the developer PC.
 sudo dnf install -y podman podman-compose git     # or the VM's equivalent
 git clone <this repo> && cd <repo>/deploy/vm
 cp .env.example .env && chmod 600 .env            # fill in; never commit .env
-mkdir -p $DATA_DIR/{neo4j,backups,log-rag,clang-logs,results}   # DATA_DIR from .env
+mkdir -p $DATA_DIR/{neo4j,backups,log-rag,clang-logs,results,sources,worker}   # DATA_DIR from .env
 podman compose -p kg up -d --build
 curl -s http://localhost:$API_PORT/api/health     # {"ok":true,...}
 ```
@@ -27,11 +27,37 @@ curl -s http://localhost:$API_PORT/api/health     # {"ok":true,...}
 On the VM set `DEV_SHIFTER_LOGIN=false` and give Neo4j real memory
 (e.g. `NEO4J_HEAP=4g`, `NEO4J_PAGECACHE=6g` on a 16 GB machine).
 
+## Moving the live database here (one-off)
+
+The database remembers the full path of every file it imported (`source_id`). On
+the developer PC those are `/home/rao/...`, here `/data/sources/...`; without
+rewriting them the worker re-imports everything once and the wiki docs end up in
+the graph twice.
+
+```bash
+# on the PC: a dump of the live database (stops it ~20 s), copy it here
+./restore.sh /path/to/neo4j-live-<date>.dump      # loads it (worker not started yet!)
+podman compose -p kg stop worker                 # if it is running
+P=/home/rao/CHAT-BOT-AI/NEO4J/cmssdt-kg-chatbot
+podman compose -p kg run --rm --no-deps worker python migrate_paths.py \
+    --map $P/cmsrepo=/data/sources/cmsrepo --map $P/shifter-wiki=/data/sources/shifter-wiki \
+    --map /home/rao/CHAT-BOT-AI/CLANG-LOGS=/data/clang-logs            # dry run: counts only
+#   ... the same + --apply --check   (must end with "old paths anywhere in the graph: none")
+rm -f $DATA_DIR/worker/state.json && podman compose -p kg up -d worker
+```
+
+Rehearsed on the PC (2026-11-16, live copy of 13:25): 2.97 million paths rewritten in
+~110 s (5,000 per transaction: the 512 MB test heap ran out with bigger ones); the
+worker's first round then took 1 min instead of 19 (only IBs newer than the copy),
+0 docs re-imported, no duplicates, same answers.
+
 ## Everyday
 
 ```bash
 podman compose -p kg ps                           # what is running
 podman compose -p kg logs --tail 50 api           # API log
+cat $DATA_DIR/worker/state.json                   # last run + result of every worker job
+podman compose -p kg exec worker python worker.py --once cmsrepo   # run one job now
 podman compose -p kg up -d --build api            # deploy new code: rebuilds only the API, Neo4j keeps running
 podman compose -p kg down                         # stop and DELETE the containers -- data stays in DATA_DIR
 podman compose -p kg up -d                        # start again on the same data
