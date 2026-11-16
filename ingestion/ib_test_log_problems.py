@@ -7,10 +7,19 @@ unitTestLogs.zip into UT/ or addOnTests.zip into AO/:
     scan_unit_test_dir(utdir + "/UT", zip_path=logFile)
     scan_addon_dir(utdir + "/AO", zip_path=logFile)
 
+and from jenkins-jobs/process-relval-logs (bash), when the RelVals of a build
+are finished, after its clean-up and before it zips the folder:
+
+    python3 ib_test_log_problems.py relval "$dir" || true
+
 Each call writes one file in the zip's folder (the build folder):
 
-    unitTestLogs.zip -> unitTestLogs-scan.json.gz
-    addOnTests.zip   -> addOnTests-scan.json.gz
+    unitTestLogs.zip                     -> unitTestLogs-scan.json.gz
+    addOnTests.zip                       -> addOnTests-scan.json.gz
+    pyRelValPartialLogs/ (before the zip) -> pyRelValMatrixLogs-scan.json.gz
+
+DBG RelVals are never zipped (cms-bot, 2026-10-16) but still reach that point,
+so they are scanned too.
 
 The file holds every test with its status, every problem found in the logs
 (ib_test_log_scanner.py does the detection), and a `source` block saying which
@@ -46,7 +55,10 @@ import ib_test_log_scanner as scanner
 # (/data/sdt/buildlogs/... on cmssdt9-02, or a copy of that layout elsewhere)
 PATH_RE = re.compile(
     r"(?:^|/)(?P<arch>[^/]+)/www/(?P<day>[^/]+)/(?P<queue>[^/]+)/(?P<tag>CMSSW_[^/]+)/(?P<rest>[^/].*)$")
-ZIP_KINDS = {"unitTestLogs.zip": "unit", "addOnTests.zip": "addon"}
+ZIP_KINDS = {"unitTestLogs.zip": "unit", "addOnTests.zip": "addon", "pyRelValMatrixLogs.zip": "relval"}
+RELVAL_DIR = "pyRelValPartialLogs"   # what process-relval-logs zips into pyRelValMatrixLogs.zip
+RELVAL_DONE_RE = re.compile(r"^done\.")
+RELVAL_TOTAL_RE = re.compile(r"^done\.\d+of(\d+)$")
 EVIDENCE_LINES_QUIET = 8  # evidence lines kept for message_logger / generic records (as the chatbot's fetcher)
 
 
@@ -83,10 +95,13 @@ def _trim(problem: dict) -> dict:
     return problem
 
 
-def _write(result: dict, source: dict, zip_path: str, out_path: str | None) -> str:
-    st = os.stat(zip_path)
+def _write(result: dict, source: dict, zip_path: str, out_path: str | None,
+           size: int | None = None, mtime: float | None = None) -> str:
+    if size is None or mtime is None:
+        st = os.stat(zip_path)
+        size, mtime = st.st_size, st.st_mtime
     result["problems"] = [_trim(p) for p in result["problems"]]
-    result["source"] = dict(source, size=st.st_size, mtime=st.st_mtime,
+    result["source"] = dict(source, size=size, mtime=mtime,
                             scanned_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
                             scanner_version=scanner.SCANNER_VERSION, scanned_by="ib_test_log_problems")
     out_path = out_path or scan_file_path(zip_path)
@@ -127,8 +142,44 @@ def scan_addon_dir(unpacked_dir: str, zip_path: str, addon_log: str | None = Non
     return _write(scanner.scan_addon_dir(unpacked_dir, addon_log_text), source, zip_path, out_path)
 
 
+def relval_progress(partial_logs_dir: str) -> dict:
+    """How many RelVal jobs reported back, counted exactly like
+    process-relval-logs: every done.* file counts, the total is N of the
+    last done.<i>of<N> in `ls` order. complete=False means the folder is
+    being zipped after cms-bot's 10-hour timeout, with jobs missing."""
+    names = sorted(n for n in os.listdir(partial_logs_dir) if RELVAL_DONE_RE.match(n))
+    totals = [m.group(1) for m in map(RELVAL_TOTAL_RE.match, names) if m]
+    total = int(totals[-1]) if totals else None
+    return dict(jobs_done=len(names), jobs_total=total, complete=total is not None and len(names) == total)
+
+
+def scan_relval_dir(partial_logs_dir: str, out_path: str | None = None) -> str:
+    """Scans <build>/[gpu/<card>/|other/<name>/]pyRelValPartialLogs/ -- the
+    folder process-relval-logs is about to zip -- and writes
+    pyRelValMatrixLogs-scan.json.gz next to it. Works when there is no zip
+    yet (or never will be, DBG). Returns the path of the file written."""
+    folder = os.path.abspath(partial_logs_dir).rstrip("/")
+    if os.path.basename(folder) != RELVAL_DIR:
+        raise ValueError(f"not a {RELVAL_DIR} folder: {partial_logs_dir}")
+    _check_dir(folder)
+    zip_path = os.path.join(os.path.dirname(folder), "pyRelValMatrixLogs.zip")   # where cms-bot puts the zip
+    source = dict(describe_zip_path(zip_path), scanned_from=RELVAL_DIR, **relval_progress(folder))
+    size = 0
+    for dirpath, _, files in os.walk(folder):
+        size += sum(os.path.getsize(os.path.join(dirpath, f)) for f in files)
+    return _write(scanner.scan_relval_dir(folder), source, zip_path, out_path,
+                  size=size, mtime=os.stat(folder).st_mtime)
+
+
 def main(argv: list[str]) -> int:
-    """By hand: ib_test_log_problems.py <unpacked dir> <zip path> [<out path>]"""
+    """By hand, or from process-relval-logs:
+    ib_test_log_problems.py <unpacked dir> <zip path> [<out path>]   unit tests / addOn
+    ib_test_log_problems.py relval <pyRelValPartialLogs dir> [<out path>]"""
+    if len(argv) in (3, 4) and argv[1] == "relval":
+        started = time.time()
+        out = scan_relval_dir(argv[2], out_path=argv[3] if len(argv) == 4 else None)
+        print(f"wrote {out} in {time.time() - started:.1f} s")
+        return 0
     if len(argv) not in (3, 4):
         print(main.__doc__)
         return 2

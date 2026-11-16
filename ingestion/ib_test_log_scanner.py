@@ -61,6 +61,7 @@ import json
 import os
 import re
 import zipfile
+import zlib
 from collections import deque
 
 SCANNER_VERSION = 6       # bump when detection changes, so stored results say what produced them
@@ -909,42 +910,95 @@ def _relval_status(raw: str | None) -> str | None:
     return {"PASSED": "passed", "NOTRUN": "not_run"}.get(raw, "failed")
 
 
-def scan_relval_zip(path: str) -> dict:
+class _RelvalZipFile:
+    """One file of a RelVal zip, as _scan_relval_members needs it."""
+
+    def __init__(self, zf: zipfile.ZipFile, info: zipfile.ZipInfo):
+        self.zf, self.info, self.name, self.size = zf, info, info.filename, info.file_size
+        self.lines = _ZipMemberLines(zf, info)
+
+    def read(self) -> bytes:
+        return self.zf.read(self.info)
+
+    def crc(self) -> int:
+        return self.info.CRC
+
+
+class _RelvalDiskFile:
+    """One file of an unpacked RelVal folder. crc() is the zip's CRC-32 of the
+    content, computed only when asked (two logs of a workflow with equal size)."""
+
+    def __init__(self, path: str, name: str):
+        self.path, self.name, self.size = path, name, os.path.getsize(path)
+        self.lines = _FileLines(path)
+        self._crc = None
+
+    def read(self) -> bytes:
+        with open(self.path, "rb") as fh:
+            return fh.read()
+
+    def crc(self) -> int:
+        if self._crc is None:
+            crc = 0
+            with open(self.path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    crc = zlib.crc32(chunk, crc)
+            self._crc = crc
+        return self._crc
+
+
+def _scan_relval_members(files) -> dict:
+    """`files`: every <workflow>/<file> of a RelVal zip or unpacked folder.
+    Files at any other depth (top-level markers, sub-folders) are ignored."""
     workflows, problems = [], []
-    with zipfile.ZipFile(path) as zf:
-        members = collections.defaultdict(list)
-        for info in zf.infolist():
-            parts = info.filename.split("/")
-            if len(parts) == 2 and parts[1]:
-                members[parts[0]].append(info)
-        for wf in sorted(members):
-            infos = members[wf]
-            status_info = next((i for i in infos if i.filename.endswith("/workflow.log")), None)
-            parsed = parse_relval_workflow_log(zf.read(status_info).decode("utf-8", "replace")) \
-                if status_info else dict(steps={}, exit_codes=[])
-            workflows.append(dict(workflow=wf, steps=parsed["steps"], exit_codes=parsed["exit_codes"],
-                                  status=None if not parsed["steps"] else "passed" if all(
-                                      s == "PASSED" for s in parsed["steps"].values()) else "failed"))
-            # step<N>.log is a byte-identical copy of the named step log (or of the
-            # das/lumi log); read each distinct content once, preferring the named file.
-            seen = set()
-            logs = [i for i in infos if i.filename.endswith(".log")
-                    and i.filename.rsplit("/", 1)[1] not in ("workflow.log", "time.log")]
-            logs.sort(key=lambda i: (re.fullmatch(r"step\d+\.log", i.filename.rsplit("/", 1)[1]) is not None,
-                                     i.filename))
-            for info in logs:
-                key = (info.CRC, info.file_size)
-                if key in seen:
-                    continue
-                seen.add(key)
-                name = info.filename.rsplit("/", 1)[1]
-                step_match = re.match(r"step(\d+)", name)
-                step = int(step_match.group(1)) if step_match else None
-                raw = parsed["steps"].get(step) if step else None
-                owner = dict(workflow=wf, step=step, test_status=_relval_status(raw), raw_status=raw,
-                             member=info.filename)
-                problems.extend(aggregate(iter_issues(_member_lines(zf, info)), owner).values())
+    members = collections.defaultdict(list)
+    for f in files:
+        parts = f.name.split("/")
+        if len(parts) == 2 and parts[1]:
+            members[parts[0]].append(f)
+    for wf in sorted(members):
+        files_of_wf = members[wf]
+        status_file = next((f for f in files_of_wf if f.name.endswith("/workflow.log")), None)
+        parsed = parse_relval_workflow_log(status_file.read().decode("utf-8", "replace")) \
+            if status_file else dict(steps={}, exit_codes=[])
+        workflows.append(dict(workflow=wf, steps=parsed["steps"], exit_codes=parsed["exit_codes"],
+                              status=None if not parsed["steps"] else "passed" if all(
+                                  s == "PASSED" for s in parsed["steps"].values()) else "failed"))
+        # step<N>.log is a byte-identical copy of the named step log (or of the
+        # das/lumi log); read each distinct content once, preferring the named file.
+        kept_by_size = collections.defaultdict(list)
+        logs = [f for f in files_of_wf if f.name.endswith(".log")
+                and f.name.rsplit("/", 1)[1] not in ("workflow.log", "time.log")]
+        logs.sort(key=lambda f: (re.fullmatch(r"step\d+\.log", f.name.rsplit("/", 1)[1]) is not None, f.name))
+        for f in logs:
+            same_size = kept_by_size[f.size]
+            if same_size and any(k.crc() == f.crc() for k in same_size):
+                continue
+            same_size.append(f)
+            name = f.name.rsplit("/", 1)[1]
+            step_match = re.match(r"step(\d+)", name)
+            step = int(step_match.group(1)) if step_match else None
+            raw = parsed["steps"].get(step) if step else None
+            owner = dict(workflow=wf, step=step, test_status=_relval_status(raw), raw_status=raw, member=f.name)
+            problems.extend(aggregate(iter_issues(iter(f.lines)), owner).values())
     return dict(kind="relval", workflows=workflows, problems=problems)
+
+
+def scan_relval_zip(path: str) -> dict:
+    with zipfile.ZipFile(path) as zf:
+        return _scan_relval_members(_RelvalZipFile(zf, info) for info in zf.infolist() if not info.is_dir())
+
+
+def scan_relval_dir(root: str) -> dict:
+    """The same as scan_relval_zip, for the folder cms-bot zips into
+    pyRelValMatrixLogs.zip (pyRelValPartialLogs/, scanned before it is zipped)."""
+    files = []
+    for wf in sorted(os.listdir(root)):
+        wf_dir = os.path.join(root, wf)
+        if os.path.isdir(wf_dir):
+            files.extend(_RelvalDiskFile(os.path.join(wf_dir, name), f"{wf}/{name}")
+                         for name in sorted(os.listdir(wf_dir)) if os.path.isfile(os.path.join(wf_dir, name)))
+    return _scan_relval_members(files)
 
 
 # ---- command line: a read-only report, writes nothing anywhere ------------

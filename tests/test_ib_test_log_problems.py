@@ -45,12 +45,16 @@ class DescribeZipPathTests(unittest.TestCase):
 
     def test_refuses_paths_it_cannot_place(self):
         for bad in ("/tmp/unitTestLogs.zip",                                   # no build folder
-                    f"/data/sdt/buildlogs/{BUILD}/pyRelValMatrixLogs.zip",     # not phase 1
+                    f"/data/sdt/buildlogs/{BUILD}/runTheMatrix.zip",           # not a test-log zip
                     f"/data/sdt/buildlogs/{BUILD}/odd/unitTestLogs.zip",       # unknown level below the tag
                     f"/data/sdt/buildlogs/{BUILD}/gpu/a/b/unitTestLogs.zip",
                     "/data/sdt/buildlogs/arch/www/fri/q/NOT_A_TAG/unitTestLogs.zip"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 problems.describe_zip_path(bad)
+
+    def test_relval_zip_path(self):
+        info = problems.describe_zip_path(f"/data/sdt/buildlogs/{BUILD}/gpu/nvidia_h100/pyRelValMatrixLogs.zip")
+        self.assertEqual((info["kind"], info["variant"]), ("relval", "gpu/nvidia_h100"))
 
     def test_scan_file_sits_next_to_the_zip(self):
         self.assertEqual(problems.scan_file_path("/b/x/unitTestLogs.zip"), "/b/x/unitTestLogs-scan.json.gz")
@@ -168,6 +172,95 @@ class ScanDirTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             problems.scan_addon_dir(str(self.build / "AO"), str(zip_path))
         self.assertFalse(list(self.build.glob("*-scan.json.gz*")))
+
+
+def _relval_files(add):
+    """The same RelVal content, written by `add(name, text)` into a zip or a folder."""
+    wf = "140.051_RunMuonEG2022C"
+    add(f"{wf}/workflow.log", f"{wf} Step0-PASSED Step1-FAILED ; exit: 0 256\n")
+    add(f"{wf}/step1_RunMuonEG2022C.log", DICTIONARY_NOT_FOUND)
+    add(f"{wf}/step1.log", DICTIONARY_NOT_FOUND)                          # identical copy: read once
+    add(f"{wf}/step2_RunMuonEG2022C.log", "%MSG-e Cat: mod\nbad thing\n%MSG\n")
+    add(f"{wf}/step2.log", "%MSG-e Cat: mod\nbad thinG\n%MSG\n")         # same size, other content: read too
+    add(f"{wf}/step1_RunMuonEG2022C.log-read_config", "{}")
+    add("11634.0_TTbar/workflow.log", "11634.0_TTbar Step0-PASSED ; exit: 0\n")
+    add("11634.0_TTbar/step1_TTbar.log", "----- Begin Fatal Exception 01-Jan-2026\nboom\n----- End Fatal Exception\n")
+
+
+class RelvalDirTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.build = Path(self.tmp.name) / "buildlogs" / BUILD
+        self.partial = self.build / "pyRelValPartialLogs"
+        self.partial.mkdir(parents=True)
+
+        def add(name, text):
+            path = self.partial / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(text)
+        _relval_files(add)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_folder_scan_matches_the_zip_scan(self):
+        zip_path = Path(self.tmp.name) / "same.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            _relval_files(zf.writestr)
+        (self.partial / "done.1of2").touch()                   # top-level markers and deeper
+        (self.partial / "140.051_RunMuonEG2022C" / "sub").mkdir()  # folders are not logs
+        (self.partial / "140.051_RunMuonEG2022C" / "sub" / "x.log").write_text(DICTIONARY_NOT_FOUND)
+
+        from_dir = scanner.scan_relval_dir(str(self.partial))
+        from_zip = scanner.scan_relval_zip(str(zip_path))
+
+        self.assertEqual(_sorted(dict(from_dir, tests=[])), _sorted(dict(from_zip, tests=[])))
+        self.assertEqual(from_dir["workflows"], from_zip["workflows"])
+        members = sorted(p["member"] for p in from_dir["problems"])
+        self.assertNotIn("140.051_RunMuonEG2022C/step1.log", members)      # the copy was skipped
+        self.assertIn("140.051_RunMuonEG2022C/step2.log", members)         # different content: kept
+
+    def test_writes_the_scan_file_without_a_zip_and_counts_jobs(self):
+        for name in ("done.1of2", "done.2of2"):
+            (self.partial / name).touch()
+
+        out = problems.scan_relval_dir(str(self.partial))
+
+        self.assertEqual(out, str(self.build / "pyRelValMatrixLogs-scan.json.gz"))
+        with gzip.open(out, "rt") as fh:
+            written = json.load(fh)
+        src = written["source"]
+        self.assertEqual((src["kind"], src["tag"], src["variant"], src["scanned_from"]),
+                         ("relval", "CMSSW_16_1_X_2026-11-13-1100", "", "pyRelValPartialLogs"))
+        self.assertEqual((src["jobs_done"], src["jobs_total"], src["complete"]), (2, 2, True))
+        self.assertTrue(src["path"].endswith("/pyRelValMatrixLogs.zip"))
+        self.assertEqual(len(written["workflows"]), 2)
+        self.assertEqual(sorted(p.name for p in self.build.iterdir()),
+                         ["pyRelValMatrixLogs-scan.json.gz", "pyRelValPartialLogs"])
+
+    def test_timed_out_run_is_marked_incomplete(self):
+        (self.partial / "done.1of3").touch()
+
+        out = problems.scan_relval_dir(str(self.partial))
+
+        with gzip.open(out, "rt") as fh:
+            src = json.load(fh)["source"]
+        self.assertEqual((src["jobs_done"], src["jobs_total"], src["complete"]), (1, 3, False))
+
+    def test_gpu_variant_and_bad_folders(self):
+        gpu = self.build / "gpu" / "nvidia_h100" / "pyRelValPartialLogs"
+        gpu.mkdir(parents=True)
+        out = problems.scan_relval_dir(str(gpu))
+        with gzip.open(out, "rt") as fh:
+            self.assertEqual(json.load(fh)["source"]["variant"], "gpu/nvidia_h100")
+        with self.assertRaises(ValueError):
+            problems.scan_relval_dir(str(self.build))                          # wrong folder name
+        with self.assertRaises(ValueError):
+            problems.scan_relval_dir(str(self.build / "nothing" / "pyRelValPartialLogs"))   # missing
+
+    def test_command_line_used_by_process_relval_logs(self):
+        self.assertEqual(problems.main(["x", "relval", str(self.partial)]), 0)
+        self.assertTrue((self.build / "pyRelValMatrixLogs-scan.json.gz").exists())
 
 
 if __name__ == "__main__":
