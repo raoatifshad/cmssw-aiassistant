@@ -10310,6 +10310,13 @@ def _ai_checked_matches(paste: str, items: list[dict], searched: list[str]) -> d
         return None
     if not judged:
         return None
+    # one model's "same" alone is "possible" only for an item the text search already found specific (a rare name, the exact message): gpt-oss-20b
+    # alone called all 8 common-word matches of a bare "ProductNotFound" paste the same problem (found 2026-11-17, right after the change above)
+    specific = {f"{i['kind']} #{i['number']}" for i in items if i.get("strong")}
+    for key, entry in judged.items():
+        if entry.get("single") and key not in specific:
+            entry["verdict"] = "related"
+            entry.pop("single")
     known = {c["id"] for c in candidates}
     for key, entry in judged.items():
         # a number the candidate's own text doesn't have: the reason goes, the verdict stays
