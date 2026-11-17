@@ -260,6 +260,19 @@ class ReadingsInTimeTests(unittest.TestCase):
         self.assertEqual(first["Issue #1"]["verdict"], "same")
         self.assertEqual(_merge_readings(first, second)["Issue #1"]["verdict"], "possible")
 
+    def test_one_model_same_on_a_common_word_match_is_only_related(self):
+        import server.api_server as api
+        items = [dict(row(1), strong=True), dict(row(2), strong=False)]
+        reading = {"Issue #1": {"verdict": "possible", "reason": "r", "single": True}, "Issue #2": {"verdict": "possible", "reason": "r", "single": True}}
+        with patch("server.api_server._llm_client", new_callable=MagicMock), patch("server.api_server.DEFAULT_MODEL", "glm"), \
+                patch("server.api_server.REVIEW_MODEL", "oss"), \
+                patch("server.api_server.get_github_item_excerpts", return_value=[{"id": "Issue #1"}, {"id": "Issue #2"}]), \
+                patch("server.api_server._readings_in_time", return_value=({}, {})), \
+                patch("server.api_server._merge_readings", return_value=reading):
+            checked = api._ai_checked_matches("paste", items, [])
+        self.assertEqual(checked["Issue #1"]["verdict"], "possible")
+        self.assertEqual(checked["Issue #2"], {"verdict": "related", "reason": "r"})
+
     def test_one_check_headline(self):
         item = dict(row(1), where={"title": ["x"]})
         lines = _ai_checked_lines([item], {"Issue #1": {"verdict": "possible", "reason": "r", "single": True}}, "item(s)", "")
