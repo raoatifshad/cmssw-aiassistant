@@ -25,6 +25,7 @@ from server.api_server import (
     _chat_response,
     _reviewed_fix_draft,
     _with_second_opinion,
+    _merge_readings,
     _github_reports_section,
     _new_exceptions_answer,
     _os_family_compare_answer,
@@ -204,6 +205,66 @@ class TwoModelTests(unittest.TestCase):
         lines = _ai_checked_lines([item], {"Issue #1": {"verdict": "possible", "reason": "r"}}, "item(s)", "")
         self.assertIn("Possibly reported: 1 item(s)", lines[0])
         self.assertIn("One AI check says the same problem: r", "\n".join(lines))
+
+
+class ReadingsInTimeTests(unittest.TestCase):
+    """2026-11-17: GLM took 45-110 s per batch of 8 and was dropped at its 20 s limit, after which gpt-oss ran: ~20 s for no AI check.
+    Now both start at once and the answer waits for the review model plus a short grace only."""
+    BATCHES = [[{"id": "Issue #1"}, {"id": "Issue #2"}]]
+
+    def run_with(self, judge, grace=0.2, deadline=2.0):
+        import server.api_server as api
+        with patch("server.api_server._llm_client", new_callable=MagicMock), patch("server.api_server.DEFAULT_MODEL", "glm"), \
+                patch("server.api_server.REVIEW_MODEL", "oss"), patch("server.api_server.judge_github_matches", side_effect=judge), \
+                patch("server.api_server._AI_CHECK_GRACE_S", grace), patch("server.api_server._AI_CHECK_DEADLINE_S", deadline):
+            import time
+            started = time.monotonic()
+            first, second = api._readings_in_time("paste", self.BATCHES)
+            return first, second, time.monotonic() - started
+
+    def test_a_slow_first_model_is_not_waited_for(self):
+        import time
+
+        def judge(_c, model, _p, batch):
+            if model == "glm":
+                time.sleep(1.5)
+                return {"Issue #1": {"verdict": "unrelated", "reason": ""}}
+            return {"Issue #1": {"verdict": "same", "reason": "r"}, "Issue #2": {"verdict": "related", "reason": ""}}
+        first, second, took = self.run_with(judge)
+        self.assertEqual(first, {})
+        self.assertEqual(second["Issue #1"]["verdict"], "same")
+        self.assertLess(took, 1.0)
+        merged = _merge_readings(first, second)
+        self.assertEqual(merged["Issue #1"], {"verdict": "possible", "reason": "r", "single": True})
+        self.assertEqual(merged["Issue #2"]["verdict"], "related")
+
+    def test_both_in_time_need_to_agree_on_same(self):
+        def judge(_c, model, _p, batch):
+            return {"Issue #1": {"verdict": "same", "reason": model}, "Issue #2": {"verdict": "same" if model == "glm" else "related", "reason": model}}
+        first, second, _ = self.run_with(judge)
+        merged = _merge_readings(first, second)
+        self.assertEqual(merged["Issue #1"]["verdict"], "same")
+        self.assertEqual(merged["Issue #2"]["verdict"], "possible")
+        self.assertNotIn("single", merged["Issue #2"])
+
+    def test_review_model_down_gives_the_first_one_the_rest_of_the_time(self):
+        import time
+
+        def judge(_c, model, _p, batch):
+            if model == "oss":
+                raise RuntimeError("502")
+            time.sleep(0.5)
+            return {"Issue #1": {"verdict": "same", "reason": "g"}}
+        first, second, took = self.run_with(judge, grace=0.1)
+        self.assertEqual(second, {})
+        self.assertEqual(first["Issue #1"]["verdict"], "same")
+        self.assertEqual(_merge_readings(first, second)["Issue #1"]["verdict"], "possible")
+
+    def test_one_check_headline(self):
+        item = dict(row(1), where={"title": ["x"]})
+        lines = _ai_checked_lines([item], {"Issue #1": {"verdict": "possible", "reason": "r", "single": True}}, "item(s)", "")
+        self.assertIn("only one AI check answered in time", lines[0])
+        self.assertNotIn("disagree", lines[0])
 
 
 class SourceCheckTests(unittest.TestCase):

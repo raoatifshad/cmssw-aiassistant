@@ -13,7 +13,7 @@ import os
 import re
 import sys
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as _wait_futures
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -10218,9 +10218,34 @@ _AI_CHECKED_BATCH = 8
 _AI_CHECKED_ITEMS = 16
 
 
+# Both models read the matches at the same time; the answer waits for REVIEW_MODEL and then at most this long for DEFAULT_MODEL. Measured 2026-11-17 on
+# 7 real batches of 8: gpt-oss-20b 5-15 s every time, glm-5.3-flash 45-110 s (and 502s), so with GLM first and a 20 s limit the check was dropped in
+# 5 of 7 and the answer waited ~20 s for nothing. Each call keeps its own 20 s limit (judge_github_matches); a late one finishes unread in the background.
+_AI_CHECK_GRACE_S = 3.0
+_AI_CHECK_DEADLINE_S = 25.0
+
+
+def _merge_readings(first: dict[str, dict], second: dict[str, dict]) -> dict[str, dict]:
+    """"Same problem" only stands if both models read it so (found 2026-11-05: glm-5.3-flash called unrelated PRs that quote a generic message
+    "identical", gpt-oss-20b missed real Triton reports; they rarely err on the same item). When they differ it is "possible"; when only one of them
+    read an item, its "same" is "possible" too, marked single (shown as "one AI check")."""
+    merged: dict[str, dict] = {}
+    for key in list(first) + [k for k in second if k not in first]:
+        one, other = first.get(key), second.get(key)
+        entry = dict(one or other)
+        if one and other:
+            if one["verdict"] == "same" and other["verdict"] != "same":
+                entry["verdict"] = "possible"
+            elif one["verdict"] != "same" and other["verdict"] == "same":
+                entry.update(verdict="possible", reason=other["reason"] or one["reason"])
+        elif entry["verdict"] == "same":
+            entry.update(verdict="possible", single=True)
+        merged[key] = entry
+    return merged
+
+
 def _with_second_opinion(judged: dict[str, dict], paste: str, batches: list[list[dict]]) -> dict[str, dict]:
-    """"Same problem" only stands if a second, different model reads it the same way (found 2026-11-05: glm-5.3-flash called unrelated PRs that quote a generic
-    message "identical", gpt-oss-20b missed real Triton reports; they rarely err on the same item). When they differ it is "possible" and shown as such."""
+    """REVIEW_MODEL's reading of the same batches merged into DEFAULT_MODEL's (_merge_readings)."""
     if REVIEW_MODEL == DEFAULT_MODEL:
         return judged
     try:
@@ -10230,31 +10255,61 @@ def _with_second_opinion(judged: dict[str, dict], paste: str, batches: list[list
         print(f"WARNING: second AI check of the GitHub matches failed: {exc}")
         replies = []
     second = {key: value for reply in replies if reply for key, value in reply.items()}
-    for key, entry in judged.items():
-        other = second.get(key)
-        if entry["verdict"] == "same" and (not other or other["verdict"] != "same"):
-            entry["verdict"] = "possible"
-        elif entry["verdict"] != "same" and other and other["verdict"] == "same":
-            entry.update(verdict="possible", reason=other["reason"] or entry["reason"])
-    return judged
+    return {key: entry for key, entry in _merge_readings(judged, second).items() if key in judged}
+
+
+def _readings_in_time(paste: str, batches: list[list[dict]]) -> tuple[dict[str, dict], dict[str, dict]]:
+    """(DEFAULT_MODEL's reading, REVIEW_MODEL's reading), both started at once. Waits for REVIEW_MODEL, then _AI_CHECK_GRACE_S for DEFAULT_MODEL;
+    if REVIEW_MODEL gave nothing, DEFAULT_MODEL gets the rest of _AI_CHECK_DEADLINE_S. A reading that isn't done by then is left out, never waited for."""
+    started = _time.monotonic()
+    pool = ThreadPoolExecutor(max_workers=2 * len(batches))
+    try:
+        review = [pool.submit(judge_github_matches, _llm_client, REVIEW_MODEL, paste, batch) for batch in batches]
+        primary = [pool.submit(judge_github_matches, _llm_client, DEFAULT_MODEL, paste, batch) for batch in batches]
+    finally:
+        pool.shutdown(wait=False)
+
+    def done(futures, model):
+        reading = {}
+        for future in futures:
+            if not future.done():
+                continue
+            try:
+                reading.update(future.result() or {})
+            except Exception as exc:
+                print(f"WARNING: AI check of the GitHub matches failed on {model}: {exc}")
+        return reading
+
+    _wait_futures(review, timeout=_AI_CHECK_DEADLINE_S)
+    second = done(review, REVIEW_MODEL)
+    left = _AI_CHECK_DEADLINE_S - (_time.monotonic() - started)
+    _wait_futures(primary, timeout=max(0.0, min(_AI_CHECK_GRACE_S, left) if second else left))
+    first = done(primary, DEFAULT_MODEL)
+    print(f"AI check of the GitHub matches: {DEFAULT_MODEL} {sum(f.done() for f in primary)}/{len(primary)}, {REVIEW_MODEL} "
+          f"{sum(f.done() for f in review)}/{len(review)} batches in {_time.monotonic() - started:.1f} s")
+    return first, second
 
 
 def _ai_checked_matches(paste: str, items: list[dict], searched: list[str]) -> dict[str, dict] | None:
-    """The LLM's reading of the text matches: {"Issue #1": {"verdict", "reason"}}. None when it can't be asked: the matches are then shown as text matches."""
+    """The LLM's reading of the text matches: {"Issue #1": {"verdict", "reason"[, "single"]}}. None when it can't be asked: the matches are then shown as text matches."""
     if _llm_client is None or not items:
         return None
     try:
         candidates = get_github_item_excerpts(items[:_AI_CHECKED_ITEMS], searched)
         batches = [candidates[i:i + _AI_CHECKED_BATCH] for i in range(0, len(candidates), _AI_CHECKED_BATCH)]
-        with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-            replies = list(pool.map(lambda batch: judge_github_matches(_llm_client, DEFAULT_MODEL, paste, batch), batches))
+        if not batches:
+            return None
+        if REVIEW_MODEL == DEFAULT_MODEL:
+            with ThreadPoolExecutor(max_workers=len(batches)) as pool:
+                replies = list(pool.map(lambda batch: judge_github_matches(_llm_client, DEFAULT_MODEL, paste, batch), batches))
+            judged = {key: value for reply in replies if reply for key, value in reply.items()}
+        else:
+            judged = _merge_readings(*_readings_in_time(paste, batches))
     except Exception as exc:
         print(f"WARNING: AI check of the GitHub matches failed: {exc}")
         return None
-    judged = {key: value for reply in replies if reply for key, value in reply.items()}
     if not judged:
         return None
-    judged = _with_second_opinion(judged, paste, batches)
     known = {c["id"] for c in candidates}
     for key, entry in judged.items():
         # a number the candidate's own text doesn't have: the reason goes, the verdict stays
@@ -10278,10 +10333,13 @@ def _ai_checked_lines(items: list[dict], checked: dict[str, dict], what: str, as
     """The verdict from reading the matches, with every checked one shown: a wrong "unrelated" stays visible."""
     groups: dict[str, list[tuple[dict, str]]] = {"same": [], "possible": [], "related": [], "unrelated": []}
     unchecked = []
+    single = []  # "possible" only because the other model didn't answer in time
     for item in items:
         entry = checked.get(f"{item['kind']} #{item['number']}")
         if entry:
             groups[entry["verdict"]].append((item, entry["reason"]))
+            if entry["verdict"] == "possible":
+                single.append(bool(entry.get("single")))
         else:
             unchecked.append(item)
     lines = []
@@ -10292,7 +10350,9 @@ def _ai_checked_lines(items: list[dict], checked: dict[str, dict], what: str, as
             if first:
                 lines.append(f"The earliest is **{first['kind']} #{first['number']}**, opened by `{first.get('author') or 'unknown'}` on {first['created_at'][:10]}.")
     elif groups["possible"]:
-        lines.append(f"**Possibly reported: {len(groups['possible'])} {what}, but the two AI checks disagree.** Read them to decide.")
+        why = ("only one AI check answered in time and says the same problem" if all(single) else
+               "the two AI checks disagree" if not any(single) else "the AI checks disagree or only one answered in time")
+        lines.append(f"**Possibly reported: {len(groups['possible'])} {what}, but {why}.** Read them to decide.")
     else:
         read = sum(len(g) for g in groups.values())
         lines.append(f"**No report of this same problem found.** The AI check read {read} text match(es) and none clearly looks like it.")
@@ -10300,7 +10360,8 @@ def _ai_checked_lines(items: list[dict], checked: dict[str, dict], what: str, as
         lines.append(_github_item_line(item) + (f"\n  - _AI check: {reason}_" if reason else ""))
     if groups["possible"]:
         if groups["same"]:
-            lines.append("\nPossibly the same, the two AI checks disagree:")
+            lines.append("\nPossibly the same, " + ("only one AI check answered in time:" if all(single) else "the two AI checks disagree:" if not any(single)
+                                                      else "the AI checks disagree or only one answered in time:"))
         for item, reason in groups["possible"][:6]:
             lines.append(_github_item_line(item) + (f"\n  - _One AI check says the same problem: {reason}_" if reason else ""))
     if groups["related"]:
