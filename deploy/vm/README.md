@@ -13,7 +13,34 @@ rebuilt at any time without losing anything.
 Not included on purpose: OpenSearch and Logstash (only ever held one smoke-test
 event; no chat answer used them). The nightly tester stays on the developer PC.
 
-## First start
+## Rebuild from scratch (the VM is gone)
+
+The production VM (created 2026-11-17) is `cmssdt-chatbot.cern.ch`, OpenStack project
+"CMS SDT Build": image `ALMA9 - x86_64`, flavor `m4.xlarge` (8 vCPU, 29 GB RAM, 160 GB disk),
+metadata `cern-activedirectory`, `cern-checkdns`, `cern-services`, `cern-waitdns` all `true`,
+an SSH key pair. Not Puppet-managed (yet). To build a new one:
+
+1. OpenStack: Launch Instance with the settings above; optionally a data volume (~200 GB),
+   attached to it (shows up as e.g. `/dev/vdb`).
+2. Code: `git clone <this repo> /opt/cmssdt-kg-chatbot` (not under /root), check out the branch
+   in use. Without network access to the repo: `git bundle create kg.bundle <branch>` on a machine
+   that has it, `scp`, `git clone -b <branch> kg.bundle /opt/cmssdt-kg-chatbot`.
+3. As root: `/opt/cmssdt-kg-chatbot/deploy/vm/setup-vm.sh [--data-device /dev/vdb]`
+   (packages, data disk at `/srv/kg-data`, user `kgbot`, `.env` with generated secrets and
+   Neo4j memory from the RAM, systemd units for start at boot and the 03:00 backup, firewall).
+   Safe to run again.
+4. Fill in `CERN_API_BASE` / `CERN_API_KEY` in `deploy/vm/.env`; put the new
+   `TEST_LOGS_INGEST_TOKEN` in the sender job's token file on cmssdt9-02.
+5. Data, as `kgbot` (`runuser -l kgbot`, `cd /opt/cmssdt-kg-chatbot/deploy/vm`):
+   `podman compose -p kg up -d neo4j`, `./restore.sh <newest dump>` (from EOS or another copy),
+   then `systemctl --user start kg-stack` and `curl -s localhost:8001/api/health`.
+   With no dump: just start; the worker imports cmsrepo, exceptions and docs (history older
+   than what cms-sw.github.io still has is lost).
+
+Update the code later (as `kgbot`): `git fetch origin && git checkout <branch> && git pull`,
+then `podman compose -p kg up -d --build api worker` (Neo4j keeps running).
+
+## First start (by hand, e.g. a test stack on a PC)
 
 ```bash
 sudo dnf install -y podman podman-compose git     # or the VM's equivalent
