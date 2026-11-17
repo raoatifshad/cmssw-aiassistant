@@ -7,7 +7,7 @@ rebuilt at any time without losing anything.
 | Container | What | Data (on the host) |
 |---|---|---|
 | `neo4j` | Neo4j 5.26.29 Community | `DATA_DIR/neo4j`, dumps in `DATA_DIR/backups` |
-| `api` | chat API (`/api/chat`, `/api/health`, ...) | `DATA_DIR/results`, `DATA_DIR/log-rag`, `DATA_DIR/clang-logs` (read-only) |
+| `api` | chat API (`/api/chat`, `/api/health`, ...); receives test-log scan files from cmssdt9-02 (`POST /api/test-logs/ingest`, saved to `DATA_DIR/results`) | `DATA_DIR/results`, `DATA_DIR/log-rag`, `DATA_DIR/clang-logs` (read-only) |
 | `worker` | test-log import every 30 min; cmsrepo, exceptions, docs at 00:30/12:30 (`worker.py`) | `DATA_DIR/sources` (checkouts), `DATA_DIR/worker` (state.json, logs) |
 
 Not included on purpose: OpenSearch and Logstash (only ever held one smoke-test
@@ -26,6 +26,20 @@ curl -s http://localhost:$API_PORT/api/health     # {"ok":true,...}
 
 On the VM set `DEV_SHIFTER_LOGIN=false` and give Neo4j real memory
 (e.g. `NEO4J_HEAP=4g`, `NEO4J_PAGECACHE=6g` on a 16 GB machine).
+
+## Test-log scan files from cmssdt9-02
+
+A sender job on cmssdt9-02 (`deploy/cmssdt/`, see its README) posts each scan file to
+`POST /api/test-logs/ingest`. The API checks it (gzip JSON, one of our scan results,
+architecture / IB tag / variant well-formed, at most 32 MB) and saves it as
+`DATA_DIR/results/<kind>/<arch>/<tag>/<variant or _>/<name>.json.gz`; the worker imports it
+within 30 min. Answers: `saved`, `replaced` (newer scan of the same build), `unchanged`
+(same bytes), `older` (not stored: never undoes a newer scan); 400/413 with the reason;
+401 wrong token. Off (503) until `TEST_LOGS_INGEST_TOKEN` is set in `.env`; the same value
+goes into the sender job's token file. Port reachable from cmssdt9-02 is needed.
+
+    curl -s -H "X-Test-Logs-Token: $TOKEN" -H 'Content-Type: application/gzip' \
+         --data-binary @unitTestLogs-scan.json.gz http://localhost:$API_PORT/api/test-logs/ingest
 
 ## Moving the live database here (one-off)
 

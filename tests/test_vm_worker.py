@@ -81,6 +81,19 @@ class JobTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         self.assertIn("ingest_test_logs.py", run.call_args.args[0][1])
 
+    def test_an_unreadable_results_folder_fails_instead_of_saying_no_files(self):
+        self._result("a.json.gz", 1_000_000)
+        with patch.object(worker.os, "access", return_value=False):
+            with self.assertRaises(worker.StepFailed):
+                worker.job_testlogs({})
+        sub = self.root / "results" / "relval" / "el9_amd64_gcc14"
+        sub.chmod(0)                                    # a folder below it: os.walk would skip it silently
+        self.addCleanup(sub.chmod, 0o755)
+        if os.access(sub, os.R_OK):                     # running as root: permissions not enforced
+            self.skipTest("root ignores folder permissions")
+        with self.assertRaises(worker.StepFailed):
+            worker.job_testlogs({})
+
     def test_a_failed_import_is_tried_again_next_time(self):
         self._result("a.json.gz", 1_000_000)
         state = {}
