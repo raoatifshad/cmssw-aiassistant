@@ -16,7 +16,8 @@ soon as it starts again.
 
 Not here (they need a Kerberos login to cmssdt9-02; waiting for a service-account
 decision): copying test-log zips and the GitHub issues backup. Test logs arrive in
-/data/results instead (later: POST /api/test-logs/ingest).
+/data/results instead, sent from cmssdt9-02 to POST /api/test-logs/ingest
+(deploy/cmssdt/send_test_log_scans.py).
 
 Everything it keeps is under /data (DATA_DIR on the host):
   /data/sources/{cmsrepo,shifter-wiki,cms-bot,exceptions}   checkouts + newest export
@@ -167,9 +168,20 @@ def job_docs() -> str:
 
 
 def newest_result_mtime() -> float:
+    """Newest results file. An unreadable folder raises (os.walk would skip it silently
+    and the job would say "no results files yet" -- found with a wrong SELinux label)."""
+    def unreadable(err: OSError) -> None:
+        raise StepFailed(f"cannot read {err.filename}: {err.strerror}")
+
+    if not RESULTS.exists():
+        return 0.0                      # a new VM: nothing received yet
+    if not os.access(RESULTS, os.R_OK | os.X_OK):
+        raise StepFailed(f"cannot read {RESULTS} (permissions / SELinux label?)")
     newest = 0.0
     for kind in ("unit", "addon", "relval"):
-        for dirpath, _, files in os.walk(RESULTS / kind):
+        if not (RESULTS / kind).exists():
+            continue
+        for dirpath, _, files in os.walk(RESULTS / kind, onerror=unreadable):
             for name in files:
                 if name.endswith(".json.gz"):
                     newest = max(newest, os.stat(os.path.join(dirpath, name)).st_mtime)

@@ -49,6 +49,7 @@ from server.github_ask import github_named_ask_answer  # noqa: E402
 from server.sample_questions import help_markdown as sample_help_markdown, next_suggestions, sample_groups, PASTE_HINT  # noqa: E402
 from server.pr_cause import cause_answer as pr_cause_answer, cause_hint as pr_cause_hint, files_answer as pr_cause_files_answer  # noqa: E402
 from server.question_catalog import KNOWN_QUESTIONS  # noqa: E402
+from server import test_log_ingest  # noqa: E402
 from graph.analytics import _github_data_reach, neighbour_build, newest_complete_primary, partial_builds, pr_files, pr_origin, relval_counts  # noqa: E402
 from server.agent import (  # noqa: E402
     parse_json_reply,
@@ -23066,6 +23067,21 @@ async def ingest(request: Request, source: str, build: str | None = None,
         return _pipeline.ingest(payload, source_name=source, content_type=content_type, build=build)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/test-logs/ingest")
+async def test_logs_ingest(request: Request):
+    """One IB test-log scan file (<name>-scan.json.gz, gzip body) from the sender job on
+    cmssdt9-02. Checked and saved under TEST_LOG_RESULTS_DIR; the worker imports it.
+    Needs header X-Test-Logs-Token (= TEST_LOGS_INGEST_TOKEN). See server/test_log_ingest.py."""
+    try:
+        test_log_ingest.check_token(request.headers.get("x-test-logs-token"))
+        length = request.headers.get("content-length") or ""
+        if length.isdigit() and int(length) > test_log_ingest.MAX_BYTES:
+            raise test_log_ingest.Rejected(413, f"file is {length} bytes, limit {test_log_ingest.MAX_BYTES}")
+        return test_log_ingest.receive(await request.body()).as_dict()
+    except test_log_ingest.Rejected as exc:
+        raise HTTPException(exc.status, exc.reason) from None
 
 
 @app.post("/api/search")
