@@ -32,8 +32,12 @@ an SSH key pair. Not Puppet-managed (yet). To build a new one:
 4. Fill in `CERN_API_BASE` / `CERN_API_KEY` in `deploy/vm/.env`; put the new
    `TEST_LOGS_INGEST_TOKEN` in the sender job's token file on cmssdt9-02.
 5. Data, as `kgbot` (`runuser -l kgbot`, `cd /opt/cmssdt-kg-chatbot/deploy/vm`):
-   `podman compose -p kg up -d neo4j`, `./restore.sh <newest dump>` (from EOS or another copy),
-   then `systemctl --user start kg-stack` and `curl -s localhost:8001/api/health`.
+   `podman compose -p kg up -d neo4j`, `./restore.sh <newest dump>` (from EOS or another copy);
+   a dump from another machine also needs the path rewrite ("Moving the live database here");
+   then, as root, `systemctl --user -M kgbot@ enable --now kg-stack` (`systemctl --user` does not
+   work inside `runuser`: no session bus) and `curl -s localhost:8001/api/health`.
+   Changed `.env` later? `podman compose -p kg up -d --force-recreate --no-deps api worker`:
+   a plain `up -d` keeps the old containers with the old settings.
    With no dump: just start; the worker imports cmsrepo, exceptions and docs (history older
    than what cms-sw.github.io still has is lost).
 

@@ -15,12 +15,12 @@
 #      VM's RAM, Neo4j ports bound to 127.0.0.1 only, random NEO4J_PASSWORD, SESSION_SECRET_KEY
 #      and TEST_LOGS_INGEST_TOKEN. Never overwrites a value already set. CERN_API_KEY etc.
 #      must be filled in by hand.
-#   6. systemd user units for kgbot: kg-stack.service (compose up at boot, clean stop) and
+#   6. systemd user units for kgbot: kg-stack.service (compose up, clean stop; at boot see 8) and
 #      kg-backup.timer (backup.sh every night at 03:00)
 #   7. firewalld: opens the API port (the CERN perimeter firewall still blocks outside access)
-#   8. with --start: builds the images and starts the stack. Without it nothing is started,
-#      so a database can be restored first (an empty one would make the worker import
-#      everything from scratch).
+#   8. with --start: builds the images, starts the stack and enables it at boot. Without it
+#      nothing is started, not even after a reboot, so a database can be restored first (an
+#      empty one would make the worker import everything from scratch).
 set -euo pipefail
 
 DATA_DIR=/srv/kg-data
@@ -109,6 +109,8 @@ PY
 rand() { python3 -c 'import secrets; print(secrets.token_urlsafe(32))'; }
 [ "$(get DATA_DIR)" = /srv/kg-data ] && put DATA_DIR "$DATA_DIR" force
 put DATA_DIR "$DATA_DIR"
+# an unquoted value with spaces breaks `source .env` in backup.sh/restore.sh
+sed -i -E 's/^WORKER_STEPS=([^"].* .*)$/WORKER_STEPS="\1"/' "$ENV"
 ram_gb=$(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo)
 if [ "$ram_gb" -ge 24 ]; then heap=8g; pc=12g; elif [ "$ram_gb" -ge 12 ]; then heap=4g; pc=6g; else heap=1g; pc=2g; fi
 [ "$(get NEO4J_HEAP)" = 512m ] && put NEO4J_HEAP "$heap" force
@@ -164,8 +166,10 @@ EOF
 chown "$RUN_USER:$RUN_USER" "$UNITS"/kg-*
 ucl() { systemctl --user -M "$RUN_USER@" "$@"; }
 ucl daemon-reload
-ucl enable kg-stack.service kg-backup.timer >/dev/null 2>&1
-ucl start kg-backup.timer
+ucl enable --now kg-backup.timer >/dev/null 2>&1
+# start at boot only once the stack is meant to run: enabled here before a restore, a reboot
+# would start the worker on the empty database (happened 2026-11-17)
+[ "$START" = 1 ] && ucl enable kg-stack.service >/dev/null 2>&1
 
 log "7. firewall: API port $API_PORT"
 if systemctl is-active -q firewalld; then
@@ -187,4 +191,5 @@ echo
 echo "Done. Code: $REPO   Data: $DATA_DIR   Config: $ENV (user $RUN_USER)"
 [ -z "$missing" ] || echo "Fill in by hand in $ENV:$missing"
 echo "Work as the stack's user:  runuser -l $RUN_USER    (then: cd $VMDIR)"
-echo "Restore a dump first:      ./restore.sh <dump>   then start: systemctl --user start kg-stack"
+[ "$START" = 1 ] || echo "Not started, not started at boot. As $RUN_USER: podman compose -p kg up -d neo4j; ./restore.sh <dump>;
+                           then as root: systemctl --user -M $RUN_USER@ enable --now kg-stack   (api + worker, and at every boot)"
