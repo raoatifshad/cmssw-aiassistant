@@ -320,9 +320,19 @@ class AiSupervisorTests(unittest.TestCase):
         return dict(fits=False, problem="p", standalone_question=standalone)
 
     def run_chat(self, chats, verdicts, investigated=None, question="is it new?", routed=None):
+        # both models are asked at once (_preferred_in_time): a list is model "a"'s verdicts ("b" gives nothing usable), a dict is per model
+        if isinstance(verdicts, BaseException):
+            verdicts = {"a": [verdicts], "b": [verdicts]}
+        pending = {k: list(v) for k, v in verdicts.items()} if isinstance(verdicts, dict) else {"a": list(verdicts), "b": [None] * len(verdicts)}
+
+        def judge_fit(_client, model, *_args):
+            verdict = pending[model].pop(0)
+            if isinstance(verdict, BaseException):
+                raise verdict
+            return verdict
         with patch("server.api_server._llm_client", new_callable=MagicMock), patch("server.api_server.DEFAULT_MODEL", "a"), patch("server.api_server.REVIEW_MODEL", "b"), \
                 patch("server.api_server.route_to_known_question", return_value=routed or {"standalone": "is 537.0 new?", "known": ""}), \
-                patch("server.api_server._chat", side_effect=chats) as inner, patch("server.api_server.judge_answer_fit", side_effect=verdicts) as judge, \
+                patch("server.api_server._chat", side_effect=chats) as inner, patch("server.api_server.judge_answer_fit", side_effect=judge_fit) as judge, \
                 patch("server.api_server._run_llm_investigation", return_value=investigated) as agent, patch("server.api_server._store_chat_turns") as store:
             final = _ai_supervised_chat(ChatRequest(question=question, session_id="s1"))
         _ai_supervisor_history.pop("s1", None)
@@ -380,7 +390,7 @@ class AiSupervisorTests(unittest.TestCase):
         self.assertEqual(final.answer, "A")
 
     def test_second_model_judges_when_the_first_is_down(self):
-        final, _inner, judge, *_ = self.run_chat([self.response("A")], [RuntimeError("down"), self.FITS])
+        final, _inner, judge, *_ = self.run_chat([self.response("A")], {"a": [RuntimeError("down")], "b": [self.FITS]})
         self.assertEqual(judge.call_count, 2)
         self.assertEqual(final.answer, "A")
 
@@ -651,3 +661,84 @@ class FalseAnswerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuickChecksInTimeTests(unittest.TestCase):
+    """2026-11-18: GLM hit its 20 s / 12 s limits on the supervisor and routing checks, then gpt-oss answered in 1-3 s. Both now start at once;
+    GLM still decides when it answers in time."""
+
+    def run_with(self, judge, grace=0.3):
+        import time
+        import server.api_server as api
+        with patch("server.api_server._llm_client", new_callable=MagicMock), patch("server.api_server.DEFAULT_MODEL", "glm"), \
+                patch("server.api_server.REVIEW_MODEL", "oss"), patch("server.api_server.judge_answer_fit", side_effect=judge), \
+                patch("server.api_server._QUICK_CHECK_GRACE_S", grace):
+            started = time.monotonic()
+            verdict = api._ai_judged("q", "a", [])
+            return verdict, time.monotonic() - started
+
+    def test_fast_default_model_decides(self):
+        import time
+
+        def judge(_c, model, *_a):
+            if model == "oss":
+                time.sleep(0.3)
+            return {"fits": model == "glm", "problem": model}
+        verdict, took = self.run_with(judge)
+        self.assertEqual(verdict["problem"], "glm")
+        self.assertLess(took, 0.25)
+
+    def test_default_model_within_the_grace_decides(self):
+        import time
+
+        def judge(_c, model, *_a):
+            time.sleep(0.2 if model == "glm" else 0.05)
+            return {"fits": True, "problem": model}
+        verdict, _ = self.run_with(judge)
+        self.assertEqual(verdict["problem"], "glm")
+
+    def test_slow_default_model_is_not_waited_for(self):
+        import time
+
+        def judge(_c, model, *_a):
+            time.sleep(1.5 if model == "glm" else 0.05)
+            return {"fits": True, "problem": model}
+        verdict, took = self.run_with(judge)
+        self.assertEqual(verdict["problem"], "oss")
+        self.assertLess(took, 0.8)
+
+    def test_review_model_down_waits_for_default(self):
+        import time
+
+        def judge(_c, model, *_a):
+            if model == "oss":
+                raise RuntimeError("502")
+            time.sleep(0.6)
+            return {"fits": False, "problem": "glm"}
+        verdict, _ = self.run_with(judge)
+        self.assertEqual(verdict["problem"], "glm")
+
+    def test_unusable_default_reply_uses_review(self):
+        def judge(_c, model, *_a):
+            return None if model == "glm" else {"fits": True, "problem": "oss"}
+        verdict, _ = self.run_with(judge)
+        self.assertEqual(verdict["problem"], "oss")
+
+    def test_both_down_is_none(self):
+        def judge(*_a):
+            raise RuntimeError("down")
+        verdict, _ = self.run_with(judge)
+        self.assertIsNone(verdict)
+
+    def test_routing_uses_the_same_race(self):
+        import time
+        import server.api_server as api
+
+        def route(_c, model, *_a):
+            time.sleep(1.5 if model == "glm" else 0.05)
+            return {"standalone": "", "known": f"from {model}"}
+        with patch("server.api_server._llm_client", new_callable=MagicMock), patch("server.api_server.DEFAULT_MODEL", "glm"), \
+                patch("server.api_server.REVIEW_MODEL", "oss"), patch("server.api_server.route_to_known_question", side_effect=route), \
+                patch("server.api_server._QUICK_CHECK_GRACE_S", 0.3):
+            routed = api._ai_routed("which IB is latest?", [])
+        self.assertEqual(routed, {"standalone": "which IB is latest?", "known": "from oss"})
