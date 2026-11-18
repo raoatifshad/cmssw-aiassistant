@@ -83,6 +83,36 @@ cd deploy/vm && podman compose -p kg build api worker && podman compose -p kg up
 
 `exit` leaves `runuser`. Never `podman compose down -v`, never delete `/srv/kg-data`.
 
+## After a reboot
+
+Nothing needs to be started by hand: `kgbot` has lingering (its units run without a login),
+`kg-stack` and `kg-backup.timer` are enabled, firewalld is enabled and every container has
+`restart=always` (checked 2026-11-18). `reboot` as root stops the stack cleanly (Neo4j gets up
+to 120 s). After 2-3 minutes, check that it came back:
+
+```bash
+curl -s http://cmssdt-chatbot.cern.ch:8001/api/health; echo         # from any CERN machine, no login
+
+# on the VM, as root
+systemctl --user -M kgbot@ is-active kg-stack kg-backup.timer        # active, active
+runuser -l kgbot -c 'podman ps --format "{{.Names}}  {{.Status}}"'   # 3 containers Up, neo4j (healthy)
+ss -ltn | grep -E ':(8001|7474|7687) '                              # *:8001, 127.0.0.1:7474, 127.0.0.1:7687
+curl -s localhost:8001/api/health; echo                             # {"ok":true,...}
+curl -s -X POST localhost:8001/api/chat -H 'Content-Type: application/json' \
+     -d '{"question":"what is the latest IB?","session_id":"vm-check"}' | head -c 300; echo
+python3 -m json.tool /srv/kg-data/worker/state.json | head -40      # last run + result of each worker job
+ls -lt /srv/kg-data/backups | head -3                               # newest dump (03:00)
+uptime -s                                                           # when the VM last started
+```
+
+If something is not up:
+
+* `systemctl --user -M kgbot@ restart kg-stack` fixes most cases, including Neo4j "Up" but
+  without its `7474`/`7687` ports (the API then cannot reach the database).
+* kg-stack itself fails: as kgbot, `podman compose -p kg up -d` in this folder, then
+  `podman logs --tail 50 kg_neo4j_1` / `kg_api_1` / `kg_worker_1`; as root,
+  `journalctl _UID=$(id -u kgbot) --since today --no-pager | tail -50`.
+
 ## First start (by hand, e.g. a test stack on a PC)
 
 ```bash
