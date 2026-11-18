@@ -13,7 +13,7 @@ import os
 import re
 import sys
 import uuid
-from concurrent.futures import ThreadPoolExecutor, wait as _wait_futures
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as _wait_futures
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -21908,15 +21908,44 @@ def _ai_supervised_chat(req: ChatRequest):
     return final
 
 
-def _ai_judged(question: str, answer: str, history: list[dict]) -> dict | None:
-    """Does the answer fit, by the second model only if the first can't be reached. Measured 2026-11-05 on 243 good and 42 bad answers: glm-5.3-flash catches 33 bad, rejects 8 good, 1.3 s; gpt-oss-20b 28, 28, 4.3 s;
-    either of them 37, 32. Every wrong rejection means a slower answer and sometimes a worse one, so one model decides."""
-    for model in dict.fromkeys((DEFAULT_MODEL, REVIEW_MODEL)):
+# The quick checks (does the answer fit? which known question is it?) ask both models at once. DEFAULT_MODEL decides when it answers in time: alone, or
+# within this many seconds after REVIEW_MODEL. Measured 2026-11-17: glm-5.3-flash ran into its 20 s / 12 s limits on every question, after which
+# gpt-oss-20b answered in 1-3 s, so each check cost the full limit. On 11-05 GLM judged in 1.3 s: at that speed it still always decides.
+_QUICK_CHECK_GRACE_S = 5.0
+_QUICK_CHECK_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="quick-check")
+
+
+def _preferred_in_time(what: str, call):
+    """call(model)'s result, DEFAULT_MODEL's if it is usable in time, else REVIEW_MODEL's; None if neither. Both start at once. A late DEFAULT_MODEL
+    call finishes unread in the background (each call has its own timeout)."""
+    def safe(model):
         try:
-            return judge_answer_fit(_llm_client, model, question, answer, history)
+            return call(model)
         except Exception as exc:
-            print(f"WARNING: AI supervisor failed on {model}: {exc}")
-    return None
+            print(f"WARNING: {what} failed on {model}: {exc}")
+            return None
+    if REVIEW_MODEL == DEFAULT_MODEL:
+        return safe(DEFAULT_MODEL)
+    started = _time.monotonic()
+    first = _QUICK_CHECK_POOL.submit(safe, DEFAULT_MODEL)
+    second = _QUICK_CHECK_POOL.submit(safe, REVIEW_MODEL)
+    _wait_futures([first, second], return_when=FIRST_COMPLETED)
+    if not first.done():
+        # REVIEW_MODEL is done: a usable reading gets DEFAULT_MODEL only the grace, an unusable one leaves DEFAULT_MODEL its own limit
+        _wait_futures([first], timeout=_QUICK_CHECK_GRACE_S if second.result() is not None else None)
+    if first.done() and first.result() is not None:
+        chosen, result = DEFAULT_MODEL, first.result()
+    else:
+        chosen, result = REVIEW_MODEL, second.result()
+    print(f"{what}: {chosen if result is not None else 'no model'} decided in {_time.monotonic() - started:.1f} s"
+          f"{'' if first.done() else f' ({DEFAULT_MODEL} not in time)'}")
+    return result
+
+
+def _ai_judged(question: str, answer: str, history: list[dict]) -> dict | None:
+    """Does the answer fit. Measured 2026-11-05 on 243 good and 42 bad answers: glm-5.3-flash catches 33 bad, rejects 8 good, 1.3 s; gpt-oss-20b 28, 28, 4.3 s;
+    either of them 37, 32. Every wrong rejection means a slower answer and sometimes a worse one, so one model decides: DEFAULT_MODEL when in time."""
+    return _preferred_in_time("AI supervisor", lambda model: judge_answer_fit(_llm_client, model, question, answer, history))
 
 
 def _ai_investigated(sid: str, question: str, standalone: str, fallback: tuple | None):
@@ -22101,14 +22130,10 @@ def _keeps_real_architecture(question: str, standalone: str) -> str:
 
 def _ai_routed(question: str, history: list[dict]) -> dict:
     """{"standalone", "known"}, with the question itself when the model can't be reached."""
-    for model in dict.fromkeys((DEFAULT_MODEL, REVIEW_MODEL)):
-        try:
-            routed = route_to_known_question(_llm_client, model, question, history, KNOWN_QUESTIONS)
-            if routed:
-                # with no conversation there is nothing to resolve, and a rewrite can only change the question ("top clang checker" became "which package", found 2026-11-05)
-                return {"standalone": _resolve_relative_builds(_keeps_real_architecture(question, _keeps_only_condition(question, _keeps_known_error_condition(question, routed["standalone"] or question)))) if history else question, "known": _resolve_relative_builds(routed["known"])}
-        except Exception as exc:
-            print(f"WARNING: AI routing failed on {model}: {exc}")
+    routed = _preferred_in_time("AI routing", lambda model: route_to_known_question(_llm_client, model, question, history, KNOWN_QUESTIONS))
+    if routed:
+        # with no conversation there is nothing to resolve, and a rewrite can only change the question ("top clang checker" became "which package", found 2026-11-05)
+        return {"standalone": _resolve_relative_builds(_keeps_real_architecture(question, _keeps_only_condition(question, _keeps_known_error_condition(question, routed["standalone"] or question)))) if history else question, "known": _resolve_relative_builds(routed["known"])}
     return {"standalone": question, "known": ""}
 
 
