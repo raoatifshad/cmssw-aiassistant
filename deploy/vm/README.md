@@ -44,6 +44,45 @@ an SSH key pair. Not Puppet-managed (yet). To build a new one:
 Update the code later (as `kgbot`): `git fetch origin && git checkout <branch> && git pull`,
 then `podman compose -p kg up -d --build api worker` (Neo4j keeps running).
 
+## Cheat sheet: working on cmssdt-chatbot.cern.ch
+
+```bash
+# --- log in (from the PC that has the key; never copy the key anywhere else) ---
+ssh -i ~/.ssh/cmssdt-chatbot.pem root@cmssdt-chatbot.cern.ch
+
+# --- as root: the stack as a whole (systemd user units of kgbot) ---
+systemctl --user -M kgbot@ status kg-stack            # is it up?
+systemctl --user -M kgbot@ restart kg-stack           # stop all 3 cleanly (Neo4j gets 120 s) and start again
+systemctl --user -M kgbot@ stop kg-stack              # stop all 3; `start` to start again
+systemctl --user -M kgbot@ disable kg-stack           # not at boot any more (`enable` to undo)
+systemctl --user -M kgbot@ list-timers                # next/last 03:00 backup
+systemctl --user -M kgbot@ status kg-backup           # how the last backup ended
+journalctl _UID=$(id -u kgbot) --since today | grep backup.sh   # the backup's own log
+curl -s localhost:8001/api/health                     # {"ok":true,"model":...}
+cat /srv/kg-data/worker/state.json                    # last run + result of each worker job
+df -h /srv/kg-data                                    # disk
+
+# --- as kgbot: containers, logs, code (podman is rootless: as root you see no containers) ---
+runuser -l kgbot
+cd /opt/cmssdt-kg-chatbot/deploy/vm
+podman ps                                             # kg_neo4j_1, kg_api_1, kg_worker_1
+podman logs --tail 50 -f kg_api_1                     # API log, follow (Ctrl-C ends)
+podman logs --since 10m kg_api_1 | grep -E "AI supervisor|AI routing|AI check"   # which model decided, how long
+podman logs --tail 50 kg_worker_1
+podman compose -p kg restart api                      # restart one container (same code, same .env)
+podman compose -p kg up -d --force-recreate --no-deps api worker   # after changing .env
+podman compose -p kg exec worker python worker.py --once cmsrepo   # run one worker job now
+./backup.sh                                           # a dump now (Neo4j down ~30 s)
+
+# --- new code (as kgbot): from GitHub once the branch is pushed ---
+cd /opt/cmssdt-kg-chatbot && git fetch origin && git checkout <branch> && git pull --ff-only
+cd deploy/vm && podman compose -p kg build api worker && podman compose -p kg up -d --force-recreate --no-deps api worker
+#   without GitHub: on the PC `git bundle create kg.bundle <last commit on the VM>..<branch>`, scp it to /tmp,
+#   then here `git pull --ff-only /tmp/kg.bundle <branch>`
+```
+
+`exit` leaves `runuser`. Never `podman compose down -v`, never delete `/srv/kg-data`.
+
 ## First start (by hand, e.g. a test stack on a PC)
 
 ```bash

@@ -151,6 +151,9 @@ Description=cmssdt chatbot: nightly Neo4j dump (backup.sh)
 Type=oneshot
 WorkingDirectory=$VMDIR
 ExecStart=$VMDIR/backup.sh
+# backup.sh starts Neo4j again, so its conmon and rootlessport land in this unit; the default KillMode killed them when the
+# backup ended (2026-11-18 03:02: Neo4j kept running, without its 127.0.0.1 ports and without podman watching it)
+KillMode=process
 EOF
 cat > "$UNITS/kg-backup.timer" <<EOF
 [Unit]
