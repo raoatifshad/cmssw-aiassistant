@@ -29,8 +29,9 @@ an SSH key pair. Not Puppet-managed (yet). To build a new one:
    (packages, data disk at `/srv/kg-data`, user `kgbot`, `.env` with generated secrets and
    Neo4j memory from the RAM, systemd units for start at boot and the 03:00 backup, firewall).
    Safe to run again.
-4. Fill in `CERN_API_BASE` / `CERN_API_KEY` in `deploy/vm/.env`; put the new
-   `TEST_LOGS_INGEST_TOKEN` in the sender job's token file on cmssdt9-02.
+4. Fill in `CERN_API_BASE` / `CERN_API_KEY` in `deploy/vm/.env`. `setup-vm.sh` made a new
+   `TEST_LOGS_INGEST_TOKEN`: copy it into Jenkins credential `chatbot-test-logs-token`
+   ("The ingest token" below), or the sender job gets 401.
 5. Data, as `kgbot` (`runuser -l kgbot`, `cd /opt/cmssdt-kg-chatbot/deploy/vm`):
    `podman compose -p kg up -d neo4j`, `./restore.sh <newest dump>` (from EOS or another copy);
    a dump from another machine also needs the path rewrite ("Moving the live database here");
@@ -135,11 +136,30 @@ architecture / IB tag / variant well-formed, at most 32 MB) and saves it as
 `DATA_DIR/results/<kind>/<arch>/<tag>/<variant or _>/<name>.json.gz`; the worker imports it
 within 30 min. Answers: `saved`, `replaced` (newer scan of the same build), `unchanged`
 (same bytes), `older` (not stored: never undoes a newer scan); 400/413 with the reason;
-401 wrong token. Off (503) until `TEST_LOGS_INGEST_TOKEN` is set in `.env`; the same value
-goes into the sender job's token file. Port reachable from cmssdt9-02 is needed.
+401 wrong token. Off (503) until `TEST_LOGS_INGEST_TOKEN` is set in `.env`. Port 8001
+reachable from cmssdt9-02 is needed (checked 2026-11-18).
 
     curl -s -H "X-Test-Logs-Token: $TOKEN" -H 'Content-Type: application/gzip' \
          --data-binary @unitTestLogs-scan.json.gz http://localhost:$API_PORT/api/test-logs/ingest
+
+### The ingest token
+
+`TEST_LOGS_INGEST_TOKEN` in `.env` (random, made by `setup-vm.sh`) is the only thing that lets
+an upload in: port 8001 is open to the whole CERN network and not behind SSO, and the API
+can't filter by address (rootless podman shows every client as 10.89.0.x). The Jenkins job
+`send-test-log-scans` on cmssdt9-02 holds a copy as the Secret text credential
+`chatbot-test-logs-token`, bound to the variable `TEST_LOGS_INGEST_TOKEN` (details and the
+copy command: `deploy/cmssdt/README.md`). Never print it, never commit `.env`.
+
+New token (leaked, or someone left), as root:
+
+    cd /opt/cmssdt-kg-chatbot/deploy/vm
+    new=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+    sed -i "s/^TEST_LOGS_INGEST_TOKEN=.*/TEST_LOGS_INGEST_TOKEN=$new/" .env; unset new
+    runuser -l kgbot -c 'cd /opt/cmssdt-kg-chatbot/deploy/vm && podman compose -p kg up -d --force-recreate --no-deps api'
+
+then update the Jenkins credential (the sender job is red with exit 2 until then; scan files
+are not lost: the next good run sends everything not yet sent).
 
 ## Moving the live database here (one-off)
 
@@ -159,11 +179,6 @@ podman compose -p kg run --rm --no-deps worker python migrate_paths.py \
 #   ... the same + --apply --check   (must end with "old paths anywhere in the graph: none")
 rm -f $DATA_DIR/worker/state.json && podman compose -p kg up -d worker
 ```
-
-Rehearsed on the PC (2026-11-16, live copy of 13:25): 2.97 million paths rewritten in
-~110 s (5,000 per transaction: the 512 MB test heap ran out with bigger ones); the
-worker's first round then took 1 min instead of 19 (only IBs newer than the copy),
-0 docs re-imported, no duplicates, same answers.
 
 ## Everyday
 

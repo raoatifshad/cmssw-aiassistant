@@ -23,7 +23,7 @@ touches cms-bot's files; never prints the token. Exit 0 = everything sent or
 nothing to do, 1 = some files failed or were rejected (retried / reported next
 run), 2 = the VM refused the token or is off (nothing sent).
 
-    send_test_log_scans.py --url https://<vm>:8001 --token-file ~/.test-logs-token [--dry-run]
+    send_test_log_scans.py --url http://cmssdt-chatbot.cern.ch:8001 [--token-file F] [--dry-run]   (else $TEST_LOGS_INGEST_TOKEN)
 """
 from __future__ import annotations
 
