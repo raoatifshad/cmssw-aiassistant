@@ -122,7 +122,8 @@ class AllFlavoursCountTests(unittest.TestCase):
             return [{"tag": tag, "arch": "el9_amd64_gcc14", "variant": None, "relval_total": 10, "failed_relvals": 1, "passed_relvals": 9,
                      "known_error_relvals": 0, "das_error_relvals": 0, "failed_workflows": []}]
         with patch.object(api_server, "_relval_scope_records", side_effect=records), \
-                patch.object(api_server, "_relval_scope_summary", side_effect=lambda recs, heading, variants=None: heading):
+                patch.object(api_server, "_relval_scope_summary", side_effect=lambda recs, heading, variants=None: heading), \
+                patch.object(api_server, "_sub_ib_variant_names", return_value=[]):
             return api_server._relval_failure_count_answer(question, "r2-4"), seen["sub"]
 
     def test_all_flavours_includes_the_sub_ibs(self):
