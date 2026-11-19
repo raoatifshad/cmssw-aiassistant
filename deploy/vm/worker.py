@@ -3,8 +3,10 @@ do on the developer PC, as one long-running container.
 
   every 30 min      testlogs   import new scan files from /data/results
                                (ingest_test_logs.py; skipped when no file changed)
-  00:30 and 12:30   cmsrepo    git update of cms-sw.github.io (data/ only) -> build_graph.py
-                    exceptions cms-bot's es-cmssw-exceptions.py (through the cmssdt proxy,
+  every hour at :30 cmsrepo    git update of cms-sw.github.io (data/ only) -> build_graph.py
+                               (Jenkins summary-of-merged-prs pushes there about hourly;
+                               ~25 changed files and 20-70 s per run, measured 2026-11-19)
+  00:30 and 12:30   exceptions cms-bot's es-cmssw-exceptions.py (through the cmssdt proxy,
                                no password) -> build_graph.py --es-exceptions-json
                     docs       git update of cmssdt-wiki -> ingest_shifter_docs.py --reconcile
 
@@ -24,7 +26,8 @@ Everything it keeps is under /data (DATA_DIR on the host):
   /data/worker/state.json     last run and result of every job (read by people/status page)
   /data/worker/logs/<date>.log
 Environment: WORKER_STEPS ("cmsrepo exceptions docs"), WORKER_REFRESH_AT ("00:30,12:30"),
-WORKER_TESTLOGS_EVERY_MIN (30), TZ (Europe/Zurich). `worker.py --once <job>` runs one job now.
+WORKER_CMSREPO_AT (cmsrepo only; default every hour at :30), WORKER_TESTLOGS_EVERY_MIN (30),
+TZ (Europe/Zurich). `worker.py --once <job>` runs one job now.
 """
 from __future__ import annotations
 
@@ -49,7 +52,14 @@ WIKI_URL = "https://github.com/cms-sw/cmssdt-wiki.git"
 CMSBOT_URL = "https://github.com/cms-sw/cms-bot.git"
 
 REFRESH_STEPS = os.environ.get("WORKER_STEPS", "cmsrepo exceptions docs").split()
-REFRESH_AT = [tuple(map(int, t.split(":"))) for t in os.environ.get("WORKER_REFRESH_AT", "00:30,12:30").split(",") if t]
+
+
+def _times(text: str) -> list[tuple[int, int]]:
+    return [tuple(map(int, t.split(":"))) for t in text.split(",") if t]
+
+
+REFRESH_AT = _times(os.environ.get("WORKER_REFRESH_AT") or "00:30,12:30")
+CMSREPO_AT = _times(os.environ.get("WORKER_CMSREPO_AT") or ",".join(f"{h:02d}:30" for h in range(24)))
 TESTLOGS_EVERY = dt.timedelta(minutes=int(os.environ.get("WORKER_TESTLOGS_EVERY_MIN", "30")))
 PY = sys.executable
 
@@ -204,17 +214,17 @@ REFRESH_JOBS = {"cmsrepo": job_cmsrepo, "exceptions": job_exceptions, "docs": jo
 
 # ---------------------------------------------------------------- schedule
 
-def last_refresh_slot(now: dt.datetime) -> dt.datetime:
-    """The most recent REFRESH_AT time at or before `now`."""
+def last_refresh_slot(now: dt.datetime, at: list[tuple[int, int]] | None = None) -> dt.datetime:
+    """The most recent of the `at` times (default REFRESH_AT) at or before `now`."""
     slots = [now.replace(hour=h, minute=m, second=0, microsecond=0) - dt.timedelta(days=d)
-             for d in (0, 1) for h, m in REFRESH_AT]
+             for d in (0, 1) for h, m in (at or REFRESH_AT)]
     return max(s for s in slots if s <= now)
 
 
 def due_jobs(state: dict, now: dt.datetime) -> list[str]:
     due = []
-    slot = last_refresh_slot(now).isoformat()
     for name in REFRESH_STEPS:
+        slot = last_refresh_slot(now, CMSREPO_AT if name == "cmsrepo" else REFRESH_AT).isoformat()
         if state.get(name, {}).get("tried_at", "") < slot:   # missed or not yet run for this slot
             due.append(name)
     tried = state.get("testlogs", {}).get("tried_at")
@@ -246,7 +256,8 @@ def run_job(name: str, state: dict) -> bool:
 def main(argv: list[str]) -> int:
     if len(argv) == 3 and argv[1] == "--once":
         return 0 if run_job(argv[2], load_state()) else 1
-    log(f"worker started: refresh {REFRESH_STEPS} at {REFRESH_AT}, test logs every {TESTLOGS_EVERY}")
+    log(f"worker started: cmsrepo {len(CMSREPO_AT)} times a day, refresh {REFRESH_STEPS} at {REFRESH_AT}, "
+        f"test logs every {TESTLOGS_EVERY}")
     while True:
         state = load_state()
         for name in due_jobs(state, dt.datetime.now()):
