@@ -177,7 +177,9 @@ class PrOriginTests(unittest.TestCase):
     }
 
     def origin(self, number):
-        with patch.object(analytics, "_pr_authors", side_effect=lambda repo, n: self.PRS.get(int(n))):
+        # _rows: the "is it an Issue?" lookup for a number that is no imported PR (no database in CI)
+        with patch.object(analytics, "_pr_authors", side_effect=lambda repo, n: self.PRS.get(int(n))), \
+                patch.object(analytics, "_rows", return_value=[]):
             return analytics.pr_origin(number)
 
     def test_a_person_is_just_the_opener(self):

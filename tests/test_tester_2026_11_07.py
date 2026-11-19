@@ -70,7 +70,8 @@ class OverviewWithoutBuildStatusTests(unittest.TestCase):
         session.run.return_value = [row]
         driver = MagicMock()
         driver.session.return_value.__enter__.return_value = session
-        with patch.object(api_server, "get_driver", return_value=driver), patch.object(api_server, "get_exit_code_names", return_value={}):
+        with patch.object(api_server, "get_driver", return_value=driver), patch.object(api_server, "get_exit_code_names", return_value={}), \
+                patch.object(api_server, "_variant_previous_tag", return_value=None):
             return api_server._failure_overview_answer(row["tag"], row["arch"])[0]
 
     def test_unset_status_is_not_called_clean(self):
