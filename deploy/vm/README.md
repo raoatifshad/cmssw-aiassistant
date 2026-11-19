@@ -8,7 +8,7 @@ rebuilt at any time without losing anything.
 |---|---|---|
 | `neo4j` | Neo4j 5.26.29 Community | `DATA_DIR/neo4j`, dumps in `DATA_DIR/backups` |
 | `api` | chat API (`/api/chat`, `/api/health`, ...); receives test-log scan files from cmssdt9-02 (`POST /api/test-logs/ingest`, saved to `DATA_DIR/results`) | `DATA_DIR/results`, `DATA_DIR/log-rag`, `DATA_DIR/clang-logs` (read-only) |
-| `worker` | test-log import every 30 min; cmsrepo, exceptions, docs at 00:30/12:30 (`worker.py`) | `DATA_DIR/sources` (checkouts), `DATA_DIR/worker` (state.json, logs) |
+| `worker` | test-log import every 30 min; cmsrepo every hour at :30 (`WORKER_CMSREPO_AT`); exceptions, docs at 00:30/12:30 (`worker.py`) | `DATA_DIR/sources` (checkouts), `DATA_DIR/worker` (state.json, logs) |
 
 Not included on purpose: OpenSearch and Logstash (only ever held one smoke-test
 event; no chat answer used them). The nightly tester stays on the developer PC.

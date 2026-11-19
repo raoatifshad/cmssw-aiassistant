@@ -69,6 +69,7 @@ services:
       TZ: ${TZ:-Europe/Zurich}  # 00:30 means CERN time
       WORKER_STEPS: ${WORKER_STEPS:-cmsrepo exceptions docs}
       WORKER_REFRESH_AT: ${WORKER_REFRESH_AT:-00:30,12:30}
+      WORKER_CMSREPO_AT: ${WORKER_CMSREPO_AT:-}  # empty = every hour at :30
       WORKER_TESTLOGS_EVERY_MIN: ${WORKER_TESTLOGS_EVERY_MIN:-30}
     volumes:
       - ${DATA_DIR}/results:/data/results:z

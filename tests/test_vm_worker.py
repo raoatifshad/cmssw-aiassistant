@@ -16,12 +16,14 @@ worker = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(worker)
 
 AT = lambda s: dt.datetime.fromisoformat(s)
+DEFAULT_CMSREPO_AT = list(worker.CMSREPO_AT)   # as loaded, before any test patches it
 
 
 class ScheduleTests(unittest.TestCase):
     def setUp(self):
-        patcher = patch.multiple(worker, REFRESH_AT=[(0, 30), (12, 30)], REFRESH_STEPS=["cmsrepo", "exceptions", "docs"],
-                                 TESTLOGS_EVERY=dt.timedelta(minutes=30))
+        # cmsrepo on the same two slots here: these tests are about the slot logic itself
+        patcher = patch.multiple(worker, REFRESH_AT=[(0, 30), (12, 30)], CMSREPO_AT=[(0, 30), (12, 30)],
+                                 REFRESH_STEPS=["cmsrepo", "exceptions", "docs"], TESTLOGS_EVERY=dt.timedelta(minutes=30))
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -49,6 +51,40 @@ class ScheduleTests(unittest.TestCase):
         state["testlogs"] = {"tried_at": "2026-11-16T14:40:00"}
         self.assertEqual(worker.due_jobs(state, AT("2026-11-16T15:09:00")), [])
         self.assertEqual(worker.due_jobs(state, AT("2026-11-16T15:10:00")), ["testlogs"])
+
+
+class HourlyCmsrepoTests(unittest.TestCase):
+    """cmsrepo every hour at :30 (the IB page's data is pushed about hourly); exceptions and docs
+    stay at 00:30 and 12:30."""
+
+    def setUp(self):
+        patcher = patch.multiple(worker, REFRESH_AT=[(0, 30), (12, 30)], CMSREPO_AT=[(h, 30) for h in range(24)],
+                                 REFRESH_STEPS=["cmsrepo", "exceptions", "docs"], TESTLOGS_EVERY=dt.timedelta(minutes=30))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _state(self, cmsrepo, others="2026-11-16T12:30:05"):
+        state = {"cmsrepo": {"tried_at": cmsrepo}, "exceptions": {"tried_at": others}, "docs": {"tried_at": others}}
+        state["testlogs"] = {"tried_at": "2026-11-16T14:50:00"}
+        return state
+
+    def test_default_is_every_hour_at_half_past(self):
+        self.assertEqual(DEFAULT_CMSREPO_AT, [(h, 30) for h in range(24)])
+
+    def test_cmsrepo_is_due_every_hour_the_others_are_not(self):
+        self.assertEqual(worker.due_jobs(self._state("2026-11-16T13:30:04"), AT("2026-11-16T14:31:00")), ["cmsrepo"])
+        self.assertEqual(worker.due_jobs(self._state("2026-11-16T14:30:40"), AT("2026-11-16T15:00:00")), [])
+
+    def test_at_half_past_twelve_cmsrepo_runs_first(self):
+        # exceptions attach to RelVals already in the graph: the fresh cmsrepo import comes first
+        due = worker.due_jobs(self._state("2026-11-17T11:30:03", others="2026-11-17T00:30:05"), AT("2026-11-17T12:31:00"))
+        self.assertEqual(due, ["cmsrepo", "exceptions", "docs", "testlogs"])   # testlogs: last run 11-16
+
+    def test_own_times_can_be_set(self):
+        self.assertEqual(worker._times("06:15,18:15"), [(6, 15), (18, 15)])
+        with patch.object(worker, "CMSREPO_AT", worker._times("06:15,18:15")):
+            self.assertEqual(worker.due_jobs(self._state("2026-11-16T06:15:02"), AT("2026-11-16T15:00:00")), [])
+            self.assertEqual(worker.due_jobs(self._state("2026-11-16T06:15:02"), AT("2026-11-16T18:15:00")), ["cmsrepo", "testlogs"])
 
 
 class JobTests(unittest.TestCase):
