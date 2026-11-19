@@ -18,7 +18,7 @@ Each call writes one file in the zip's folder (the build folder):
     addOnTests.zip                       -> addOnTests-scan.json.gz
     pyRelValPartialLogs/ (before the zip) -> pyRelValMatrixLogs-scan.json.gz
 
-DBG RelVals are never zipped (cms-bot, 2026-10-16) but still reach that point.
+DBG RelVals are never zipped but still reach that point.
 They are SKIPPED for now: one DBG RelVal folder is ~220 GB (each step log twice,
 ~117 GB unique), hours of reading inside their job. Set TEST_LOG_SCAN_DBG_RELVAL=1
 to scan them (a later step). DBG unit tests / addOn are still scanned.
@@ -53,8 +53,7 @@ import time
 
 import ib_test_log_scanner as scanner
 
-# <arch>/www/<day>/<queue>/<IB tag>/[gpu/<card>/|other/<name>/]<zip>, anywhere in the path
-# (/data/sdt/buildlogs/... on cmssdt9-02, or a copy of that layout elsewhere)
+# <arch>/www/<day>/<queue>/<IB tag>/[gpu/<card>/|other/<name>/]<zip>
 PATH_RE = re.compile(
     r"(?:^|/)(?P<arch>[^/]+)/www/(?P<day>[^/]+)/(?P<queue>[^/]+)/(?P<tag>CMSSW_[^/]+)/(?P<rest>[^/].*)$")
 ZIP_KINDS = {"unitTestLogs.zip": "unit", "addOnTests.zip": "addon", "pyRelValMatrixLogs.zip": "relval"}
