@@ -70,15 +70,16 @@ NODES:
     (:ImportState {source_id, content_hash, source_type, source_path, last_ingested_at})
     (:TestLogRun {key, ib_key, ib_tag, arch, suite, run_variant, queue, server_path, total, passed,
         failed, other, passed_tests, failed_tests, other_tests, failed_details, scanned_at,
-        jobs_done, jobs_total, complete})
+        jobs_done, jobs_total, complete, closed, not_scanned})
         — one scanned test-log zip of one IB: suite is 'unit' (unitTestLogs.zip), 'addon'
         (addOnTests.zip) or 'relval' (pyRelValMatrixLogs.zip); run_variant is '' or e.g.
         'gpu/nvidia_t4', 'other/rntuple' (NOT the same as IB.variant). passed_tests etc. are
         lists of names: unit 'Package/Sub/testName', addon 'test:stepN', relval workflow
         folder '<number>_<name>'. Statuses come from the logs themselves. RelVal runs only:
-        jobs_done of jobs_total RelVal jobs reported back; complete=false means cms-bot zipped
-        it after its 10-hour wait, so workflows of the missing jobs are unknown (not clean);
-        null = not known.
+        jobs_done of jobs_total RelVal jobs reported back; complete=false means jobs are missing
+        (closed=false: still running; closed=true: cms-bot stopped waiting after 10 hours), so
+        their workflows are unknown (not clean); null = not known. not_scanned lists
+        'workflow:stepN' that ran but whose log was not scanned (unknown, not clean).
     (:LogProblem {key, ib_key, ib_tag, arch, suite, run_variant, kind, category, severity, origin,
         serious, summary, message, evidence, signature_id, count, owners, owner_statuses,
         in_passed, in_failed, intentional_hint, example_member, example_line, server_path,
@@ -2184,7 +2185,8 @@ def _incomplete_run_note(run: dict) -> str:
     """A RelVal run cms-bot zipped after its 10-hour wait, with jobs missing."""
     done, total = run.get("jobs_done"), run.get("jobs_total")
     counts = f"only {done} of {total}" if done is not None and total else "not all"
-    return (f"{counts} RelVal jobs reported back (cms-bot stopped waiting after 10 hours): "
+    why = "so far, still running" if run.get("closed") is False else "cms-bot stopped waiting after 10 hours"
+    return (f"{counts} RelVal jobs reported back ({why}): "
             "workflows of the missing jobs are unknown, not clean")
 
 
@@ -2214,7 +2216,8 @@ def get_test_log_changes(to_tag: str, from_tag: str, arch: str | None = None) ->
                 "RETURN r.key AS key, r.ib_tag AS tag, r.arch AS arch, r.suite AS suite, "
                 "coalesce(r.run_variant, '') AS run_variant, "
                 "r.passed_tests + r.failed_tests + r.other_tests AS ran, "
-                "r.jobs_done AS jobs_done, r.jobs_total AS jobs_total, r.complete AS complete",
+                "r.jobs_done AS jobs_done, r.jobs_total AS jobs_total, r.complete AS complete, "
+                "r.closed AS closed, coalesce(r.not_scanned, []) AS not_scanned",
                 prefix=release + "_", when=to_when, arch=arch)]
             to_runs = {}
             for row in run_rows:
@@ -2229,7 +2232,8 @@ def get_test_log_changes(to_tag: str, from_tag: str, arch: str | None = None) ->
                 "WHERE r.ib_tag STARTS WITH t.prefix AND size(r.ib_tag) = size(t.prefix) + 15 "
                 "AND substring(r.ib_tag, size(r.ib_tag) - 15) < $to_when "
                 "RETURN t.id AS track, r.key AS key, r.ib_tag AS tag, "
-                "r.passed_tests + r.failed_tests + r.other_tests AS ran",
+                "r.passed_tests + r.failed_tests + r.other_tests AS ran, "
+                "coalesce(r.not_scanned, []) AS not_scanned",
                 tracks=tracks, to_when=to_when)] if tracks else []
             # the same track at from_tag if imported, else its own newest earlier build
             baselines: dict[str, dict] = {}
@@ -2280,7 +2284,8 @@ def get_test_log_changes(to_tag: str, from_tag: str, arch: str | None = None) ->
             track["baseline_note"] = (f"no imported log at {from_when}: compared with its own previous "
                                       f"build {base['tag']}")
         now, before = passed_pairs(key), passed_pairs(base["key"])
-        ran_now = set(run["ran"] or [])
+        ran_now, unread_now = set(run["ran"] or []), set(run.get("not_scanned") or [])
+        unread_before = set(base.get("not_scanned") or [])
         for pair, row in now.items():
             if pair in before:
                 entry["still_present"] += 1
@@ -2291,13 +2296,14 @@ def get_test_log_changes(to_tag: str, from_tag: str, arch: str | None = None) ->
                 evidence=row["evidence"], log=dict(server_path=row["server_path"], member=row["member"],
                                                    line=row["line"]), tests=[]))
             test = dict(place, name=pair[0], baseline_tag=base["tag"],
-                        ran_in_baseline=_test_log_owner_ran(pair[0], run["suite"], set(base["ran"] or [])))
+                        ran_in_baseline=pair[0] not in unread_before and _test_log_owner_ran(
+                            pair[0], run["suite"], set(base["ran"] or [])))
             group["tests"].append(test)
             # same key as ingest_test_logs.first_seen_key: per release series
             new_pairs.append((f"{run['suite']}|{release}|{pair[0]}|{row['sid']}", test))
         for pair, row in before.items():
-            if pair in now or not _test_log_owner_ran(pair[0], run["suite"], ran_now):
-                continue  # still there, or the test didn't run this time: nothing to say
+            if pair in now or pair[0] in unread_now or not _test_log_owner_ran(pair[0], run["suite"], ran_now):
+                continue  # still there, or the test didn't run (or wasn't read) this time: nothing to say
             group = entry["gone"].setdefault(row["sid"], dict(
                 signature_id=row["sid"], kind=row["kind"], category=row["category"], summary=row["summary"],
                 tests=[]))

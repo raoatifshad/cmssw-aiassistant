@@ -92,7 +92,7 @@ class JobTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
-        patcher = patch.multiple(worker, RESULTS=root / "results", STATE_DIR=root / "worker",
+        patcher = patch.multiple(worker, RESULTS=root / "results", RECEIVED=root / "received", STATE_DIR=root / "worker",
                                  STATE=root / "worker" / "state.json", SOURCES=root / "sources")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -116,6 +116,58 @@ class JobTests(unittest.TestCase):
             self.assertIn("imported", worker.job_testlogs(state))
         self.assertEqual(run.call_count, 2)
         self.assertIn("ingest_test_logs.py", run.call_args.args[0][1])
+
+    def _batch(self, name, folder="received", age_days=0.0):
+        path = self.root / folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        t = worker.time.time() - age_days * 86400
+        os.utime(path, (t, t))
+        return path
+
+    def test_waiting_batches_are_merged_before_the_import(self):
+        self._result("a.json.gz", 1_000_000)
+        self._batch("1.tar")
+        with patch.object(worker, "run") as run:
+            worker.job_testlogs({})
+        self.assertEqual([c.args[0][1] for c in run.call_args_list],
+                         ["ingestion/merge_test_log_batches.py", "ingestion/ingest_test_logs.py"])
+
+    def test_imported_batches_are_deleted_after_the_kept_days(self):
+        self._result("a.json.gz", 1_000_000)
+        old, new = self._batch("old.tar", "received/merged", 8), self._batch("new.tar", "received/merged", 1)
+        waiting = self._batch("wait.tar", age_days=30)
+        with patch.object(worker, "run"):
+            self.assertIn("1 imported batches deleted", worker.job_testlogs({}))
+        self.assertEqual([p.exists() for p in (old, new, waiting)], [False, True, True])
+        with patch.object(worker, "run"), patch.object(worker, "RECEIVED_KEEP_DAYS", 0):
+            worker.job_testlogs({})
+        self.assertEqual([p.exists() for p in (new, waiting)], [False, True])
+
+    def test_refused_files_are_counted_and_deleted_after_30_days(self):
+        self._result("a.json.gz", 1_000_000)
+        old, new = self._batch("a__x", "received/rejected", 31), self._batch("b__y", "received/rejected", 2)
+        self._batch("b__y.reason.txt", "received/rejected", 2)
+        state = {}
+        with patch.object(worker, "run"):
+            self.assertIn("1 refused files", worker.job_testlogs(state))
+        self.assertEqual((state["testlogs"]["refused_files"], old.exists(), new.exists()), (1, False, True))
+
+    def test_nothing_is_deleted_when_the_merge_or_the_import_failed(self):
+        self._result("a.json.gz", 1_000_000)
+        old = self._batch("old.tar", "received/merged", 8)
+        self._batch("1.tar")
+        for script in ("merge_test_log_batches", "ingest_test_logs"):
+            calls = []
+
+            def run(cmd, *a, script=script, calls=calls):
+                calls.append(cmd[1])
+                if script in cmd[1]:
+                    raise worker.StepFailed("exit 1")
+            with patch.object(worker, "run", run), self.assertRaises(worker.StepFailed):
+                worker.job_testlogs({})
+            self.assertTrue(old.exists())
+            self.assertIn("ingestion/ingest_test_logs.py", calls)          # what did merge is still imported
 
     def test_an_unreadable_results_folder_fails_instead_of_saying_no_files(self):
         self._result("a.json.gz", 1_000_000)

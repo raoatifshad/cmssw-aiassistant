@@ -1,8 +1,9 @@
 """The VM stack's worker: the scheduled imports that cron + scripts/daily_refresh.sh
 do on the developer PC, as one long-running container.
 
-  every 30 min      testlogs   import new scan files from /data/results
-                               (ingest_test_logs.py; skipped when no file changed)
+  every 5 min       testlogs   merge the batches in /data/received into /data/results
+                               (merge_test_log_batches.py), import what changed
+                               (ingest_test_logs.py), delete batches that are imported
   every hour at :30 cmsrepo    git update of cms-sw.github.io (data/ only) -> build_graph.py
                                (Jenkins summary-of-merged-prs pushes there about hourly;
                                ~25 changed files and 20-70 s per run, measured 2026-11-19)
@@ -18,7 +19,7 @@ soon as it starts again.
 
 Not here (they need a Kerberos login to cmssdt9-02; waiting for a service-account
 decision): copying test-log zips and the GitHub issues backup. Test logs arrive in
-/data/results instead, sent from cmssdt9-02 to POST /api/test-logs/ingest
+/data/received instead, sent from cmssdt9-02 to POST /api/test-logs/batch
 (deploy/cmssdt/send_test_log_scans.py).
 
 Everything it keeps is under /data (DATA_DIR on the host):
@@ -26,7 +27,8 @@ Everything it keeps is under /data (DATA_DIR on the host):
   /data/worker/state.json     last run and result of every job (read by people/status page)
   /data/worker/logs/<date>.log
 Environment: WORKER_STEPS ("cmsrepo exceptions docs"), WORKER_REFRESH_AT ("00:30,12:30"),
-WORKER_CMSREPO_AT (cmsrepo only; default every hour at :30), WORKER_TESTLOGS_EVERY_MIN (30),
+WORKER_CMSREPO_AT (cmsrepo only; default every hour at :30), WORKER_TESTLOGS_EVERY_MIN (5),
+RECEIVED_KEEP_DAYS (7: imported batches are kept that long; 0 = deleted at once),
 TZ (Europe/Zurich). `worker.py --once <job>` runs one job now.
 """
 from __future__ import annotations
@@ -43,6 +45,7 @@ APP = Path(os.environ.get("WORKER_APP_DIR", "/app"))
 DATA = Path(os.environ.get("WORKER_DATA_DIR", "/data"))
 SOURCES = DATA / "sources"
 RESULTS = DATA / "results"
+RECEIVED = DATA / "received"
 CLANG = DATA / "clang-logs"
 STATE_DIR = DATA / "worker"
 STATE = STATE_DIR / "state.json"
@@ -60,7 +63,9 @@ def _times(text: str) -> list[tuple[int, int]]:
 
 REFRESH_AT = _times(os.environ.get("WORKER_REFRESH_AT") or "00:30,12:30")
 CMSREPO_AT = _times(os.environ.get("WORKER_CMSREPO_AT") or ",".join(f"{h:02d}:30" for h in range(24)))
-TESTLOGS_EVERY = dt.timedelta(minutes=int(os.environ.get("WORKER_TESTLOGS_EVERY_MIN", "30")))
+TESTLOGS_EVERY = dt.timedelta(minutes=int(os.environ.get("WORKER_TESTLOGS_EVERY_MIN", "5")))
+REJECTED_KEEP_DAYS = 30
+RECEIVED_KEEP_DAYS = float(os.environ.get("RECEIVED_KEEP_DAYS") or 7)
 PY = sys.executable
 
 
@@ -198,15 +203,62 @@ def newest_result_mtime() -> float:
     return newest
 
 
+def merge_received() -> StepFailed | None:
+    """received/*.tar -> results/. A failure is reported at the end: what did merge is imported."""
+    if not RECEIVED.exists():
+        return None
+    if not os.access(RECEIVED, os.R_OK | os.W_OK | os.X_OK):
+        raise StepFailed(f"cannot use {RECEIVED} (permissions / SELinux label?)")
+    if not any(RECEIVED.glob("*.tar")):
+        return None
+    try:
+        run([PY, "ingestion/merge_test_log_batches.py", "--received", RECEIVED, "--results", RESULTS], 3600)
+    except StepFailed as exc:
+        return exc
+    return None
+
+
+def refused_files() -> int:
+    """Files the endpoint refused (received/rejected/): old ones are deleted, the rest counted."""
+    left = 0
+    for path in (RECEIVED / "rejected").glob("*"):
+        if path.stat().st_mtime < time.time() - REJECTED_KEEP_DAYS * 86400:
+            path.unlink()
+        elif not path.name.endswith(".reason.txt"):
+            left += 1
+    return left
+
+
+def delete_imported_batches(merged_before: float) -> int:
+    """Batches merged before the import that just succeeded started, older than RECEIVED_KEEP_DAYS."""
+    limit = min(merged_before, time.time() - RECEIVED_KEEP_DAYS * 86400)
+    old = [p for p in (RECEIVED / "merged").glob("*.tar") if p.stat().st_mtime < limit]
+    for path in old:
+        path.unlink()
+    return len(old)
+
+
 def job_testlogs(state: dict) -> str:
+    failed = merge_received()
+    state.setdefault("testlogs", {})["refused_files"] = refused_files()
+    merged_before = time.time()
     newest = newest_result_mtime()
     if not newest:
-        return "no results files yet"
-    if newest <= state.get("testlogs", {}).get("imported_up_to", 0):
-        return "nothing new"
-    run([PY, "ingestion/ingest_test_logs.py", "--results", RESULTS], 3 * 3600)
-    state.setdefault("testlogs", {})["imported_up_to"] = newest
-    return f"imported (newest file {dt.datetime.fromtimestamp(newest):%F %H:%M})"
+        result = "no results files yet"
+    elif newest <= state.get("testlogs", {}).get("imported_up_to", 0):
+        result = "nothing new"
+    else:
+        run([PY, "ingestion/ingest_test_logs.py", "--results", RESULTS], 3 * 3600)
+        state.setdefault("testlogs", {})["imported_up_to"] = newest
+        result = f"imported (newest file {dt.datetime.fromtimestamp(newest):%F %H:%M})"
+    if newest and not failed:
+        deleted = delete_imported_batches(merged_before)
+        result += f", {deleted} imported batches deleted" if deleted else ""
+    if state["testlogs"]["refused_files"]:
+        result += f"; {state['testlogs']['refused_files']} refused files in received/rejected/"
+    if failed:
+        raise StepFailed(f"merge: {failed}; {result}")
+    return result
 
 
 REFRESH_JOBS = {"cmsrepo": job_cmsrepo, "exceptions": job_exceptions, "docs": job_docs}

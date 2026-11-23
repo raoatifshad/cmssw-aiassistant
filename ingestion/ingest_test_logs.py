@@ -77,10 +77,14 @@ def run_record(data: dict) -> dict:
         scanned_at=source.get("scanned_at"), scanner_version=source.get("scanner_version"),
         total=len(units), passed=len(passed), failed=len(failed), other=len(other),
         passed_tests=passed, failed_tests=failed, other_tests=other, failed_details=failed_details,
-        # RelVal runs scanned in cms-bot (pyRelValPartialLogs): how many jobs reported back.
-        # complete=False: zipped after cms-bot's 10-hour wait, the missing jobs' workflows are unknown.
+        # RelVal runs scanned step by step in cms-bot: how many jobs reported back.
+        # complete=False: jobs are missing -- still running, or (closed=True) cms-bot stopped waiting
+        # after 10 hours: the missing jobs' workflows are unknown.
         # None for unit/addOn and for RelVal zips copied from the server (not known).
         jobs_done=source.get("jobs_done"), jobs_total=source.get("jobs_total"), complete=source.get("complete"),
+        closed=source.get("closed"),
+        # workflow:stepN that ran but whose log has no good scan (yet): unknown, not clean
+        not_scanned=source.get("not_scanned") or [],
     )
 
 

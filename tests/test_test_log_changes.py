@@ -137,6 +137,23 @@ class TestLogChangesTests(unittest.TestCase):
         unit = next(t for t in self.archs["el9_amd64_gcc14"]["tracks"] if t["suite"] == "unit")
         self.assertNotIn("incomplete_note", unit)            # unit/addOn: not known, nothing said
 
+    def test_a_run_whose_jobs_are_still_coming_in_is_called_running(self):
+        running = [dict(TO_RUNS[0], closed=False)] + TO_RUNS[1:]
+        with patch(f"{__name__}.TO_RUNS", running):
+            result = _changes()
+        note = result["coverage"]["incomplete"][0]["note"]
+        self.assertIn("only 2 of 3 RelVal jobs reported back (so far, still running)", note)
+        self.assertNotIn("10 hours", note)
+
+    def test_a_step_whose_log_was_not_scanned_is_neither_gone_nor_seen_before(self):
+        runs = [dict(TO_RUNS[0], not_scanned=["5.0:step1"])] + TO_RUNS[1:]
+        bases = [dict(b, not_scanned=["1.0:step1"]) if b["key"] == "B1" else b for b in BASE_RUNS]
+        with patch(f"{__name__}.TO_RUNS", runs), patch(f"{__name__}.BASE_RUNS", bases):
+            el9 = next(a for a in _changes()["architectures"] if a["arch"] == "el9_amd64_gcc14")
+        self.assertEqual(el9["gone"], [])                                  # E at 5.0:step1: unknown, not gone
+        new = next(g for g in el9["new"] if g["signature_id"] == "A")
+        self.assertFalse(new["tests"][0]["ran_in_baseline"])               # 1.0:step1 was not read there
+
     def test_the_chat_answer_says_which_relval_run_is_unfinished(self):
         from server.api_server import _test_log_question_answer
         driver = MagicMock()
