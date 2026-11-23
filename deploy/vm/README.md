@@ -7,8 +7,8 @@ rebuilt at any time without losing anything.
 | Container | What | Data (on the host) |
 |---|---|---|
 | `neo4j` | Neo4j 5.26.29 Community | `DATA_DIR/neo4j`, dumps in `DATA_DIR/backups` |
-| `api` | chat API (`/api/chat`, `/api/health`, ...); receives test-log scan files from cmssdt9-02 (`POST /api/test-logs/ingest`, saved to `DATA_DIR/results`) | `DATA_DIR/results`, `DATA_DIR/log-rag`, `DATA_DIR/clang-logs` (read-only) |
-| `worker` | test-log import every 30 min; cmsrepo every hour at :30 (`WORKER_CMSREPO_AT`); exceptions, docs at 00:30/12:30 (`worker.py`) | `DATA_DIR/sources` (checkouts), `DATA_DIR/worker` (state.json, logs) |
+| `api` | chat API (`/api/chat`, `/api/health`, ...); receives test-log scan files from cmssdt9-02 (`POST /api/test-logs/batch`, saved to `DATA_DIR/received`) | `DATA_DIR/received`, `DATA_DIR/results`, `DATA_DIR/log-rag`, `DATA_DIR/clang-logs` (read-only) |
+| `worker` | test-log batches merged and imported every 5 min; cmsrepo every hour at :30 (`WORKER_CMSREPO_AT`); exceptions, docs at 00:30/12:30 (`worker.py`) | `DATA_DIR/received`, `DATA_DIR/results`, `DATA_DIR/sources` (checkouts), `DATA_DIR/worker` (state.json, logs) |
 
 Not included on purpose: OpenSearch and Logstash (only ever held one smoke-test
 event; no chat answer used them). The nightly tester stays on the developer PC.
@@ -120,7 +120,7 @@ If something is not up:
 sudo dnf install -y podman podman-compose git     # or the VM's equivalent
 git clone <this repo> && cd <repo>/deploy/vm
 cp .env.example .env && chmod 600 .env            # fill in; never commit .env
-mkdir -p $DATA_DIR/{neo4j,backups,log-rag,clang-logs,results,sources,worker}   # DATA_DIR from .env
+mkdir -p $DATA_DIR/{neo4j,backups,log-rag,clang-logs,results,received,sources,worker}   # DATA_DIR from .env
 podman compose -p kg up -d --build
 curl -s http://localhost:$API_PORT/api/health     # {"ok":true,...}
 ```
@@ -130,17 +130,33 @@ On the VM set `DEV_SHIFTER_LOGIN=false` and give Neo4j real memory
 
 ## Test-log scan files from cmssdt9-02
 
-A sender job on cmssdt9-02 (`deploy/cmssdt/`, see its README) posts each scan file to
-`POST /api/test-logs/ingest`. The API checks it (gzip JSON, one of our scan results,
-architecture / IB tag / variant well-formed, at most 32 MB) and saves it as
-`DATA_DIR/results/<kind>/<arch>/<tag>/<variant or _>/<name>.json.gz`; the worker imports it
-within 30 min. Answers: `saved`, `replaced` (newer scan of the same build), `unchanged`
-(same bytes), `older` (not stored: never undoes a newer scan); 400/413 with the reason;
-401 wrong token. Off (503) until `TEST_LOGS_INGEST_TOKEN` is set in `.env`. Port 8001
-reachable from cmssdt9-02 is needed (checked 2026-11-18).
+A sender job on cmssdt9-02 (`deploy/cmssdt/`, see its README) posts tars of small files (one
+per unit/addOn zip, one per RelVal step) to `POST /api/test-logs/batch` and deletes every file
+the answer confirms, so from then on this VM has the only copy.
+
+1. **API**: checks every file, saves the good ones as one tar in `DATA_DIR/received/` (fsync),
+   then answers `{"saved": {name: sha256}, "rejected": {name: reason}, "kept": {name: sha256}}`. A
+   refused file is kept in `received/rejected/` with its reason (30 days, at most 200 MB), because
+   the sender deletes it too; after a fix, tar them and post them again. 401 wrong token; 503 when
+   `TEST_LOGS_INGEST_TOKEN` is empty or less than 5 GB is free (the sender keeps its files).
+2. **Worker**, every `WORKER_TESTLOGS_EVERY_MIN` (5) minutes:
+   `merge_test_log_batches.py` merges the steps into one file per build,
+   `DATA_DIR/results/<kind>/<arch>/<tag>/<variant or _>/<name>.json.gz`, reads it back to check,
+   and moves the batch to `received/merged/`; `ingest_test_logs.py` imports the changed files;
+   then imported batches older than `RECEIVED_KEEP_DAYS` (7; 0 = at once) are deleted.
+
+A batch that cannot be merged stays in `received/` and is tried again; an unreadable one goes to
+`received/bad/`. Both make the testlogs job FAILED in `worker/state.json` and its log. Never delete
+`results/`: it is what the graph can be rebuilt from.
+
+    ls DATA_DIR/received/ DATA_DIR/received/{bad,rejected} 2>/dev/null   # waiting / broken / refused
+    cat DATA_DIR/received/rejected/*.reason.txt                          # why (count: worker/state.json)
+
+`POST /api/test-logs/ingest` (one whole result of a build, gzip body, saved straight into
+`results/`) is still there for sending one by hand:
 
     curl -s -H "X-Test-Logs-Token: $TOKEN" -H 'Content-Type: application/gzip' \
-         --data-binary @unitTestLogs-scan.json.gz http://localhost:$API_PORT/api/test-logs/ingest
+         --data-binary @unit__<arch>__<tag>__main.json.gz http://localhost:$API_PORT/api/test-logs/ingest
 
 ### The ingest token
 
@@ -207,14 +223,21 @@ podman unshare rm -rf $DATA_DIR/neo4j/*           # only with Neo4j stopped, and
 ## Backups
 
 ```bash
-./backup.sh                     # stop neo4j -> dump -> start -> DATA_DIR/backups/neo4j-<date>.dump + .sha256
+./backup.sh                     # received/ + results/ -> DATA_DIR/backups/testlogs-<date>.tar, then
+                                # stop neo4j -> dump -> start -> neo4j-<date>.dump (both with .sha256)
 ./restore.sh <dump file>        # check .sha256 -> stop -> load (replaces the database) -> start -> count nodes
 ```
 
 * Community edition can only dump a **stopped** database, so the API gets errors
   for the few minutes the dump takes. Run it at night, e.g. a systemd timer at 03:00.
 * Never copy the files in `DATA_DIR/neo4j` while Neo4j runs: such a copy may not load.
-* The newest `BACKUP_KEEP` (14) dumps are kept.
+* The newest `BACKUP_KEEP` (3) nightly dumps and tars are kept; files named otherwise
+  (`neo4j-live-*.dump`) are never deleted.
+* Test-log files: `testlogs-<date>.tar` holds `received/` (batches not merged yet) and `results/`.
+  Into a new VM, with the worker stopped:
+  `podman unshare tar -C $DATA_DIR -xpf testlogs-<date>.tar`, then start the worker.
+  It only adds or replaces files; stop if `results/` there is newer than the tar.
+* The backups are on the same disk as the data until the EOS copy (or another one) is on.
 * EOS copy is built in but **off** (`BACKUP_EOS_ENABLED=0`). To switch it on, mount
   EOS (or make the folder reachable), set `BACKUP_EOS_ENABLED=1` and
   `BACKUP_EOS_DIR=/eos/...`; each copy is checked against its .sha256.
