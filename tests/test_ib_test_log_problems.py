@@ -53,13 +53,13 @@ class DescribeZipPathTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 problems.describe_zip_path(bad)
 
-    def test_relval_zip_path(self):
-        info = problems.describe_zip_path(f"/data/sdt/buildlogs/{BUILD}/gpu/nvidia_h100/pyRelValMatrixLogs.zip")
-        self.assertEqual((info["kind"], info["variant"]), ("relval", "gpu/nvidia_h100"))
-
-    def test_scan_file_sits_next_to_the_zip(self):
-        self.assertEqual(problems.scan_file_path("/b/x/unitTestLogs.zip"), "/b/x/unitTestLogs-scan.json.gz")
-        self.assertEqual(problems.scan_file_path("/b/x/addOnTests.zip"), "/b/x/addOnTests-scan.json.gz")
+    def test_file_names(self):
+        where = dict(arch="el8_amd64_gcc13", tag="CMSSW_16_1_X_2026-11-13-1100", variant="")
+        self.assertEqual(problems.scan_file_name(where, "unit"),
+                         "unit__el8_amd64_gcc13__CMSSW_16_1_X_2026-11-13-1100__main.json.gz")
+        step = dict(where, variant="gpu/nvidia_t4", workflow="1.0_A", step=3)
+        self.assertEqual(problems.scan_file_name(step, "relval"),
+                         "relval__el8_amd64_gcc13__CMSSW_16_1_X_2026-11-13-1100__gpu_nvidia_t4__1.0_A__step3.json.gz")
 
 
 class ScanDirTests(unittest.TestCase):
@@ -67,6 +67,11 @@ class ScanDirTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.build = Path(self.tmp.name) / "buildlogs" / BUILD
         self.build.mkdir(parents=True)
+        self.outbox = Path(self.tmp.name) / "outbox"
+        self.outbox.mkdir()
+        switch = patch.object(problems, "OUTBOX", str(self.outbox))
+        switch.start()
+        self.addCleanup(switch.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -88,7 +93,7 @@ class ScanDirTests(unittest.TestCase):
 
         out = problems.scan_unit_test_dir(str(self.build / "UT"), str(zip_path))
 
-        self.assertEqual(out, str(self.build / "unitTestLogs-scan.json.gz"))
+        self.assertEqual(out, str(self.outbox / "unit" / "unit__el8_amd64_gcc13__CMSSW_16_1_X_2026-11-13-1100__main.json.gz"))
         with gzip.open(out, "rt") as fh:
             written = json.load(fh)
         expected = scanner.scan_unit_test_zip(str(zip_path))
@@ -131,7 +136,8 @@ class ScanDirTests(unittest.TestCase):
 
         self.assertEqual(sorted(p.name for p in (self.build / "UT").rglob("*")), before)
         self.assertEqual(sorted(p.name for p in self.build.iterdir()),
-                         ["UT", "unitTestLogs-scan.json.gz", "unitTestLogs.zip"])
+                         ["UT", "unitTestLogs.zip"])
+        self.assertEqual([p.suffix for p in (self.outbox / "unit").iterdir()], [".gz"])
 
     def test_running_twice_rewrites_the_same_file(self):
         zip_path = self._unit_zip()
@@ -141,7 +147,7 @@ class ScanDirTests(unittest.TestCase):
         second = problems.scan_unit_test_dir(str(self.build / "UT"), str(zip_path))
 
         self.assertEqual(first, second)
-        self.assertEqual(len(list(self.build.glob("*-scan.json.gz*"))), 1)
+        self.assertEqual(len(list(self.outbox.rglob("*.json.gz*"))), 1)
 
     def test_empty_unpacked_zip_gives_an_empty_result(self):
         zip_path = self.build / "gpu" / "amd_mi300x" / "unitTestLogs.zip"
@@ -163,6 +169,16 @@ class ScanDirTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             problems.scan_addon_dir(str(self.build), str(zip_path))              # wrong kind
         self.assertEqual([p.name for p in self.build.iterdir()], ["unitTestLogs.zip"])
+        self.assertEqual(list(self.outbox.iterdir()), [])
+
+    def test_without_an_outbox_nothing_is_scanned(self):
+        zip_path = self._unit_zip()
+        _unpack(zip_path, self.build / "UT")
+        self.outbox.rmdir()
+        with patch.object(scanner, "scan_unit_test_dir", side_effect=AssertionError("scanned")):
+            self.assertIsNone(problems.scan_unit_test_dir(str(self.build / "UT"), str(zip_path)))
+        self.assertIsNone(problems.scan_addon_dir(str(self.build), str(self.build / "addOnTests.zip")))
+        self.assertFalse(self.outbox.exists())
 
     def test_missing_addon_status_log_raises(self):
         zip_path = self.build / "addOnTests.zip"
@@ -172,7 +188,7 @@ class ScanDirTests(unittest.TestCase):
 
         with self.assertRaises(FileNotFoundError):
             problems.scan_addon_dir(str(self.build / "AO"), str(zip_path))
-        self.assertFalse(list(self.build.glob("*-scan.json.gz*")))
+        self.assertEqual(list(self.outbox.rglob("*.json.gz*")), [])
 
 
 def _relval_files(add):
@@ -221,88 +237,152 @@ class RelvalDirTests(unittest.TestCase):
         self.assertNotIn("140.051_RunMuonEG2022C/step1.log", members)      # the copy was skipped
         self.assertIn("140.051_RunMuonEG2022C/step2.log", members)         # different content: kept
 
-    def test_writes_the_scan_file_without_a_zip_and_counts_jobs(self):
-        for name in ("done.1of2", "done.2of2"):
-            (self.partial / name).touch()
 
-        out = problems.scan_relval_dir(str(self.partial))
+class RelvalStepTests(unittest.TestCase):
+    """write_relval_step_scan: one small file per step log, for parseLog."""
 
-        self.assertEqual(out, str(self.build / "pyRelValMatrixLogs-scan.json.gz"))
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.build = Path(self.tmp.name) / "buildlogs" / BUILD
+        self.partial = self.build / "pyRelValPartialLogs"
+        self.partial.mkdir(parents=True)
+        self.outbox = Path(self.tmp.name) / "outbox"
+        self.outbox.mkdir()
+        _relval_files(self.add)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def add(self, name, text):
+        path = self.partial / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(text)
+
+    def scan(self, name):
+        out = problems.write_relval_step_scan(str(self.partial / name), outbox=str(self.outbox))
+        if out is None:
+            return None
         with gzip.open(out, "rt") as fh:
-            written = json.load(fh)
-        src = written["source"]
-        self.assertEqual((src["kind"], src["tag"], src["variant"], src["scanned_from"]),
-                         ("relval", "CMSSW_16_1_X_2026-11-13-1100", "", "pyRelValPartialLogs"))
-        self.assertEqual((src["jobs_done"], src["jobs_total"], src["complete"]), (2, 2, True))
-        self.assertTrue(src["path"].endswith("/pyRelValMatrixLogs.zip"))
-        self.assertEqual(len(written["workflows"]), 2)
-        self.assertEqual(sorted(p.name for p in self.build.iterdir()),
-                         ["pyRelValMatrixLogs-scan.json.gz", "pyRelValPartialLogs"])
+            return json.load(fh)
 
-    def test_a_job_that_comes_back_after_the_zip_completes_the_run(self):
-        # 2 of 3 jobs, zipped after the 10-hour wait; cms-bot renames the folder to .tmp
-        for name in ("done.1of3", "done.2of3"):
-            (self.partial / name).touch()
-        out = problems.scan_relval_dir(str(self.partial))
-        self.partial.rename(self.partial.with_name("pyRelValPartialLogs.tmp"))
-        # job 3 comes back: a new folder with only its workflows (one of them also ran before)
-        wf = self.partial / "11634.0_TTbar"
-        wf.mkdir(parents=True)
-        (wf / "workflow.log").write_text("11634.0_TTbar Step0-PASSED ; exit: 0\n")
-        (wf / "step1_TTbar.log").write_text("all good\n")
-        new = self.partial / "999.0_New"
-        new.mkdir()
-        (new / "workflow.log").write_text("999.0_New Step0-PASSED ; exit: 0\n")
-        (self.partial / "done.3of3").touch()
+    def test_one_file_per_step_with_status_exit_code_and_problems(self):
+        wf = "140.051_RunMuonEG2022C"
+        before = sorted(str(p) for p in self.partial.rglob("*"))
+        one, two = self.scan(f"{wf}/step1_RunMuonEG2022C.log"), self.scan(f"{wf}/step2_RunMuonEG2022C.log")
 
-        self.assertEqual(problems.scan_relval_dir(str(self.partial)), out)
+        self.assertEqual((one["kind"], one["arch"], one["tag"], one["variant"], one["queue"]),
+                         ("relval_step", "el8_amd64_gcc13", "CMSSW_16_1_X_2026-11-13-1100", "", "16.1-fri-11"))
+        self.assertEqual((one["workflow"], one["step"], one["status"], one["exit_code"]), (wf, 1, "PASSED", 0))
+        self.assertEqual((two["step"], two["status"], two["exit_code"]), (2, "FAILED", 256))
+        self.assertEqual(one["workflow_steps"], {"1": "PASSED", "2": "FAILED"})
+        self.assertNotIn("scan_error", one)
+        self.assertEqual({p["member"] for p in one["problems"]}, {f"{wf}/step1_RunMuonEG2022C.log"})   # copy skipped
+        self.assertEqual({p["member"] for p in two["problems"]},
+                         {f"{wf}/step2_RunMuonEG2022C.log", f"{wf}/step2.log"})      # other content: kept
+        name = "relval__el8_amd64_gcc13__CMSSW_16_1_X_2026-11-13-1100__main__140.051_RunMuonEG2022C__step"
+        self.assertEqual(sorted(p.name for p in (self.outbox / "relval").iterdir()), [name + "1.json.gz", name + "2.json.gz"])
+        self.assertEqual(sorted(str(p) for p in self.partial.rglob("*")), before)     # nothing written there
 
-        with gzip.open(out, "rt") as fh:
-            data = json.load(fh)
-        src = data["source"]
-        self.assertEqual((src["jobs_done"], src["jobs_total"], src["complete"]), (3, 3, True))
-        self.assertEqual(src["jobs"], ["done.1of3", "done.2of3", "done.3of3"])
-        self.assertTrue(src["merged_with_scan_of"])
-        self.assertEqual([w["workflow"] for w in data["workflows"]],
-                         ["11634.0_TTbar", "140.051_RunMuonEG2022C", "999.0_New"])        # kept + rerun + new
-        owners = {p["workflow"] for p in data["problems"]}
-        self.assertIn("140.051_RunMuonEG2022C", owners)       # earlier problems kept
-        self.assertNotIn("11634.0_TTbar", owners)             # rerun log is clean now: old problem replaced
+    def test_all_steps_together_equal_the_whole_folder_scan(self):
+        wf = "17034.96_PU"
+        self.add(f"{wf}/workflow.log", f"{wf} Step0-PASSED Step1-PASSED ; exit: 0 0\n")
+        self.add(f"{wf}/step0_PU.log", "%MSG-w A: m\nzero\n%MSG\n")
+        self.add(f"{wf}/step1_PU.log", "%MSG-w B: m\none\n%MSG\n")
+        self.add(f"{wf}/step1_dasquery.log", "%MSG-w C: m\ndas\n%MSG\n")
+        self.add(f"{wf}/step2_PU.log", "fine\n")
+        self.add(f"{wf}/step11_PU.log", "%MSG-e D: m\neleven\n%MSG\n")
+        self.add(f"{wf}/das-up-to-nevents.log", "%MSG-e E: m\nno step\n%MSG\n")
+        self.add(f"{wf}/step7.log", "%MSG-e F: m\nno named copy\n%MSG\n")
 
-    def test_timed_out_run_is_marked_incomplete(self):
-        (self.partial / "done.1of3").touch()
+        got = []
+        for log in sorted(self.partial.glob("*/step*_*.log")):
+            got += self.scan(str(log.relative_to(self.partial)))["problems"] if "dasquery" not in log.name else []
 
-        out = problems.scan_relval_dir(str(self.partial))
+        key = lambda p: (p["member"], p["step"] or 0, p["signature_id"], p["count"])
+        full = scanner.scan_relval_dir(str(self.partial))["problems"]
+        self.assertEqual(sorted(map(key, got)), sorted(map(key, full)))
 
-        with gzip.open(out, "rt") as fh:
-            src = json.load(fh)["source"]
-        self.assertEqual((src["jobs_done"], src["jobs_total"], src["complete"]), (1, 3, False))
+    def test_step0_has_no_status_and_no_exit_code(self):
+        self.add("5.0_X/workflow.log", "5.0_X Step0-PASSED Step1-FAILED ; exit: 0 256\n")
+        self.add("5.0_X/step0_X.log", "fine\n")
+        doc = self.scan("5.0_X/step0_X.log")
+        self.assertEqual((doc["step"], doc["status"], doc["exit_code"]), (0, None, None))
 
-    def test_gpu_variant_and_bad_folders(self):
-        gpu = self.build / "gpu" / "nvidia_h100" / "pyRelValPartialLogs"
-        gpu.mkdir(parents=True)
-        out = problems.scan_relval_dir(str(gpu))
-        with gzip.open(out, "rt") as fh:
-            self.assertEqual(json.load(fh)["source"]["variant"], "gpu/nvidia_h100")
-        with self.assertRaises(ValueError):
-            problems.scan_relval_dir(str(self.build))                          # wrong folder name
-        with self.assertRaises(ValueError):
-            problems.scan_relval_dir(str(self.build / "nothing" / "pyRelValPartialLogs"))   # missing
+    def test_das_or_lumi_log_gives_the_same_file_as_the_named_log(self):
+        wf = "140.051_RunMuonEG2022C"
+        self.add(f"{wf}/step1_lumiRanges.log", "{}")
+        named = self.scan(f"{wf}/step1_RunMuonEG2022C.log")
+        lumi = self.scan(f"{wf}/step1_lumiRanges.log")       # what parseLog's glob may pick instead
+        for doc in (named, lumi):
+            doc.pop("scanned_at"), doc.pop("log_mtime")
+        self.assertEqual(named, lumi)
+        self.assertEqual(len(list((self.outbox / "relval").iterdir())), 1)
 
-    def test_command_line_used_by_process_relval_logs(self):
-        self.assertEqual(problems.main(["x", "relval", str(self.partial)]), 0)
-        self.assertTrue((self.build / "pyRelValMatrixLogs-scan.json.gz").exists())
+    def test_big_copy_is_found_from_its_first_and_last_megabyte(self):
+        big = "line\n" * 600000 + "%MSG-e Cat: mod\nbad\n%MSG\n"
+        self.add("6.0_Y/workflow.log", "6.0_Y Step0-PASSED ; exit: 0\n")
+        self.add("6.0_Y/step1_Y.log", big)
+        self.add("6.0_Y/step1.log", big)
+        self.assertEqual([p["member"] for p in self.scan("6.0_Y/step1_Y.log")["problems"]], ["6.0_Y/step1_Y.log"])
 
-    def test_dbg_relvals_are_skipped_unless_switched_on(self):
-        dbg = Path(self.tmp.name) / "buildlogs" / "el9_amd64_gcc14/www/fri/20.1.DBG-fri-23/CMSSW_20_1_DBG_X_2026-11-13-2300"
-        (dbg / "pyRelValPartialLogs").mkdir(parents=True)
-        out = dbg / "pyRelValMatrixLogs-scan.json.gz"
-        with patch.dict(os.environ, {problems.DBG_RELVAL_ENV: ""}):
-            self.assertEqual(problems.main(["x", "relval", str(dbg / "pyRelValPartialLogs")]), 0)
-        self.assertFalse(out.exists())
-        with patch.dict(os.environ, {problems.DBG_RELVAL_ENV: "1"}):
-            self.assertEqual(problems.main(["x", "relval", str(dbg / "pyRelValPartialLogs")]), 0)
-        self.assertTrue(out.exists())
+    def test_clean_step_still_gets_a_file(self):
+        self.add("7.0_Z/workflow.log", "7.0_Z Step0-PASSED ; exit: 0\n")
+        self.add("7.0_Z/step1_Z.log", "fine\n")
+        self.assertEqual(self.scan("7.0_Z/step1_Z.log")["problems"], [])
+
+    def test_failed_scan_is_written_down(self):
+        with patch.object(scanner, "_scan_relval_members", side_effect=RuntimeError("boom")):
+            doc = self.scan("11634.0_TTbar/step1_TTbar.log")
+        self.assertEqual(doc["scan_error"], "RuntimeError: boom")
+        self.assertEqual((doc["workflow"], doc["step"], doc["problems"]), ("11634.0_TTbar", 1, []))
+
+    def test_dbg_and_missing_outbox_write_nothing(self):
+        dbg = Path(self.tmp.name) / "buildlogs/el9_amd64_gcc14/www/fri/20.1.DBG-fri-23/CMSSW_20_1_DBG_X_2026-11-13-2300"
+        log = dbg / "pyRelValPartialLogs" / "1.0_A" / "step1_A.log"
+        log.parent.mkdir(parents=True)
+        log.write_text(DICTIONARY_NOT_FOUND)
+        self.assertIsNone(problems.write_relval_step_scan(str(log), outbox=str(self.outbox)))
+        self.assertIsNone(problems.write_relval_step_scan(
+            str(self.partial / "11634.0_TTbar/step1_TTbar.log"), outbox=str(self.outbox / "no")))
+        self.assertEqual(list(self.outbox.iterdir()), [])
+        self.assertFalse((self.outbox / "no").exists())
+
+    def test_variants_are_in_the_name_and_odd_paths_are_refused(self):
+        for variant, word in (("gpu/nvidia_h100", "gpu_nvidia_h100"), ("other/rntuple", "other_rntuple")):
+            log = self.build / variant / "pyRelValPartialLogs" / "1.0_A" / "step1_A.log"
+            log.parent.mkdir(parents=True)
+            log.write_text("x\n")
+            out = problems.write_relval_step_scan(str(log), outbox=str(self.outbox))
+            self.assertIn(f"__{word}__1.0_A__step1", out)
+            with gzip.open(out, "rt") as fh:
+                self.assertEqual(json.load(fh)["variant"], variant)
+        for bad in ("/tmp/1.0_A/step1_A.log", f"/x/{BUILD}/odd/pyRelValPartialLogs/1.0_A/step1_A.log",
+                    f"/x/{BUILD}/pyRelValPartialLogs/1.0_A/workflow.log",
+                    f"/x/{BUILD}/pyRelValPartialLogs/step1_A.log"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                problems.describe_step_log(bad)
+
+    def test_no_scan_when_the_sender_has_not_run_for_a_day(self):
+        old = problems.time.time() - 25 * 3600
+        os.utime(self.outbox, (old, old))
+        self.assertIsNone(self.scan("11634.0_TTbar/step1_TTbar.log"))
+        self.assertEqual(list(self.outbox.iterdir()), [])
+        os.utime(self.outbox)
+        self.assertIsNotNone(self.scan("11634.0_TTbar/step1_TTbar.log"))
+        os.utime(self.outbox, (old, old))                                  # writing into relval/ does not keep it alive
+        self.assertIsNone(self.scan("11634.0_TTbar/step1_TTbar.log"))
+
+    def test_a_failed_write_leaves_no_half_file(self):
+        with patch.object(problems.json, "dump", side_effect=OSError("No space left on device")):
+            with self.assertRaises(OSError):
+                self.scan("11634.0_TTbar/step1_TTbar.log")
+        self.assertEqual(list((self.outbox / "relval").iterdir()), [])
+
+    def test_rewritten_log_replaces_its_file_and_leaves_no_tmp(self):
+        self.scan("11634.0_TTbar/step1_TTbar.log")
+        self.add("11634.0_TTbar/step1_TTbar.log", "all good now\n")
+        self.assertEqual(self.scan("11634.0_TTbar/step1_TTbar.log")["problems"], [])
+        self.assertEqual([p.suffix for p in (self.outbox / "relval").iterdir()], [".gz"])
 
 
 if __name__ == "__main__":
