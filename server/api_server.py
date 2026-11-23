@@ -20,6 +20,7 @@ from typing import Literal
 from urllib.parse import quote_plus
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from neo4j.exceptions import ClientError, ServiceUnavailable
@@ -23173,6 +23174,22 @@ async def test_logs_ingest(request: Request):
         if length.isdigit() and int(length) > test_log_ingest.MAX_BYTES:
             raise test_log_ingest.Rejected(413, f"file is {length} bytes, limit {test_log_ingest.MAX_BYTES}")
         return test_log_ingest.receive(await request.body()).as_dict()
+    except test_log_ingest.Rejected as exc:
+        raise HTTPException(exc.status, exc.reason) from None
+
+
+@app.post("/api/test-logs/batch")
+async def test_logs_batch(request: Request):
+    """A tar of IB test-log scan files from the sender job on cmssdt9-02. Checked and saved
+    under TEST_LOG_RECEIVED_DIR, then confirmed file by file with sha256 (the sender deletes
+    what was confirmed); the worker merges and imports. Same token as /api/test-logs/ingest."""
+    try:
+        test_log_ingest.check_token(request.headers.get("x-test-logs-token"))
+        length = request.headers.get("content-length") or ""
+        if length.isdigit() and int(length) > test_log_ingest.MAX_BYTES:
+            raise test_log_ingest.Rejected(413, f"batch is {length} bytes, limit {test_log_ingest.MAX_BYTES}")
+        body = await request.body()
+        return await run_in_threadpool(test_log_ingest.receive_batch, body)
     except test_log_ingest.Rejected as exc:
         raise HTTPException(exc.status, exc.reason) from None
 

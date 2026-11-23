@@ -9,8 +9,8 @@
 # one smoke-test event and no chat answer has used them; without OPENSEARCH_URL
 # the API falls back to reading its archive files.
 #
-# SELinux labels: a folder used by ONE container gets :Z (private label); results/ and
-# clang-logs/ are used by BOTH api and worker and get :z (shared). With :Z on both, the
+# SELinux labels: a folder used by ONE container gets :Z (private label); results/, received/
+# and clang-logs/ are used by BOTH api and worker and get :z (shared). With :Z on both, the
 # container started last takes the folder and the other gets "Permission denied"
 # (found 2026-11-17: the worker saw no results after the api was recreated).
 services:
@@ -45,6 +45,7 @@ services:
       NEO4J_USER: neo4j
       LOG_RAG_ARCHIVE_DIR: /data/log-rag
       CLANG_LOG_ROOT: /data/clang-logs
+      TEST_LOG_RECEIVED_DIR: /data/received # where POST /api/test-logs/batch saves batches (the worker merges them)
       TEST_LOG_RESULTS_DIR: /data/results   # where POST /api/test-logs/ingest saves scan files (token: TEST_LOGS_INGEST_TOKEN in .env)
     ports:
       - "${API_PORT:-8001}:8001"
@@ -52,11 +53,12 @@ services:
       - ${DATA_DIR}/log-rag:/data/log-rag:Z
       - ${DATA_DIR}/clang-logs:/data/clang-logs:ro,z
       - ${DATA_DIR}/results:/data/results:z
+      - ${DATA_DIR}/received:/data/received:z
     depends_on:
       neo4j:
         condition: service_healthy
 
-  worker:                       # scheduled imports (worker.py): test logs every 30 min, refresh 00:30/12:30
+  worker:                       # scheduled imports (worker.py): test logs every 5 min, refresh 00:30/12:30
     build:
       context: ../..
       dockerfile: deploy/vm/Containerfile.worker
@@ -70,9 +72,11 @@ services:
       WORKER_STEPS: ${WORKER_STEPS:-cmsrepo exceptions docs}
       WORKER_REFRESH_AT: ${WORKER_REFRESH_AT:-00:30,12:30}
       WORKER_CMSREPO_AT: ${WORKER_CMSREPO_AT:-}  # empty = every hour at :30
-      WORKER_TESTLOGS_EVERY_MIN: ${WORKER_TESTLOGS_EVERY_MIN:-30}
+      WORKER_TESTLOGS_EVERY_MIN: ${WORKER_TESTLOGS_EVERY_MIN:-5}
+      RECEIVED_KEEP_DAYS: ${RECEIVED_KEEP_DAYS:-7}   # imported batches; 0 = delete at once
     volumes:
       - ${DATA_DIR}/results:/data/results:z
+      - ${DATA_DIR}/received:/data/received:z
       - ${DATA_DIR}/clang-logs:/data/clang-logs:ro,z
       - ${DATA_DIR}/sources:/data/sources:Z
       - ${DATA_DIR}/worker:/data/worker:Z

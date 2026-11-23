@@ -79,7 +79,7 @@ for _ in $(seq 30); do [ -S "/run/user/$uid/bus" ] && break; sleep 1; done
 chown -R "$RUN_USER:$RUN_USER" "$REPO"
 
 log "4. folders in $DATA_DIR"
-for d in neo4j backups log-rag clang-logs results sources worker; do
+for d in neo4j backups log-rag clang-logs results received sources worker; do
     [ -d "$DATA_DIR/$d" ] || install -d -o "$RUN_USER" -g "$RUN_USER" "$DATA_DIR/$d"
 done
 chown "$RUN_USER:$RUN_USER" "$DATA_DIR"

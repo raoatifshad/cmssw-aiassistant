@@ -1,38 +1,69 @@
 # Sender job on cmssdt9-02
 
 `send_test_log_scans.py` sends the IB test-log scan files that cms-bot's jobs write on
-cmssdt9-02 to the chatbot VM (`POST /api/test-logs/ingest`). Standard library only,
-Python 3.8+, reads nothing but `*-scan.json.gz`.
+cmssdt9-02 to the chatbot VM (`POST /api/test-logs/batch`) and deletes each file the VM
+confirmed. Standard library only, Python 3.8+, writes only inside the outbox.
 
-## Where the files come from (checked in the Jenkins configs, 2026-11-17)
+## Where the files come from
 
-| Jenkins job | runs | writes (our hook) |
+| Jenkins job | code | writes into `/data/sdt/chatbot-outbox/` |
 |---|---|---|
-| `ib-build-logs` (every 30 min) | `es_ibs_log.py` | `unitTestLogs-scan.json.gz`, `addOnTests-scan.json.gz` |
-| `process-relval-logs` (every 20 min) | `jenkins-jobs/process-relval-logs` | `pyRelValMatrixLogs-scan.json.gz` |
+| `ib-build-logs` (every 30 min) | `es_ibs_log.py`, after it unpacks a zip | `unit/`, `addon/`: one file per zip |
+| `process-relval-logs` (every 20 min) | `runPyRelValThread.py` `parseLog`, before `es_parse_log` | `relval/`: one file per step log (no DBG) |
 
-Both run on node `cmssdt` = `cmsbuild@cmssdt9-02.cern.ch`. Every scan file sits next to its zip:
+Both run on node `cmssdt` = `cmsbuild@cmssdt9-02.cern.ch`, as the sender does. File names:
 
-    /data/sdt/buildlogs/<arch>/www/<day>/<queue>/<IB tag>/[gpu/<card>/|other/<name>/]<name>-scan.json.gz
+    unit__<arch>__<tag>__<variant>.json.gz            <variant> = main, gpu_<card>, other_<name>
+    relval__<arch>__<tag>__<variant>__<workflow>__step<N>.json.gz
 
-## The Jenkins job `send-test-log-scans` (created 2026-11-19, disabled until the sender is in cms-bot)
+About 130,000-175,000 RelVal step files a day over all IBs, ~1.4 KB each.
 
-Freestyle project, no "Copy from" (process-relval-logs would bring its triggers and parameters):
+**Nothing stays on this machine, nobody has to clean up.** The outbox is normally empty; nothing
+of ours is written anywhere else.
 
-* Enabled: off until PR 1 (scan hook) and PR 2 (this sender in cms-bot) are merged
-* Discard old builds: 7 days / 200 builds
-* String parameter `RESEND_DAYS`, default `0`
-* Restrict where this project can be run: `cmssdt`; Do not allow concurrent builds
-* Source Code Management: None; Build periodically: `H/15 * * * *`
-* Environment: Delete workspace before build starts, timestamps, Terminate a build if it's
-  stuck (Absolute, 30 min, Fail the build), Use secret text(s) or file(s) (see the token below)
+| what | removed |
+|---|---|
+| a file the VM confirmed | at once |
+| a file the VM refused | at once: the VM keeps it with the reason (`DATA_DIR/received/rejected/`, 30 days, 200 MB; no room there = it waits like the next one) |
+| a file nobody could take (VM down) | after 3 days (~0.7 GB on disk per day) |
+| `.tmp` of a killed job | after 1 day |
+| `sending/` | when empty, at the end of each run |
+
+**On/off.** The first run creates the outbox; every run renews its modification time, and cms-bot
+scans only while that is less than a day old. Enabling the job switches the scan on; if the job is
+disabled or broken, the scan stops by itself after a day. For good: disable the job and
+`rm -rf /data/sdt/chatbot-outbox`.
+
+## What one run does
+
+1. Takes what an earlier run left in `sending/<kind>/`, else moves new files there
+   (unit, addon, relval; up to 500 files or 16 MB per batch).
+2. POSTs the batch as a tar. The VM answers `{"saved": {name: sha256}, "rejected": {name: reason},
+   "kept": {name: sha256}}` (kept = rejected but stored there).
+3. Deletes the files whose sha256 matches, saved or kept. Others go first next time.
+4. Repeats until nothing is waiting (or 25 min), then sends which jobs of the recent RelVal builds
+   reported back (`done.<i>of<N>`; the VM ignores what it already knows), then cleans up.
+
+Exit codes: 0 = done, or the VM is not reachable for a short time (next run tries again),
+1 = a file was refused or is waiting for more than an hour (build unstable), 2 = the VM refused
+the token or the upload is off (build red).
+
+## The Jenkins job `send-test-log-scans` (created 2026-11-19, disabled)
+
+To change from the 2026-11-19 configuration (it still has the old command and `H/15`):
+
+* remove the parameter `RESEND_DAYS` (files are deleted; nothing to resend)
+* Build periodically: `H/2 * * * *`, or a file trigger on `/data/sdt/chatbot-outbox/{unit,addon,relval}`
+  (if the plugin is there) plus `H * * * *`, which retries after the VM was down (and keeps the
+  scan on when no files come)
 * Execute shell, with "Exit code to set build unstable" = `1`:
 
-      python3 $CMS_BOT_DIR/send_test_log_scans.py --url http://cmssdt-chatbot.cern.ch:8001 --resend-days ${RESEND_DAYS:-0}
+      python3 $CMS_BOT_DIR/send_test_log_scans.py --url http://cmssdt-chatbot.cern.ch:8001
 
-Exit codes: 0 = done, 1 = some files failed or were rejected (shown in the log; failed ones
-are retried next run; build unstable), 2 = the VM refused the token or ingest is off (nothing
-sent; build red).
+* Post-build action: E-mail notification to us, only when the status changes
+
+Unchanged: node `cmssdt`; no concurrent builds; no SCM; discard old builds; delete workspace,
+timestamps; terminate if stuck after 30 min; the token below.
 
 ### The token
 
@@ -59,28 +90,21 @@ showing it:
       | tr -d '\n' | wl-copy        # paste with Ctrl+V, then: wl-copy --clear
 
 Changed on the VM (new VM, or a new token: see the VM README "The ingest token")? Update the
-credential the same way; until then every run ends red with exit 2 and sends nothing.
+credential the same way; until then every run ends red with exit 2 and nothing is deleted.
 
 ### Switching it on
 
-1. Command once with `--dry-run` appended, Enabled on, Build with Parameters: lists what it
-   would send, sends nothing.
-2. Remove `--dry-run`, build once by hand: `saved ...` lines, exit 0; the VM's worker imports
-   the files within 30 min.
-3. From then on every 15 min. Red / 401 / exit 2 = token mismatch; "No such file" = the sender
-   is not in cms-bot yet; "Connection refused" = VM down (VM README "After a reboot").
+1. The VM runs the code with `/api/test-logs/batch`; an outside copy of its data exists.
+2. Both cms-bot PRs are merged.
+3. Enable the job and build once by hand: it creates the outbox, sends nothing yet, exit 0.
+4. After the next `ib-build-logs` / `process-relval-logs` run: `summary: N sent`, outbox empty.
 
-## What it leaves behind
-
-Next to each scan file a marker `<scan file>.sent`: `<sha256> <answer> <time>`. A file is
-sent again only when its content changed (a RelVal scan is rewritten when a late job is
-merged). The markers go away with the build folder when cms-bot reuses the weekday folder.
+Red / exit 2 = token mismatch or upload off (404 = the VM has older code); `NOT SENT` = VM not
+reachable (VM README "After a reboot"); `No such file` = the sender is not in cms-bot yet;
+`Permission denied` = cmsbuild cannot create `/data/sdt/chatbot-outbox` (someone with root:
+`mkdir /data/sdt/chatbot-outbox && chown cmsbuild /data/sdt/chatbot-outbox`).
 
 ## By hand
 
-    send_test_log_scans.py --dry-run                     # what would be sent
-    send_test_log_scans.py --url ... --resend-days 7     # token from $TEST_LOGS_INGEST_TOKEN or --token-file
-        # after the VM was down or rebuilt: the VM answers "unchanged" for what it has
-
-
-
+    send_test_log_scans.py --dry-run                     # what is waiting; changes nothing
+    send_test_log_scans.py --url ...                     # token from $TEST_LOGS_INGEST_TOKEN or --token-file
