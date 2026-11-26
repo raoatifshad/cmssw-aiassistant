@@ -43,7 +43,9 @@ an SSH key pair. Not Puppet-managed (yet). To build a new one:
    than what cms-sw.github.io still has is lost).
 
 Update the code later (as `kgbot`): `git fetch origin && git checkout <branch> && git pull`,
-then `podman compose -p kg up -d --build api worker` (Neo4j keeps running).
+then `podman compose -p kg build api worker`, `podman rm -f kg_worker_1 kg_api_1`,
+`podman compose -p kg up -d --no-deps api worker`. Without `--no-deps` podman-compose also
+recreates Neo4j (found 2026-11-23).
 
 ## Cheat sheet: working on cmssdt-chatbot.cern.ch
 
@@ -237,7 +239,9 @@ podman unshare rm -rf $DATA_DIR/neo4j/*           # only with Neo4j stopped, and
   Into a new VM, with the worker stopped:
   `podman unshare tar -C $DATA_DIR -xpf testlogs-<date>.tar`, then start the worker.
   It only adds or replaces files; stop if `results/` there is newer than the tar.
-* The backups are on the same disk as the data until the EOS copy (or another one) is on.
+* Copy outside the VM: `fetch_backup.sh` on the developer PC (cron 03:30 and 15 min after a boot)
+  copies the newest dump and tar to `/home/rao/CHAT-BOT-AI/vm-backups/`, checks the sha256, keeps 3;
+  `status.txt` there says OK or FAILED. Restored on the PC on 2026-11-23: same node counts.
 * EOS copy is built in but **off** (`BACKUP_EOS_ENABLED=0`). To switch it on, mount
   EOS (or make the folder reachable), set `BACKUP_EOS_ENABLED=1` and
   `BACKUP_EOS_DIR=/eos/...`; each copy is checked against its .sha256.
