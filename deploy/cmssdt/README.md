@@ -50,20 +50,20 @@ the token or the upload is off (build red).
 
 ## The Jenkins job `send-test-log-scans` (created 2026-11-19, disabled)
 
-To change from the 2026-11-19 configuration (it still has the old command and `H/15`):
+Configured on 2026-11-24:
 
-* remove the parameter `RESEND_DAYS` (files are deleted; nothing to resend)
-* Build periodically: `H/2 * * * *`, or a file trigger on `/data/sdt/chatbot-outbox/{unit,addon,relval}`
-  (if the plugin is there) plus `H * * * *`, which retries after the VM was down (and keeps the
-  scan on when no files come)
+* Build periodically: `* * * * *` (every minute). This Jenkins has no file trigger, and "Build after
+  other projects are built" would wait for the whole `process-relval-logs` run (usually minutes,
+  sometimes hours). A run sends everything that is waiting and ends at once when there is nothing;
+  it is also what retries after the VM was down and keeps the scan on when no files come.
 * Execute shell, with "Exit code to set build unstable" = `1`:
 
       python3 $CMS_BOT_DIR/send_test_log_scans.py --url http://cmssdt-chatbot.cern.ch:8001
 
-* Post-build action: E-mail notification to us, only when the status changes
-
-Unchanged: node `cmssdt`; no concurrent builds; no SCM; discard old builds; delete workspace,
-timestamps; terminate if stuck after 30 min; the token below.
+* Post-build action: E-mail notification to us, "Send e-mail for every unstable build" off
+* no parameters; node `cmssdt`; no concurrent builds; no SCM; discard old builds (7 days, 1000
+  builds: at one a minute that is about the last 17 hours); delete workspace, timestamps; terminate if
+  stuck after 30 min; the token below.
 
 ### The token
 
