@@ -1,4 +1,4 @@
-"""Wrong answers found by item R1 of the weekend test (2026-11-11): management-style questions on IB health, what broke
+"""Wrong answers found in testing (2026-11-11): management-style questions on IB health, what broke
 and since when, PRs, counts, trends and comparisons across releases and architectures."""
 import re
 import unittest

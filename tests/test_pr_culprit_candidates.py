@@ -1,3 +1,4 @@
+"""Which PRs may have caused a failure: the candidate list."""
 import unittest
 from unittest import mock
 from server import api_server as a

@@ -1,4 +1,4 @@
-"""Problems found by item G2 of the weekend test (2026-11-12): pass 1 against pass 2 of the 2,803 earlier items."""
+"""Problems found in testing (2026-11-12): two passes over the same 2,803 earlier questions."""
 import unittest
 from unittest.mock import patch
 

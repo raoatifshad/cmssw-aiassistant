@@ -1,4 +1,4 @@
-"""Fixes from test item E3 (2026-11-10): newest IBs, natural wording, short follow-ups."""
+"""Fixes found in testing (2026-11-10): newest IBs, natural wording, short follow-ups."""
 import unittest
 from unittest.mock import patch
 

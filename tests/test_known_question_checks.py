@@ -1,3 +1,4 @@
+"""Known-question answers must not invent PR numbers."""
 import unittest
 from server import api_server as a
 

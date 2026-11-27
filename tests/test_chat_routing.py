@@ -3732,7 +3732,7 @@ class ChatRoutingTests(unittest.TestCase):
         self, concepts, latest_ib_records, execute_capability, verify_answer, session_cls,
         store_chat_turns, restore, store_decision, clear_pending
     ):
-        # Found live, 2026-10-06 tester replay: the verifier wrongly flagged a
+        # Found live, 2026-10-06 in a replay of real questions: the verifier wrongly flagged a
         # correct "13 failed RelVals" answer, and the rescue's LLM -- having
         # called a tool with the wrong arguments -- replaced it with "No failing
         # RelVal workflows were recorded". An unverified absence claim must
@@ -4110,7 +4110,7 @@ class ChatRoutingTests(unittest.TestCase):
         self.assertIsNone(_persistent_failures_answer("which unit tests are failing", sid))
 
     def test_held_out_phrasings_reach_the_right_place(self):
-        # Found live 2026-10-06 on a held-out tester set (never tuned on).
+        # Found live 2026-10-06 on a held-out question set (never tuned on).
         from server.api_server import _request_planner, _with_workflow_follow_up_context, _last_workflow_contexts
         from server.request_planner import RequestContext
         tag = " CMSSW_20_1_X_2026-10-05-2300"
@@ -4769,7 +4769,7 @@ class LatestTypoToleranceTests(unittest.TestCase):
 
 class ShiftSummaryCapabilityTests(unittest.TestCase):
     def setUp(self):
-        # kept off the live graph: R1-15 (2026-11-11) checks whether the newest build has results before using the newest pair (tested in test_tester_r1)
+        # kept off the live graph: R1-15 (2026-11-11) checks whether the newest build has results before using the newest pair (tested in test_ib_health_questions)
         patcher = patch("server.api_server._shift_pair_with_results", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -5014,7 +5014,7 @@ class LatestAndDaysAgoIbTagsTests(unittest.TestCase):
 
 class ShiftSummaryDayWindowTests(unittest.TestCase):
     def setUp(self):
-        # kept off the live graph: R1-15 (2026-11-11) checks whether the newest build has results before using the newest pair (tested in test_tester_r1)
+        # kept off the live graph: R1-15 (2026-11-11) checks whether the newest build has results before using the newest pair (tested in test_ib_health_questions)
         patcher = patch("server.api_server._shift_pair_with_results", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)

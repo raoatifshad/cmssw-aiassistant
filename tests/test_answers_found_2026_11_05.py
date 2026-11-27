@@ -1,4 +1,4 @@
-"""Wrong/dead-end answers found by the unattended tester run of 2026-11-05 (fresh questions about
+"""Wrong/dead-end answers found in testing on 2026-11-05 (fresh questions about
 that day's data: read in full and checked against the graph)."""
 import unittest
 from unittest.mock import MagicMock, patch

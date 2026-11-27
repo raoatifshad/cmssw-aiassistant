@@ -1,4 +1,4 @@
-"""Wrong answers found by item R2 of the weekend test (2026-11-11): management-style questions, round 2."""
+"""Wrong answers found in testing (2026-11-11): management-style questions, round 2."""
 import unittest
 from unittest.mock import patch
 

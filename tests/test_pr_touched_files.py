@@ -1,4 +1,4 @@
-"""Item E2 (weekend test 2026-11-09): the PR patch data, (PR)-[:TOUCHED_FILE]->(SourceFile), PR.patch_status, PR.patch_files.
+"""The PR patch data, (PR)-[:TOUCHED_FILE]->(SourceFile), PR.patch_status, PR.patch_files.
 Before these, nothing read it: "which PRs modified FWCore/ParameterSet/src/Entry.cc" was answered "no PR touched it" from the empty
 CHANGED_FILE, while 34 PRs did."""
 import unittest

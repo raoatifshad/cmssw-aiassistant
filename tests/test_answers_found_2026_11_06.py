@@ -1,4 +1,4 @@
-"""Wrong/dead-end answers found by reading the 2,803 earlier questions on the data of 2026-11-06 (weekend test, item C3)."""
+"""Wrong/dead-end answers found by reading the 2,803 earlier questions on the data of 2026-11-06."""
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch

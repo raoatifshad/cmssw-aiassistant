@@ -1,4 +1,4 @@
-"""Wrong answers found by item E4 of the weekend test (2026-11-10): pasted RelVal exceptions and test-log problems asked as
+"""Wrong answers found in testing (2026-11-10): pasted RelVal exceptions and test-log problems asked as
 "has anyone reported this?" / "what is this?"."""
 import unittest
 from unittest.mock import patch
