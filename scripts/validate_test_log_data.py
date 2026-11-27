@@ -390,7 +390,7 @@ def run(args) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base-url", default="http://localhost:8001")
-    parser.add_argument("--username", default="mrao", help="Must be in SHIFTER_CERN_USERNAMES.")
+    parser.add_argument("--username", default="testshifter", help="Must be in SHIFTER_CERN_USERNAMES.")
     parser.add_argument("--series", nargs="+", default=["CMSSW_20_1_X", "CMSSW_20_0_X", "CMSSW_16_1_X"])
     parser.add_argument("--windows", type=int, default=20, help="Consecutive windows to replay per series.")
     parser.add_argument("--chat-samples", type=int, default=3)

@@ -10,7 +10,7 @@ The graph is built from local files only:
 - An optional, separately supplied Issues/PR export for Issue bodies and comments.
 - An optional local Clang-log directory for compiler diagnostics.
 - Scan results of the raw IB test logs (unit tests, addOn tests, RelVals)
-  copied from cmssdt9-02, kept under `/home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results/`.
+  sent by cms-bot to the VM, kept under `/data/results/` there (`results/` in the backups).
 
 The importer does not call GitHub. A PR relationship is created only from an
 exact commit-hash match in the supplied local files.

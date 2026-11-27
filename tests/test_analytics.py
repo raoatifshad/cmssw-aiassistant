@@ -291,6 +291,28 @@ class PartialNoteTests(unittest.TestCase):
             self.assertEqual(_with_partial_build_note(answer, "what are the unit test failures right now?"), answer)
         check.assert_not_called()
 
+    def test_an_answer_about_one_architecture_gets_only_its_builds(self):
+        partial = [dict(tag=self.TAG, arch="el9_amd64_gcc14", results=325, usual=956)]
+        answer = f"## IB comparison: el8_amd64_gcc14\n`{self.TAG}` failing RelVals: none"
+        with patch("server.api_server.partial_builds", return_value=partial):
+            self.assertEqual(_with_partial_build_note(answer, "what changed on el8?"), answer)
+            on_el9 = answer.replace("el8_amd64", "el9_amd64")
+            self.assertIn("325 of about 956", _with_partial_build_note(on_el9, "what changed on el9?"))
+
+    def test_unit_tests_not_imported_does_not_hide_partial_relvals(self):
+        partial = [dict(tag=self.TAG, arch="el9_amd64_gcc14", results=325, usual=956)]
+        answer = f"`{self.TAG}` RelVals run 325\n_Unit-test results of `{self.TAG}` are not imported yet._"
+        with patch("server.api_server.partial_builds", return_value=partial):
+            self.assertIn("325 of about 956", _with_partial_build_note(answer, "compare the relvals"))
+
+    def test_builds_compared_in_tables_are_checked(self):
+        partial = [dict(tag=self.TAG, arch="el9_amd64_gcc14", results=325, usual=956)]
+        answer = ("## All-architecture IB comparison\n\n**Newly failing:** 1\n" + "x" * 500
+                  + f"\n| Metric | {self.TAG} | CMSSW_20_1_X_2026-11-05-2300 | Delta |\n| RelVals run | 325 | 957 | +632 |")
+        with patch("server.api_server.partial_builds", return_value=partial) as check:
+            self.assertIn("325 of about 956", _with_partial_build_note(answer, "compare the last two 20_1 IBs"))
+        self.assertIn(self.TAG, check.call_args.args[0])
+
     def test_not_repeated_or_invented(self):
         with patch("server.api_server.partial_builds", return_value=[]):
             self.assertEqual(_with_partial_build_note(f"`{self.TAG}` is clean", "q"), f"`{self.TAG}` is clean")

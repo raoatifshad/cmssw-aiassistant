@@ -6,13 +6,15 @@ import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-SOURCE_DIR = os.environ.get("CMSSW_SOURCE_DIR", "/home/rao/CHAT-BOT-AI/cmssw")
+SOURCE_DIR = os.environ.get("CMSSW_SOURCE_DIR", "")   # unset = no checkout: every lookup returns None ("not checked")
 _MAX_FILES_FOR_A_SPECIFIC_NAME = 40
 _MAX_NAMES = 16
 
 
 def _git(*args: str, timeout: float = 8) -> str | None:
     """stdout, or None if git failed. `git grep` exits 1 for "no match": that is "" here, not a failure."""
+    if not SOURCE_DIR:
+        return None   # `git -C ""` would search the current directory
     try:
         done = subprocess.run(["git", "-c", "safe.directory=*", "-C", SOURCE_DIR, *args], capture_output=True, text=True,
                               errors="replace", timeout=timeout, check=False)

@@ -113,6 +113,19 @@ def run(cmd: list[str], timeout_s: int, cwd: Path = APP, stdout=None) -> None:
         raise StepFailed(f"exit {proc.returncode}: {' '.join(map(str, cmd[:3]))}")
 
 
+def remove_stale_git_lock(path: Path) -> None:
+    """A crash during git leaves .git/index.lock behind and every later git fails.
+    Git steps time out after 30 min, so a lock older than an hour is left over."""
+    lock = path / ".git" / "index.lock"
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except FileNotFoundError:
+        return
+    if age > 3600:
+        lock.unlink()
+        log(f"  removed a stale {lock} ({age / 3600:.1f} h old)")
+
+
 def git_update(path: Path, url: str, sparse: str | None = None, shallow: bool = False) -> str:
     """Clone once, then fetch + hard reset to origin/master. Returns the commit date."""
     if not (path / ".git").exists():
@@ -124,6 +137,7 @@ def git_update(path: Path, url: str, sparse: str | None = None, shallow: bool = 
         if sparse:
             run(["git", "-C", path, "sparse-checkout", "set", sparse], 1800)
     else:
+        remove_stale_git_lock(path)
         run(["git", "-C", path, "fetch", "--prune"] + (["--depth", "1"] if shallow else []) + ["origin", "master"], 1800)
         run(["git", "-C", path, "reset", "--hard", "origin/master"], 600)
         if sparse:

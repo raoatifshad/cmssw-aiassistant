@@ -2420,6 +2420,86 @@ def _requested_release_series(question: str) -> tuple[int, int] | None:
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
+_ARCHS_OF_BUILD_RE = re.compile(
+    r"\bhow\s+many\s+(?:(?:el|slc)\d+|aarch64|arm\w*|amd64|x86\w*|riscv\w*|arch\w*|platforms?)\b|"
+    r"\b(?:which|what|list(?:\s+the)?)\s+(?:(?:el|slc)\d+\s+|aarch64\s+|amd64\s+)?(?:arch\w*|platforms?)\b", re.IGNORECASE)
+
+
+def _newest_build_with_arch(prefix: str, before: str, wanted) -> tuple[str, list[str]] | None:
+    """The newest primary build of a series up to `before` with an architecture `wanted` accepts."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE ib.tag STARTS WITH $prefix AND ib.tag <= $before RETURN ib.tag AS tag, ib.arch AS arch "
+                "ORDER BY tag DESC LIMIT 2000", prefix=prefix, before=before)]
+    finally:
+        driver.close()
+    for row in rows:
+        if wanted(row["arch"]):
+            tag = row["tag"]
+            return tag, sorted(r["arch"] for r in rows if r["tag"] == tag and wanted(r["arch"]))
+    return None
+
+
+def _architectures_of_build_answer(question: str) -> str | None:
+    """ "how many el9 in latest IB?": the architectures one build has, optionally of one family, with its sub-IBs on each."""
+    if not _ARCHS_OF_BUILD_RE.search(question):
+        return None
+    tag_match = IB_TAG_RE.search(question)
+    if tag_match:
+        tag = tag_match.group(1)
+    elif re.search(r"\b(?:latest|newest|last)\b", question, re.IGNORECASE):
+        latest = _latest_ib_records(None, _requested_release_series(question))
+        tag = latest[0]["tag"] if latest else None
+    else:
+        return None
+    if not tag:
+        return None
+    primary = tag if re.match(r"CMSSW_\d+_\d+_X_", tag) else None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE ib.tag = $tag OR ($primary IS NOT NULL AND ib.parent_tag = $primary) "
+                "RETURN DISTINCT ib.tag AS tag, ib.arch AS arch", tag=tag, primary=primary)]
+    finally:
+        driver.close()
+    if not rows:
+        return f"No IB `{tag}` is imported."
+    os_word = _OS_FAMILY_RE.search(question)
+    cpu = _arch_family(question)
+    def wanted(arch: str) -> bool:
+        return (not os_word or arch.lower().startswith(os_word.group(1).lower() + "_")) and (not cpu or f"_{cpu}_" in arch)
+    builds: dict[str, list[str]] = {}
+    for row in rows:
+        flavour = re.match(r"CMSSW_\d+_\d+_(\w+?)_X_", row["tag"])
+        builds.setdefault(row["arch"], []).append("primary" if row["tag"] == tag or not flavour else flavour.group(1))
+    all_archs = sorted(builds)
+    archs = [a for a in all_archs if wanted(a)]
+    what = " ".join(w for w in ((os_word.group(1).lower() if os_word else ""), (cpu or "")) if w)
+    label = f"{what} architecture(s)" if what else "architecture(s)"
+    if not archs:
+        text = f"`{tag}` has **no {what} architecture**. It is imported for: " + ", ".join(f"`{a}`" for a in all_archs) + "."
+        series = re.match(r"(CMSSW_\d+_\d+_)", tag)
+        newest = _newest_build_with_arch(series.group(1) + "X_", tag, wanted) if series and primary else None
+        if newest:
+            return text + f" Not every architecture is built every time: the newest `{series.group(1)}X` build with {what} is `{newest[0]}` (" + ", ".join(f"`{a}`" for a in newest[1]) + ")."
+        return text + " An IB's architectures can land hours apart, so one may still come."
+    lines = [f"`{tag}` is imported for **{len(archs)} {label}**: " + ", ".join(f"`{a}`" for a in archs) + "."]
+    others = [a for a in all_archs if a not in archs]
+    if others:
+        lines[0] += f" ({len(all_archs)} in all; also " + ", ".join(f"`{a}`" for a in others) + ".)"
+    lines.append("")
+    lines.append("Builds on each:")
+    for arch in archs:
+        names = sorted(set(builds[arch]), key=lambda n: (n != "primary", n))
+        lines.append(f"- `{arch}`: " + ", ".join(names))
+    lines.append("")
+    lines.append("_An IB's architectures can land hours apart, so one not listed may still come._")
+    return "\n".join(lines)
+
+
 def _latest_ib_answer(question: str) -> str | None:
     """Return the latest imported IB, optionally scoped to an architecture."""
     if not _is_latest_ib_question(question):
@@ -6317,7 +6397,7 @@ def _render_failing_workflows(
         current = later or previous
         name = current["name"]
         if previous and later:
-            status = f"Still failing (already failing in `{before_tag}`)"
+            status = f"Still failing (already failing in `{before.get('tag') or before_tag}`)"   # the build really compared
         elif later:
             status = "Newly failing"
         else:
@@ -6509,7 +6589,8 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
             missing = before_tag if not before else after_tag
             return [f"`{missing}` has no imported record here."]
         block = [substitution_note] if substitution_note else []
-        block.extend(_render_metric_deltas(before, after, metrics, before_tag, after_tag))
+        # the builds really compared: a sub-IB's own tag, or its own previous build
+        block.extend(_render_metric_deltas(before, after, metrics, before.get("tag") or before_tag, after.get("tag") or after_tag))
         if "relval_" not in _comparison_missing_categories(before, after):
             block.extend(_render_failing_workflows(
                 before, after, before_tag, after_tag, exit_code_names, variant, all_variants
@@ -7652,6 +7733,26 @@ def _ib_comparison_answer(question: str) -> tuple[str, list[dict]] | None:
         architectures = [row["arch"] for row in rows]
         if not architectures:
             return "Neither requested Integration Build is present in the imported graph.", []
+        word = _ARCH_TOKEN_RE.search(IB_TAG_RE.sub(" ", question))
+        if word and not re.search(r"\ball\s+arch", question, re.IGNORECASE):
+            # "compare ... on el9" (found 2026-11-06: asked which architecture, offering el8 too). Only what both builds have
+            # can be compared; one such architecture leaves nothing to ask.
+            family = _arch_family_word(word.group(1))
+            driver = get_driver()
+            try:
+                with driver.session() as session:
+                    in_both = [r["arch"] for r in session.run(
+                        "MATCH (a:IB {tag:$first}), (b:IB {tag:$second, arch:a.arch}) RETURN DISTINCT a.arch AS arch ORDER BY arch",
+                        first=tags[0], second=tags[1])]
+            finally:
+                driver.close()
+            matching = [a for a in in_both if family in a]
+            if len(matching) == 1:
+                return _ib_comparison_answer(f"{question} {matching[0]}")
+            if not matching:
+                return (f"`{tags[0]}` and `{tags[1]}` have no `{family}` architecture in common, so there is nothing to compare on it: "
+                        "architectures are never merged. Both have: " + (", ".join(f"`{a}`" for a in in_both) or "none") + ".", [])
+            architectures = matching
         if len(architectures) == 1:
             # one architecture between them: nothing to choose (found 2026-10-16 asking anyway)
             return _ib_comparison_answer(f"{question} {architectures[0]}")
@@ -8644,6 +8745,26 @@ def _looks_like_pasted_error_text(question: str) -> bool:
     )
 
 
+def _newest_older_tag_with_results(tag: str, arch: str | None) -> str | None:
+    """The newest earlier build of the same series and flavour with any RelVal or unit-test result."""
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                row = session.run(
+                    "MATCH (ib:IB) WHERE ib.tag STARTS WITH $prefix AND ib.tag < $tag AND ($arch IS NULL OR ib.arch = $arch) "
+                    "AND (EXISTS { (ib)-[:RAN_RELVAL]->() } OR EXISTS { (ib)-[:RAN_UNITTEST]->() }) "
+                    "RETURN ib.tag AS tag ORDER BY ib.tag DESC LIMIT 1",
+                    prefix=tag.rsplit("_X_", 1)[0] + "_X_", tag=tag, arch=arch).single()
+        finally:
+            driver.close()
+    except Exception as exc:
+        print(f"WARNING: previous build lookup failed: {exc}")
+        return None
+    found = row["tag"] if row else None
+    return found if isinstance(found, str) else None
+
+
 def _failure_overview_answer(tag: str, arch: str | None, item_cap: int = 12) -> tuple[str, list[dict]] | None:
     """"What is failing in <tag>?" -- every failing thing across build, RelVal
     and unit tests for the IB and its sub-IBs, in one answer, instead of asking
@@ -8676,6 +8797,14 @@ def _failure_overview_answer(tag: str, arch: str | None, item_cap: int = 12) -> 
         driver.close()
     if not rows:
         return None
+    if all(not r.get("relval_total") and not r.get("unittest_total") for r in rows):
+        # "what's failing in 12_4?" (found 2026-11-06: this session's newest 12_4 build was only just out, so "unknown",
+        # though the build before it had failures; every morning after the refresh): also the build with results
+        older = _newest_older_tag_with_results(tag, arch)
+        previous = _failure_overview_answer(older, arch, item_cap) if older else None
+        if previous:
+            return (f"_`{tag}` has no RelVal or unit-test results imported yet, so this is for `{older}`, the newest build before it that has them._\n\n"
+                    + previous[0], previous[1])
     names = get_exit_code_names()
     scope = f" on `{arch}`" if arch else ""
     # Imported build_status is passed / warning / error (or unset when the
@@ -9301,15 +9430,48 @@ def _topic_phrase_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+WORKER_STATE_FILE = os.getenv("WORKER_STATE_FILE", "")   # the VM worker's state.json; unset = no worker
+WORKER_FAILING_HOURS = 3
+
+
+def _worker_health() -> dict | None:
+    """Jobs whose last success is over WORKER_FAILING_HOURS old and that failed since,
+    and whether the worker still writes its state (test logs every 5 min)."""
+    if not WORKER_STATE_FILE:
+        return None
+    try:
+        path = Path(WORKER_STATE_FILE)
+        state = json.loads(path.read_text())
+        stale_min = int((datetime.now().timestamp() - path.stat().st_mtime) // 60)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"cannot read the worker state: {exc.__class__.__name__}"}
+    # job times are the worker's local time: compare them with its newest run, not with this clock
+    tried = [job.get("tried_at") for job in state.values() if job.get("tried_at")]
+    newest = datetime.fromisoformat(max(tried)) if tried else None
+    failing = {}
+    for name, job in state.items():
+        if job.get("ok") is False:
+            ok_at = datetime.fromisoformat(job["ok_at"]) if job.get("ok_at") else None
+            if ok_at is None or newest is None or newest - ok_at > timedelta(hours=WORKER_FAILING_HOURS):
+                failing[name] = {"last_ok": job.get("ok_at"), "result": job.get("result")}
+    stopped = stale_min > 60
+    return {"ok": not failing and not stopped, "failing": failing,
+            "state_updated_min_ago": stale_min, **({"stopped": True} if stopped else {})}
+
+
 @app.get("/api/health")
 def health():
-    return {
+    result = {
         "ok": _llm_client is not None,
         "model": DEFAULT_MODEL,
         "tools_available": len(TOOLS),
         "backend": "neo4j-knowledge-graph",
         "log_rag": _pipeline is not None,
     }
+    worker = _worker_health()
+    if worker is not None:
+        result["worker"] = worker
+    return result
 
 
 def _verification_session_context(question: str, session_id: str) -> str | None:
@@ -11778,7 +11940,7 @@ _BASIC_TERMS = (
     (r"\b(?:relval\s+)?workflow\s+numbers?\b", "A **workflow number** like `1349.0` names one RelVal in the matrix (`runTheMatrix.py -l 1349.0`). The same number can mean a different workflow in another release series, so results are read per series."),
     (r"(?<![a-z])_?pre\d*\b[^?]*\b(?:release\s+name|mean)|\brelease\s+name\b[^?]*\bpre\b", "`_pre5` in a release name means **pre-release 5**: a development snapshot of the cycle, before the final release (`CMSSW_20_1_0_pre5` comes before `CMSSW_20_1_0`)."),
     (r"\brelease\s+cycles?\b", "A **release cycle** is one CMSSW version line such as `20_1`: IBs from its `CMSSW_20_1_X` branch, pre-releases such as `CMSSW_20_1_0_pre5`, then the final `CMSSW_20_1_0` and its patch versions."),
-    (r"\b(?:fc|el|slc)\d+\s*[?.!]*\s*$", "In an architecture name, `el` is Enterprise Linux, `fc` is Fedora and `slc` is Scientific Linux CERN; the number is the version. So `fc42` is Fedora 42 and `el9` is Enterprise Linux 9."),
+    (r"^\s*(?:(?:what(?:'s|\s+is|\s+does)|meaning\s+of|explain)\s+)?(?:an?\s+|the\s+)?(?:fc|el|slc)\d+(?:\s+(?:mean|stand\s+for))?\s*[?.!]*\s*$", "In an architecture name, `el` is Enterprise Linux, `fc` is Fedora and `slc` is Scientific Linux CERN; the number is the version. So `fc42` is Fedora 42 and `el9` is Enterprise Linux 9."),
     (r"\bpile[\s-]*up\b|\bPU\b(?=[^?]*\bworkflow)", "**Pileup** means extra proton-proton collisions overlaid on the event of interest. `PU` in a workflow name means it simulates them."),
     (r"\bsonic\b", "**SONIC** is the CMSSW framework for running ML inference on a server rather than inside the job. A `SonicCallFailed` error means such a call failed, often through `TritonService`."),
     (r"\btriton\b", "**Triton** is NVIDIA's inference server. CMSSW's `TritonService` starts or connects to it, so that modules can run ML models through SONIC."),
@@ -12825,6 +12987,14 @@ def _with_variant_ib_context(question: str) -> str:
     # appending the newest build here answered "yesterday" with today's (found 2026-10-15)
     if re.search(r"\b(?:yesterday|today|tonight|this\s+morning|20\d\d-\d\d-\d\d)\b", question, re.IGNORECASE):
         return question
+    # "20_1 G4ADEPT unit tests", "148.0 in 13_0_HeavyIon" (found 2026-11-06: the primary and other flavours, "✅ clean" without
+    # G4ADEPT, which had a failure; a dead end): that series' newest build of the flavour with results
+    named = re.search(rf"(?<![\w.-])(?:CMSSW_)?(\d{{1,2}})_(\d{{1,2}})[\s_]+({_ALL_VARIANTS_RE})(?![A-Za-z0-9])", question, re.IGNORECASE)
+    if named:
+        flavour = _flavour_in(named.group(3))
+        tag = _newest_flavour_tag(flavour, (int(named.group(1)), int(named.group(2)))) if flavour else None
+        if tag:
+            return f"{question} {tag}"
     match = re.search(
         r"(?<![A-Za-z0-9])(" + "|".join(sorted(_IB_VARIANT_GLOSSARY, key=len, reverse=True)) + r")(?![A-Za-z0-9])"
         r"(?i:\s+(?:sub[\s-]*)?(?:ibs?|builds?|variant|flavou?r|latest|newest)|\b[^?!]{0,30}\b(?:latest|newest)\s+(?:build|ib|release)\b)",
@@ -13101,6 +13271,32 @@ def _with_newest_arch_ib(question: str) -> str:
     return f"{question} {found[0]}" + (f" {found[1][0]}" if len(found[1]) == 1 else "")
 
 
+def _category_in_build_note(category: str, tag: str, arch: str | None) -> str:
+    """How many RelVals of one build show this exception category, and how many are known errors."""
+    try:
+        driver = get_driver()
+        try:
+            with driver.session() as session:
+                row = session.run(
+                    "MATCH (ib:IB {tag:$tag})-[:RAN_RELVAL]->(r:RelVal)-[:HAS_EXCEPTION]->(e:RelValException {category:$category}) "
+                    "WHERE $arch IS NULL OR ib.arch = $arch "
+                    "RETURN count(DISTINCT r) AS n, count(DISTINCT CASE WHEN r.known_error THEN r END) AS known",
+                    tag=tag, arch=arch, category=category).single()
+        finally:
+            driver.close()
+    except Exception as exc:
+        print(f"WARNING: exception category lookup failed: {exc}")
+        return ""
+    where = f"`{tag}`" + (f" on `{arch}`" if arch else "")
+    if not row or not row["n"]:
+        return f"**`{category}`:** no RelVal in {where} shows it.\n\n"
+    known = row["known"]
+    if not known:
+        return f"**`{category}`:** {row['n']} RelVal(s) in {where} show it.\n\n"
+    known_text = "all of them known errors" if known == row["n"] else f"{known} of them known errors"
+    return f"**`{category}`:** {row['n']} RelVal(s) in {where} show it ({known_text}, left out of the failing count below).\n\n"
+
+
 def _with_arch_missing_from_newest(question: str, session_id: str) -> str:
     """ "what's broken on gcc16?", "RelVal failures on el10 in the newest IB?": an IB's architectures land hours apart,
     so right after each build the newest IB has only el8/el9, and the answer silently replaced the asked architecture
@@ -13114,7 +13310,9 @@ def _with_arch_missing_from_newest(question: str, session_id: str) -> str:
     if re.search(r"\b(?:compare\w*|vs|versus|both|week|month|days?|since|finish\w*|done|ready|yet|out|prs?|issues?|clang|warnings?|exit\s*codes?|only|besides|anywhere\s+else|known)\b|"
                  r"(?<![\d.])\d+\.\d+(?![\d.])", question, re.IGNORECASE):
         return question
-    if re.search(r"\b[A-Z][a-z0-9]+[A-Z]\w*", question):
+    named_thing = re.search(r"\b[A-Z][a-z0-9]+[A-Z]\w*", question)
+    if named_thing and not (series and re.search(r"(?:Producer|Failure|Exception|Error)$", named_thing.group(0))):
+        # "is aarch64 still failing with ExternalLHEProducer on 17_0?": an exception category with a series is about that series' build
         return question  # about one named thing ("why would TritonService fail on aarch64?", a test name), not an IB's overview
     try:
         if _packages_named_loosely(question):
@@ -13129,6 +13327,10 @@ def _with_arch_missing_from_newest(question: str, session_id: str) -> str:
             if newest_of_series and newest_of_series != found_in_series[0]:
                 _default_tag_notes[session_id] = (f"_`{newest_of_series}` has no `{word.lower()}` build yet, so this is for `{found_in_series[0]}`, "
                                                   "the newest build of that series on it._\n\n")
+            if named_thing:   # the exception asked about, in that build
+                arch = found_in_series[1][0] if len(found_in_series[1]) == 1 else None
+                _default_tag_notes[session_id] = (_default_tag_notes.get(session_id, "")
+                                                  + _category_in_build_note(named_thing.group(0), found_in_series[0], arch))
             return f"{question} {found_in_series[0]}" + (f" {found_in_series[1][0]}" if len(found_in_series[1]) == 1 else "")
         scope = _arch_scope_matches(question, session_id)
         if not scope or scope[2] or not scope[1]:
@@ -13225,13 +13427,17 @@ def _arch_build_out_answer(question: str) -> str | None:
 def _with_series_change_tags(question: str) -> str:
     """ "what changed in 17_1 between the last two builds?": that series' two newest primary IBs
     (found 2026-11-04: just the newest tag). Windows ("this week") stay with the digest."""
-    if IB_TAG_RE.search(question) or not re.search(r"\bwhat\s+changed\b|\bdiff(?:erence)?\b", question, re.IGNORECASE):
+    if IB_TAG_RE.search(question) or not re.search(r"\bwhat\s+(?:did\s+|has\s+)?changed?\b|\bdiff(?:erence)?\b", question, re.IGNORECASE):
         return question
     series = _requested_release_series(question)
     if not series or re.search(r"\bweek|\bmonth|\bdays?\b|\bsince\b", question, re.IGNORECASE):
         return question
     latest = _latest_ib_records(None, series)
     older = _previous_primary_tag(latest[0]["tag"]) if latest else None
+    # "... on el8?" (found 2026-11-06: the architecture was dropped, or the question got a glossary line)
+    arch_word = _ARCH_TOKEN_RE.search(question)
+    if older and arch_word:
+        return f"compare {older} and {latest[0]['tag']} on {arch_word.group(1)}"
     return f"what changed between {older} and {latest[0]['tag']}" if older else question
 
 
@@ -21857,6 +22063,7 @@ _ai_supervisor_history: dict[str, list[dict]] = {}
 _ARCH_CHOICE_START = "RelVal failures over this period span several architectures"
 _ASKS_ABOUT_FAILURES_RE = re.compile(r"\b(?:fail\w*|relvals?|workflows?|recurring|frequent|top)\b", re.IGNORECASE)  # "in which tests?" and "is it new?" got this menu (found 2026-11-06)
 _WORD_SEARCH_DEAD_END_RE = re.compile(r"\s*No\s+(?:imported\s+)?(?:CMSSW\s+)?(?:Issue|PR)\b[^\n]{0,60}\bcontains\b")
+_FULL_ARCH_RE = re.compile(r"\b(?:el|fc|slc)\d+_[a-z0-9]+_gcc\d+\b")
 _SAYS_PARTIAL_RE = re.compile(r"\b(?:partly|partial\w*|incomplete|still\s+(?:being\s+)?(?:import\w*|running|arriving)|not\s+imported\s+yet|may\s+still\s+be\s+running|results?\s+imported|of\s+\d[\d,]*\s+imported|\d[\d,]*\s+of\s+(?:about\s+|the\s+usual\s+|~)?\d[\d,]*\s+RelVal)\b", re.IGNORECASE)
 
 
@@ -21865,7 +22072,11 @@ def _with_partial_build_note(answer: str, question: str) -> str:
     try:
         # the builds the answer is about, in its first lines: a tag deep in a history table isn't its subject, and a note on everything is a note nobody reads
         tags = list(dict.fromkeys(IB_TAG_RE.findall(answer[:400])))[:6]
-        if not tags or _SAYS_PARTIAL_RE.search(answer):
+        # a comparison's tables name the builds compared
+        tags += [t for t in dict.fromkeys(IB_TAG_RE.findall("\n".join(
+            line for line in answer.splitlines() if line.startswith("| Metric |")))) if t not in tags][:12]
+        # a sentence about unit tests not being imported doesn't say the RelVals are partial
+        if not tags or _SAYS_PARTIAL_RE.search(re.sub(r"[^\n]*(?<![a-z])unit[-\s]test[^\n]*", "", answer, flags=re.IGNORECASE)):
             return answer
         if not re.search(r"\b(?:relvals?|workflows?|failing|failures?|passed|clean|status|summary|health)\b", question + " " + answer[:300], re.IGNORECASE) or re.search(r"\bunit[-\s]tests?\b", question, re.IGNORECASE):
             return answer  # the note is about RelVal results: unit tests arrive first and are complete by then
@@ -21873,6 +22084,9 @@ def _with_partial_build_note(answer: str, question: str) -> str:
     except Exception as exc:
         print(f"WARNING: partial build check failed: {exc}")
         return answer
+    archs = set(_FULL_ARCH_RE.findall(answer[:400]))
+    if len(archs) == 1 and _ARCH_TOKEN_RE.search(question):   # asked about one architecture: only its builds
+        partial = [p for p in partial if p["arch"] in archs]
     if not partial:
         return answer
     listed = "; ".join(f"`{p['tag']}` on `{p['arch']}` has {p['results']} of about {p['usual']} RelVal results" for p in partial[:3])
@@ -23014,6 +23228,9 @@ def _chat(req: ChatRequest):
     author_ranking = _pr_author_ranking_answer(original_question)
     if author_ranking:
         return _chat_response(sid, original_question, author_ranking, "deterministic:pr_author_ranking")
+    archs_of_build = _architectures_of_build_answer(question)
+    if archs_of_build:
+        return _chat_response(sid, original_question, archs_of_build, "deterministic:architectures")
     arch_answer = _architectures_answer(question if question != original_question and "still built" in question else original_question)
     if arch_answer:
         return _chat_response(sid, original_question, arch_answer, "deterministic:architectures")

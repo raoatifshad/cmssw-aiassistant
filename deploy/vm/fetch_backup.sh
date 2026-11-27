@@ -2,13 +2,13 @@
 # Runs on the PC (not on the VM): copies the VM's newest nightly backup here, so losing the VM
 # costs at most a day. Read-only on the VM. Copies the newest neo4j-<date>.dump and
 # testlogs-<date>.tar with their .sha256, checks them, keeps the newest KEEP of each.
-#   fetch_backup.sh            # from cron, 03:30 (the VM backs up at 03:00) and after a boot
+#   DEST=/path/to/vm-backups fetch_backup.sh   # from cron, 03:30 (the VM backs up at 03:00) and after a boot
 # Result in $DEST/status.txt, log in $DEST/fetch.log. Exit 1 = no fresh, verified copy.
 set -uo pipefail
 VM=${VM:-root@cmssdt-chatbot.cern.ch}
 KEY=${KEY:-$HOME/.ssh/cmssdt-chatbot.pem}
 SRC=${SRC:-/srv/kg-data/backups}
-DEST=${DEST:-/home/rao/CHAT-BOT-AI/vm-backups}
+DEST=${DEST:?set DEST to the folder for the copies, e.g. DEST=$HOME/vm-backups}
 KEEP=${KEEP:-3}
 MAX_AGE_H=${MAX_AGE_H:-30}         # an older newest backup means the VM did not make one
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -i $KEY"

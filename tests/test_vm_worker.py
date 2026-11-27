@@ -217,5 +217,41 @@ class JobTests(unittest.TestCase):
                 worker.job_exceptions()
 
 
+class StaleGitLockTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        (self.repo / ".git").mkdir()
+        self.lock = self.repo / ".git" / "index.lock"
+        patcher = patch.object(worker, "log")
+        self.log = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_an_old_lock_is_removed_and_logged(self):
+        self.lock.touch()
+        old = worker.time.time() - 2 * 3600
+        os.utime(self.lock, (old, old))
+        worker.remove_stale_git_lock(self.repo)
+        self.assertFalse(self.lock.exists())
+        self.assertIn("stale", self.log.call_args.args[0])
+
+    def test_a_fresh_lock_is_kept(self):
+        self.lock.touch()
+        worker.remove_stale_git_lock(self.repo)
+        self.assertTrue(self.lock.exists())
+        self.log.assert_not_called()
+
+    def test_no_lock_nothing_happens(self):
+        worker.remove_stale_git_lock(self.repo)
+        self.log.assert_not_called()
+
+    def test_git_update_checks_the_lock_before_fetch(self):
+        calls = []
+        with patch.object(worker, "remove_stale_git_lock", side_effect=lambda p: calls.append("lock")), \
+             patch.object(worker, "run", side_effect=lambda cmd, *a, **k: calls.append(cmd[3])), \
+             patch.object(worker.subprocess, "run"):
+            worker.git_update(self.repo, "url")
+        self.assertEqual(calls[:2], ["lock", "fetch"])
+
+
 if __name__ == "__main__":
     unittest.main()
