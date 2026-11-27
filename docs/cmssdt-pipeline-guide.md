@@ -7,28 +7,6 @@ Builds (IBs), RelVals, unit tests, build-status warnings, parsed Clang
 diagnostics, and CMSSW GitHub discussions. It imports these sources into Neo4j
 and exposes a chat API at `POST /api/chat`.
 
-The editable architecture companion is
-[cmssdt-current-pipeline.drawio](cmssdt-current-pipeline.drawio).
-
-![CMSSDT knowledge graph chatbot pipeline](cmssdt-pipeline-overview.svg)
-
-The image is a readable overview. Use the linked Draw.io file to edit the
-complete diagram.
-
-## Sharing This Guide
-
-For use inside this repository, copy or link to this Markdown file only. The
-image reference is relative, so it renders automatically as long as
-`cmssdt-pipeline-guide.md` and `cmssdt-pipeline-overview.svg` remain together
-in the `docs` directory.
-
-For a document system that accepts Markdown and local attachments, provide both
-the guide and the SVG image. For a document system that does not render local
-Markdown images, upload `cmssdt-pipeline-overview.svg` separately and replace
-the image path with the URL supplied by that system. The SVG is the ready-to-use
-pipeline image; no Draw.io download is needed unless someone needs to edit the
-diagram. In that case, provide `cmssdt-current-pipeline.drawio` as well.
-
 ## Plain-Language Overview
 
 This project is a searchable, evidence-based assistant for CMSSW development

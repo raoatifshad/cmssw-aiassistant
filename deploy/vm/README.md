@@ -34,7 +34,7 @@ an SSH key pair. Not Puppet-managed (yet). To build a new one:
    ("The ingest token" below), or the sender job gets 401.
 5. Data, as `kgbot` (`runuser -l kgbot`, `cd /opt/cmssdt-kg-chatbot/deploy/vm`):
    `podman compose -p kg up -d neo4j`, `./restore.sh <newest dump>` (from EOS or another copy);
-   a dump from another machine also needs the path rewrite ("Moving the live database here");
+   a dump of the database that already ran here (or on another VM with the same paths) loads as is;
    then, as root, `systemctl --user -M kgbot@ enable --now kg-stack` (`systemctl --user` does not
    work inside `runuser`: no session bus) and `curl -s localhost:8001/api/health`.
    Changed `.env` later? `podman compose -p kg up -d --force-recreate --no-deps api worker`:
@@ -179,24 +179,12 @@ New token (leaked, or someone left), as root:
 then update the Jenkins credential (the sender job is red with exit 2 until then; scan files
 are not lost: the next good run sends everything not yet sent).
 
-## Moving the live database here (one-off)
+## Moving the live database here (one-off, done 2026-11-16)
 
-The database remembers the full path of every file it imported (`source_id`). On
-the developer PC those are `/home/rao/...`, here `/data/sources/...`; without
-rewriting them the worker re-imports everything once and the wiki docs end up in
-the graph twice.
-
-```bash
-# on the PC: a dump of the live database (stops it ~20 s), copy it here
-./restore.sh /path/to/neo4j-live-<date>.dump      # loads it (worker not started yet!)
-podman compose -p kg stop worker                 # if it is running
-P=/home/rao/CHAT-BOT-AI/NEO4J/cmssdt-kg-chatbot
-podman compose -p kg run --rm --no-deps worker python migrate_paths.py \
-    --map $P/cmsrepo=/data/sources/cmsrepo --map $P/shifter-wiki=/data/sources/shifter-wiki \
-    --map /home/rao/CHAT-BOT-AI/CLANG-LOGS=/data/clang-logs            # dry run: counts only
-#   ... the same + --apply --check   (must end with "old paths anywhere in the graph: none")
-rm -f $DATA_DIR/worker/state.json && podman compose -p kg up -d worker
-```
+The database remembers the full path of every file it imported (`source_id`). When it moved
+from the developer PC (`/home/rao/...`) to the VM (`/data/sources/...`), `migrate_paths.py`
+rewrote those paths once. It was removed afterwards (2026-11-27); it is in the git history
+(commit f5adcfb) if a database ever moves from a machine with other paths again.
 
 ## Everyday
 

@@ -5,10 +5,10 @@ Completely independent from the SQL-based chatbot — shares no code, no
 database, no imports. Same API shape (`POST /api/chat`, `GET /api/health`)
 so the existing React chat widget works by changing one env var.
 
-## Meeting Documentation
+## Documentation
 
-The plain-language implementation walkthrough, API/data-flow explanation, and
-architecture diagrams are in [docs/meeting/cmssdt-chatbot-meeting-pack.md](docs/meeting/cmssdt-chatbot-meeting-pack.md).
+A plain-language overview of the pipeline is in
+[docs/cmssdt-pipeline-guide.md](docs/cmssdt-pipeline-guide.md).
 The current Neo4j labels, relationships, identities, and local refresh flow are
 documented in [docs/current-neo4j-database-structure.md](docs/current-neo4j-database-structure.md).
 

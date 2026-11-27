@@ -16,6 +16,5 @@ COPY ingestion ./ingestion
 COPY log_rag ./log_rag
 COPY server ./server
 COPY deploy/vm/worker.py ./worker.py
-COPY deploy/vm/migrate_paths.py ./migrate_paths.py
 
 CMD ["python", "worker.py"]

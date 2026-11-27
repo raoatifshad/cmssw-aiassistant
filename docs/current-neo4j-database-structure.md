@@ -1,9 +1,5 @@
 # Current Neo4j Database Structure
 
-For a visual, editable explanation, open
-[cmssdt-current-database.drawio](cmssdt-current-database.drawio) in Draw.io or
-the VS Code Draw.io extension.
-
 ## 1. Purpose and Data Boundary
 
 Neo4j stores CMSSDT build evidence and connects it to supplied CMSSW PR data.

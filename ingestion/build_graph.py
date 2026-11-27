@@ -995,7 +995,7 @@ def github_pr_from_issue(issue: dict) -> dict | None:
         "url": issue.get("html_url"),
         "created_at": issue.get("created_at"),
         "updated_at": issue.get("updated_at"),
-        # set only by the stopgap web fetch (ingestion/fetch_github_web_updates.py); a real backup clears it
+        # set only by the stopgap web fetch (fetch_github_web_updates.py, removed 2026-11-27); a real backup clears it
         "fetched_via": issue.get("_fetched_via"),
     }
 

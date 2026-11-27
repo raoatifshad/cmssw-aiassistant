@@ -236,7 +236,7 @@ additionally deletes graph records whose backing source file is gone
   The backup on cmssdt9-02 was stuck at 2026-09-04 until 2026-11-06; the `github` step of
   `scripts/daily_refresh.sh` now copies it (rsync, no --delete) and imports it when `issues/latest.txt` moved,
   without `--reconcile`. The importer keeps whichever copy has the newer `updated_at`. Nodes from the earlier web
-  stopgap (`ingestion/fetch_github_web_updates.py`, `GITHUB-ISSUES/web-update/`, no longer run) carry `fetched_via`
+  stopgap (`fetch_github_web_updates.py`, removed 2026-11-27, in git history; `GITHUB-ISSUES/web-update/`) carry `fetched_via`
   and have no new comments until the backup replaces them; answers say so through `_github_export_note`.
 - **PR patches** -- `ingestion/ingest_github_patches.py` reads each PR's `patch.txt` from the same backup into
   `(PR)-[:TOUCHED_FILE {evidence:'github_patch'}]->(SourceFile)`, `PR.patch_files` and `PR.patch_status`. Only paths are

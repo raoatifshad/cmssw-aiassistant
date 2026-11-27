@@ -2819,7 +2819,7 @@ def _github_export_note() -> str:
         finally:
             driver.close()
         if web and web["n"]:
-            # the stopgap web fetch (ingestion/fetch_github_web_updates.py, 2026-11-04): newer states and
+            # the stopgap web fetch (fetch_github_web_updates.py, 2026-11-04, removed 2026-11-27): newer states and
             # Issues, no comments
             fetched_on = str(web["via"]).split()[-1]
             note = (f"GitHub data: the full export (with comments) reaches {str(row['t'])[:10]}; "
