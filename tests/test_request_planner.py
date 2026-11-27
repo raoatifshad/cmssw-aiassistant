@@ -77,7 +77,7 @@ class RequestPlannerTests(unittest.TestCase):
         # Regression: found live -- "which packages are failing in <tag>
         # <arch>" has neither "unit" nor "test" in it at all. UnitTest
         # results are package-level aggregates in this graph (see
-        # CLAUDE.md), so "package" is as much a unittest synonym here as
+        # docs/DEVELOPER.md), so "package" is as much a unittest synonym here as
         # "wf"/"workflow" already are for "relval" -- without this, the
         # question had no recognized category and fell into the ambiguous
         # "choose a scope" clarification instead of routing directly.

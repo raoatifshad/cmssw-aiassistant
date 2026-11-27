@@ -1,6 +1,6 @@
-# CLAUDE.md
+# Developer guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Architecture, commands, request routing and the invariants of this repository.
 
 ## What this is
 
@@ -14,10 +14,11 @@ env var (`VITE_CHAT_API_BASE`).
 Where it runs: the production VM `cmssdt-chatbot.cern.ch` (Neo4j + API + worker
 containers, `deploy/vm/`, runbook in `deploy/vm/README.md`); a new Puppet-managed VM
 `cmschatbot-01.cern.ch` is being set up (hostgroup `vocmssdt/sdt/cms_chatbot` in
-`ai/it-puppet-hostgroup-vocmssdt`, class `code/manifests/sdt/cms_chatbot.pp`); the
-developer PC runs a local stack on :8002, the daily refresh and the nightly tester.
-`master` is the current code (feature branches were merged into it on 2026-11-27):
-start new work from `master`.
+`ai/it-puppet-hostgroup-vocmssdt`, class `code/manifests/sdt/cms_chatbot.pp`).
+
+Branches: `master` is what production runs; `dev` holds fixes under test and is
+merged into `master` after review; `tester` (separate history) holds the tools of
+the test machine (nightly refresh of a copy of the data, live checks, reports).
 
 ## Commands
 
@@ -27,67 +28,37 @@ python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # fill in CERN_API_BASE, CERN_API_KEY
 
-# Neo4j (standalone docker run, port 7688 bolt via compose or 7687 direct)
-docker run -d --name neo4j -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/cmssdt2026 -v $HOME/neo4j-data:/data docker.io/library/neo4j:5
+# Neo4j for development (bolt on 7688, the port every command below uses)
+docker run -d --name neo4j -p 7475:7474 -p 7688:7687 \
+  -e NEO4J_AUTH=neo4j/<password> -v $HOME/neo4j-data:/data docker.io/library/neo4j:5
 
-# build/refresh the graph (incremental — hashes each source file, skips unchanged)
-PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
-  --cmsrepo cmsrepo --clang-root /home/rao/CHAT-BOT-AI/CLANG-LOGS --reconcile
-# add --clear only for a one-time full rebuild; --force to reimport unchanged sources
-
-# the daily refresh routine by hand (scripts/daily_refresh.sh runs the same from cron
-# on the PC; the VM worker has its own schedule, see deploy/vm/worker.py). Always run
-# the cmsrepo half FIRST, since --cmsrepo here also re-ingests cmsrepo's own top-level docs.
+# build/refresh the graph (incremental — hashes each source file, skips unchanged).
+# Run the cmsrepo import FIRST: --cmsrepo also re-ingests cmsrepo's own top-level docs.
 cd cmsrepo && git fetch --prune origin master && git reset --hard origin/master \
   && git sparse-checkout reapply && cd ..
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
-  --cmsrepo "$PWD/cmsrepo" --clang-root /home/rao/CHAT-BOT-AI/CLANG-LOGS --reconcile
+  --cmsrepo "$PWD/cmsrepo" --clang-root /path/to/CLANG-LOGS
 cd shifter-wiki && git fetch --prune origin master && git reset --hard origin/master && cd ..
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_shifter_docs.py \
   --wiki-root "$PWD/shifter-wiki" --cmsrepo "$PWD/cmsrepo" --reconcile
+# --clear only for a one-time full rebuild; --force to reimport unchanged sources.
+# NEVER --reconcile on cmsrepo: cms-sw.github.io drops IB files after ~2 weeks and squashes
+# its git history, so --reconcile deletes those IBs' RelVals/unit tests and PR nodes for
+# good. Retention is prune_old_data.py's job (90 days, PRs/Issues never pruned).
 
-# NOTE: the unattended refresh imports cmsrepo WITHOUT --reconcile (user, 2026-11-03: keep >= 90 days).
-# cms-sw.github.io drops IB files after ~2 weeks and squashes its git history, so --reconcile on
-# cmsrepo deletes those IBs' RelVals/unit tests and PR nodes for good. Don't add it back; retention
-# is prune_old_data.py's job (90 days, PRs/Issues never pruned). Data before ~2026-10-26 is lost.
-# all of the above, unattended, every day at 00:30 and 12:30 (cron; logs + status.txt in
-# /home/rao/CHAT-BOT-AI/daily-refresh-logs/). Exceptions go to a dated file per run: importing
-# the same path again deletes what that path imported before. cmssdt9-02 is reached with
-# your Kerberos ticket (renewed each run, max 5 days; or a fresh one from ~/.mrao.keytab if it
-# exists, kept on this PC only); nothing is stored or installed there.
-scripts/daily_refresh.sh [--install-cron|--uninstall-cron]   # STEPS="cmsrepo exceptions testlogs docs github frontend checks"; also runs 10 min after each boot
-# after each refresh it starts scripts/daily_tester.sh -- NIGHT ONLY (20:00-06:00, so after the 00:30 run; FORCE=1 by hand) (Claude Code headless, prompt scripts/tester_prompt.md,
-# worktree ../../cmssdt-kg-vacation on auto/vacation-fixes; reports in /home/rao/CHAT-BOT-AI/daily-test-reports/; TESTER=0 skips)
-# progress page (read-only, started @reboot by cron): http://localhost:8090 -- copy/scan GB done/left,
-# import into Neo4j, test-log runs per IB date ("missing" days), tester runs. Never edit daily_refresh.sh
-# in place while a run is going (bash reads it by byte offset): write a new file and mv it over.
-venv/bin/python scripts/refresh_status_page.py [--port 8090]
-# (frontend = cmssdt-18V's public/updateData.sh; the previous SDT/ is kept until the new clone is complete)
-
-# IB test logs from cmssdt9-02 (unit/addOn/RelVal zips; the server deletes
-# them after ~1 week, so run at least every few days). The user copies with
-# their own rsync (full command in README "IB test logs"), then:
-PYTHONPATH=ingestion venv/bin/python ingestion/fetch_ib_test_logs.py --no-server --delete-local
+# import IB test-log scan results (results/, one file per IB)
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_test_logs.py \
-  --results /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results
+  --results /path/to/results
 # 90-day retention (dry run unless --apply; --chat also drops idle chat sessions +
 # router shadow logs). Pruned sources get ImportState.pruned_at and are never
 # re-imported, not even with --force. Keeps IB, ProblemFirstSeen, PR/Issue, Concept.
 NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/prune_old_data.py [--days 90] [--apply]
-# one-off: re-derive RelVal.status from the cmsrepo files (e.g. after a status-rule
-# change -- DAS_ERROR was stored as PASSED until 2026-10-15); only differing rows written
-NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/backfill_relval_status.py --cmsrepo cmsrepo [--apply]
 # scan one zip by hand (read-only report, writes nothing)
 PYTHONPATH=ingestion venv/bin/python ingestion/ib_test_log_scanner.py <zip> [--addon-log addOnTests.log] [--json out.json]
 
 # run the API
 uvicorn server.api_server:app --reload --port 8001
 curl http://localhost:8001/api/health
-
-# full stack (Neo4j + OpenSearch + Logstash + API) via Compose
-./start.sh    # detects Podman or Docker
-./stop.sh     # stops services, preserves volumes
 
 # tests (unittest, not pytest — no pytest.ini/conftest.py in this repo)
 # PYTHONPATH=ingestion is required: build_graph.py imports sibling modules
@@ -125,13 +96,13 @@ venv/bin/python scripts/question_bank.py --check-facts
 venv/bin/python scripts/validate_test_log_data.py --base-url http://localhost:8002 --username testshifter
 
 # production VM (details + cheat sheet: deploy/vm/README.md). Login: see that README.
-# update the code there (as kgbot, in /opt/cmssdt-kg-chatbot/deploy/vm): always --no-deps,
-# otherwise podman-compose also recreates Neo4j
+# update the code there (in deploy/vm): always --no-deps, otherwise podman-compose also
+# recreates Neo4j
 podman compose -p kg build api worker && podman rm -f kg_worker_1 kg_api_1 \
   && podman compose -p kg up -d --no-deps api worker
 # worker (deploy/vm/worker.py): test-log batches every 5 min, cmsrepo hourly at :30,
-# exceptions + docs at 00:30/12:30; nightly backup 03:00 (deploy/vm/backup.sh), copied to the
-# PC by deploy/vm/fetch_backup.sh (cron 03:30)
+# exceptions + docs at 00:30/12:30; nightly backup 03:00 (deploy/vm/backup.sh), copied off
+# the VM by deploy/vm/fetch_backup.sh
 ```
 
 Tests mock the Neo4j driver / LLM client rather than requiring a live
@@ -149,8 +120,7 @@ non-empty on every RelVal row (added after a real workflow with multiple
 sub-IB variants rendered as unlabeled, seemingly-duplicate/contradictory
 rows), and that no identity is listed as both newly-failing and resolved for
 the same architecture in the same digest. Coordinate with whoever owns the
-Shift Console frontend (a separate repo, `cmssdt-18V` — see
-`reference-shift-console-frontend` in project memory) before changing the
+Shift Console frontend (a separate repo, `cmssdt-18V`) before changing the
 digest's column shape, since their parser and this script both hard-code the
 same contract.
 
@@ -160,7 +130,7 @@ same contract.
 
 1. **Knowledge graph chat** (`ingestion/`, `graph/`, most of `server/`) —
    deterministic Q&A over CMSSW IB facts stored in Neo4j.
-2. **Log RAG platform** (`log_rag/`, `logstash/`) — a separate durable
+2. **Log RAG platform** (`log_rag/`) — a separate durable
    pipeline for ingesting arbitrary JSON/JSONL/Clang logs, archiving them,
    projecting event context into Neo4j, and retrieving cited evidence
    (`/api/ingest`, `/api/search`). Both share the same Neo4j instance and the
@@ -194,8 +164,8 @@ additionally deletes graph records whose backing source file is gone
   `build_graph.py`: `ib_test_log_scanner.py` (pure parser, streams zip
   members line by line with a 64 KB per-line cap -- a CLANG unit log has a
   single 2 GB line, and the DBG unit zip is 13 GB unpacked),
-  `fetch_ib_test_logs.py` (copy → scan → `results/*.json.gz` + ledger →
-  delete the copy; `results/` is the durable copy, never delete it) and
+  `merge_test_log_batches.py` (the scan batches cms-bot sends → `results/`,
+  one file per IB; `results/` is the durable copy, never delete it) and
   `ingest_test_logs.py` (results → `TestLogRun`/`LogProblem`/
   `ProblemSignature`/`ProblemFirstSeen`, ImportState prefix `testlogs:`, so
   `build_graph.py --reconcile` never touches it). Its purpose: problems
@@ -261,16 +231,15 @@ additionally deletes graph records whose backing source file is gone
 - `--github-issues` — optional raw CMSSW GitHub Issues export
   (dir or `.tar`/`.tar.gz`), imports PR/Issue bodies, labels, comments, and
   explicit `#number`/URL cross-references. Never calls GitHub live.
-  The backup on cmssdt9-02 was stuck at 2026-09-04 until 2026-11-06; the `github` step of
-  `scripts/daily_refresh.sh` now copies it (rsync, no --delete) and imports it when `issues/latest.txt` moved,
-  without `--reconcile`. The importer keeps whichever copy has the newer `updated_at`. Nodes from the earlier web
+  The backup on cmssdt9-02 was stuck at 2026-09-04 until 2026-11-06. It is copied with rsync (no --delete) and
+  imported when `issues/latest.txt` moved, without `--reconcile`; the production worker does not do this yet. The importer keeps whichever copy has the newer `updated_at`. Nodes from the earlier web
   stopgap (`fetch_github_web_updates.py`, removed 2026-11-27, in git history; `GITHUB-ISSUES/web-update/`) carry `fetched_via`
   and have no new comments until the backup replaces them; answers say so through `_github_export_note`.
 - **PR patches** -- `ingestion/ingest_github_patches.py` reads each PR's `patch.txt` from the same backup into
   `(PR)-[:TOUCHED_FILE {evidence:'github_patch'}]->(SourceFile)`, `PR.patch_files` and `PR.patch_status`. Only paths are
   stored, not the 21 GB of diffs. About 7,200 patches are saved error pages (`patch_status='unavailable'`): unknown,
   never "no files". Not `CHANGED_FILE`: `find_prs_for_error` joins that against every failed unit test.
-  Chat side (item E2, 2026-11-10): AI tools `pr_files` / `prs_touching_path` (graph/analytics.py), the PR card's "Files touched" line, and
+  Chat side (2026-11-10): AI tools `pr_files` / `prs_touching_path` (graph/analytics.py), the PR card's "Files touched" line, and
   `_touched_path_answer` ("which PRs / who touched <path>", with a window, open/merged, "most" ranking, or one IB tag = that series' PRs merged
   in the 30 days before the build). Unknown files = patch_status not 'ok' (error page, or a PR newer than the backup); always say how many.
 
@@ -294,8 +263,7 @@ live during a chat request — and same incremental hashing
 (`source_needs_import`/`mark_source_imported`, reused directly from
 `build_graph.py`) so re-running is cheap.
 
-It is refreshed on a schedule, together with `build_graph.py`: on the PC by
-`scripts/daily_refresh.sh` (cron 00:30/12:30), on the VM by the worker (00:30/12:30).
+It is refreshed on a schedule by the VM worker (00:30/12:30).
 Each run does `git fetch`/`reset` of the wiki clone and re-runs
 `ingest_shifter_docs.py`; GitHub is never queried during a chat request
 (the "never call GitHub live" invariant below).
@@ -374,10 +342,9 @@ PR/Issue about X?"), `server/pr_cause.py` ("which PR may have caused this?"),
 Two older phases are gated by env vars, each adding a real per-message
 LLM call: `ENABLE_ROUTER_SHADOW` (logs an independent LLM classification
 against the deterministic planner's choice for later promotion-gate
-comparison, never used to answer — this deployment's `.env` has it **on**,
-deliberately, to accumulate real agreement data instead of hand-patching
-another regex for every new phrasing forever; summarize with
-`ingestion/summarize_router_shadow.py`) and `ENABLE_ANSWER_SYNTHESIS` (LLM
+comparison, never used to answer — on in production, deliberately, to
+accumulate real agreement data instead of hand-patching another regex for
+every new phrasing forever) and `ENABLE_ANSWER_SYNTHESIS` (LLM
 rephrases an already-correct deterministic answer, verified to preserve
 every number via `_extract_numbers` before being shown — falls back to the
 original text on any mismatch; still off). Don't assume either is off by
@@ -518,9 +485,7 @@ append-only evidence archive + checksum manifest under
 MERGEs event/build/service/host context into the graph, and `retriever.py`
 does hybrid retrieval (OpenSearch when `OPENSEARCH_URL` is set, filesystem
 evidence scan as the inspectable fallback) surfaced as `citations` in chat
-responses. `ingestion/ingest_json_logs.py` is the chunked importer for large
-JSONL backfills (avoids sending an entire file through `/api/ingest` in one
-request). The production VM runs no OpenSearch/Logstash (dropped 2026-11-16: they only
+responses. The production VM runs no OpenSearch/Logstash (dropped 2026-11-16: they only
 ever held one smoke-test event), so there retrieval is the filesystem fallback.
 
 ## Key invariants (violate these and answers become unsafe/wrong)

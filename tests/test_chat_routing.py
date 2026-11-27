@@ -673,7 +673,7 @@ class ChatRoutingTests(unittest.TestCase):
         # ticl::AssociationMap any PR/issue open?" has qualified-code syntax
         # (triggering the LLM check) but its bare-term match was already a small,
         # reasonably-focused set (well under the row limit) of a genuinely relevant
-        # real PR (see CLAUDE.md's "Capability-handler coverage" section -- this exact
+        # real PR (see docs/DEVELOPER.md's "Capability-handler coverage" section -- this exact
         # question is the documented regression case for combining PR+Issue evidence
         # without short-circuiting). Relabeling a small set as "not an exact match"
         # just because the LLM's stricter qualified-string check didn't also confirm
@@ -907,7 +907,7 @@ class ChatRoutingTests(unittest.TestCase):
         # (triggering the LLM check) but its bare-term match was already a small,
         # reasonably-focused set (well under the row limit) that genuinely relevant
         # real Issues were part of (#42737 et al., confirmed live in
-        # project_cross_variant... -- see CLAUDE.md's capability-handler-coverage
+        # project_cross_variant... -- see docs/DEVELOPER.md's capability-handler-coverage
         # history). Relabeling a small set as "not an exact match" just because the
         # LLM's stricter qualified-string check didn't also confirm it (people often
         # drop a C++ namespace prefix in casual discussion) is wrong -- it implies
@@ -1866,7 +1866,7 @@ class ChatRoutingTests(unittest.TestCase):
     def test_relval_failure_count_mentions_sub_ib_variants(self, get_driver, scope_records, _get_failing_relvals):
         # Sub-IB variants (ASAN, UBSAN, ROOT6, ...) are never merged into a
         # primary tag's RelVal numbers (different (tag, architecture)
-        # identities, per CLAUDE.md), but their existence should be
+        # identities, per docs/DEVELOPER.md), but their existence should be
         # mentioned rather than silently omitted -- found live: a real
         # question about a primary tag gave no hint that 10 sub-IB variants
         # with very different failure profiles existed for the same build.

@@ -9,7 +9,7 @@ that name (RecoLocalFastTime/FTLRecProducers/plugins/alpaka/BTLBaseRecHitSoAProd
 Method: the failing streak of the newest release series (last passing build -> first failing build, primary IBs), the PRs
 merged into the builds of that window ((PR)-[:MERGED_BEFORE]->(IB)), ranked by whether the files they touched
 ((PR)-[:TOUCHED_FILE]->(SourceFile), from the GitHub backup's patches) carry names from the failure's error text, or lie in
-the failing package. Timing plus file names is evidence to read, never proof of a cause (CLAUDE.md invariant): every answer says so.
+the failing package. Timing plus file names is evidence to read, never proof of a cause (docs/DEVELOPER.md invariant): every answer says so.
 """
 from __future__ import annotations
 

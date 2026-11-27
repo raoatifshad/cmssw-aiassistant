@@ -216,7 +216,7 @@ class RecurringFailureTests(unittest.TestCase):
         # Regression: "is this a known issue" contains the word "issue", which
         # routes it to the pr_evidence capability — it must not dead-end there
         # once every PR/Issue evidence lookup in that capability's chain (see
-        # CLAUDE.md's "Capability-handler coverage" section for the full list)
+        # docs/DEVELOPER.md's "Capability-handler coverage" section for the full list)
         # finds nothing.
         answer, _ = _execute_planned_capability(
             "pr_evidence", "is workflow 140.051 a known issue?", "known-issue-session",

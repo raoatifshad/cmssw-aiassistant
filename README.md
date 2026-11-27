@@ -28,7 +28,7 @@ backend over HTTP only (`VITE_CHAT_API_BASE`).
 - [docs/current-neo4j-database-structure.md](docs/current-neo4j-database-structure.md) -- labels, relationships, identities
 - [docs/llm-knowledge-contract.md](docs/llm-knowledge-contract.md) -- what the LLM may and may not do
 - [docs/shifter-sso-cutover.md](docs/shifter-sso-cutover.md) -- CERN SSO for the Shift Console
-- [CLAUDE.md](CLAUDE.md) -- architecture, request routing, invariants and the full command list, for developers
+- [docs/DEVELOPER.md](docs/DEVELOPER.md) -- architecture, request routing, invariants and the full command list, for developers
 
 ## Quick start (local)
 

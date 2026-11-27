@@ -18,7 +18,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       # Deliberately no Neo4j service here: the suite mocks the driver (see
-      # CLAUDE.md), so running with no database reachable is what catches an
+      # docs/DEVELOPER.md), so running with no database reachable is what catches an
       # unmocked session.run() call instead of letting it silently pass
       # because a live DB happened to be up.
       - run: PYTHONPATH=ingestion python -m unittest discover -s tests

@@ -1361,7 +1361,7 @@ def _sub_ib_variant_tags(tag: str) -> list[dict]:
     """Sub-IB variants (ASAN, UBSAN, ROOT6, CLANG, ...) imported for a
     primary tag, as {"variant", "tag"} pairs -- the full tag lets a caller
     actually fetch that variant's own separate results, not just name it.
-    Per CLAUDE.md's "IB (tag, architecture) pairs are never merged"
+    Per docs/DEVELOPER.md's "IB (tag, architecture) pairs are never merged"
     invariant: a sanitizer/variant build's failure profile isn't comparable
     to the primary build's (e.g. UBSAN/ROOT6 routinely differ from DEFAULT
     by 10-1000x, and CLANG/DEVEL/MULTIARCHS/NONLTO each run their own
@@ -1936,7 +1936,7 @@ def _unittest_summary_from_records(tag: str, records: list[dict], include_sub_ib
         lines.extend(failing_package_lines)
     # Inline each sub-IB variant's own unit-test results too, never merged
     # into the numbers above -- each is a genuinely separate build per
-    # CLAUDE.md's IB-identity invariant. Approved 2026-08-26: a plain
+    # docs/DEVELOPER.md's IB-identity invariant. Approved 2026-08-26: a plain
     # "not included above" footnote (RelVal's treatment) wasn't enough here;
     # the user wanted the variants' own failures shown directly, the same
     # way the CMSSDT dashboard already shows a distinct Unit count per
@@ -2145,7 +2145,7 @@ def _failed_unittest_list_answer(
     ever called it -- only the aggregate count/errors summary existed
     (_unittest_summary_answer), the same "designed but only half-built"
     pattern as MERGED_BEFORE. UnitTest results are package-level aggregates
-    (see CLAUDE.md), so "failed packages" and "failed unit tests" are the
+    (see docs/DEVELOPER.md), so "failed packages" and "failed unit tests" are the
     same list at this granularity -- both phrasings resolve here."""
     if not re.search(r"\b(?:list|show|give)\b|\b(?:what|which)\b.*\bfail", question, re.IGNORECASE):
         return None
@@ -3598,7 +3598,7 @@ def _pr_and_issue_evidence_answer(question: str, session_id: str) -> tuple[str, 
     evidence back, with matching open Issues never even searched for once
     _pr_evidence_answer matched first -- the "capability matched, one
     handler in its chain swallowed the rest" bug class documented in
-    CLAUDE.md's "Capability-handler coverage" section. "relval" also falls
+    docs/DEVELOPER.md's "Capability-handler coverage" section. "relval" also falls
     back to this: a workflow-focused question ("any PR/Issue open for
     Workflow <id>?") can legitimately want PR/Issue evidence even when it
     has no IB tag and matches no relval-failure-specific phrasing, but
@@ -3777,7 +3777,7 @@ def _open_issue_answer(question: str, relval_context: dict[str, str | None] | No
         # later in the same capability's chain, could answer with real recurrence
         # data immediately, no extra input needed. Returning None lets that happen,
         # same "capability matched, one handler in its chain must not swallow a
-        # better answer downstream" principle as CLAUDE.md's "Capability-handler
+        # better answer downstream" principle as docs/DEVELOPER.md's "Capability-handler
         # coverage" section.
         return None
 
@@ -4475,7 +4475,7 @@ def _issue_detail_answer(question: str, context_number: int | None = None) -> st
 def _latest_issue_answer(question: str) -> str | None:
     """Report the most recently imported CMSSW Issue. Mirrors
     _latest_clang_warning_answer's shape -- another instance of the "no
-    handler exists at all for this phrasing" gap (see CLAUDE.md's
+    handler exists at all for this phrasing" gap (see docs/DEVELOPER.md's
     "Capability-handler coverage" section): nothing answered "what is the
     latest issue" before this, only a *named* Issue's author
     (_issue_author_answer) or open-Issue text search (_open_issue_answer)."""
@@ -5618,7 +5618,7 @@ def _category_failure_snapshot(tag: str) -> str | None:
     2026-09-30: for CMSSW_20_1_X_2026-09-20-2300 that undercounted real
     failures to zero for RelVals even though CUDART/DEVEL/EVTGEN3/G4ADEPT
     all had real ones -- the same sub-IB-crowd-out bug class this codebase
-    has hit and fixed multiple times before (see CLAUDE.md).
+    has hit and fixed multiple times before (see docs/DEVELOPER.md).
 
     build_status (a string: 'passed'/'error'/...) and comp_warnings (an int
     count of compiler warnings on an otherwise-passing build) are two
@@ -9141,7 +9141,7 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         if issue_author_answer:
             return issue_author_answer, []
         # _issue_detail_answer closes a "no handler exists at all" gap (see
-        # CLAUDE.md's "Capability-handler coverage" section): nothing ever
+        # docs/DEVELOPER.md's "Capability-handler coverage" section): nothing ever
         # answered "what is the title of issue #X", only who opened it.
         issue_detail_answer = _issue_detail_answer(question, context_number)
         if issue_detail_answer:
@@ -9161,7 +9161,7 @@ def _execute_planned_capability(capability: str, question: str, session_id: str)
         # "is 512.0 a known issue? has it failed before" asks for BOTH the
         # PR/Issue text evidence and the workflow's own failure history --
         # found live 2026-10-06: only the PR/Issue half was shown. Combine,
-        # don't short-circuit (CLAUDE.md "Capability-handler coverage" #3).
+        # don't short-circuit (docs/DEVELOPER.md "Capability-handler coverage" #3).
         recurrence_answer = (
             _recurring_failure_answer(question, session_id)
             if _RECURRING_FAILURE_INTENT_RE.search(question) and re.search(r"\b\d{1,6}\.\d+\b", question)
@@ -10575,7 +10575,7 @@ def _reported_answer(question: str, sid: str) -> str | None:
     if re.search(r"(?<![\d.])\d{1,8}\.\d{1,7}(?![\d.])", text):
         return None  # a workflow without a report word
     if re.search(r"\bopen\b", text, re.IGNORECASE):
-        return None  # "any information about ticl::AssociationMap any PR/issue open?" wants the open items, which the PR and open-Issue route lists (a real report, CLAUDE.md)
+        return None  # "any information about ticl::AssociationMap any PR/issue open?" wants the open items, which the PR and open-Issue route lists (a real report, docs/DEVELOPER.md)
     names = re.findall(r"['\"`]([^'\"`]{6,})['\"`]", text) or [n for n in _PASTE_NAME_RE.findall(text) if _paste_name_term(n)]
     if not names:
         return None
