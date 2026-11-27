@@ -61,7 +61,7 @@ systemctl --user -M kgbot@ disable kg-stack           # not at boot any more (`e
 systemctl --user -M kgbot@ list-timers                # next/last 03:00 backup
 systemctl --user -M kgbot@ status kg-backup           # how the last backup ended
 journalctl _UID=$(id -u kgbot) --since today | grep backup.sh   # the backup's own log
-curl -s localhost:8001/api/health                     # {"ok":true,"model":...}
+curl -s localhost:8001/api/health                     # {"ok":true,...,"worker":{"ok":true,"failing":{}}}
 cat /srv/kg-data/worker/state.json                    # last run + result of each worker job
 df -h /srv/kg-data                                    # disk
 

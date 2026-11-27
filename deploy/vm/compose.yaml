@@ -9,8 +9,8 @@
 # one smoke-test event and no chat answer has used them; without OPENSEARCH_URL
 # the API falls back to reading its archive files.
 #
-# SELinux labels: a folder used by ONE container gets :Z (private label); results/, received/
-# and clang-logs/ are used by BOTH api and worker and get :z (shared). With :Z on both, the
+# SELinux labels: a folder used by ONE container gets :Z (private label); results/, received/,
+# clang-logs/ and worker/ are used by BOTH api and worker and get :z (shared). With :Z on both, the
 # container started last takes the folder and the other gets "Permission denied"
 # (found 2026-11-17: the worker saw no results after the api was recreated).
 services:
@@ -47,6 +47,7 @@ services:
       CLANG_LOG_ROOT: /data/clang-logs
       TEST_LOG_RECEIVED_DIR: /data/received # where POST /api/test-logs/batch saves batches (the worker merges them)
       TEST_LOG_RESULTS_DIR: /data/results   # where POST /api/test-logs/ingest saves scan files (token: TEST_LOGS_INGEST_TOKEN in .env)
+      WORKER_STATE_FILE: /data/worker/state.json   # /api/health reports failing worker jobs
     ports:
       - "${API_PORT:-8001}:8001"
     volumes:
@@ -54,6 +55,7 @@ services:
       - ${DATA_DIR}/clang-logs:/data/clang-logs:ro,z
       - ${DATA_DIR}/results:/data/results:z
       - ${DATA_DIR}/received:/data/received:z
+      - ${DATA_DIR}/worker:/data/worker:ro,z
     depends_on:
       neo4j:
         condition: service_healthy
@@ -79,7 +81,7 @@ services:
       - ${DATA_DIR}/received:/data/received:z
       - ${DATA_DIR}/clang-logs:/data/clang-logs:ro,z
       - ${DATA_DIR}/sources:/data/sources:Z
-      - ${DATA_DIR}/worker:/data/worker:Z
+      - ${DATA_DIR}/worker:/data/worker:z
     depends_on:
       neo4j:
         condition: service_healthy

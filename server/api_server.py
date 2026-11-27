@@ -9301,15 +9301,48 @@ def _topic_phrase_answer(question: str) -> str | None:
     return "\n".join(lines)
 
 
+WORKER_STATE_FILE = os.getenv("WORKER_STATE_FILE", "")   # the VM worker's state.json; unset = no worker
+WORKER_FAILING_HOURS = 3
+
+
+def _worker_health() -> dict | None:
+    """Jobs whose last success is over WORKER_FAILING_HOURS old and that failed since,
+    and whether the worker still writes its state (test logs every 5 min)."""
+    if not WORKER_STATE_FILE:
+        return None
+    try:
+        path = Path(WORKER_STATE_FILE)
+        state = json.loads(path.read_text())
+        stale_min = int((datetime.now().timestamp() - path.stat().st_mtime) // 60)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"cannot read the worker state: {exc.__class__.__name__}"}
+    # job times are the worker's local time: compare them with its newest run, not with this clock
+    tried = [job.get("tried_at") for job in state.values() if job.get("tried_at")]
+    newest = datetime.fromisoformat(max(tried)) if tried else None
+    failing = {}
+    for name, job in state.items():
+        if job.get("ok") is False:
+            ok_at = datetime.fromisoformat(job["ok_at"]) if job.get("ok_at") else None
+            if ok_at is None or newest is None or newest - ok_at > timedelta(hours=WORKER_FAILING_HOURS):
+                failing[name] = {"last_ok": job.get("ok_at"), "result": job.get("result")}
+    stopped = stale_min > 60
+    return {"ok": not failing and not stopped, "failing": failing,
+            "state_updated_min_ago": stale_min, **({"stopped": True} if stopped else {})}
+
+
 @app.get("/api/health")
 def health():
-    return {
+    result = {
         "ok": _llm_client is not None,
         "model": DEFAULT_MODEL,
         "tools_available": len(TOOLS),
         "backend": "neo4j-knowledge-graph",
         "log_rag": _pipeline is not None,
     }
+    worker = _worker_health()
+    if worker is not None:
+        result["worker"] = worker
+    return result
 
 
 def _verification_session_context(question: str, session_id: str) -> str | None:
