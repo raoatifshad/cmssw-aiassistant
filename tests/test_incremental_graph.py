@@ -10,12 +10,14 @@ from build_graph import (
     command_records,
     command_source_paths,
     discover_clang_builds,
+    exit_code_records,
     file_hash,
     github_issue_from_issue,
     github_pr_from_issue,
     github_reference_numbers,
     ib_key,
     is_unchanged,
+    merged_pr_records,
     pr_cache_records,
     relval_default_records,
     relval_exception_records,
@@ -84,6 +86,17 @@ class IncrementalGraphTests(unittest.TestCase):
         self.assertEqual(records[0]["number"], 51668)
         self.assertEqual(records[0]["sha"], "1234567890abcdef1234567890abcdef12345678")
         self.assertEqual(records[0]["branch"], "CMSSW_20_1_X")
+
+    def test_exit_code_records_parses_codes_as_integers(self):
+        records = exit_code_records({"16640": "OtherCMS", "35584": "SIGSEGV"})
+
+        self.assertIn({"code": 16640, "name": "OtherCMS"}, records)
+        self.assertIn({"code": 35584, "name": "SIGSEGV"}, records)
+
+    def test_exit_code_records_skips_malformed_entries(self):
+        records = exit_code_records({"not-a-number": "Whatever", "16640": "", "35584": "SIGSEGV"})
+
+        self.assertEqual(records, [{"code": 35584, "name": "SIGSEGV"}])
 
     def test_ib_key_preserves_architecture(self):
         tag = "CMSSW_20_1_X_2026-08-03-2300"
@@ -194,10 +207,94 @@ class IncrementalGraphTests(unittest.TestCase):
             "tag": "CMSSW_20_1_DBG_X_2026-08-07-2300",
             "arch": "el9_amd64_gcc13",
             "release": "CMSSW_20_1_DBG_X",
+            "parent_tag": "CMSSW_20_1_X_2026-08-07-2300",
+            "variant": "DBG",
             "status": "warning",
             "comp_warnings": 1,
             "ignored_warnings": 2117,
+            "addon_status": None,
         }])
+
+    def test_build_status_records_translate_addon_pass_fail_booleans(self):
+        # The 'addons' list is a separate array in the same queue-summary
+        # entry, keyed by arch -- 'passed' there is a genuine JSON boolean,
+        # unlike builds[].passed which is a status string ('passed'/'warning'/
+        # 'error'). No per-test detail exists in this source at all (details
+        # is always {}), so this stays a whole-architecture flag.
+        records = build_status_records([{
+            "release_name": "CMSSW_20_1_X_2026-08-07-2300",
+            "builds": [
+                {"arch": "el9_amd64_gcc13", "passed": "passed", "details": {}},
+                {"arch": "el8_amd64_gcc14", "passed": "passed", "details": {}},
+            ],
+            "addons": [
+                {"arch": "el9_amd64_gcc13", "passed": False, "details": {}},
+            ],
+        }])
+
+        by_arch = {record["arch"]: record["addon_status"] for record in records}
+        self.assertEqual(by_arch, {"el9_amd64_gcc13": "error", "el8_amd64_gcc14": None})
+
+    def test_merged_pr_import_keeps_earlier_builds_links(self):
+        # 2026-11-04: each import deleted the previous import's MERGED_BEFORE links, and the
+        # source file only lists the last few builds, so older builds lost their PR lists
+        import tempfile, json as _json
+        from unittest.mock import MagicMock, patch as _patch
+        import build_graph
+        session = MagicMock()
+        driver = MagicMock()
+        driver.session.return_value.__enter__.return_value = session
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            _json.dump([{"base_branch": "CMSSW_20_1_X", "comparisons": [{
+                "compared_tags": "CMSSW_20_1_X_2026-11-01-2300-->CMSSW_20_1_X_2026-11-02-1100",
+                "merged_prs": [{"number": "52223", "author_login": "fwyzard", "hash": "abc"}]}]}], handle)
+        with _patch.object(build_graph, "source_needs_import", return_value=True), \
+                _patch.object(build_graph, "mark_source_imported"):
+            build_graph.ingest_merged_prs(driver, build_graph.Path(handle.name))
+        queries = " ".join(str(call.args[0]) for call in session.run.call_args_list)
+        self.assertNotIn("DELETE", queries)
+        self.assertIn("MERGE (pr)-[rel:MERGED_BEFORE]->(ib)", queries)
+
+    def test_merged_pr_records_attach_to_the_target_tag_of_each_comparison(self):
+        # merged_prs_summary.json's compared_tags is "SOURCE-->TARGET"; the
+        # PRs in merged_prs are new as of TARGET, not SOURCE -- this is the
+        # per-build "recently merged" changelog the CMSSDT dashboard shows
+        # under each IB tag's tab (find_prs_before_ib's missing ingestion
+        # half, see ingest_merged_prs).
+        payload = [{
+            "base_branch": "CMSSW_20_1_X",
+            "comparisons": [{
+                "compared_tags": "CMSSW_20_1_X_2026-08-25-1100-->CMSSW_20_1_X_2026-08-25-2300",
+                "merged_prs": [
+                    {"number": "51750", "author_login": "makortel", "hash": "431734c"},
+                    {"number": "51715", "author_login": "aterigun", "hash": "997d5b7"},
+                ],
+            }],
+        }]
+
+        records = merged_pr_records(payload)
+
+        self.assertEqual(records, [
+            {"target_tag": "CMSSW_20_1_X_2026-08-25-2300", "number": 51750,
+             "author_login": "makortel", "commit_hash": "431734c"},
+            {"target_tag": "CMSSW_20_1_X_2026-08-25-2300", "number": 51715,
+             "author_login": "aterigun", "commit_hash": "997d5b7"},
+        ])
+
+    def test_merged_pr_records_skip_malformed_entries(self):
+        payload = [{
+            "base_branch": "CMSSW_20_1_X",
+            "comparisons": [
+                {"compared_tags": "no-arrow-here", "merged_prs": [{"number": "1"}]},
+                {"compared_tags": "A-->", "merged_prs": [{"number": "2"}]},
+                {"compared_tags": "A-->B", "merged_prs": [{"number": "not-a-number"}]},
+                {"compared_tags": "A-->B", "merged_prs": [{"number": "3"}]},
+            ],
+        }]
+
+        records = merged_pr_records(payload)
+
+        self.assertEqual(records, [{"target_tag": "B", "number": 3, "author_login": None, "commit_hash": None}])
 
     def test_patch_parser_keeps_renamed_and_deleted_paths(self):
         patch = (

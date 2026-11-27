@@ -11,6 +11,7 @@ import json
 import re
 import sys
 import tarfile
+from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
@@ -19,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "graph"))
 from neo4j_conn import clear_graph, get_driver, setup_schema  # noqa: E402
 
 from clang_parser import aggregate_occurrences, extract_warnings, html_to_text  # noqa: E402
+from relval_log_parser import extract_es_exception_blocks  # noqa: E402
 
 
 GITHUB_REFERENCE_PATTERN = re.compile(r"(?<![\w/])#(\d+)\b")
@@ -135,17 +137,40 @@ def to_iso(unix_ts) -> str | None:
         return None
 
 
-def _source_hash(driver, source_id: str) -> str | None:
+def dashboard_time_to_iso(unix_ts) -> str | None:
+    """A time from cms-sw.github.io's data/prs files. They are written as if UTC clock time were local: all 87 merged PRs comparable on 2026-11-05 were exactly 3600 s behind GitHub
+    (CET). Reading the number back on that local clock gives GitHub's time. Summer time (CEST) couldn't be checked, the files keep recent PRs only; GitHub's own value always wins in the import."""
+    if not unix_ts:
+        return None
+    try:
+        return datetime.fromtimestamp(int(unix_ts), tz=ZoneInfo("Europe/Zurich")).replace(tzinfo=timezone.utc).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
+def _source_state(driver, source_id: str) -> dict | None:
     with driver.session() as session:
         record = session.run(
-            "MATCH (state:ImportState {source_id:$source_id}) RETURN state.content_hash AS content_hash",
+            "MATCH (state:ImportState {source_id:$source_id}) "
+            "RETURN state.content_hash AS content_hash, state.pruned_at IS NOT NULL AS pruned",
             source_id=source_id,
         ).single()
-    return record["content_hash"] if record else None
+    return dict(record) if record else None
+
+
+def _source_hash(driver, source_id: str) -> str | None:
+    state = _source_state(driver, source_id)
+    return state["content_hash"] if state else None
 
 
 def source_needs_import(driver, source_id: str, content_hash: str, force: bool = False) -> bool:
-    return not is_unchanged(_source_hash(driver, source_id), content_hash, force)
+    """A source whose data prune_old_data.py deleted (ImportState.pruned_at) is never
+    re-imported, not even with --force: it is past the retention window, and its file
+    can still be on disk (IB-TEST-LOGS/results is kept for good)."""
+    state = _source_state(driver, source_id)
+    if state and state.get("pruned"):
+        return False
+    return not is_unchanged(state["content_hash"] if state else None, content_hash, force)
 
 
 def mark_source_imported(driver, source_id: str, content_hash: str, source_type: str, source_path: Path):
@@ -187,7 +212,31 @@ def _reset_source_nodes(session, relation: str, label: str, source_id: str, curr
     )
 
 
+# The node labels each reconciled source prefix writes `source_id` onto. The
+# delete is scoped to these labels (each has a source_id index, neo4j_conn.py)
+# instead of an unlabeled `MATCH (node) WHERE node.source_id=...`, which
+# scanned all ~2.2M nodes once per removed source -- the reason --reconcile
+# seemed to hang. Add the label here when an ingest_* function starts writing
+# source_id onto a new label for one of these prefixes.
+RECONCILE_LABELS = {
+    "relvals:": ("RelVal",),
+    "relval-exceptions:": ("RelValException",),
+    "unittests:": ("UnitTest",),
+    "prs:": ("PR",),
+    "commands:": ("WorkflowCommand",),
+    "clang:": ("Warning",),
+}
+
+
+def _reconcile_labels(prefix: str) -> tuple[str, ...]:
+    for known, labels in RECONCILE_LABELS.items():
+        if prefix.startswith(known):
+            return labels
+    raise ValueError(f"no RECONCILE_LABELS entry for source prefix {prefix!r}")
+
+
 def _reconcile_missing_sources(driver, prefix: str, active_sources: set[str]):
+    labels = _reconcile_labels(prefix)
     with driver.session() as session:
         records = session.run(
             "MATCH (state:ImportState) WHERE state.source_id STARTS WITH $prefix "
@@ -199,13 +248,26 @@ def _reconcile_missing_sources(driver, prefix: str, active_sources: set[str]):
         if source_id in active_sources:
             continue
         with driver.session() as session:
-            session.run(
-                "MATCH (node) WHERE node.source_id=$source_id AND NOT node:ImportState "
-                "DETACH DELETE node",
-                source_id=source_id,
-            )
+            for label in labels:
+                session.run(f"MATCH (node:{label} {{source_id:$source_id}}) DETACH DELETE node", source_id=source_id)
             session.run("MATCH (state:ImportState {source_id:$source_id}) DELETE state", source_id=source_id)
         print(f"  removed missing source: {source_id}")
+
+
+def relval_status(steps: list[dict]) -> str:
+    """FAILED if any step failed, else DAS_ERROR if a step could not get its input
+    files from DAS (the job never processed anything), else PASSED. Found
+    2026-10-15: DAS_ERROR was stored as PASSED (only "FAILED" was checked), so
+    workflow 38551.85 -- DAS_ERROR at step1 in all 250 imported runs -- read as
+    passing everywhere. DAS_ERROR is kept apart from FAILED: it is an input-data
+    problem, not a code failure -- although the IB dashboard itself counts it as failed
+    (num_failed), so answers say so when they list DAS errors separately."""
+    statuses = {step.get("status") for step in steps}
+    if "FAILED" in statuses:
+        return "FAILED"
+    if "DAS_ERROR" in statuses:
+        return "DAS_ERROR"
+    return "PASSED"
 
 
 def _ingest_relval_file(driver, path: Path, arch: str, force: bool) -> tuple[int, str]:
@@ -227,6 +289,7 @@ def _ingest_relval_file(driver, path: Path, arch: str, force: bool) -> tuple[int
                 "SET relval.ib_key=$ib_key, relval.ib_tag=$tag, relval.arch=$arch, "
                 "relval.workflow_id=$workflow_id, relval.name=$name, relval.status=$status, "
                 "relval.exitcode=$exitcode, relval.errors=$errors, relval.warnings=$warnings, "
+                "relval.known_error=$known_error, relval.known_error_message=$known_error_message, "
                 "relval.source_id=$source_id "
                 "MERGE (ib)-[:RAN_RELVAL]->(relval)",
                 ib_key=current_ib_key,
@@ -235,10 +298,21 @@ def _ingest_relval_file(driver, path: Path, arch: str, force: bool) -> tuple[int
                 key=f"{current_ib_key}:{workflow_id}",
                 workflow_id=workflow_id,
                 name=entry.get("name", ""),
-                status="FAILED" if any(step.get("status") == "FAILED" for step in steps) else "PASSED",
+                status=relval_status(steps),
                 exitcode=entry.get("exitcode"),
                 errors=sum(step.get("errors", 0) for step in steps),
                 warnings=sum(step.get("warnings", 0) for step in steps),
+                # A workflow can be marked "known_error" for reasons unrelated to the
+                # code under test (e.g. missing grid-pack shared libraries for a build
+                # variant) - the real CMSDT dashboard excludes these from its failing
+                # count/list entirely (verified live: workflow 534.0/536.0 on
+                # CMSSW_20_1_ASAN_X_2026-08-31-2300/el9_amd64_gcc14 both have known_error=1,
+                # "Grid-packs missing asan and non-asan shared libraries", and don't appear
+                # on the real dashboard's 5-row failing list even though our graph's
+                # step-level status derivation correctly marks them FAILED). Storing this
+                # here lets get_failing_relvals match that same exclusion.
+                known_error=bool(entry.get("known_error")),
+                known_error_message=entry.get("known_error_message"),
                 source_id=source_id,
             )
     mark_source_imported(driver, source_id, digest, "relvals", path)
@@ -318,6 +392,171 @@ def ingest_relval_exceptions(driver, root: Path, force: bool = False, reconcile:
         _reconcile_missing_sources(driver, "relval-exceptions:", active_sources)
     print(f"  RelVal exceptions imported: {total}")
     return total
+
+
+LOGREADER_BASE_URL = "https://cmssdt.cern.ch/SDT/cgi-bin/logreader"
+
+
+def ingest_es_exceptions(driver, path: Path, force: bool = False) -> int:
+    """Import RelVal exceptions from an Elasticsearch export (e.g. the output
+    of cms-bot's es-cmssw-exceptions.py, redirected to a JSON file) rather
+    than manually-staged step logs. One JSON file is one source: it's a batch
+    snapshot, not per-IB, so any change to the file reprocesses the whole
+    thing (consistent with how every other single-file source here works).
+
+    No source_url line anchor: an ES document's `exception` field is a
+    structured value, not a byte offset into a real log file, so there's no
+    line range to cite -- the constructed URL points at the run's log file
+    without a `#/start-end` fragment.
+    """
+    if not path.is_file():
+        print(f"  ES exceptions: path not found {path}")
+        return 0
+    source_id = f"es-exceptions:{path.resolve()}"
+    digest = file_hash(path)
+    if not source_needs_import(driver, source_id, digest, force):
+        return 0
+
+    payload = json.loads(path.read_text())
+    docs = [hit["_source"] for hit in payload.get("hits", {}).get("hits", [])]
+
+    records = []
+    for doc in docs:
+        tag = doc.get("release")
+        arch = doc.get("architecture")
+        workflow_id = doc.get("workflow")
+        step = doc.get("step")
+        exception_text = doc.get("exception")
+        if not (tag and arch and workflow_id and step and exception_text):
+            continue
+        current_ib_key = ib_key(tag, arch)
+        for block in extract_es_exception_blocks(exception_text):
+            text = f"{block['category']}: {block['message']}" if block["message"] else block["category"]
+            records.append({
+                "tag": tag,
+                "arch": arch,
+                "workflow_id": workflow_id,
+                "step": step,
+                "category": block["category"],
+                "message": block["message"],
+                "context": block["context"],
+                "text": text,
+                "exception_hash": sha256_bytes(text.encode())[:16],
+                "ib_key": current_ib_key,
+            })
+
+    with driver.session() as session:
+        # The export is a rolling window (the last 7 days), and the refresh imports the same
+        # dated file twice a day. Deleting everything this path imported before would remove the
+        # exceptions that left the window between the two runs (most of a 23:00 build's, every
+        # day): replace only the exceptions of the RelVals the new export still has.
+        session.run(
+            "MATCH (relval:RelVal)-[:HAS_EXCEPTION]->(exception:RelValException {source_id:$source_id}) "
+            "WHERE relval.key IN $relval_keys "
+            "DETACH DELETE exception",
+            source_id=source_id,
+            relval_keys=sorted({record["ib_key"] + ":" + record["workflow_id"] for record in records}),
+        )
+        session.run(
+            "UNWIND $records AS record "
+            "MATCH (relval:RelVal {key:record.ib_key + ':' + record.workflow_id}) "
+            "MERGE (exception:RelValException "
+            "{key:record.ib_key + ':' + record.workflow_id + ':' + record.exception_hash}) "
+            "SET exception.text=record.text, exception.category=record.category, "
+            "exception.message=record.message, exception.context=record.context, "
+            "exception.ib_key=record.ib_key, exception.ib_tag=record.tag, exception.arch=record.arch, "
+            "exception.workflow_id=record.workflow_id, exception.step=record.step, "
+            "exception.source_url=$logreader_base + '/' + record.arch + '/' + record.tag + "
+            "'/pyRelValMatrixLogs/run/' + record.workflow_id + '_' + relval.name + '/' + "
+            "record.step + '_' + relval.name + '.log', "
+            "exception.source_id=$source_id "
+            "MERGE (relval)-[:HAS_EXCEPTION]->(exception)",
+            records=records,
+            logreader_base=LOGREADER_BASE_URL,
+            source_id=source_id,
+        )
+    mark_source_imported(driver, source_id, digest, "es-exceptions", path)
+    print(f"  ES exceptions imported: {len(records)} (from {len(docs)} documents)")
+    return len(records)
+
+
+def merged_pr_records(payload: list) -> list[dict]:
+    """Flatten merged_prs_summary.json into (target_tag, number, author_login,
+    commit_hash) records. Each `comparisons` entry's `compared_tags` is
+    "SOURCE_TAG-->TARGET_TAG"; the PRs in `merged_prs` are new as of the
+    TARGET tag -- the same "PRs merged since the previous build" list the
+    CMSSDT dashboard shows under each IB tag's tab. Skips malformed entries
+    (missing/unparseable `number`, no "-->" in `compared_tags`) the same way
+    every other *_records() parser in this file does."""
+    records = []
+    for branch_entry in payload:
+        for comparison in branch_entry.get("comparisons", []):
+            compared_tags = comparison.get("compared_tags") or ""
+            if "-->" not in compared_tags:
+                continue
+            target_tag = compared_tags.split("-->")[-1].strip()
+            if not target_tag:
+                continue
+            for pr in comparison.get("merged_prs", []):
+                try:
+                    number = int(pr.get("number"))
+                except (TypeError, ValueError):
+                    continue
+                records.append({
+                    "target_tag": target_tag,
+                    "number": number,
+                    "author_login": pr.get("author_login"),
+                    "commit_hash": pr.get("hash"),
+                })
+    return records
+
+
+def ingest_merged_prs(driver, path: Path, force: bool = False) -> int:
+    """Populate (PR)-[:MERGED_BEFORE]->(IB) -- see merged_pr_records() for the
+    parsing rules. This relationship and the graph_tools.find_prs_before_ib()
+    query against it were already designed and registered as an LLM tool;
+    only the ingestion side was never built, so it always returned empty.
+    This is that missing half, sourced from cms-sw.github.io's
+    merged_prs_summary.json (already present in a normal --cmsrepo checkout,
+    no separate flag needed).
+
+    One JSON file is one source (same whole-file-hash pattern as
+    ingest_es_exceptions): any change to the file reprocesses the whole
+    thing. PRs attach to every imported IB node sharing the target tag
+    (architecture-independent source-code fact, not tied to one build's
+    architecture). A PR only attaches if it's already imported (from
+    cmsrepo/data/prs) and the target tag matches an already-imported IB --
+    one without the other is silently skipped, not stored, the same rule
+    RelVal exceptions already follow for their own cross-references."""
+    if not path.is_file():
+        print(f"  merged PRs: path not found {path}")
+        return 0
+    source_id = f"merged-prs:{path.resolve()}"
+    digest = file_hash(path)
+    if not source_needs_import(driver, source_id, digest, force):
+        return 0
+
+    payload = json.loads(path.read_text())
+    records = merged_pr_records(payload)
+
+    # Links are only added, never deleted: merged_prs_summary.json keeps just the last few
+    # builds per branch, so deleting the previous import's links first (as this did until
+    # 2026-11-04) dropped every older build's merged-PR list on each refresh, against the
+    # 90-day retention. Which PRs went into a build does not change afterwards.
+    with driver.session() as session:
+        session.run(
+            "UNWIND $records AS record "
+            "MATCH (pr:PR {repo:'cmssw', number:record.number}) "
+            "MATCH (ib:IB {tag:record.target_tag}) "
+            "MERGE (pr)-[rel:MERGED_BEFORE]->(ib) "
+            "SET rel.source_id=$source_id, rel.commit_author_login=record.author_login, "
+            "rel.commit_hash=record.commit_hash",
+            records=records,
+            source_id=source_id,
+        )
+    mark_source_imported(driver, source_id, digest, "merged-prs", path)
+    print(f"  Merged-PR build attachments imported: {len(records)}")
+    return len(records)
 
 
 def ingest_relvals(driver, root: Path, force: bool = False, reconcile: bool = False):
@@ -443,7 +682,13 @@ def ingest_unittests(driver, root: Path, force: bool = False, reconcile: bool = 
 
 
 def build_status_records(entries: list[dict] | dict) -> list[dict]:
-    """Extract per-architecture compilation status from a CMS queue summary."""
+    """Extract per-architecture compilation and addon-test status from a CMS
+    queue summary. addon_status is a whole-architecture pass/fail flag only
+    (from the separate 'addons' list in the same source entry, same shape
+    Release Explorer's summarizeArchCell already renders as a plain badge
+    with no per-test detail) -- the addOnTests.log files themselves are never
+    staged or parsed here, so no per-test name/error/exit-code exists,
+    unlike RelVal/UnitTest."""
     release_name = None
     if isinstance(entries, dict):
         release_name = entries.get("release_name")
@@ -453,11 +698,16 @@ def build_status_records(entries: list[dict] | dict) -> list[dict]:
         tag = entry.get("release_name") or release_name
         if not tag:
             continue
+        addon_by_arch = {
+            addon.get("arch"): addon.get("passed")
+            for addon in entry.get("addons", []) if addon.get("arch")
+        }
         for build in entry.get("builds", []):
             arch = build.get("arch")
             if not arch:
                 continue
             details = build.get("details") or {}
+            addon_passed = addon_by_arch.get(arch)
             records.append({
                 "tag": tag,
                 "arch": arch,
@@ -467,6 +717,7 @@ def build_status_records(entries: list[dict] | dict) -> list[dict]:
                 "status": build.get("passed"),
                 "comp_warnings": details.get("compWarning", 0),
                 "ignored_warnings": details.get("ignoreWarning", 0),
+                "addon_status": None if addon_passed is None else ("passed" if addon_passed else "error"),
             })
     return records
 
@@ -478,10 +729,13 @@ def _ingest_build_status_file(driver, path: Path, force: bool) -> tuple[int, str
         return 0, source_id
     records = build_status_records(json.loads(path.read_text()))
     with driver.session() as session:
+        # Only the IBs this file still lists: the source keeps about 10 days, and an IB that rolled off it keeps its status
+        # (found 2026-11-06: every status older than that was gone, "no build-status record" for builds with results).
         session.run(
-            "MATCH (ib:IB {build_status_source_id:$source_id}) "
-            "REMOVE ib.build_status, ib.comp_warnings, ib.ignored_warnings, ib.build_status_source_id",
-            source_id=source_id,
+            "MATCH (ib:IB {build_status_source_id:$source_id}) WHERE ib.tag IN $tags "
+            "REMOVE ib.build_status, ib.comp_warnings, ib.ignored_warnings, ib.addon_status, "
+            "ib.build_status_source_id",
+            source_id=source_id, tags=sorted({record["tag"] for record in records}),
         )
         session.run(
             "UNWIND $records AS raw "
@@ -489,7 +743,8 @@ def _ingest_build_status_file(driver, path: Path, force: bool) -> tuple[int, str
             "SET ib.tag=raw.tag, ib.arch=raw.arch, ib.release=raw.release, "
             "ib.parent_tag=raw.parent_tag, ib.variant=raw.variant, "
             "ib.build_status=raw.status, ib.comp_warnings=raw.comp_warnings, "
-            "ib.ignored_warnings=raw.ignored_warnings, ib.build_status_source_id=$source_id",
+            "ib.ignored_warnings=raw.ignored_warnings, ib.addon_status=raw.addon_status, "
+            "ib.build_status_source_id=$source_id",
             records=records,
             source_id=source_id,
         )
@@ -537,7 +792,9 @@ def _ingest_pr_file(driver, path: Path, force: bool, reconcile: bool) -> tuple[i
                     continue
                 session.run(
                     "MERGE (pr:PR {repo:$repo, number:$number}) "
-                    "SET pr.pr_key=$pr_key, pr.title=$title, pr.body=$body, pr.merged_at=$merged_at, "
+                    "SET pr.pr_key=$pr_key, pr.title=$title, pr.body=$body, "
+                    # GitHub's own time ends in Z and comes from the export or the web fetch: it wins over the dashboard's
+                    "pr.merged_at=CASE WHEN pr.merged_at ENDS WITH 'Z' THEN pr.merged_at ELSE $merged_at END, "
                     "pr.release=$release, pr.changed_files=$changed_files, pr.additions=$additions, "
                     "pr.deletions=$deletions, pr.sha=$sha, pr.labels=$labels, "
                     "pr.github_state=$github_state, "
@@ -549,7 +806,7 @@ def _ingest_pr_file(driver, path: Path, force: bool, reconcile: bool) -> tuple[i
                     pr_key=pr_key,
                     title=pr.get("title"),
                     body=pr.get("body") or "",
-                    merged_at=to_iso(pr.get("merged_at")),
+                    merged_at=dashboard_time_to_iso(pr.get("merged_at")),
                     release=release,
                     changed_files=pr.get("changed_files"),
                     additions=pr.get("additions"),
@@ -559,7 +816,8 @@ def _ingest_pr_file(driver, path: Path, force: bool, reconcile: bool) -> tuple[i
                     github_state=pr.get("state") or ("closed" if pr.get("merged_at") else "unknown"),
                     content_hash=content_hash,
                     source_id=source_id,
-                    author=pr.get("author", "unknown"),
+                    # "user" is who opened the PR; "author" in these files is the owner of the branch's repository, such as cms-sw or cms-tau-pog (found 2026-11-05: 921 PRs credited wrongly)
+                    author=pr.get("user") or pr.get("author", "unknown"),
                 )
                 imported += 1
         if reconcile:
@@ -608,8 +866,7 @@ def ingest_pr_cache(driver, path: Path, force: bool = False) -> list[dict]:
                 "pr.body='', pr.github_state='unknown' "
                 "SET pr.cache_branch=raw.branch, pr.cache_user_ref=raw.user_ref, "
                 "pr.cache_source_id=$source_id "
-                "MERGE (author:Author {name:raw.author}) "
-                "MERGE (pr)-[:AUTHORED_BY]->(author) "
+                # no author from this file: its "author" is the branch's owner, not who opened the PR, and it gave 902 PRs a second, wrong author (found 2026-11-05)
                 "MERGE (commit:Commit {sha:raw.sha}) "
                 "SET commit.source_id=$source_id "
                 "MERGE (pr)-[:MERGED_AS {source:'cmsrepo-pr-cache'}]->(commit)",
@@ -619,6 +876,45 @@ def ingest_pr_cache(driver, path: Path, force: bool = False) -> list[dict]:
     mark_source_imported(driver, source_id, digest, "pr-cache", path)
     print(f"  PR cache imported: {len(records)}")
     return records
+
+
+def exit_code_records(entries: dict) -> list[dict]:
+    """Normalize cmsrepo's CMSSW exit-code table. A later duplicate key in the
+    source file wins, matching how json.loads already resolved it."""
+    records = []
+    for code_text, name in entries.items():
+        try:
+            code = int(code_text)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(name, str) or not name:
+            continue
+        records.append({"code": code, "name": name})
+    return records
+
+
+def ingest_exit_codes(driver, path: Path, force: bool = False) -> int:
+    """Import CMSSW's exit-code-to-category table (e.g. 16640 -> OtherCMS),
+    sourced from cms-sw.github.io. Static reference data, not IB-scoped."""
+    if not path.is_file():
+        print(f"  exit codes: path not found {path}")
+        return 0
+    source_id = f"exit-codes:{path.resolve()}"
+    digest = file_hash(path)
+    if not source_needs_import(driver, source_id, digest, force):
+        return 0
+    records = exit_code_records(json.loads(path.read_text()))
+    with driver.session() as session:
+        session.run(
+            "UNWIND $records AS record "
+            "MERGE (code:ExitCode {code:record.code}) "
+            "SET code.name=record.name, code.source_id=$source_id",
+            records=records,
+            source_id=source_id,
+        )
+    mark_source_imported(driver, source_id, digest, "exit-codes", path)
+    print(f"  Exit codes imported: {len(records)}")
+    return len(records)
 
 
 def ingest_commands(
@@ -699,6 +995,8 @@ def github_pr_from_issue(issue: dict) -> dict | None:
         "url": issue.get("html_url"),
         "created_at": issue.get("created_at"),
         "updated_at": issue.get("updated_at"),
+        # set only by the stopgap web fetch (ingestion/fetch_github_web_updates.py); a real backup clears it
+        "fetched_via": issue.get("_fetched_via"),
     }
 
 
@@ -717,13 +1015,24 @@ def github_issue_from_issue(issue: dict) -> dict | None:
         "closed_at": issue.get("closed_at"),
         "labels": [label["name"] for label in issue.get("labels", []) if label.get("name")],
         "author": (issue.get("user") or {}).get("login") or "unknown",
+        "fetched_via": issue.get("_fetched_via"),
     }
 
 
+# Not references to GitHub items: stack frames quoted in bodies ("#7  0x0000150c in foo () from /lib") -- found 2026-11-05 when
+# Issue #52323 "linked" PRs #6 and #7, about 6% of the numbers in bodies -- and counters such as "thread #3".
+GITHUB_NOT_A_REFERENCE_PATTERN = re.compile(
+    r"#\d{1,3}\s+(?:0x[0-9a-fA-F]+|<signal\b)"
+    r"|(?m:^[\s>`|]*#\d{1,3}\s+[\w:~<>,*&. -]+\(.*\)(?:\s+(?:at|from)\s.*)?$)"
+    r"|\b(?:thread|frame|event|lumi|stream|step|run|job|module|record|entry|item)\s+#\d+",
+    re.IGNORECASE)
+
+
 def github_reference_numbers(text: str) -> list[int]:
-    text = text or ""
+    text = GITHUB_NOT_A_REFERENCE_PATTERN.sub(" ", text or "")
     return sorted({
-        *(int(number) for number in GITHUB_REFERENCE_PATTERN.findall(text)),
+        # "#3" under 100 is a counter ("tested with whiteRabbit #3"), not one of cmssw's first PRs; a full URL still counts
+        *(int(number) for number in GITHUB_REFERENCE_PATTERN.findall(text) if int(number) >= 100),
         *(int(number) for number in GITHUB_ITEM_URL_PATTERN.findall(text)),
     })
 
@@ -770,8 +1079,15 @@ def _import_raw_pr_batch(session, records: list[dict], force: bool) -> int:
     session.run(
         "UNWIND $records AS raw "
         "MERGE (pr:PR {repo:'cmssw', number:raw.number}) "
+        # never overwrite a newer copy with an older one (an old backup re-imported after the
+        # 2026-11-04 web fetch must not undo the newer states)
+        "WITH pr, raw WHERE coalesce(pr.github_updated_at, '') <= coalesce(raw.updated_at, '') "
         "SET pr.pr_key='cmssw:' + toString(raw.number), pr.title=raw.title, pr.body=raw.body, "
-        "pr.merged_at=raw.merged_at, pr.release=coalesce(pr.release, raw.release), "
+        "pr.fetched_via=raw.fetched_via, "
+        # the release a PR targets is its GitHub milestone, which moves (open PRs are retargeted to the new master):
+        # a newer milestone replaces an older GitHub value; only the dashboard's own value (source_id set) is kept
+        "pr.merged_at=raw.merged_at, pr.release=CASE WHEN pr.source_id IS NULL "
+        "THEN coalesce(raw.release, pr.release) ELSE coalesce(pr.release, raw.release) END, "
         "pr.labels=raw.labels, pr.github_state=raw.state, pr.github_url=raw.url, "
         "pr.github_created_at=raw.created_at, pr.github_updated_at=raw.updated_at, "
         "pr.raw_content_hash=raw.content_hash, pr.raw_source_id=raw.source_id "
@@ -808,7 +1124,9 @@ def _import_raw_issue_batch(session, records: list[dict], force: bool) -> int:
     session.run(
         "UNWIND $records AS raw "
         "MERGE (issue:Issue {issue_key:'cmssw:' + toString(raw.number)}) "
+        "WITH issue, raw WHERE coalesce(issue.updated_at, '') <= coalesce(raw.updated_at, '') "
         "SET issue.repo='cmssw', issue.number=raw.number, issue.title=raw.title, issue.body=raw.body, "
+        "issue.fetched_via=raw.fetched_via, "
         "issue.state=raw.state, issue.github_url=raw.url, issue.created_at=raw.created_at, "
         "issue.updated_at=raw.updated_at, issue.closed_at=raw.closed_at, issue.labels=raw.labels, "
         "issue.raw_content_hash=raw.content_hash, issue.raw_source_id=raw.source_id "
@@ -829,6 +1147,9 @@ def _import_raw_issue_batch(session, records: list[dict], force: bool) -> int:
     return len(changed)
 
 
+GITHUB_COMMENT_FILE_CAP = 100
+
+
 def _import_raw_comment_batch(session, records: list[dict], force: bool) -> int:
     source_ids = [record["source_id"] for record in records]
     hashes = {
@@ -842,9 +1163,12 @@ def _import_raw_comment_batch(session, records: list[dict], force: bool) -> int:
     changed = [record for record in records if force or hashes.get(record["source_id"]) != record["content_hash"]]
     if not changed:
         return 0
+    # The backup keeps only the first 100 comments of some long threads (found 2026-11-06: issue.json says 135, the file has
+    # 100), so a file of exactly 100 must not wipe a longer copy: its comments are added, nothing is removed.
+    replaced = [record["source_id"] for record in changed if len(record["comments"]) != GITHUB_COMMENT_FILE_CAP]
     session.run(
         "MATCH (comment:GitHubComment) WHERE comment.source_id IN $source_ids DETACH DELETE comment",
-        source_ids=[record["source_id"] for record in changed],
+        source_ids=replaced,
     )
     comments = [comment for record in changed for comment in record["comments"]]
     if comments:
@@ -1130,6 +1454,11 @@ def main():
     parser.add_argument("--force", action="store_true", help="reimport unchanged source files")
     parser.add_argument("--reconcile", action="store_true", help="remove records from sources no longer on disk")
     parser.add_argument("--command-history", action="store_true", help="import all historical command snapshots")
+    parser.add_argument(
+        "--es-exceptions-json",
+        help="JSON file from cms-bot's es-cmssw-exceptions.py (e.g. `es-cmssw-exceptions.py > exceptions.JSON`), "
+        "imported as RelVal exceptions -- no CERN SSO or manual log staging needed",
+    )
     args = parser.parse_args()
     if args.clang_logs and not args.ib_tag:
         parser.error("--clang-logs requires --ib-tag")
@@ -1145,9 +1474,13 @@ def main():
     ingest_relval_defaults(driver, cmsrepo / "data" / "RelvalsAvailableResults.json", args.force)
     ingest_unittest_defaults(driver, cmsrepo / "data" / "UnitTestsAvailableResults.json", args.force)
     ingest_relval_exceptions(driver, cmsrepo / "data" / "relvals", args.force, args.reconcile)
+    if args.es_exceptions_json:
+        ingest_es_exceptions(driver, Path(args.es_exceptions_json), args.force)
     ingest_unittests(driver, cmsrepo / "data" / "unitTests", args.force, args.reconcile)
     ingest_prs(driver, cmsrepo / "data" / "prs", args.force, args.reconcile)
     pr_cache = ingest_pr_cache(driver, cmsrepo / "cmssw-prs-cache.json", args.force)
+    ingest_merged_prs(driver, cmsrepo / "data" / "merged_prs_summary.json", args.force)
+    ingest_exit_codes(driver, cmsrepo / "exitcodes.json", args.force)
     ingest_commands(
         driver, cmsrepo / "data" / "commands", pr_cache, args.force,
         args.reconcile, args.command_history,

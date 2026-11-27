@@ -1,0 +1,21 @@
+# The worker: same Python code as the API image, plus git (it keeps cmsrepo,
+# cmssdt-wiki and cms-bot checkouts under /data/sources). Build context = repo root.
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates tzdata \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY graph ./graph
+COPY ingestion ./ingestion
+COPY log_rag ./log_rag
+COPY server ./server
+COPY deploy/vm/worker.py ./worker.py
+COPY deploy/vm/migrate_paths.py ./migrate_paths.py
+
+CMD ["python", "worker.py"]

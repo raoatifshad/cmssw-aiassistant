@@ -14,10 +14,78 @@ from typing import Iterable
 
 IB_TAG_RE = re.compile(r"\b(CMSSW_[A-Za-z0-9_]+_\d{4}-\d{2}-\d{2}-\d{4})\b")
 ARCH_RE = re.compile(
-    r"\b(el\d+|fc\d+)[_\s-]+(amd64|aarch64|riscv64)[_\s-]+(gcc\d+)\b", re.IGNORECASE
+    r"\b(el\d+|fc\d+|slc\d+|cc\d+|cs\d+)[_\s-]+(amd64|aarch64|riscv64|ppc64le)[_\s-]+(gcc\d+)\b", re.IGNORECASE
 )
-PR_RE = re.compile(r"(?:\b(?:pr|mr|pull request|merge request)\s*#?|#)(\d+)\b", re.IGNORECASE)
+PR_RE = re.compile(r"(?:\b(?:pr|mr|pull request|merge request)\s*#?|#)(\d+)\b(?!\.\d)", re.IGNORECASE)
 WORKFLOW_RE = re.compile(r"\bworkflow\s*#?(\d+(?:\.\d+)?)\b", re.IGNORECASE)
+SHIFT_SUMMARY_RE = re.compile(
+    r"\bshift\s*summary\b|\bshift\s*report\b|\bvirtual\s*shift(?:er)?\b|"
+    r"\bwhat\s+changed\s+(?:since|between)\b|\b(?:since|from)\s+the\s+(?:last|previous)\s+(?:ib|build)\b|"
+    # "what are the new failures/errors" is the same request as "what
+    # changed since the last IB" -- "new" only means something relative to
+    # a previous build, so this is inherently a previous-vs-latest
+    # comparison request, not a plain failure-count question. Also covers
+    # "new <noun> [are/is] failing" (e.g. "what new workflows are failing")
+    # -- found live: the exact-noun form above didn't cover this shape, so
+    # it fell through to the raw list of *every* currently-failing workflow
+    # instead of the previous-vs-latest delta the question actually asked
+    # for ("only those absent in the previous release"). A bounded gap
+    # (rather than requiring "new" and the failure noun to be adjacent) also
+    # covers a category noun in between -- "new relval failures", "new unit
+    # test failures", "new build warnings" -- found live: naming two IBs and
+    # asking for one category's new failures ("what are the new relval
+    # failures between <A> and <B>") fell through to the two-IB
+    # comparison-or-single-build clarification instead of answering, because
+    # the old exact-adjacency pattern only matched "new failures" with
+    # nothing in between.
+    r"\bnew\b[^?!]{0,20}\b(?:failures?|errors?|warnings?|issues?)\b|"
+    r"\bnew\b[^?!]{0,30}\bfailing\b|"
+    # Reversed order: "relval failures are new [between <A> and <B>]" --
+    # found live alongside the gap above, same underlying question, just
+    # phrased with the category noun and "new" swapped.
+    r"\b(?:failures?|errors?|warnings?|issues?)\b[^?!]{0,10}\b(?:is|are)\s+new\b|"
+    # "anything new broken since this morning's IB?" / "what regressed since
+    # yesterday" -- found live 2026-10-06 tester run: no failure noun, so none
+    # of the above matched and the uppercase "IB" became a GitHub text search.
+    r"\bnew(?:ly)?\b[^?!]{0,20}\b(?:broken|broke|regress(?:ed|ions?)?)\b|"
+    r"\b(?:broken|broke|regress(?:ed|ions?)?)\b[^?!]{0,30}\bsince\b|"
+    r"\bsince\s+(?:(?:this|the)\s+morning|yesterday|(?:last|this)\s+night|today|the\s+last\s+(?:ib|build))\b|"
+    r"\bwhat'?s\s+new\b|"
+    # "what's newly failing in the last 3 days" (found live 2026-10-15 getting the latest
+    # IB's failure overview: "newly" never matched \bnew\b)
+    r"\bnewly\s+(?:failing|failed|broken|broke)\b|"
+    # "summarize the week for CMSSW_20_1_X" (held-out pass 2026-10-15: LLM tool-name leak)
+    r"\bsummar(?:y|ise|ize)\b[^?!]{0,30}\b(?:the\s+|this\s+|last\s+|past\s+)?(?:week|\d+\s+days?)\b|"
+    r"\b(?:fail(?:ing|ed|ures?)?|broken|broke|regress\w*)\b[^?!]{0,30}\b(?:in|over|during)\s+the\s+(?:last|past)\s+\d+\s+days?\b|"
+    # shifter openers found 2026-10-16 ending in raw list_ib_tags dumps: "what broke between
+    # yesterday and today", "what should the shifter look at today", "give me the morning
+    # report", "I'm the shifter today, where do I start", "is the IB getting better or worse"
+    r"\b(?:broke|broken|changed|regress\w*)\b[^?!]{0,20}\bbetween\s+yesterday\s+and\s+today\b|"
+    r"\bshifters?\b[^?!]{0,40}\b(?:look\s+at|check|start|focus|worry|watch)\b[^?!]{0,20}\b(?:today|now|first|this\s+morning)\b|"
+    r"\b(?:where|how)\s+(?:do|should)\s+i\s+start\b|"
+    # "what should I check first as a shifter today?" (found 2026-11-03: LLM dead end)
+    r"\bwhat\s+should\s+(?:i|we|the\s+shifter)\s+(?:check|look\s+at|watch|focus\s+on)\b[^?!]{0,40}"
+    r"\b(?:first|today|now|shift(?:er)?)\b|"
+    r"\bmorning\s+(?:report|summary|digest|check)\b|\b(?:daily|today'?s)\s+(?:report|summary|digest)\b|"
+    r"\b(?:getting|got)\s+(?:better|worse)\b|\bbetter\s+or\s+worse\b|"
+    # found 2026-11-04: "overview of IB health this week" (one build only), "did anything get
+    # fixed today?", "which unit tests started failing this week?", "summary for the shift meeting"
+    r"\b(?:overview|health|status|state)\b[^?!]{0,30}\b(?:this|last|past)\s+(?:week|\d+\s+days?)\b|"
+    r"\b(?:get|got|been|was|were)\s+(?:fixed|resolved)\b[^?!]{0,30}\b(?:today|yesterday|this\s+week|since)\b|"
+    r"\banything\s+(?:get\s+|got\s+)?(?:fixed|resolved)\b|"
+    r"\b(?:better|worse)\s+than\b|"
+    r"\bwhat(?:'s|\s+has)?\s+changed\s+in\s+(?:the\s+)?(?:ib\s+of\s+)?(?:CMSSW_|20\d\d-)|"
+    r"\bstarted\s+(?:to\s+)?fail(?:ing)?\b|"
+    r"\bshift(?:er)?\s+(?:meeting|handover|hand-over)\b",
+    re.IGNORECASE,
+)
+
+
+RANKING_RE = re.compile(
+    r"\bmost\s+(?:often|frequent(?:ly)?|common(?:ly)?)\b|\btop\s+\d+\b|\bhow\s+often\b|\bfrequently\b|"
+    r"\bmost\s+failing\b|\bfail(?:s|ed)?\s+the\s+most\b",
+    re.IGNORECASE,
+)
 
 
 class Scope(StrEnum):
@@ -30,6 +98,12 @@ class PlanKind(StrEnum):
     DETERMINISTIC = "deterministic"
     CLARIFICATION = "clarification"
     LLM = "llm"
+
+
+# "what failed in the 2026-10-30-1100 20_1 build?": here "build" is the IB, not its compilation (found 2026-11-06: only the
+# build status, or "no build-status record", for an IB with RelVal and unit-test results).
+_BUILD_MEANS_THE_IB_RE = re.compile(
+    r"\bwhat(?:'s|\s+is|\s+was|\s+are)?\s+(?:fail\w*|broken|wrong|red)\b(?:(?!\bwarnings?\b).)*\b(?:in|on|of|for)\s+(?:the\s+|that\s+|this\s+)?(?:[\w.:-]+\s+){0,4}build\b(?!\s+(?:status|logs?|errors?|warnings?))")
 
 
 @dataclass(frozen=True)
@@ -47,6 +121,7 @@ class RequestContext:
     has_failure_request: bool = False
     has_comparison_request: bool = False
     has_relationship_request: bool = False
+    has_shift_summary_request: bool = False
     is_bare_ib_tag: bool = False
 
     @property
@@ -60,15 +135,25 @@ class RequestContext:
         architecture = "_".join(architecture_match.groups()).lower() if architecture_match else None
         lowered = question.lower()
         categories: set[str] = set()
-        if re.search(r"\brel[\s-]*vals?\b", lowered):
+        # (?<![\w-]) / (?![\w-]) rather than \b: a hyphen is a \b boundary, so
+        # Jenkins job names like "ib-run-gpu-relvals" / "build-any-ib" used to
+        # trigger the relval / build categories (found live 2026-10-06; the same
+        # bug _normalize_deterministic_question already fixed for its own
+        # relvals->relval rewrite). "workflow" in a process sense ("PR approval
+        # workflow", "release workflow") isn't a RelVal workflow either.
+        if re.search(r"(?<![\w-])rel[\s-]*vals?(?![\w-])", lowered) or re.search(
+            r"(?<!approval )(?<!review )(?<!release )(?<!request )(?<!github )(?<!jenkins )(?<!ci )"
+            r"(?<![\w-])(?:wfs?|work\s*flows?)(?![\w-])",
+            lowered,
+        ):
             categories.add("relval")
-        if re.search(r"\bunit[\s-]*tests?\b", lowered):
+        if re.search(r"\bunit(?:[\s-]*tests?)?\b", lowered) or re.search(r"\bpackages?\b", lowered):
             categories.add("unittest")
         if re.search(r"\bclang\b", lowered):
             categories.add("clang")
-        if re.search(r"\b(?:build|warnings?)\b", lowered):
+        if re.search(r"(?<![\w-])(?:build|warnings?)(?![\w-])", lowered) and not _BUILD_MEANS_THE_IB_RE.search(lowered):
             categories.add("build")
-        if re.search(r"\b(?:pr|mr|pull\s+request|merge\s+request|issues?)\b", lowered):
+        if re.search(r"\b(?:prs?|mrs?|pull\s+requests?|merge\s+requests?|issues?)\b", lowered):
             categories.add("pr_evidence")
         scope = Scope.EXPLICIT_ARCHITECTURE if architecture else (
             Scope.ALL if re.search(r"\b(?:all|everything)\b", lowered) else Scope.DEFAULT
@@ -85,9 +170,33 @@ class RequestContext:
             scope=scope,
             categories=frozenset(categories),
             has_summary_request=bool(re.search(r"\b(?:summary|summarize|results?|show|provide)\b", lowered)),
-            has_failure_request=bool(re.search(r"\b(?:fail(?:ing|ed|ures?)|errors?)\b", lowered)),
+            # "anything red on aarch64", "how bad is the latest IB", "is it broken"
+            # are failure questions too -- found live 2026-10-06 (held-out tester
+            # set) never reaching the failure overview.
+            has_failure_request=bool(re.search(
+                r"\b(?:fail(?:s|ing|ed|ures?)?|errors?|red|green|clean|broken|breaks?|problems?|unhealthy|health)\b|"
+                r"\ball\s+(?:good|ok|fine)\b|\beverything\s+(?:ok|fine|good|passing)\b|"
+                r"\bhow\s+(?:bad|healthy|good)\b|\bwhat(?:'s|\s+is)\s+wrong\b|"
+                r"\bstatus\s+of\s+(?:the\s+)?(?:today'?s\s+|latest\s+|last\s+|current\s+)?ibs?\b",
+                lowered,
+            )),
             has_comparison_request=bool(re.search(r"\b(?:compare|comparison|delta|difference)\b", lowered)),
-            has_relationship_request=bool(re.search(r"\b(?:why|parent|sub[\s-]*ib|variant)\b", lowered)),
+            # Bare "why" used to count -- found live 2026-10-06 (held-out set 2):
+            # "why is HeterogeneousCore/MPICore failing" was answered "<tag> is a
+            # primary IB, not a sub-IB variant". "why" only signals the
+            # relationship question when it's about how an IB was shown/classed.
+            has_relationship_request=bool(re.search(
+                r"\b(?:parent|sub[\s-]*ib|variant)\b|"
+                r"\bwhy\b[^?!]{0,40}\b(?:show(?:n|ed)?|list(?:ed)?|call(?:ed)?|consider(?:ed)?|treat(?:ed)?|"
+                r"mark(?:ed)?|classif(?:y|ied)|primary)\b",
+                lowered,
+            )),
+            # a ranking over a window ("which workflow failed most often in the last 14 days")
+            # is the frequent-failure report, not a two-build diff (found 2026-11-03)
+            # ... nor "any new sanitizer errors?" -- the digest has no sanitizer section (2026-11-04)
+            has_shift_summary_request=bool(SHIFT_SUMMARY_RE.search(question)) and not RANKING_RE.search(question)
+            and not re.search(r"\bsanitizer\b|\b(?:asan|ubsan)\b[^?!]{0,20}\b(?:errors?|problems?|reports?|findings?)\b",
+                              question, re.IGNORECASE),
             is_bare_ib_tag=bare_tag,
         )
 
@@ -103,6 +212,8 @@ class Capability:
     requires_failures: bool = False
     requires_comparison: bool = False
     requires_relationship: bool = False
+    requires_shift_summary: bool = False
+    requires_no_categories: bool = False
     bare_tag_only: bool = False
     llm_only: bool = False
     priority: int = 0
@@ -122,7 +233,11 @@ class Capability:
             return None
         if self.requires_relationship and not context.has_relationship_request:
             return None
+        if self.requires_shift_summary and not context.has_shift_summary_request:
+            return None
         if self.bare_tag_only and not context.is_bare_ib_tag:
+            return None
+        if self.requires_no_categories and context.categories:
             return None
         score = self.priority
         score += 20 * len(self.required_categories)
@@ -131,6 +246,7 @@ class Capability:
         score += 8 if self.requires_failures else 0
         score += 8 if self.requires_comparison else 0
         score += 8 if self.requires_relationship else 0
+        score += 8 if self.requires_shift_summary else 0
         score += 16 if self.bare_tag_only else 0
         score += 4 if context.architecture else 0
         return score
@@ -176,7 +292,7 @@ def validate_llm_plan(raw: object, capabilities: Iterable[Capability], allowed_t
     for tool_call in tool_calls:
         if not isinstance(tool_call, dict):
             return None
-        name = tool_call.get("name")
+        name = str(tool_call.get("name") or "").split("<|", 1)[0].strip()  # harmony token leak
         arguments = tool_call.get("arguments")
         if name not in allowed_tools or not isinstance(arguments, dict):
             return None
@@ -224,23 +340,54 @@ class RequestPlanner:
         if pending.missing_field != "category" or not context.categories:
             return None
         self.pending.pop(session_id, None)
-        return RequestContext.extract(f"{context.question} {pending.context['tag']}")
+        # An architecture named in the ORIGINAL ambiguous question (the one
+        # that triggered this clarification) must survive into the resolved
+        # follow-up -- found live, 2026-09-21: "how many ibs are failing for
+        # el9_amd64_gcc14 for release <tag>" triggered this clarification,
+        # but replying "summary for <tag>" (the exact canned "Combined
+        # summary" choice text, which never carried the architecture either
+        # -- see _clarification below) silently widened the answer to every
+        # imported architecture instead of just the one originally asked
+        # about, with no indication anything had been dropped.
+        arch_suffix = f" {pending.context['arch']}" if pending.context.get("arch") else ""
+        return RequestContext.extract(f"{context.question} {pending.context['tag']}{arch_suffix}")
 
-    @staticmethod
-    def _clarification(context: RequestContext) -> Clarification | None:
-        if context.tag and context.has_failure_request and not context.categories:
+    def _clarification(self, context: RequestContext) -> Clarification | None:
+        # "what is failing in <tag>" with no category used to ask "build
+        # warnings, failed RelVals, unit-test results, or a combined IB
+        # summary?" -- 126 of 128 clarifications in the 2026-10-06 replay of
+        # real sessions. It is now answered directly by the "failure_overview"
+        # capability (everything failing, every category); this branch only
+        # remains for a planner built without that capability registered.
+        if (
+            context.tag and context.has_failure_request
+            and not context.categories and not context.has_shift_summary_request
+            and not any(capability.name == "failure_overview" for capability in self.capabilities)
+        ):
+            arch_suffix = f" {context.architecture}" if context.architecture else ""
+            clarification_context = {"tag": context.tag}
+            if context.architecture:
+                clarification_context["arch"] = context.architecture
             return Clarification(
                 missing_field="category",
                 question="Do you want build warnings, failed RelVals, unit-test results, or a combined IB summary?",
-                context={"tag": context.tag},
+                context=clarification_context,
                 choices=(
-                    ("Build warnings", f"build warnings for {context.tag}"),
-                    ("RelVal failures", f"failed RelVals for {context.tag}"),
-                    ("Unit-test results", f"unit tests for {context.tag}"),
-                    ("Combined summary", f"summary for {context.tag}"),
+                    ("Build warnings", f"build warnings for {context.tag}{arch_suffix}"),
+                    ("RelVal failures", f"failed RelVals for {context.tag}{arch_suffix}"),
+                    ("Unit-test results", f"unit tests for {context.tag}{arch_suffix}"),
+                    ("Combined summary", f"summary for {context.tag}{arch_suffix}"),
                 ),
             )
-        if len(context.ib_tags) > 1 and not context.has_comparison_request:
+        if (
+            len(context.ib_tags) > 1 and not context.has_comparison_request
+            and not context.has_shift_summary_request
+        ):
+            # Mirrors the single-tag guard above: "what's new failing between
+            # <A> and <B>" is already an unambiguous shift-summary request
+            # (has_shift_summary_request), just like "shift summary for <tag>"
+            # is unambiguous for the single-tag case -- neither needs the
+            # generic "comparison or single build?" clarification.
             return Clarification(
                 missing_field="intent",
                 question="Do you want a comparison of these Integration Builds, or results for one specific build?",

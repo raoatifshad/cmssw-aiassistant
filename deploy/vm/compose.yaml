@@ -1,0 +1,85 @@
+# The chatbot backend as it will run on the CERN VM: Neo4j + API + worker.
+# Programs live in containers; ALL data lives under ${DATA_DIR} on the host, so
+# containers can be deleted and recreated at any time without losing anything.
+#
+#   cd deploy/vm && cp .env.example .env   # fill in, never commit .env
+#   podman compose -p ${PROJECT} up -d --build
+#
+# OpenSearch/Logstash are deliberately left out (2026-11-16): they only ever held
+# one smoke-test event and no chat answer has used them; without OPENSEARCH_URL
+# the API falls back to reading its archive files.
+#
+# SELinux labels: a folder used by ONE container gets :Z (private label); results/, received/
+# and clang-logs/ are used by BOTH api and worker and get :z (shared). With :Z on both, the
+# container started last takes the folder and the other gets "Permission denied"
+# (found 2026-11-17: the worker saw no results after the api was recreated).
+services:
+  neo4j:
+    image: docker.io/library/neo4j:5.26.29   # pinned: a dump loads cleanly into the same version
+    restart: always
+    stop_grace_period: 2m      # a database must never be SIGKILLed after podman's default 10 s
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-512m}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-512m}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512m}
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - ${DATA_DIR:?set DATA_DIR in .env}/neo4j:/data:Z
+      - ${DATA_DIR}/backups:/backups:Z
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  api:
+    build:
+      context: ../..            # the repo root, same Dockerfile as today
+    restart: always
+    env_file: .env              # LLM gateway, session secret, shifter settings
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      LOG_RAG_ARCHIVE_DIR: /data/log-rag
+      CLANG_LOG_ROOT: /data/clang-logs
+      TEST_LOG_RECEIVED_DIR: /data/received # where POST /api/test-logs/batch saves batches (the worker merges them)
+      TEST_LOG_RESULTS_DIR: /data/results   # where POST /api/test-logs/ingest saves scan files (token: TEST_LOGS_INGEST_TOKEN in .env)
+    ports:
+      - "${API_PORT:-8001}:8001"
+    volumes:
+      - ${DATA_DIR}/log-rag:/data/log-rag:Z
+      - ${DATA_DIR}/clang-logs:/data/clang-logs:ro,z
+      - ${DATA_DIR}/results:/data/results:z
+      - ${DATA_DIR}/received:/data/received:z
+    depends_on:
+      neo4j:
+        condition: service_healthy
+
+  worker:                       # scheduled imports (worker.py): test logs every 5 min, refresh 00:30/12:30
+    build:
+      context: ../..
+      dockerfile: deploy/vm/Containerfile.worker
+    restart: always
+    stop_grace_period: 1m
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      TZ: ${TZ:-Europe/Zurich}  # 00:30 means CERN time
+      WORKER_STEPS: ${WORKER_STEPS:-cmsrepo exceptions docs}
+      WORKER_REFRESH_AT: ${WORKER_REFRESH_AT:-00:30,12:30}
+      WORKER_CMSREPO_AT: ${WORKER_CMSREPO_AT:-}  # empty = every hour at :30
+      WORKER_TESTLOGS_EVERY_MIN: ${WORKER_TESTLOGS_EVERY_MIN:-5}
+      RECEIVED_KEEP_DAYS: ${RECEIVED_KEEP_DAYS:-7}   # imported batches; 0 = delete at once
+    volumes:
+      - ${DATA_DIR}/results:/data/results:z
+      - ${DATA_DIR}/received:/data/received:z
+      - ${DATA_DIR}/clang-logs:/data/clang-logs:ro,z
+      - ${DATA_DIR}/sources:/data/sources:Z
+      - ${DATA_DIR}/worker:/data/worker:Z
+    depends_on:
+      neo4j:
+        condition: service_healthy

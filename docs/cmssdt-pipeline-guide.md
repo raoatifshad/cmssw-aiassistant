@@ -148,6 +148,61 @@ A raw export provides `issue.json` and `comments.json` data, either in a
 directory or a tar archive. The importer classifies pull requests and ordinary
 Issues, imports their authors and labels, and stores discussion comments.
 
+Unlike `cmsrepo` (git submodule, bumped regularly) and the exceptions feed
+(refreshed via a routine `--es-exceptions-json` run), **this source has no
+automatic refresh** — it drifts until someone manually re-syncs it. Check
+staleness before assuming an answer about "the latest Issue/PR" is current.
+
+**Where the live data lives:** `cmssdt9-02.cern.ch`, path
+`/data/sdt/SDT/public/github/cms-sw/cmssw/issues` (owned by `cmsbuild`; needs
+a `cmsbld`/root shell on that host to read). It's produced by `cms-bot`'s
+`github_backup.py`, which is itself incremental — it only re-fetches issues
+updated since its own checkpoint. That checkpoint lives at
+`issues/latest.txt` on `cmssdt9-02` as a Unix timestamp; decode it to sanity-check
+freshness before syncing:
+
+```bash
+# on cmssdt9-02
+cat /data/sdt/SDT/public/github/cms-sw/cmssw/issues/latest.txt
+date -d @<value> -u
+```
+
+If that date isn't recent, the upstream backup job hasn't run — syncing won't
+add anything new until someone re-runs it there.
+
+**Direct inbound SSH from a normal dev machine to `cmssdt9-02` does not
+work** (confirmed: the connection closes mid-GSSAPI-handshake, from both a
+direct attempt and via an `lxplus` jump host) — it looks like `cmssdt9-02`
+restricts inbound SSH to an allowlist that doesn't include general logins.
+The sync has to be **pushed from `cmssdt9-02` outward** instead, which does
+work:
+
+```bash
+# run this ON cmssdt9-02 (as cmsbld/root), pushing OUT to the chatbot host
+rsync -avz --info=progress2 \
+  /data/sdt/SDT/public/github/cms-sw/cmssw/issues/ \
+  <local-user>@<local-host-ip>:/home/rao/CHAT-BOT-AI/GITHUB-ISSUES/issues/
+```
+
+Then, back on the chatbot host, ingest it:
+
+```bash
+PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
+  --cmsrepo cmsrepo \
+  --github-issues /home/rao/CHAT-BOT-AI/GITHUB-ISSUES/issues \
+  --reconcile
+```
+
+Watch the printed `GitHub raw PRs imported: N; issues imported: M; comment
+files imported: K` line — since imports are content-hashed per Issue/PR, `N`
+and `M` reflect only what actually changed, not the full export size. Verify
+in Neo4j afterward if needed:
+
+```cypher
+MATCH (i:Issue {repo:'cmssw'}) RETURN max(i.number), count(i)
+MATCH (p:PR {repo:'cmssw'}) RETURN max(p.number), count(p)
+```
+
 ### External Clang logs
 
 Clang diagnostics are kept independently of `cmsrepo` under this layout:
@@ -158,6 +213,35 @@ Clang diagnostics are kept independently of `cmsrepo` under this layout:
 
 The parser extracts diagnostic locations and associates them with package,
 file, and checker facts.
+
+### IB test logs (cmssdt9-02)
+
+The dashboard data only says whether each test passed. The raw logs on
+`cmssdt9-02:/data/sdt/buildlogs/` (`unitTestLogs.zip`, `addOnTests.zip`,
+`pyRelValMatrixLogs.zip` per IB, architecture and GPU/other variant) show
+what happened inside, and the server deletes them after about one week.
+
+```text
+cmssdt9-02 --rsync--> IB-TEST-LOGS/server-copy/ --fetch_ib_test_logs.py--> results/*.json.gz --ingest_test_logs.py--> Neo4j
+                                   (deleted once scanned)                  (kept, a few MB/day)
+```
+
+- `ib_test_log_scanner.py` reads every log line by line and keeps every
+  test/workflow with its status, plus exceptions, crashes, sanitizer
+  reports, assertions, tracebacks and infrastructure errors, with the test
+  they belong to and whether it passed. Warnings and plain error lines are
+  grouped, and debug output is dropped.
+- `fetch_ib_test_logs.py` keeps a ledger, so nothing is scanned twice. It
+  keeps the local copy of a zip that failed and retries it, and at the end
+  lists every zip the dashboard expects that was never scanned.
+- `ingest_test_logs.py` stores `TestLogRun`, `LogProblem`,
+  `ProblemSignature` and `ProblemFirstSeen` nodes (see
+  `current-neo4j-database-structure.md`, section 7).
+
+The copy is a pull from the chatbot host (`rsync root@cmssdt9-02.cern.ch:...`),
+which works for `/data/sdt/buildlogs/` (used daily since 2026-10-12). The exact
+rsync command and the routine are in the README section "IB test logs". Run it
+at least every few days, or logs are lost.
 
 ## Incremental Ingestion
 

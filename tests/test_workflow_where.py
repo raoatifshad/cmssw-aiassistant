@@ -1,0 +1,270 @@
+"""DAS_ERROR RelVal status (importer + backfill) and the cross-build "where is workflow X
+failing" answer. Found 2026-10-15: 38551.85 had DAS_ERROR at step1 in all 250 imported
+runs but was stored as PASSED, and "where is 38551.85 failing?" got the latest IB's
+failure overview while a bare "38551.85" got the "couldn't match that" menu."""
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import backfill_relval_status
+from build_graph import relval_status
+from server.api_server import _relval_scope_summary, _release_extreme_answer, _workflow_where_failing_answer
+
+
+class RelvalStatusTests(unittest.TestCase):
+    def test_status_rule(self):
+        self.assertEqual(relval_status([{"status": "PASSED"}, {"status": "FAILED"}]), "FAILED")
+        self.assertEqual(relval_status([{"status": "DAS_ERROR"}]), "DAS_ERROR")
+        self.assertEqual(relval_status([{"status": "DAS_ERROR"}, {"status": "FAILED"}]), "FAILED")
+        self.assertEqual(relval_status([{"status": "PASSED"}]), "PASSED")
+        self.assertEqual(relval_status([]), "PASSED")
+
+    def test_backfill_reads_the_same_keys_build_graph_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            day = Path(tmp) / "el9_amd64_gcc14" / "2026-10-12-1100"
+            day.mkdir(parents=True)
+            (day / "CMSSW_20_1_X.json").write_text(json.dumps([
+                {"id": "38551.85", "steps": [{"status": "DAS_ERROR"}]},
+                {"id": "1.0", "steps": [{"status": "PASSED"}]},
+                {"id": "2.0", "steps": [{"status": "FAILED"}]},
+            ]))
+            rows = backfill_relval_status.wanted_statuses(Path(tmp))
+        self.assertEqual(rows, [
+            {"key": "CMSSW_20_1_X_2026-10-12-1100:el9_amd64_gcc14:38551.85", "status": "DAS_ERROR"},
+            {"key": "CMSSW_20_1_X_2026-10-12-1100:el9_amd64_gcc14:2.0", "status": "FAILED"},
+        ])
+
+    @patch("server.api_server.get_driver")
+    def test_summary_counts_das_errors_separately(self, get_driver):
+        get_driver.return_value.session.return_value.__enter__.return_value.run.return_value = [
+            {"workflow_id": "38551.85"}]
+        record = {"tag": "CMSSW_20_1_X_2026-10-12-1100", "arch": "el9_amd64_gcc14", "relval_total": 951,
+                  "failed_relvals": 0, "passed_relvals": 950, "known_error_relvals": 0, "das_error_relvals": 1}
+        answer = _relval_scope_summary([record], "RelVals")
+        self.assertTrue(answer.startswith("🟠"))  # not green: one workflow could not run
+        self.assertIn("950 passed, 1 DAS error (input files not found, nothing ran; the IB dashboard counts these as failed)", answer)
+        self.assertIn("1 DAS error(s): `38551.85`", answer)
+
+
+def _rows(tag, archs, variant="primary", status="DAS_ERROR", exitcode=1, name="HydjetQMinBias_5519GeV+Run4D128_hi"):
+    return [{"tag": tag, "arch": arch, "variant": variant, "name": name, "status": status, "exitcode": exitcode,
+             "known_error": False, "known_error_message": None} for arch in archs]
+
+
+class WorkflowWhereTests(unittest.TestCase):
+    def _patch_graph(self, relvals, details=(), exceptions=()):
+        session = MagicMock()
+
+        def run(query, **params):
+            if "RAN_RELVAL" in query:
+                return relvals
+            if "TestLogRun" in query:
+                return [{"detail": d} for d in details]
+            return list(exceptions)
+        session.run.side_effect = run
+        driver = MagicMock()
+        driver.session.return_value.__enter__.return_value = session
+        return patch("server.api_server.get_driver", return_value=driver)
+
+    def test_das_error_everywhere(self):
+        relvals = (_rows("CMSSW_20_1_X_2026-10-14-2300", ["el9_amd64_gcc14", "el8_amd64_gcc14"])
+                   + _rows("CMSSW_20_1_CLANG_X_2026-10-14-2300", ["el9_amd64_gcc14"], variant="CLANG")
+                   + _rows("CMSSW_20_0_X_2026-10-07-2300", ["el8_aarch64_gcc13"]))
+        detail = "38551.85_HydjetQMinBias_5519GeV+Run4D128_hi: step1=DAS_ERROR step2=NOTRUN; exit 1 0"
+        with self._patch_graph(relvals, [detail, detail]), \
+                patch("server.api_server.get_exit_code_names", return_value={}):
+            for question in ("where is 38551.85 failing?", "38551.85", "wf 38551.85", "is workflow 38551.85 failing"):
+                answer = _workflow_where_failing_answer(question, "s")
+                self.assertIn("is **failing everywhere**: it did not pass in any of its 4 imported run(s)",
+                              answer, question)
+        self.assertIn("Runs: 🟠 4 DAS error", answer)
+        self.assertIn("could not get its input files from DAS", answer)
+        self.assertIn("every run of `CMSSW_20_0`, `CMSSW_20_1`, in 2 build type(s) (primary, CLANG)", answer)
+        self.assertNotIn("| Release |", answer)  # the sentence already says "everywhere"
+        self.assertIn("`step1=DAS_ERROR step2=NOTRUN; exit 1 0` -- 2 run(s)", answer)
+        # no "<IB tag>" placeholder: the Shift Console rendered it as "[object Object]"
+        self.assertNotIn("<", answer)
+        self.assertIn("\"why is workflow 38551.85 failing in CMSSW_20_1_X_2026-10-14-2300\"", answer)
+
+    def test_mixed_results_list_where_it_failed(self):
+        relvals = (_rows("CMSSW_20_1_X_2026-10-13-2300", ["el9_amd64_gcc14"], status="FAILED", exitcode=256, name="W")
+                   + _rows("CMSSW_20_1_X_2026-10-12-2300", ["el9_amd64_gcc14"], status="PASSED", exitcode=0, name="W")
+                   + _rows("CMSSW_17_0_X_2026-10-13-2300", ["el8_amd64_gcc12"], status="PASSED", exitcode=0, name="W"))
+        with self._patch_graph(relvals), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is 512.0 failing", "s")
+        self.assertTrue(answer.startswith("Workflow `512.0` (`W`) is **now failing in 1 place**"))
+        self.assertIn("`CMSSW_20_1` primary on `el9_amd64_gcc14` (failing since `CMSSW_20_1_X_2026-10-13-2300`)", answer)
+        self.assertIn("Runs: 🔴 1 failed · 🟢 2 passed", answer)
+        self.assertIn("Never failed in 1 other release series (`CMSSW_17_0`).", answer)
+
+    def test_since_is_per_architecture_and_an_old_last_run_is_named(self):
+        """Found live 2026-11-06 on 539.0: the primary row said "since 10-29-1100", taken from riscv
+        (last run 10-29); el9 passed until 11-02-1100 and failed from 11-02-2300."""
+        def run(tag, arch, status):
+            return _rows(tag, [arch], status=status, exitcode=0 if status == "PASSED" else 31744, name="W")
+        relvals = (run("CMSSW_20_1_X_2026-10-29-1100", "fc42_riscv64_gcc15", "FAILED")
+                   + run("CMSSW_20_1_X_2026-10-29-2300", "fc42_riscv64_gcc15", "FAILED")
+                   + run("CMSSW_20_1_X_2026-11-02-1100", "el9_amd64_gcc14", "PASSED")
+                   + run("CMSSW_20_1_X_2026-11-02-2300", "el9_amd64_gcc14", "FAILED")
+                   + run("CMSSW_20_1_X_2026-11-05-2300", "el9_amd64_gcc14", "FAILED"))
+        with self._patch_graph(relvals), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is 539.0 failing", "s")
+        self.assertIn("`el9_amd64_gcc14` (failing since `CMSSW_20_1_X_2026-11-02-2300`)", answer)
+        self.assertIn("`fc42_riscv64_gcc15` (last run 2026-10-29) (failing since `CMSSW_20_1_X_2026-10-29-1100`)", answer)
+        self.assertNotIn("`el9_amd64_gcc14` (last run", answer)
+
+    def test_table_has_one_row_per_start_date(self):
+        def run(tag, arch, status="FAILED"):
+            return _rows(tag, [arch], status=status, exitcode=0 if status == "PASSED" else 31744, name="W")
+        relvals = (run("CMSSW_20_1_X_2026-11-01-2300", "el9_amd64_gcc14", "PASSED")
+                   + run("CMSSW_20_1_X_2026-11-02-2300", "el9_amd64_gcc14")
+                   + run("CMSSW_20_1_X_2026-11-02-2300", "el8_amd64_gcc14")
+                   + run("CMSSW_20_1_X_2026-11-03-2300", "el10_amd64_gcc15"))
+        for flavour in ("ASAN", "CLANG", "DBG", "DEVEL", "ROOT6"):
+            relvals += _rows(f"CMSSW_20_1_{flavour}_X_2026-11-02-2300", ["el9_amd64_gcc14"], variant=flavour,
+                             status="FAILED", exitcode=31744, name="W")
+        with self._patch_graph(relvals), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is 539.0 failing", "s")
+        self.assertIn("| `CMSSW_20_1` | primary | `el8_amd64_gcc14`, `el9_amd64_gcc14` | failing | `CMSSW_20_1_X_2026-11-02-2300` |", answer)
+        self.assertIn("| `CMSSW_20_1` | primary | `el10_amd64_gcc15` | failing | `CMSSW_20_1_X_2026-11-03-2300` |", answer)
+
+    def test_recovered_workflow_says_so_and_ignores_other_names_and_stale_exceptions(self):
+        """Found live 2026-10-15 on 1349.0: failed only in the 10-09..10-11 builds, passing
+        since, but the answer read as still failing; it also showed test-log DAS errors
+        from CMSSW_8_0 (a differently named 1349.0) and an August EVTGEN3 exception."""
+        relvals = (_rows("CMSSW_20_1_X_2026-10-09-2300", ["el9_amd64_gcc14"], status="FAILED", exitcode=256, name="BsToMuMu_13")
+                   + _rows("CMSSW_20_1_X_2026-10-12-2300", ["el9_amd64_gcc14"], status="PASSED", exitcode=0, name="BsToMuMu_13")
+                   + _rows("CMSSW_8_0_X_2026-10-11-0000", ["slc7_amd64_gcc530"], status="DAS_ERROR", name="Other_13+INPUT"))
+        details = ["1349.0_BsToMuMu_13: step1=PASSED step2=PASSED step3=FAILED; exit 0 0 256",
+                   "1349.0_Other_13+INPUT: step1=DAS_ERROR step2=NOTRUN; exit 1 0"]
+        exceptions = [
+            {"tag": "CMSSW_20_1_X_2026-10-09-2300", "arch": "el9_amd64_gcc14", "category": "LogicError", "message": "now"},
+            {"tag": "CMSSW_20_1_EVTGEN3_X_2026-08-12-2300", "arch": "el9_amd64_gcc13", "category": "PluginNotFound",
+             "message": "EvtGen130"},
+        ]
+        with self._patch_graph(relvals, details, exceptions), \
+                patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is workflow 1349.0 failing", "s")
+        self.assertIn("is **not failing now**: the newest run passed everywhere. "
+                      "It last failed in `CMSSW_20_1_X_2026-10-09-2300`", answer)
+        self.assertIn("Earlier failures, passing since: `CMSSW_20_1` primary (build 2026-10-09-2300).", answer)
+        self.assertIn("step3=FAILED", answer)
+        self.assertNotIn("DAS_ERROR", answer)
+        self.assertIn("**[LogicError]** now", answer)
+        self.assertNotIn("EvtGen130", answer)
+        self.assertIn("Not counted above: 1 run(s) in `CMSSW_8_0`", answer)
+
+    def test_old_release_step_list_names_are_the_same_workflow(self):
+        """Found 2026-11-04: 12_4 stores "RunDoubleMuon2016C+RunDoubleMuon2016C+RAWRECOTE16", 13_0 "RunDoubleMuon2016C";
+        "is 136.9 failing everywhere?" left 12_4 out."""
+        relvals = (_rows("CMSSW_12_4_X_2026-11-03-2300", ["el8_amd64_gcc10"], status="FAILED", exitcode=256,
+                         name="RunDoubleMuon2016C+RunDoubleMuon2016C+RAWRECOTE16")
+                   + _rows("CMSSW_13_0_X_2026-11-03-2300", ["el8_amd64_gcc11"], status="FAILED", exitcode=256, name="RunDoubleMuon2016C"))
+        with self._patch_graph(relvals, [], []), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is workflow 136.9 failing", "s-names")
+        self.assertIn("CMSSW_12_4", answer)
+        self.assertIn("CMSSW_13_0", answer)
+        self.assertNotIn("Not counted above", answer)
+
+    def test_still_failing_track_is_named_with_its_start(self):
+        relvals = (_rows("CMSSW_20_1_X_2026-10-12-2300", ["el9_amd64_gcc14"], status="PASSED", exitcode=0, name="W")
+                   + _rows("CMSSW_20_1_X_2026-10-13-2300", ["el9_amd64_gcc14"], status="FAILED", exitcode=256, name="W")
+                   + _rows("CMSSW_20_1_X_2026-10-14-2300", ["el9_amd64_gcc14"], status="FAILED", exitcode=256, name="W")
+                   + _rows("CMSSW_20_1_X_2026-10-14-2300", ["el8_amd64_gcc14"], status="PASSED", exitcode=0, name="W"))
+        with self._patch_graph(relvals), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is 7.0 workflow failing", "s")
+        self.assertIn("is **now failing in 1 place**", answer)
+        self.assertIn("`CMSSW_20_1` primary on `el9_amd64_gcc14` (failing since `CMSSW_20_1_X_2026-10-13-2300`)", answer)
+
+    def test_known_errors_are_not_counted_as_failing_places(self):
+        relvals = (_rows("CMSSW_20_1_CLANG_X_2026-10-14-2300", ["el9_amd64_gcc14"], variant="CLANG",
+                         status="FAILED", exitcode=18944, name="W")
+                   + _rows("CMSSW_20_1_X_2026-10-14-2300", ["el9_amd64_gcc14"], status="PASSED", exitcode=0, name="W"))
+        known = _rows("CMSSW_17_0_X_2026-10-14-2300", ["el8_aarch64_gcc13"], status="FAILED", exitcode=256, name="W")
+        known[0].update(known_error=True, known_error_message="GridPacks were built for x86_64")
+        with self._patch_graph(relvals + known), patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_where_failing_answer("where is 512.0 failing", "s")
+        self.assertIn("is **now failing in 1 place**", answer)
+        self.assertIn("`CMSSW_20_1` CLANG on `el9_amd64_gcc14` (failing since", answer)
+        self.assertIn("Known error, excluded from failure counts, in 1 place: `CMSSW_17_0` primary on "
+                      "`el8_aarch64_gcc13` (known error since `CMSSW_17_0_X_2026-10-14-2300`).", answer)
+
+    def test_why_without_tag_falls_back_to_every_build_when_latest_ib_lacks_it(self):
+        from server.api_server import _workflow_why_failing_answer
+        relvals = _rows("CMSSW_20_1_X_2026-10-14-2300", ["el9_amd64_gcc14"])
+        session = MagicMock()
+
+        def run(query, **params):
+            if "ib.parent_tag = $tag" in query:
+                return []  # the latest IB has no record of the workflow yet
+            if "RAN_RELVAL" in query:
+                return relvals
+            return []
+        session.run.side_effect = run
+        driver = MagicMock()
+        driver.session.return_value.__enter__.return_value = session
+        with patch("server.api_server.get_driver", return_value=driver), \
+                patch("server.api_server._latest_ib_records", return_value=[{"tag": "CMSSW_20_1_X_2026-10-15-0900"}]), \
+                patch("server.api_server.get_exit_code_names", return_value={}):
+            answer = _workflow_why_failing_answer("why is workflow 38551.85 failing", "why-no-tag")
+        self.assertIn("is **failing everywhere**", answer)
+        self.assertIn("Runs: 🟠 1 DAS error", answer)
+        self.assertNotIn("has no imported RelVal record", answer)
+
+    def test_other_handlers_keep_their_questions(self):
+        with self._patch_graph([]) as get_driver:
+            for question in ("why is 38551.85 failing", "38551.85 any PR?", "is there an issue for workflow 38551.85",
+                             "where is 38551.85 failing in CMSSW_20_1_X_2026-10-14-2300",
+                             "relval exception for 38551.85", "what is failing in the latest IB"):
+                self.assertIsNone(_workflow_where_failing_answer(question, "s"), question)
+            get_driver.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ReleaseExtremeTests(unittest.TestCase):
+    """Found 2026-11-06: 20_1 named as having the newest build with 16_1 newer, and 10_6 as the oldest with 16_1 older."""
+    ROWS = [
+        {"tag": "CMSSW_20_1_X_2026-11-05-2300", "arch": "el9_amd64_gcc14", "relvals": 954, "unittests": 381},
+        {"tag": "CMSSW_16_1_X_2026-11-06-1100", "arch": "el8_amd64_gcc13", "relvals": 0, "unittests": 308},
+        {"tag": "CMSSW_12_4_HLT_X_2026-11-06-1100", "arch": "el8_amd64_gcc10", "relvals": 1, "unittests": 0},
+        {"tag": "CMSSW_10_6_X_2026-07-26-0000", "arch": "el7_amd64_gcc7", "relvals": 0, "unittests": 0},
+        {"tag": "CMSSW_16_1_X_2026-07-23-2300", "arch": "el8_amd64_gcc13", "relvals": 0, "unittests": 0},
+        {"tag": "CMSSW_20_1_X_2026-07-23-2300", "arch": "el9_amd64_gcc14", "relvals": 0, "unittests": 0},
+        {"tag": "CMSSW_20_1_X_2026-10-26-2300", "arch": "el9_amd64_gcc14", "relvals": 954, "unittests": 381},
+    ]
+
+    def _ask(self, question, session="s1"):
+        driver = MagicMock()
+        driver.session.return_value.__enter__.return_value.run.return_value = self.ROWS
+        with patch("server.api_server.get_driver", return_value=driver):
+            return _release_extreme_answer(question, session)
+
+    def test_newest_goes_by_date_and_says_what_latest_ib_means(self):
+        answer = self._ask("which release has the newest build?", "n1")
+        self.assertIn("`2026-11-06-1100`, in **2 release series**: `CMSSW_12_4`, `CMSSW_16_1`", answer)
+        self.assertIn("may still be importing", answer)
+        self.assertIn("highest release series is `CMSSW_20_1`", answer)
+        self.assertNotIn("| `CMSSW_20_1_X_2026-11-05-2300`", answer)
+
+    def test_oldest_lists_every_series_and_the_oldest_with_results(self):
+        answer = self._ask("which release series has the oldest imported build", "o1")
+        self.assertIn("`2026-07-23-2300`, in **2 release series**: `CMSSW_16_1`, `CMSSW_20_1`", answer)
+        self.assertNotIn("CMSSW_10_6", answer)
+        self.assertIn("oldest build with RelVal results is from `2026-10-26-2300`", answer)
+
+    def test_short_follow_up_only_straight_after_this_answer(self):
+        self.assertIsNone(self._ask("which has the oldest?", "f1"))
+        self.assertIsNotNone(self._ask("which release has the newest build?", "f2"))
+        self.assertIn("Oldest imported", self._ask("which has the oldest?", "f2"))
+        self.assertIsNone(self._ask("failed relvals for CMSSW_20_1_X_2026-11-05-2300", "f2"))
+        self.assertIsNone(self._ask("and the newest?", "f2"))
+
+    def test_other_questions_are_left_alone(self):
+        for question in ("which release has the most failures?", "what is the latest IB?",
+                         "which release has the newest failing workflow?", "which flavour has the oldest build?"):
+            self.assertIsNone(self._ask(question, "x"), question)

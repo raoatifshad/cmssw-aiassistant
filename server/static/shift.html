@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CMSSDT Shift Console</title>
+  <style>
+    :root {
+      --ink: #152423;
+      --muted: #60716d;
+      --line: #cedbd6;
+      --paper: #f5f6ef;
+      --panel: #ffffff;
+      --teal: #087f78;
+      --teal-dark: #05655f;
+      --orange: #d8642b;
+      --alert-ink: #8e2b1f;
+      --alert-bg: #fff1ed;
+      --alert-line: #e3a292;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background-color: var(--paper);
+      background-image: linear-gradient(90deg, rgba(8, 127, 120, .05) 1px, transparent 1px), linear-gradient(rgba(8, 127, 120, .05) 1px, transparent 1px);
+      background-size: 28px 28px;
+      font-family: Georgia, "Times New Roman", serif;
+    }
+    .shell { max-width: 1060px; margin: 0 auto; padding: 28px 24px 48px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 18px; flex-wrap: wrap; margin-bottom: 22px; }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .mark { width: 42px; height: 42px; display: grid; place-items: center; border: 2px solid var(--teal); color: var(--teal); font: 700 18px/1 Georgia, serif; }
+    h1 { margin: 0; font-size: 21px; }
+    .subhead { margin: 3px 0 0; color: var(--muted); font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .who { display: flex; align-items: center; gap: 12px; font: 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
+    a.btn, button.btn {
+      padding: 9px 12px; color: var(--teal-dark); background: var(--panel); border: 1px solid var(--teal);
+      font: 600 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-decoration: none; cursor: pointer;
+    }
+    a.btn:hover, button.btn:hover { color: #fff; background: var(--teal); }
+    section.panel { background: var(--panel); border: 1px solid var(--line); box-shadow: 6px 6px 0 rgba(8, 127, 120, .1); padding: 22px 24px; margin-bottom: 20px; }
+    section.panel h2 { margin-top: 0; font-size: 17px; }
+    .status-line { color: var(--muted); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; margin: -6px 0 16px; }
+    .alert-row { padding: 10px 12px; margin-bottom: 8px; color: var(--alert-ink); background: var(--alert-bg); border-left: 3px solid var(--alert-line); font-size: 14px; }
+    .alert-row strong { display: block; font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; margin-bottom: 4px; }
+    .none { color: var(--muted); font-style: italic; }
+    .digest h2 { font-size: 19px; border-bottom: 1px solid var(--line); padding-bottom: 6px; margin-top: 26px; }
+    .digest h3 { font-size: 16px; color: var(--teal-dark); margin-top: 22px; }
+    .digest h4 { font-size: 14px; margin: 16px 0 6px; }
+    .digest table { border-collapse: collapse; width: 100%; margin: 8px 0 14px; font-size: 13px; }
+    .digest th, .digest td { border: 1px solid var(--line); padding: 5px 8px; text-align: left; }
+    .digest th { background: #eef3f1; }
+    .digest ul { margin: 6px 0 14px; padding-left: 20px; }
+    .digest li { margin-bottom: 4px; font-size: 13px; line-height: 1.5; }
+    .digest code { background: #eef3f1; padding: 1px 4px; font-size: 12px; }
+    .digest p { line-height: 1.6; }
+    .digest hr { border: none; border-top: 1px solid var(--line); margin: 18px 0; }
+    .error-box { padding: 20px; color: var(--alert-ink); background: var(--alert-bg); border: 1px solid var(--alert-line); }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <div class="mark">SH</div>
+        <div>
+          <h1>CMSSDT Shift Console</h1>
+          <p class="subhead">Not the IB dashboard — evidence-linked shift digest and live alerts, shifter-only.</p>
+        </div>
+      </div>
+      <div class="who">
+        <span id="whoami">checking access&hellip;</span>
+        <button class="btn" id="refresh">Refresh</button>
+        <a class="btn" href="/shift/logout">Sign out</a>
+      </div>
+    </header>
+
+    <div id="content">
+      <section class="panel">
+        <h2>Active alerts</h2>
+        <div class="status-line" id="alerts-status">Loading&hellip;</div>
+        <div id="alerts-list"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Shift summary</h2>
+        <div class="status-line" id="digest-status">Loading&hellip;</div>
+        <div class="digest" id="digest"></div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    function escapeHtml(text) {
+      return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function inline(text) {
+      let out = escapeHtml(text);
+      out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+      out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      return out;
+    }
+
+    // Minimal renderer for exactly the Markdown subset generate_shift_summary()
+    // produces (headers, tables, bullet lists, bold/code, hr) -- not a general
+    // Markdown parser, and deliberately not one: every text fragment goes through
+    // escapeHtml() before any markup is added back, so ingested content (PR
+    // titles, warning messages) can never inject HTML.
+    function renderMarkdown(markdown) {
+      const lines = markdown.split("\n");
+      const html = [];
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        if (line.startsWith("#### ")) { html.push(`<h4>${inline(line.slice(5))}</h4>`); i++; continue; }
+        if (line.startsWith("### ")) { html.push(`<h3>${inline(line.slice(4))}</h3>`); i++; continue; }
+        if (line.startsWith("## ")) { html.push(`<h2>${inline(line.slice(3))}</h2>`); i++; continue; }
+        if (line.trim() === "---") { html.push("<hr>"); i++; continue; }
+        if (line.startsWith("|")) {
+          const rows = [];
+          while (i < lines.length && lines[i].startsWith("|")) { rows.push(lines[i]); i++; }
+          const cellsOf = (row) => row.split("|").slice(1, -1).map((cell) => cell.trim());
+          const header = cellsOf(rows[0]);
+          const body = rows.slice(2); // rows[1] is the "| --- | ---: |" separator
+          html.push("<table><thead><tr>" + header.map((cell) => `<th>${inline(cell)}</th>`).join("") + "</tr></thead><tbody>");
+          for (const row of body) {
+            html.push("<tr>" + cellsOf(row).map((cell) => `<td>${inline(cell)}</td>`).join("") + "</tr>");
+          }
+          html.push("</tbody></table>");
+          continue;
+        }
+        if (line.startsWith("- ")) {
+          const items = [];
+          while (i < lines.length && lines[i].startsWith("- ")) { items.push(lines[i].slice(2)); i++; }
+          html.push("<ul>" + items.map((item) => `<li>${inline(item)}</li>`).join("") + "</ul>");
+          continue;
+        }
+        if (line.trim() === "") { i++; continue; }
+        html.push(`<p>${inline(line)}</p>`);
+        i++;
+      }
+      return html.join("\n");
+    }
+
+    async function requireAuth() {
+      const res = await fetch("/api/shift-whoami");
+      if (res.status === 401) { window.location.href = "/shift/login"; return null; }
+      if (res.status === 403) {
+        document.getElementById("content").innerHTML =
+          '<div class="error-box">This CERN account is not on the shifter allowlist. Ask whoever maintains ' +
+          "<code>SHIFTER_CERN_USERNAMES</code> to add you.</div>";
+        document.getElementById("whoami").textContent = "access denied";
+        return null;
+      }
+      const data = await res.json();
+      document.getElementById("whoami").textContent = "signed in as " + data.username;
+      return data.username;
+    }
+
+    async function loadAlerts() {
+      const statusEl = document.getElementById("alerts-status");
+      const listEl = document.getElementById("alerts-list");
+      statusEl.textContent = "Loading…";
+      try {
+        const res = await fetch("/api/alerts/status");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        statusEl.textContent = data.fired + " rule(s) currently triggered.";
+        if (!data.fired) {
+          listEl.innerHTML = '<p class="none">No alerts currently firing.</p>';
+          return;
+        }
+        listEl.innerHTML = data.alerts.map((item) => (
+          `<div class="alert-row"><strong>${escapeHtml(item.rule.name)}</strong>${inline(item.message)}</div>`
+        )).join("");
+      } catch (err) {
+        statusEl.textContent = "Could not load alert status: " + err.message;
+      }
+    }
+
+    async function loadDigest() {
+      const statusEl = document.getElementById("digest-status");
+      const digestEl = document.getElementById("digest");
+      statusEl.textContent = "Loading…";
+      try {
+        const res = await fetch("/api/shift-summary");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        statusEl.textContent = "Served from the cached digest when the scheduled job has already run for this build pair, otherwise generated live.";
+        digestEl.innerHTML = renderMarkdown(data.markdown);
+      } catch (err) {
+        statusEl.textContent = "Could not load shift summary: " + err.message;
+      }
+    }
+
+    async function refreshAll() {
+      await requireAuth();
+      await Promise.all([loadAlerts(), loadDigest()]);
+    }
+
+    document.getElementById("refresh").addEventListener("click", refreshAll);
+    refreshAll();
+  </script>
+</body>
+</html>

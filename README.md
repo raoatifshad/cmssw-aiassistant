@@ -51,6 +51,63 @@ outside `cmsrepo` and must have this layout:
 /home/rao/CHAT-BOT-AI/CLANG-LOGS/<ib-tag>/<arch>/build-logs/**/log.html
 ```
 
+### Shifter documentation (optional, additive)
+
+A second, static evidence source the chat LLM can cite alongside live graph
+facts: CMSSW/CMSSDT shifter documentation (Jenkins job runbooks,
+release-cycle procedures, CI topology). Cloned locally once, like `cmsrepo`
+— never fetched live during a chat request.
+
+```bash
+git clone --depth 1 https://github.com/cms-sw/cmssdt-wiki.git shifter-wiki
+
+PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_shifter_docs.py \
+  --wiki-root shifter-wiki \
+  --cmsrepo cmsrepo \
+  --reconcile
+```
+
+`--cmsrepo` here additionally ingests `cmsrepo`'s own unused top-level `*.md`
+pages (`troubleshooting.md`, `faq.md`, etc.) — `build_graph.py` only ever
+reads `cmsrepo/data/...`, so these sit on disk unused otherwise. Re-running
+is incremental (same `ImportState` content-hashing as every other source);
+pass `--force` to reimport unchanged files. Skipping this step entirely is
+safe: `search_shifter_docs` degrades to "no documentation evidence" if the
+`DocChunk` fulltext index has nothing in it yet.
+
+### RelVal exception logs
+
+The CMSSDT logreader (`cmssdt.cern.ch/SDT/cgi-bin/logreader/...`) requires a
+CERN SSO login, so exceptions are sourced from Elasticsearch instead: run
+cms-bot's `es-cmssw-exceptions.py` and redirect its output to a file, kept at
+the fixed path `/home/rao/CHAT-BOT-AI/exceptions-json-file/exceptions.json` —
+
+```bash
+es-cmssw-exceptions.py > /home/rao/CHAT-BOT-AI/exceptions-json-file/exceptions.json
+```
+
+— then pass that file with `--es-exceptions-json`. Ingestion parses each
+document's `exception` field (category, message, context — a single document
+can concatenate several occurrences of the same category back to back) and
+links them to the matching `RelVal` via `HAS_EXCEPTION`. There's no exact
+source-line citation this way (an ES document is a structured field, not a
+byte offset into a real log file), but coverage is far broader than manually
+staging individual logs, since one export can span many releases and
+architectures at once. The whole file is tracked as a single hashed source,
+so overwriting it with a fresh export and re-running ingestion picks up the
+update automatically — no code changes needed:
+
+```bash
+PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
+  --cmsrepo cmsrepo \
+  --es-exceptions-json /home/rao/CHAT-BOT-AI/exceptions-json-file/exceptions.json \
+  --reconcile
+```
+
+An exception only attaches if its `release`/`architecture`/`workflow` already
+matches an ingested `RelVal` record — one without the other is silently
+skipped, not stored.
+
 Run the normal update after refreshing `cmsrepo` or adding Clang logs:
 
 ```bash
@@ -64,6 +121,127 @@ PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/b
 been deleted. Use `--force` only when intentionally reprocessing all sources.
 IBs are identified by both their timestamped tag and architecture, so results
 for `el9_amd64_gcc13` and `el9_amd64_gcc14` remain distinct.
+
+### IB test logs (unit tests, addOn tests, RelVals) from cmssdt9-02
+
+The dashboard only says whether a test passed. A test can pass even though
+its log contains a fatal exception, a crash, a sanitizer report or an
+infrastructure error, and nobody sees it. This pipeline reads the raw logs
+so those problems are stored and can be shown to the shifter.
+
+**Source:** `cmssdt9-02:/data/sdt/buildlogs/<arch>/www/<day>/<queue>/<IB tag>/`
+(plus `gpu/<type>/` and `other/<name>/` sub-folders) holds
+`unitTestLogs.zip`, `addOnTests.zip` (+ `addOnTests.log`) and
+`pyRelValMatrixLogs.zip` for every IB. **The server deletes them after about
+one week**, so the routine below has to run at least every few days.
+
+**Flow:** copy → scan → keep the extracted facts → delete the copy. The raw
+logs are never kept; `results/` (a few MB per day) is.
+
+1. Copy new zips into `/home/rao/CHAT-BOT-AI/IB-TEST-LOGS/server-copy/`
+   with rsync. `results/rsync-exclude.txt` (rewritten by every scan run)
+   keeps already-finished zips from being downloaded again:
+
+   ```bash
+   mkdir -p /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results && touch /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results/rsync-exclude.txt   # first time only
+   rsync -a --prune-empty-dirs --info=progress2 \
+     --exclude-from=/home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results/rsync-exclude.txt \
+     --exclude='/filtered/' \
+     --include='/*/' --include='/*/www/' --include='/*/www/*/' --include='/*/www/*/*/' \
+     --include='/*/www/*/*/CMSSW_*/' \
+     --include='/*/www/*/*/CMSSW_*/gpu/' --include='/*/www/*/*/CMSSW_*/gpu/*/' \
+     --include='/*/www/*/*/CMSSW_*/other/' --include='/*/www/*/*/CMSSW_*/other/*/' \
+     --include='unitTestLogs.zip' --include='unitTestLogs.zip.checked' \
+     --include='addOnTests.zip' --include='addOnTests.zip.checked' --include='addOnTests.log' \
+     --include='pyRelValMatrixLogs.zip' \
+     --exclude='*' \
+     root@cmssdt9-02.cern.ch:/data/sdt/buildlogs/ /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/server-copy/
+   ```
+
+   A full week is ~250 GB, ~100 GB of it the three DBG RelVal zips (~33 GB
+   each). When disk is short, add `--max-size=5G` first (skips only the DBG
+   RelVal zips), run step 2, then rsync again without it.
+
+2. Scan and delete the copies (`--dry-run` first to see what it would do):
+
+   ```bash
+   cd cmsrepo && git fetch --prune origin master && git reset --hard origin/master \
+     && git sparse-checkout reapply && cd ..
+   nohup env PYTHONPATH=ingestion venv/bin/python ingestion/fetch_ib_test_logs.py \
+     --no-server --delete-local > /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/fetch.log 2>&1 &
+   ```
+
+   It can run while rsync is still copying (it only takes zips rsync has
+   finished); run it once more after rsync ends. Each zip's facts go to
+   `results/<suite>/<arch>/<tag>/<variant>/*.json.gz` and
+   `results/ledger.jsonl`; only then is the zip deleted. A zip that fails to
+   scan keeps its local copy and is retried next run. The end of `fetch.log`
+   lists every zip the dashboard data (cmsrepo) expects that is neither
+   scanned nor in `server-copy/` (`MISSING`, also in `results/missing.txt`):
+   copy those before the server deletes them.
+
+   Without `--no-server` the script lists and copies from the server itself
+   over ssh (open one ssh `ControlMaster` connection first, see the script's
+   docstring); `--delete-local` is then only needed for zips you copied by hand.
+
+3. Import into Neo4j (incremental; unchanged results files are skipped):
+
+   ```bash
+   PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python \
+     ingestion/ingest_test_logs.py --results /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results
+   ```
+
+**What is extracted** (`ingestion/ib_test_log_scanner.py`, logs are streamed,
+never loaded whole — one CLANG log has a single 2 GB line):
+
+- every unit test, addOn test step and RelVal workflow, with its status from
+  the log itself — passing ones included;
+- fatal exceptions, sanitizer/UBSan reports, crashes, assertions, uncaught
+  exceptions, Python tracebacks and known infrastructure errors, with up to
+  60 evidence lines, the test they belong to and whether it passed;
+- MessageLogger warnings/errors grouped by category, and plain lines that
+  say error/failed, both grouped (millions of repeated lines become a few
+  hundred records); `%MSG-i`/`%MSG-d` debug output is dropped.
+
+Each problem gets a normalized signature (dates, paths, IB names, numbers,
+host names, GUIDs and hex values stripped), so the same problem is
+recognised across IBs and architectures. That gives "first seen"/"last seen",
+and lets a pasted exception (whole or a fragment) be matched later through the
+`logProblemText` fulltext index.
+
+**Not stored:** the raw logs, `%MSG-i`/`%MSG-d` messages, minified JavaScript
+(a test prints a downloaded web page), stack frames beyond 20, evidence
+beyond 60 lines per problem, and plain error lines beyond 1,000 distinct ones
+per test (those are still counted). The server path of each zip is kept,
+even though it stops resolving after about a week.
+
+**In the chat:** a pasted error -- a CMSSW exception, sanitizer report,
+traceback, assertion or crash, whole or a fragment -- is looked up in these
+logs first (`search_test_log_problems`, also available to the LLM path). The
+paste is read with the same parser as the logs, so the same problem from
+another run is an exact match; otherwise the answer says the exact error is
+not in the logs and shows, each under its own heading, problems that contain
+the pasted text, problems sharing its specific names (plugin, class, module,
+library -- never just the exception category), and same-category problems in
+an IB the paste names. All of these run at once: an exact signature lookup,
+the pasted text, every specific name (matched whole in the `logProblemNames`
+index, which holds the modules, producers and names of *every* occurrence --
+not just the stored example) and the producer ("same producer, different
+message"). Weak matches (only ordinary identifiers in common) are shown only
+when nothing stronger is found, and the answer ends with every key it
+searched by and how many problems each found. When the paste shows it was raised by a build-time
+tool such as `edmWriteConfigs`, the answer says it belongs in build logs, not
+test logs. The answer lists the tests/workflows that hit it and their status ("reported as
+PASSED in all N runs"), how many IBs and architectures, first/last IB seen,
+whether newer builds no longer show it, any IB named in the question, and one
+evidence excerpt with its log location. PRs/Issues the text names by number are
+looked up, PRs/Issues mentioning the paste's specific names are listed (most
+names first), and the category-only GitHub matches follow, shortened and
+labelled as broader context.
+
+The graph never gets new `IB` nodes from this import: results attach to IBs
+already imported from the dashboard data, and ones imported earlier are linked
+on a later run once their IB exists.
 
 ### Primary and sub-IB runs
 
@@ -101,6 +279,14 @@ PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/b
 The graph retains explicit `#number` and CMSSW GitHub URL references found in
 PR/Issue bodies and comments. These links are textual facts, not evidence that
 one PR caused, fixed, or depends on another item.
+
+Unlike `cmsrepo` and the exceptions feed, **this source has no automatic
+refresh** and will silently go stale. The live export lives on
+`cmssdt9-02.cern.ch:/data/sdt/SDT/public/github/cms-sw/cmssw/issues`; see
+"Raw CMSSW GitHub export" in `docs/cmssdt-pipeline-guide.md` for the full
+sync procedure (freshness check via `issues/latest.txt`, why the sync must be
+pushed *from* `cmssdt9-02` rather than pulled, and the exact `rsync`/ingest
+commands).
 
 ## Run the API server
 
@@ -147,6 +333,99 @@ overwrites imported IB or warning facts.
   "ib_tag": "CMSSW_20_1_X_2026-08-10-1100"
 }
 ```
+
+An `accepted` correction (`verdict: incorrect` with a `corrected_answer`)
+becomes a durable `Concept` fact, retrievable in later chats — but never
+because a user asserted it, only because the same evidence gate above
+confirmed it against the graph. That trust isn't permanent: run
+`ingestion/revalidate_feedback.py` on a schedule (same standalone,
+cron-invoked pattern as `ingestion/run_alerts.py`) to re-check `pending`
+feedback against the graph as it changes, and to re-verify active Concepts
+before they expire — a Concept that no longer holds is revoked
+automatically, and one that comes back undecidable gets a single grace
+period before revocation. No human review step is involved at any point;
+the graph is always the one deciding.
+
+```bash
+# crontab, once a day
+0 3 * * * cd /path/to/cmssdt-kg-chatbot && \
+    NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/revalidate_feedback.py
+```
+
+`CONCEPT_TTL_DAYS` (default 14) and `CONCEPT_PENDING_GRACE_DAYS` (default 3)
+control the expiry and grace windows; `--limit` bounds how many rows a single
+run re-checks, since each re-check may cost an LLM call.
+
+## Router shadow mode
+
+The deterministic router is regex/keyword-based, so it only ever recognizes
+the phrasings someone has already tested — a phrasing it doesn't recognize
+either gets no answer or falls to the constrained LLM investigation path.
+Rather than hand-patching a new regex for every new phrasing forever
+(unbounded, no stopping point), `ENABLE_ROUTER_SHADOW=true` logs an
+independent LLM classification of every question next to the deterministic
+router's choice (`RouterShadowLog` nodes) — purely for comparison, **never**
+used to answer. This is the evidence to look at before ever considering
+promoting an LLM router to *select* a capability more robustly than regex
+matching — the answer itself must always stay Cypher-only, that doesn't
+change either way.
+
+Summarize accumulated agreement/disagreement:
+
+```bash
+NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/summarize_router_shadow.py --days 7
+```
+
+`ENABLE_ANSWER_SYNTHESIS=true` is a separate, independent flag: it lets an
+LLM rephrase an already-deterministic answer into more natural prose,
+verified to preserve every number in it before being shown, falling back to
+the original deterministic text otherwise. Both flags are off by default in
+`.env.example` since each costs a real per-message LLM call.
+
+### Capability dead-end fallback
+
+The router correctly picking a capability doesn't guarantee that
+capability's own regex-driven `_*_answer()` helpers recognize the exact
+phrasing — when they don't, `chat()` used to give up immediately with a flat
+"No imported local evidence is available for the selected `X` request"
+message, even though the same evidence-gated LLM investigation path
+described above was one step away and already reachable from every other
+routing gap in the same function. `ENABLE_CAPABILITY_FALLBACK_TO_LLM=true`
+closes that one remaining dead end: instead of the flat message, it falls
+through to that same investigation path (still Cypher-tool-only, still
+verified against evidence before being shown). Off by default for a safe
+rollout — flip it, re-ask a phrasing that used to dead-end, and compare
+against the flat-message baseline before leaving it on. Unlike
+`ENABLE_ROUTER_SHADOW`/`ENABLE_ANSWER_SYNTHESIS`, this only adds an LLM call
+on the minority of messages that would otherwise dead-end, not on every
+message, so it's a safer default-on candidate once validated.
+
+### Deterministic answer verification
+
+Deterministic routing only ever tests keyword/substring presence, never
+phrase-level meaning — so "workflows that are NOT failing" and "workflows
+that are failing" both trigger the same "failing" keyword in the relval
+handler and can return the identical, wrong-for-one-of-them answer. Found
+live 2026-09-22: both phrasings returned "No failing RelVals were found",
+even though the negated question actually wanted the passing workflows.
+
+`ENABLE_DETERMINISTIC_ANSWER_VERIFICATION=true` closes this gap: every
+deterministic capability answer is checked against the full question with a
+small, constrained LLM call (`verify_answer_matches_question`,
+`server/agent.py`) — the same non-agentic pattern as
+`propose_capability_classification`, judging yes/no only, never writing the
+answer itself. A mismatch reroutes through the same evidence-gated LLM
+investigation path used elsewhere (`_run_llm_investigation`) instead of
+showing the wrong answer. The verifier fails open at the call site — any
+error (network, timeout, malformed response) defaults to trusting the
+deterministic answer, so a verifier-layer failure can never be worse than
+not having verification at all.
+
+Unlike `ENABLE_CAPABILITY_FALLBACK_TO_LLM`, this one *does* cost an LLM call
+on every deterministic answer, not just misses. Off by default — not for
+LLM-call cost, but because the verifier itself isn't infallible and needs
+validating against real traffic before it's trusted to override a
+deterministic answer by default.
 
 ## Log RAG platform
 
@@ -234,6 +513,9 @@ ingestion/
   clang_parser.py    — standalone clang warning extractor (same proven regex)
   build_graph.py     — reads raw sources, builds the Neo4j graph
   ingest_json_logs.py — chunked JSONL importer for large backfills
+  ib_test_log_scanner.py — streams unit/addOn/RelVal log zips, extracts tests + problems
+  fetch_ib_test_logs.py  — copy → scan → results/ → delete, for the cmssdt9-02 test logs
+  ingest_test_logs.py    — imports results/ into Neo4j (TestLogRun, LogProblem, ...)
 graph/
   neo4j_conn.py      — connection helper, schema constraints
   tools.py           — Cypher query tools the LLM calls

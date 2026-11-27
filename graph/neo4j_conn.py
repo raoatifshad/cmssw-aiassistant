@@ -41,6 +41,10 @@ def setup_schema(driver):
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Warning) REQUIRE n.key IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:RelVal) REQUIRE n.key IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:RelValException) REQUIRE n.key IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:ExitCode) REQUIRE n.code IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Concept) REQUIRE n.concept_id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:AlertRule) REQUIRE n.rule_id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:RouterShadowLog) REQUIRE n.log_id IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:UnitTest) REQUIRE n.key IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:PRComment) REQUIRE n.key IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:GitHubComment) REQUIRE n.key IS UNIQUE",
@@ -56,20 +60,59 @@ def setup_schema(driver):
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Build) REQUIRE n.tag IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Service) REQUIRE n.name IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Host) REQUIRE n.name IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:DocChunk) REQUIRE n.id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:TestLogRun) REQUIRE n.key IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:LogProblem) REQUIRE n.key IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:ProblemSignature) REQUIRE n.signature_id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:ProblemFirstSeen) REQUIRE n.key IS UNIQUE",
         "CREATE INDEX IF NOT EXISTS FOR (n:IB) ON (n.tag)",
         "CREATE INDEX IF NOT EXISTS FOR (n:IB) ON (n.release)",
         "CREATE INDEX IF NOT EXISTS FOR (n:IB) ON (n.parent_tag)",
         "CREATE INDEX IF NOT EXISTS FOR (n:PR) ON (n.repo, n.number)",
         "CREATE INDEX IF NOT EXISTS FOR (n:WorkflowCommand) ON (n.workflow_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:RelVal) ON (n.ib_key)",
+        # get_relval_recurrence looks a workflow up across every build; without this it
+        # read every RelVal (~950k db hits, 110 ms at 475k rows, 2026-10-15) and grew with them
+        "CREATE INDEX IF NOT EXISTS FOR (n:RelVal) ON (n.workflow_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:RelValException) ON (n.ib_key, n.workflow_id)",
+        # per-workflow exception lookups (digest evidence, chat) filter on workflow_id alone
+        "CREATE INDEX IF NOT EXISTS FOR (n:RelValException) ON (n.workflow_id)",
         "CREATE INDEX IF NOT EXISTS FOR (n:UnitTest) ON (n.ib_key)",
         "CREATE INDEX IF NOT EXISTS FOR (n:Warning) ON (n.package)",
         "CREATE INDEX IF NOT EXISTS FOR (n:ChatTurn) ON (n.turn_order)",
         "CREATE INDEX IF NOT EXISTS FOR (n:EventOccurrence) ON (n.timestamp)",
         "CREATE INDEX IF NOT EXISTS FOR (n:EventOccurrence) ON (n.severity)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:Concept) ON (n.status, n.expires_at)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:UserFeedback) ON (n.status)",
         "CREATE FULLTEXT INDEX github_artifact_text IF NOT EXISTS "
         "FOR (n:Issue|PR) ON EACH [n.title, n.body]",
+        "CREATE FULLTEXT INDEX shifterDocText IF NOT EXISTS "
+        "FOR (n:DocChunk) ON EACH [n.heading, n.text]",
+        # build_graph.py --reconcile deletes by (label, source_id) -- see RECONCILE_LABELS
+        "CREATE INDEX IF NOT EXISTS FOR (n:RelVal) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:RelValException) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:UnitTest) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:PR) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:WorkflowCommand) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:Warning) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:TestLogRun) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:TestLogRun) ON (n.ib_key)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.source_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.ib_key)",
+        # chat filters test-log problems by IB tag (sanitizer list, named test): 1.8 s over
+        # 538k nodes without it (2026-11-04)
+        "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.ib_tag)",
+        # test-log paste search groups matches by signature: a full scan of ~236k rows took 39s
+        "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.signature_id)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:LogProblem) ON (n.kind, n.in_passed)",
+        "CREATE INDEX IF NOT EXISTS FOR (n:ProblemFirstSeen) ON (n.first_seen_when)",
+        "CREATE FULLTEXT INDEX logProblemText IF NOT EXISTS "
+        "FOR (n:LogProblem) ON EACH [n.summary, n.text]",
+        # every specific name and "<category>|<producer>" key of a test-log problem, matched
+        # whole (whitespace analyzer: no splitting at '::', '_' or '.', no stemming)
+        "CREATE FULLTEXT INDEX logProblemNames IF NOT EXISTS "
+        "FOR (n:LogProblem) ON EACH [n.names_text, n.context_keys_text] "
+        "OPTIONS {indexConfig: {`fulltext.analyzer`: 'whitespace'}}",
     ]
     with driver.session() as s:
         s.run("MATCH (comment:PRComment) SET comment:GitHubComment")

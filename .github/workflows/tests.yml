@@ -1,0 +1,24 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - run: pip install -r requirements.txt
+
+      # Deliberately no Neo4j service here: the suite mocks the driver (see
+      # CLAUDE.md), so running with no database reachable is what catches an
+      # unmocked session.run() call instead of letting it silently pass
+      # because a live DB happened to be up.
+      - run: PYTHONPATH=ingestion python -m unittest discover -s tests
