@@ -1,14 +1,10 @@
-"""DAS_ERROR RelVal status (importer + backfill) and the cross-build "where is workflow X
+"""DAS_ERROR RelVal status (importer) and the cross-build "where is workflow X
 failing" answer. Found 2026-10-15: 38551.85 had DAS_ERROR at step1 in all 250 imported
 runs but was stored as PASSED, and "where is 38551.85 failing?" got the latest IB's
 failure overview while a bare "38551.85" got the "couldn't match that" menu."""
-import json
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import backfill_relval_status
 from build_graph import relval_status
 from server.api_server import _relval_scope_summary, _release_extreme_answer, _workflow_where_failing_answer
 
@@ -20,21 +16,6 @@ class RelvalStatusTests(unittest.TestCase):
         self.assertEqual(relval_status([{"status": "DAS_ERROR"}, {"status": "FAILED"}]), "FAILED")
         self.assertEqual(relval_status([{"status": "PASSED"}]), "PASSED")
         self.assertEqual(relval_status([]), "PASSED")
-
-    def test_backfill_reads_the_same_keys_build_graph_writes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            day = Path(tmp) / "el9_amd64_gcc14" / "2026-10-12-1100"
-            day.mkdir(parents=True)
-            (day / "CMSSW_20_1_X.json").write_text(json.dumps([
-                {"id": "38551.85", "steps": [{"status": "DAS_ERROR"}]},
-                {"id": "1.0", "steps": [{"status": "PASSED"}]},
-                {"id": "2.0", "steps": [{"status": "FAILED"}]},
-            ]))
-            rows = backfill_relval_status.wanted_statuses(Path(tmp))
-        self.assertEqual(rows, [
-            {"key": "CMSSW_20_1_X_2026-10-12-1100:el9_amd64_gcc14:38551.85", "status": "DAS_ERROR"},
-            {"key": "CMSSW_20_1_X_2026-10-12-1100:el9_amd64_gcc14:2.0", "status": "FAILED"},
-        ])
 
     @patch("server.api_server.get_driver")
     def test_summary_counts_das_errors_separately(self, get_driver):

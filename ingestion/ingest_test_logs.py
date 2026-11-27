@@ -1,4 +1,4 @@
-"""Import the IB test-log scan results (fetch_ib_test_logs.py's results/) into Neo4j.
+"""Import the IB test-log scan results (results/, one file per IB, written by merge_test_log_batches.py) into Neo4j.
 
 One results file = one zip of one IB (tag, architecture, GPU/other variant):
 unitTestLogs, addOnTests or pyRelValMatrixLogs. It becomes

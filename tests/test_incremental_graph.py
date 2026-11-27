@@ -22,7 +22,6 @@ from build_graph import (
     relval_default_records,
     relval_exception_records,
 )
-from link_pr_warnings import changed_files_from_patch
 
 
 class IncrementalGraphTests(unittest.TestCase):
@@ -295,14 +294,6 @@ class IncrementalGraphTests(unittest.TestCase):
         records = merged_pr_records(payload)
 
         self.assertEqual(records, [{"target_tag": "B", "number": 3, "author_login": None, "commit_hash": None}])
-
-    def test_patch_parser_keeps_renamed_and_deleted_paths(self):
-        patch = (
-            "diff --git a/Foo/old.py b/Foo/new.py\n"
-            "diff --git a/Bar/deleted.py b/Bar/deleted.py\n"
-        )
-
-        self.assertEqual(changed_files_from_patch(patch), ["Foo/new.py", "Bar/deleted.py"])
 
 
 if __name__ == "__main__":

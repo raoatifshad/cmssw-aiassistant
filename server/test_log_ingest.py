@@ -16,7 +16,7 @@ waiting and a received file is never lost.
   POST /api/test-logs/ingest   receive(): ONE whole result of a build (gzip body), saved
       straight into <results>/. Kept for sending a result by hand.
 
-receive() saves where the copied-zip pipeline (fetch_ib_test_logs.result_path) saves the
+receive() saves where the old copied-zip pipeline (result_path) saved the
 same build, so a scan file replaces that build's earlier result instead of
 adding a second run:
 

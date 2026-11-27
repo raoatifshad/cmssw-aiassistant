@@ -40,7 +40,7 @@ cp .env.example .env          # fill in CERN_API_BASE, CERN_API_KEY; set NEO4J_U
 # Neo4j on bolt://localhost:7688 (the port every command below uses)
 docker run -d --name neo4j -p 7475:7474 -p 7688:7687 \
   -e NEO4J_AUTH=neo4j/<NEO4J_PASSWORD from .env> -v $HOME/neo4j-data:/data docker.io/library/neo4j:5
-#   or the whole local stack (Neo4j, OpenSearch, Logstash, API on :8002): ./start.sh
+#   or the same containers as production (Neo4j, API, worker): see deploy/vm/README.md
 
 uvicorn server.api_server:app --reload --port 8001
 curl http://localhost:8001/api/health
@@ -51,14 +51,14 @@ cmssdt-ib checkout's `.env.development` and restart the Vite dev server.
 
 ## Data sources
 
-| Source | Importer | Production VM (worker) | Developer PC (`scripts/daily_refresh.sh`) |
-|---|---|---|---|
-| Dashboard data: RelVals, unit tests, build status, merged PRs ([cms-sw.github.io](https://github.com/cms-sw/cms-sw.github.io) `data/`) | `ingestion/build_graph.py --cmsrepo` | every hour at :30 | 00:30, 12:30 |
-| RelVal exceptions (Elasticsearch, cms-bot `es-cmssw-exceptions.py`) | `build_graph.py --es-exceptions-json` | 00:30, 12:30 | 00:30, 12:30 |
-| Problems in the raw IB test logs (unit, addOn, RelVal) | `merge_test_log_batches.py` + `ingest_test_logs.py` | every 5 min, from what cmssdt sends (once cms-bot#2908 is merged) | copied from cmssdt9-02 |
-| Shifter documentation ([cmssdt-wiki](https://github.com/cms-sw/cmssdt-wiki)) | `ingest_shifter_docs.py` | 00:30, 12:30 | 00:30, 12:30 |
-| CMSSW GitHub PRs/Issues + PR patches (backup on cmssdt9-02) | `build_graph.py --github-issues`, `ingest_github_patches.py` | not yet (needs a Kerberos service account) | when the backup moved |
-| Clang warnings (`log.html` build logs) | `build_graph.py --clang-root` | no | by hand |
+| Source | Importer | Production VM (worker) |
+|---|---|---|
+| Dashboard data: RelVals, unit tests, build status, merged PRs ([cms-sw.github.io](https://github.com/cms-sw/cms-sw.github.io) `data/`) | `ingestion/build_graph.py --cmsrepo` | every hour at :30 |
+| RelVal exceptions (Elasticsearch, cms-bot `es-cmssw-exceptions.py`) | `build_graph.py --es-exceptions-json` | 00:30, 12:30 |
+| Problems in the raw IB test logs (unit, addOn, RelVal) | `merge_test_log_batches.py` + `ingest_test_logs.py` | every 5 min, from what cmssdt sends (once cms-bot#2908 is merged) |
+| Shifter documentation ([cmssdt-wiki](https://github.com/cms-sw/cmssdt-wiki)) | `ingest_shifter_docs.py` | 00:30, 12:30 |
+| CMSSW GitHub PRs/Issues + PR patches (backup on cmssdt9-02) | `build_graph.py --github-issues`, `ingest_github_patches.py` | not yet (needs a Kerberos service account) |
+| Clang warnings (`log.html` build logs) | `build_graph.py --clang-root` | no (staged by hand) |
 
 All importers are incremental: each source file is hashed (`ImportState` nodes) and
 skipped when unchanged; `--force` reimports. An IB is always the pair
@@ -116,16 +116,14 @@ in `received/`. The worker merges them per IB into `results/`
 (`ingestion/merge_test_log_batches.py`) and imports what changed
 (`ingestion/ingest_test_logs.py`). Details: [deploy/cmssdt/README.md](deploy/cmssdt/README.md).
 
-**Copying from cmssdt9-02 (developer PC):** `cmssdt9-02:/data/sdt/buildlogs/<arch>/www/<day>/<queue>/<IB tag>/`
-holds `unitTestLogs.zip`, `addOnTests.zip` (+ `addOnTests.log`) and
-`pyRelValMatrixLogs.zip` for every IB, deleted by the server after about a week.
-`ingestion/fetch_ib_test_logs.py` copies, scans and deletes the zips one at a time;
-`results/` (a few MB per day) is the durable copy. By hand, with zips you copied yourself:
+The raw zips are on `cmssdt9-02:/data/sdt/buildlogs/<arch>/www/<day>/<queue>/<IB tag>/`
+(`unitTestLogs.zip`, `addOnTests.zip` + `addOnTests.log`, `pyRelValMatrixLogs.zip`), deleted by
+the server after about a week. `results/` (a few MB per day) is the durable copy. To import
+results by hand:
 
 ```bash
-PYTHONPATH=ingestion venv/bin/python ingestion/fetch_ib_test_logs.py --no-server --delete-local
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python \
-  ingestion/ingest_test_logs.py --results <IB-TEST-LOGS>/results
+  ingestion/ingest_test_logs.py --results <results dir>
 ```
 
 One zip by hand, read-only: `PYTHONPATH=ingestion venv/bin/python ingestion/ib_test_log_scanner.py <zip>`.
@@ -184,8 +182,7 @@ PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/i
 
 References, changed files and comment mentions are relevance evidence only, never proof
 that a PR caused or fixed something; every answer that shows them says so.
-`ingestion/link_pr_warnings.py` (PR changed files to Clang warnings) is the one tool that
-calls the GitHub API (`GITHUB_TOKEN`); it is run by hand and is not part of any refresh.
+Nothing here calls the GitHub API: GitHub data comes only from the backup.
 
 ### Clang warnings
 
@@ -238,7 +235,7 @@ NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/prune_old_data.py [--d
 | `CERN_MODEL` | `hf-qwen3-32b-awq` | `glm-5.3-flash-int4` | main model (CERN LLM gateway, `CERN_API_BASE`/`CERN_API_KEY`) |
 | `CERN_REVIEW_MODEL` | `gpt-oss-20b` (code default) | `gpt-oss-20b` | second opinion for the supervisor's quick checks |
 | `ENABLE_AI_SUPERVISOR` | off | on | read every answer against the question (above) |
-| `ENABLE_ROUTER_SHADOW` | off | on | log an LLM classification next to the regex router (`RouterShadowLog`), never used to answer; summary: `ingestion/summarize_router_shadow.py --days 7` |
+| `ENABLE_ROUTER_SHADOW` | off | on | log an LLM classification next to the regex router (`RouterShadowLog`), never used to answer |
 | `ENABLE_CAPABILITY_FALLBACK_TO_LLM` | off | on | when the router picked a capability but no helper understood the phrasing, investigate instead of answering "no imported local evidence" |
 | `ENABLE_DETERMINISTIC_ANSWER_VERIFICATION` | off | on | check each deterministic answer against the question (e.g. "NOT failing" vs "failing"); fails open |
 | `ENABLE_ANSWER_SYNTHESIS` | off | off | rephrase a deterministic answer, only if every number is kept |
@@ -278,11 +275,10 @@ curl -X POST 'http://localhost:8001/api/ingest?source=build-42.jsonl&build=CMSSW
   -H 'Content-Type: application/json' --data-binary @build-42.jsonl
 curl -X POST http://localhost:8001/api/search -H 'Content-Type: application/json' \
   -d '{"question":"Which service emitted timeout errors?"}'
-venv/bin/python ingestion/ingest_json_logs.py big.jsonl --build CMSSW_20_1_X --project-neo4j
 ```
 
-OpenSearch (`OPENSEARCH_URL`) is optional: the local `./start.sh` stack runs it with
-Logstash, the production VM does not, and without it retrieval reads the archive files.
+OpenSearch (`OPENSEARCH_URL`) is optional and not used on the production VM; without it,
+retrieval reads the archive files.
 
 ## Tests and validation
 
@@ -299,10 +295,8 @@ venv/bin/python scripts/validate_test_log_data.py --base-url http://localhost:80
 venv/bin/python scripts/stress_test_bot.py                                   # load test
 ```
 
-On the developer PC, `scripts/daily_refresh.sh` (cron 00:30 and 12:30, `--install-cron`)
-runs the refresh steps, then the live checks, and at night starts `scripts/daily_tester.sh`
-(headless Claude Code with `scripts/tester_prompt.md`). `scripts/refresh_status_page.py`
-shows progress on port 8090. These scripts contain the developer PC's paths.
+Nightly testing on the test machine (a copy of the production data, the live checks
+above, reports) is kept on the separate `tester` branch, not on `master`.
 
 ## Project layout
 
@@ -335,19 +329,14 @@ ingestion/
   ingest_github_patches.py  files each PR touched, from the backup's patch.txt
   ib_test_log_scanner.py the test-log parser (also copied into cms-bot)
   ib_test_log_problems.py   the cms-bot entry point (also copied into cms-bot)
-  fetch_ib_test_logs.py  copy -> scan -> results/ -> delete, from cmssdt9-02
   merge_test_log_batches.py batches from cmssdt -> results/, per IB
   ingest_test_logs.py    results/ -> TestLogRun, LogProblem, ProblemSignature, ProblemFirstSeen
   prune_old_data.py      90-day retention
-  backfill_relval_status.py re-derive RelVal.status from cmsrepo
   generate_shift_summaries.py, log_summary.py  shift digest data
-  revalidate_feedback.py, run_alerts.py, summarize_router_shadow.py  scheduled checks
-  link_pr_warnings.py    PR changed files -> Clang warnings (calls GitHub)
-  ingest_json_logs.py    chunked JSONL importer for Log RAG
+  revalidate_feedback.py, run_alerts.py  scheduled checks
 log_rag/                 Log RAG: models, archive, pipeline, retriever, opensearch
 deploy/vm/               production VM: compose.yaml, worker, backup/restore, setup, runbook
 deploy/cmssdt/           the Jenkins sender for the test-log scan files
-scripts/                 daily refresh, tester, validation scripts, status page
+scripts/                 live validation scripts, question bank, load test
 tests/                   unit tests (mocked Neo4j and LLM)
-docker-compose.yml, start.sh, stop.sh, logstash/   local stack with OpenSearch/Logstash
 ```

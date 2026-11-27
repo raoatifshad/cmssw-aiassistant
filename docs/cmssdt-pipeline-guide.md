@@ -139,9 +139,9 @@ ssh root@cmssdt9-02.cern.ch 'date -u -d @$(cat /data/sdt/SDT/public/github/cms-s
 If that date is old, the backup job itself has not run, and copying adds
 nothing new.
 
-**How it gets here:** the `github` step of `scripts/daily_refresh.sh` pulls
-the backup with your Kerberos ticket (`rsync -a`, no `--delete`) and imports it
-only when `latest.txt` moved, without `--reconcile`. By hand, the same thing is:
+**How it gets here:** the production VM does not import it yet (copying it
+needs a Kerberos login to cmssdt9-02). Copy it with `rsync -a` (never
+`--delete`) and import it, ideally only when `latest.txt` moved:
 
 ```bash
 rsync -a root@cmssdt9-02.cern.ch:/data/sdt/SDT/public/github/cms-sw/cmssw/issues/ \
@@ -189,8 +189,8 @@ The dashboard data only says whether each test passed. The raw logs on
 what happened inside, and the server deletes them after about one week.
 
 ```text
-cmssdt9-02 --rsync--> IB-TEST-LOGS/server-copy/ --fetch_ib_test_logs.py--> results/*.json.gz --ingest_test_logs.py--> Neo4j
-                                   (deleted once scanned)                  (kept, a few MB/day)
+cms-bot on cmssdt (scans the logs it unpacks) --> outbox --send-test-log-scans job--> VM POST /api/test-logs/batch
+  --> received/ --merge_test_log_batches.py--> results/ (one file per IB, kept) --ingest_test_logs.py--> Neo4j
 ```
 
 - `ib_test_log_scanner.py` reads every log line by line and keeps every
@@ -198,17 +198,13 @@ cmssdt9-02 --rsync--> IB-TEST-LOGS/server-copy/ --fetch_ib_test_logs.py--> resul
   reports, assertions, tracebacks and infrastructure errors, with the test
   they belong to and whether it passed. Warnings and plain error lines are
   grouped, and debug output is dropped.
-- `fetch_ib_test_logs.py` keeps a ledger, so nothing is scanned twice. It
-  keeps the local copy of a zip that failed and retries it, and at the end
-  lists every zip the dashboard expects that was never scanned.
+- `merge_test_log_batches.py` merges the received batches per IB into
+  `results/`; a newer scan of a step replaces the older one.
 - `ingest_test_logs.py` stores `TestLogRun`, `LogProblem`,
   `ProblemSignature` and `ProblemFirstSeen` nodes (see
   `current-neo4j-database-structure.md`, section 7).
 
-The copy is a pull from the chatbot host (`rsync root@cmssdt9-02.cern.ch:...`),
-which works for `/data/sdt/buildlogs/` (used daily since 2026-10-12). The exact
-rsync command and the routine are in the README section "IB test logs". Run it
-at least every few days, or logs are lost.
+Details of the sending side: `deploy/cmssdt/README.md`.
 
 ## Incremental Ingestion
 

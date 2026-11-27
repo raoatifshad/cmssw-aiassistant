@@ -123,9 +123,8 @@ are separate evidence types. They must not be summed or treated as equivalent.
 
 ## 7. Test-Log Layer
 
-Imported by `ingestion/ingest_test_logs.py` from the results that
-`ingestion/fetch_ib_test_logs.py` extracts from the raw log zips (see the
-README section "IB test logs"). Its purpose is the problems the dashboard
+Imported by `ingestion/ingest_test_logs.py` from the scan results of the
+raw log zips (see the README section "IB test logs"). Its purpose is the problems the dashboard
 can't see: an exception, crash or sanitizer report inside a test that is
 reported as PASSED.
 

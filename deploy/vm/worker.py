@@ -1,5 +1,4 @@
-"""The VM stack's worker: the scheduled imports that cron + scripts/daily_refresh.sh
-do on the developer PC, as one long-running container.
+"""The VM stack's worker: the scheduled imports, as one long-running container.
 
   every 5 min       testlogs   merge the batches in /data/received into /data/results
                                (merge_test_log_batches.py), import what changed
@@ -11,7 +10,7 @@ do on the developer PC, as one long-running container.
                                no password) -> build_graph.py --es-exceptions-json
                     docs       git update of cmssdt-wiki -> ingest_shifter_docs.py --reconcile
 
-Same rules as daily_refresh.sh: cmsrepo is imported WITHOUT --reconcile (keep >= 90 days;
+Rules: cmsrepo is imported WITHOUT --reconcile (keep >= 90 days;
 cms-sw.github.io drops IBs after ~2 weeks), a failed step is recorded and the next one still
 runs, an empty or broken exceptions export never reaches the graph. One job at a time,
 never two. A refresh slot missed while the container was down (reboot, update) runs as

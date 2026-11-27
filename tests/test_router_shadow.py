@@ -11,7 +11,7 @@ class RouterShadowFlagTests(unittest.TestCase):
         # is not asserted here -- it's a live import of this deployment's
         # actual .env value, and this deployment deliberately sets
         # ENABLE_ROUTER_SHADOW=true to accumulate real router-agreement data
-        # (see ingestion/summarize_router_shadow.py) -- asserting it's False
+        # -- asserting it's False
         # would just be asserting today's .env content, not real behavior.
         self.assertFalse(ANSWER_SYNTHESIS_ENABLED)
 
