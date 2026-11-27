@@ -126,50 +126,39 @@ A raw export provides `issue.json` and `comments.json` data, either in a
 directory or a tar archive. The importer classifies pull requests and ordinary
 Issues, imports their authors and labels, and stores discussion comments.
 
-Unlike `cmsrepo` (git submodule, bumped regularly) and the exceptions feed
-(refreshed via a routine `--es-exceptions-json` run), **this source has no
-automatic refresh** — it drifts until someone manually re-syncs it. Check
-staleness before assuming an answer about "the latest Issue/PR" is current.
-
-**Where the live data lives:** `cmssdt9-02.cern.ch`, path
-`/data/sdt/SDT/public/github/cms-sw/cmssw/issues` (owned by `cmsbuild`; needs
-a `cmsbld`/root shell on that host to read). It's produced by `cms-bot`'s
-`github_backup.py`, which is itself incremental — it only re-fetches issues
-updated since its own checkpoint. That checkpoint lives at
-`issues/latest.txt` on `cmssdt9-02` as a Unix timestamp; decode it to sanity-check
-freshness before syncing:
+**Where the data lives:** `cmssdt9-02.cern.ch`, path
+`/data/sdt/SDT/public/github/cms-sw/cmssw/issues`. It is written by cms-bot's
+`github_backup.py`, which is incremental: it only fetches issues updated since
+its checkpoint, `issues/latest.txt` (a Unix timestamp). Check that date before
+assuming an answer about "the latest Issue/PR" is current:
 
 ```bash
-# on cmssdt9-02
-cat /data/sdt/SDT/public/github/cms-sw/cmssw/issues/latest.txt
-date -d @<value> -u
+ssh root@cmssdt9-02.cern.ch 'date -u -d @$(cat /data/sdt/SDT/public/github/cms-sw/cmssw/issues/latest.txt)'
 ```
 
-If that date isn't recent, the upstream backup job hasn't run — syncing won't
-add anything new until someone re-runs it there.
+If that date is old, the backup job itself has not run, and copying adds
+nothing new.
 
-**Direct inbound SSH from a normal dev machine to `cmssdt9-02` does not
-work** (confirmed: the connection closes mid-GSSAPI-handshake, from both a
-direct attempt and via an `lxplus` jump host) — it looks like `cmssdt9-02`
-restricts inbound SSH to an allowlist that doesn't include general logins.
-The sync has to be **pushed from `cmssdt9-02` outward** instead, which does
-work:
+**How it gets here:** the `github` step of `scripts/daily_refresh.sh` pulls
+the backup with your Kerberos ticket (`rsync -a`, no `--delete`) and imports it
+only when `latest.txt` moved, without `--reconcile`. By hand, the same thing is:
 
 ```bash
-# run this ON cmssdt9-02 (as cmsbld/root), pushing OUT to the chatbot host
-rsync -avz --info=progress2 \
-  /data/sdt/SDT/public/github/cms-sw/cmssw/issues/ \
-  <local-user>@<local-host-ip>:/home/rao/CHAT-BOT-AI/GITHUB-ISSUES/issues/
-```
-
-Then, back on the chatbot host, ingest it:
-
-```bash
+rsync -a root@cmssdt9-02.cern.ch:/data/sdt/SDT/public/github/cms-sw/cmssw/issues/ \
+  /path/to/GITHUB-ISSUES/issues/
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
-  --cmsrepo cmsrepo \
-  --github-issues /home/rao/CHAT-BOT-AI/GITHUB-ISSUES/issues \
-  --reconcile
+  --cmsrepo cmsrepo --github-issues /path/to/GITHUB-ISSUES/issues
+PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_github_patches.py \
+  --github-issues /path/to/GITHUB-ISSUES/issues
 ```
+
+Do not add `--reconcile` here: `cmsrepo` drops IB files after about two weeks,
+and reconciling would delete those IBs' RelVals, unit tests and PRs from the
+graph. Retention is `ingestion/prune_old_data.py`'s job (90 days; PRs and
+Issues are never pruned).
+
+When the importer sees the same PR or Issue twice, it keeps the copy with the
+newer `updated_at`.
 
 Watch the printed `GitHub raw PRs imported: N; issues imported: M; comment
 files imported: K` line — since imports are content-hashed per Issue/PR, `N`
@@ -226,7 +215,10 @@ at least every few days, or logs are lost.
 `ingestion/build_graph.py` hashes every source unit. When a file's hash has
 not changed, the importer skips it. When a source has changed, it replaces only
 the graph records owned by that source. `--reconcile` also removes records for
-previously imported source files that no longer exist.
+previously imported source files that no longer exist. Do not use it for the
+regular refresh: `cms-sw.github.io` drops IB files after about two weeks, so
+`--reconcile` deletes those IBs' RelVals, unit tests and PRs for good. Old data
+is removed by `ingestion/prune_old_data.py` (90 days) instead.
 
 Typical refresh command:
 
@@ -234,8 +226,7 @@ Typical refresh command:
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
   --cmsrepo cmsrepo \
   --github-issues /path/to/cmssw-github-issues.tar.gz \
-  --clang-root /home/rao/CHAT-BOT-AI/CLANG-LOGS \
-  --reconcile
+  --clang-root /path/to/CLANG-LOGS
 ```
 
 Use `--force` only when an intentional complete reprocessing is required.
