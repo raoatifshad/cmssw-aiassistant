@@ -115,3 +115,61 @@ class CategoryInBuildNoteTests(unittest.TestCase):
 
     def test_not_in_the_build(self):
         self.assertIn("no RelVal in", self.note(0, 0))
+
+
+class AllArchComparisonLabelTests(unittest.TestCase):
+    """A section compared against its own previous build is labelled with that build (found 2026-11-27:
+    el9_aarch64 compared against 11-24-2300 under a 11-26-1100 header)."""
+    BEFORE, AFTER, OWN = "CMSSW_20_1_X_2026-11-26-1100", "CMSSW_20_1_X_2026-11-26-2300", "CMSSW_20_1_X_2026-11-24-2300"
+
+    def row(self, tag, failing):
+        return {"tag": tag, "primary_tag": tag, "arch": "el9_aarch64_gcc14", "variant": "primary", "build_warnings": 0,
+                "ignored_warnings": 0, "clang_locations": 0, "clang_occurrences": 0, "relval_total": 956,
+                "relval_failed": len(failing), "relval_errors": 5 + len(failing), "relval_warnings": 2, "unit_test_total": 381,
+                "unit_test_failed": 0, "unit_test_errors": 0,
+                "failing_relvals": [{"workflow_id": w, "name": "W", "errors": 1, "warnings": 1, "exitcode": 1} for w in failing]}
+
+    def test_header_and_status_name_the_build_really_compared(self):
+        after = dict(self.row(self.AFTER, ["1.0"]), relval_warnings=9)   # a change, so a table is drawn
+        driver, _ = _driver_with([after])
+        with patch.object(api_server, "get_driver", return_value=driver), \
+             patch.object(api_server, "get_exit_code_names", return_value={}), \
+             patch.object(api_server, "_variant_previous_tag", return_value=self.OWN), \
+             patch.object(api_server, "_single_ib_comparison_row", return_value=self.row(self.OWN, ["1.0"])):
+            answer = api_server._all_arch_ib_comparison_answer(f"compare {self.BEFORE} and {self.AFTER} all architectures")
+        self.assertIn(f"compared against its own previous build `{self.OWN}`", answer)
+        self.assertIn(f"| Metric | {self.OWN} | {self.AFTER} | Delta |", answer)
+        self.assertNotIn(f"| Metric | {self.BEFORE} |", answer)
+        self.assertIn(f"already failing in `{self.OWN}`", answer)
+
+
+class ArchitecturesOfBuildTests(unittest.TestCase):
+    """ "how many el9 in latest IB?" (found 2026-11-27: only el9_amd64 named, no count)."""
+    TAG = "CMSSW_20_1_X_2026-11-26-2300"
+    ROWS = [{"tag": TAG, "arch": "el8_amd64_gcc14"}, {"tag": TAG, "arch": "el9_amd64_gcc14"},
+            {"tag": TAG, "arch": "el9_aarch64_gcc14"}, {"tag": "CMSSW_20_1_ROOT6_X_2026-11-26-2300", "arch": "el9_aarch64_gcc14"}]
+
+    def ask(self, question, rows=None):
+        driver, _ = _driver_with(rows if rows is not None else self.ROWS)
+        with patch.object(api_server, "get_driver", return_value=driver), \
+             patch.object(api_server, "_latest_ib_records", return_value=[{"tag": self.TAG}]):
+            return api_server._architectures_of_build_answer(question)
+
+    def test_counts_one_family(self):
+        answer = self.ask("how many el9 in latest IB?")
+        self.assertIn("**2 el9 architecture(s)**", answer)
+        self.assertIn("`el9_aarch64_gcc14`: primary, ROOT6", answer)
+        self.assertIn("also `el8_amd64_gcc14`", answer)
+
+    def test_all_architectures(self):
+        self.assertIn("**3 architecture(s)**", self.ask("how many architectures in the latest IB?"))
+
+    def test_a_family_it_lacks_names_the_newest_build_with_it(self):
+        with patch.object(api_server, "_newest_build_with_arch", return_value=("CMSSW_20_1_X_2026-11-24-2300", ["el10_amd64_gcc15"])):
+            answer = self.ask("how many el10 in latest IB?")
+        self.assertIn("no el10 architecture", answer)
+        self.assertIn("`CMSSW_20_1_X_2026-11-24-2300`", answer)
+
+    def test_other_questions_are_left_alone(self):
+        for question in ("what is the latest el9 IB?", "how many relvals failed in the latest IB?", "how many el9 builds failed?"):
+            self.assertIsNone(self.ask(question), question)

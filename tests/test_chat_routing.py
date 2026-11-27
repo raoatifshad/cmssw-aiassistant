@@ -5328,7 +5328,7 @@ class IbComparisonAnswerTests(unittest.TestCase):
         # "still failing" (already failing in the substitute) and cross-references
         # primary only on the after side (primary didn't have it failing before).
         self.assertIn(
-            f"| `700.0` | PrimaryNew | 2 | 2 | Still failing (already failing in `{before_tag}`) | "
+            f"| `700.0` | PrimaryNew | 2 | 2 | Still failing (already failing in `{substitute_tag}`) | "
             f"- | primary (`{after_tag}`) |",
             asan_block,
         )
@@ -5503,7 +5503,7 @@ class IbComparisonAnswerTests(unittest.TestCase):
         # onward, so primary appears in the after-side column only, not before --
         # the symmetric reference is real, not a mirrored copy of primary's row.
         self.assertIn(
-            f"| `500.0` | CrossVariant | 3 | 3 | Still failing (already failing in `{before_tag}`) | "
+            f"| `500.0` | CrossVariant | 3 | 3 | Still failing (already failing in `{asan_before}`) | "
             f"- | primary (`{after_tag}`) |",
             asan_block,
         )

@@ -2420,6 +2420,86 @@ def _requested_release_series(question: str) -> tuple[int, int] | None:
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
+_ARCHS_OF_BUILD_RE = re.compile(
+    r"\bhow\s+many\s+(?:(?:el|slc)\d+|aarch64|arm\w*|amd64|x86\w*|riscv\w*|arch\w*|platforms?)\b|"
+    r"\b(?:which|what|list(?:\s+the)?)\s+(?:(?:el|slc)\d+\s+|aarch64\s+|amd64\s+)?(?:arch\w*|platforms?)\b", re.IGNORECASE)
+
+
+def _newest_build_with_arch(prefix: str, before: str, wanted) -> tuple[str, list[str]] | None:
+    """The newest primary build of a series up to `before` with an architecture `wanted` accepts."""
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE ib.tag STARTS WITH $prefix AND ib.tag <= $before RETURN ib.tag AS tag, ib.arch AS arch "
+                "ORDER BY tag DESC LIMIT 2000", prefix=prefix, before=before)]
+    finally:
+        driver.close()
+    for row in rows:
+        if wanted(row["arch"]):
+            tag = row["tag"]
+            return tag, sorted(r["arch"] for r in rows if r["tag"] == tag and wanted(r["arch"]))
+    return None
+
+
+def _architectures_of_build_answer(question: str) -> str | None:
+    """ "how many el9 in latest IB?": the architectures one build has, optionally of one family, with its sub-IBs on each."""
+    if not _ARCHS_OF_BUILD_RE.search(question):
+        return None
+    tag_match = IB_TAG_RE.search(question)
+    if tag_match:
+        tag = tag_match.group(1)
+    elif re.search(r"\b(?:latest|newest|last)\b", question, re.IGNORECASE):
+        latest = _latest_ib_records(None, _requested_release_series(question))
+        tag = latest[0]["tag"] if latest else None
+    else:
+        return None
+    if not tag:
+        return None
+    primary = tag if re.match(r"CMSSW_\d+_\d+_X_", tag) else None
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = [dict(r) for r in session.run(
+                "MATCH (ib:IB) WHERE ib.tag = $tag OR ($primary IS NOT NULL AND ib.parent_tag = $primary) "
+                "RETURN DISTINCT ib.tag AS tag, ib.arch AS arch", tag=tag, primary=primary)]
+    finally:
+        driver.close()
+    if not rows:
+        return f"No IB `{tag}` is imported."
+    os_word = _OS_FAMILY_RE.search(question)
+    cpu = _arch_family(question)
+    def wanted(arch: str) -> bool:
+        return (not os_word or arch.lower().startswith(os_word.group(1).lower() + "_")) and (not cpu or f"_{cpu}_" in arch)
+    builds: dict[str, list[str]] = {}
+    for row in rows:
+        flavour = re.match(r"CMSSW_\d+_\d+_(\w+?)_X_", row["tag"])
+        builds.setdefault(row["arch"], []).append("primary" if row["tag"] == tag or not flavour else flavour.group(1))
+    all_archs = sorted(builds)
+    archs = [a for a in all_archs if wanted(a)]
+    what = " ".join(w for w in ((os_word.group(1).lower() if os_word else ""), (cpu or "")) if w)
+    label = f"{what} architecture(s)" if what else "architecture(s)"
+    if not archs:
+        text = f"`{tag}` has **no {what} architecture**. It is imported for: " + ", ".join(f"`{a}`" for a in all_archs) + "."
+        series = re.match(r"(CMSSW_\d+_\d+_)", tag)
+        newest = _newest_build_with_arch(series.group(1) + "X_", tag, wanted) if series and primary else None
+        if newest:
+            return text + f" Not every architecture is built every time: the newest `{series.group(1)}X` build with {what} is `{newest[0]}` (" + ", ".join(f"`{a}`" for a in newest[1]) + ")."
+        return text + " An IB's architectures can land hours apart, so one may still come."
+    lines = [f"`{tag}` is imported for **{len(archs)} {label}**: " + ", ".join(f"`{a}`" for a in archs) + "."]
+    others = [a for a in all_archs if a not in archs]
+    if others:
+        lines[0] += f" ({len(all_archs)} in all; also " + ", ".join(f"`{a}`" for a in others) + ".)"
+    lines.append("")
+    lines.append("Builds on each:")
+    for arch in archs:
+        names = sorted(set(builds[arch]), key=lambda n: (n != "primary", n))
+        lines.append(f"- `{arch}`: " + ", ".join(names))
+    lines.append("")
+    lines.append("_An IB's architectures can land hours apart, so one not listed may still come._")
+    return "\n".join(lines)
+
+
 def _latest_ib_answer(question: str) -> str | None:
     """Return the latest imported IB, optionally scoped to an architecture."""
     if not _is_latest_ib_question(question):
@@ -6317,7 +6397,7 @@ def _render_failing_workflows(
         current = later or previous
         name = current["name"]
         if previous and later:
-            status = f"Still failing (already failing in `{before_tag}`)"
+            status = f"Still failing (already failing in `{before.get('tag') or before_tag}`)"   # the build really compared
         elif later:
             status = "Newly failing"
         else:
@@ -6509,7 +6589,8 @@ def _all_arch_ib_comparison_answer(question: str) -> str | None:
             missing = before_tag if not before else after_tag
             return [f"`{missing}` has no imported record here."]
         block = [substitution_note] if substitution_note else []
-        block.extend(_render_metric_deltas(before, after, metrics, before_tag, after_tag))
+        # the builds really compared: a sub-IB's own tag, or its own previous build
+        block.extend(_render_metric_deltas(before, after, metrics, before.get("tag") or before_tag, after.get("tag") or after_tag))
         if "relval_" not in _comparison_missing_categories(before, after):
             block.extend(_render_failing_workflows(
                 before, after, before_tag, after_tag, exit_code_names, variant, all_variants
@@ -21991,6 +22072,9 @@ def _with_partial_build_note(answer: str, question: str) -> str:
     try:
         # the builds the answer is about, in its first lines: a tag deep in a history table isn't its subject, and a note on everything is a note nobody reads
         tags = list(dict.fromkeys(IB_TAG_RE.findall(answer[:400])))[:6]
+        # a comparison's tables name the builds compared
+        tags += [t for t in dict.fromkeys(IB_TAG_RE.findall("\n".join(
+            line for line in answer.splitlines() if line.startswith("| Metric |")))) if t not in tags][:12]
         # a sentence about unit tests not being imported doesn't say the RelVals are partial
         if not tags or _SAYS_PARTIAL_RE.search(re.sub(r"[^\n]*(?<![a-z])unit[-\s]test[^\n]*", "", answer, flags=re.IGNORECASE)):
             return answer
@@ -23144,6 +23228,9 @@ def _chat(req: ChatRequest):
     author_ranking = _pr_author_ranking_answer(original_question)
     if author_ranking:
         return _chat_response(sid, original_question, author_ranking, "deterministic:pr_author_ranking")
+    archs_of_build = _architectures_of_build_answer(question)
+    if archs_of_build:
+        return _chat_response(sid, original_question, archs_of_build, "deterministic:architectures")
     arch_answer = _architectures_answer(question if question != original_question and "still built" in question else original_question)
     if arch_answer:
         return _chat_response(sid, original_question, arch_answer, "deterministic:architectures")
