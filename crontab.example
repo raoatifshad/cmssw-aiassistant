@@ -1,0 +1,6 @@
+# Test machine cron (crontab -e). Adjust the paths. The VM makes its backup at 03:00.
+# 1. copy the VM's newest backup here (script from the chatbot repo, deploy/vm/)
+30 3 * * *          DEST=/path/to/vm-backups /path/to/chatbot-dev/deploy/vm/fetch_backup.sh >/dev/null 2>&1
+@reboot sleep 900 && DEST=/path/to/vm-backups /path/to/chatbot-dev/deploy/vm/fetch_backup.sh >/dev/null 2>&1
+# 2. test dev on that copy (restore, rebuild, checks, tester)
+30 4 * * *          /path/to/tester/nightly.sh >/dev/null 2>&1
