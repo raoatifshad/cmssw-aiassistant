@@ -11,6 +11,14 @@ database, no imports) but exposes the same API shape (`POST /api/chat`,
 `GET /api/health`) so the existing React chat widget works by changing one
 env var (`VITE_CHAT_API_BASE`).
 
+Where it runs: the production VM `cmssdt-chatbot.cern.ch` (Neo4j + API + worker
+containers, `deploy/vm/`, runbook in `deploy/vm/README.md`); a new Puppet-managed VM
+`cmschatbot-01.cern.ch` is being set up (hostgroup `vocmssdt/sdt/cms_chatbot` in
+`ai/it-puppet-hostgroup-vocmssdt`, class `code/manifests/sdt/cms_chatbot.pp`); the
+developer PC runs a local stack on :8002, the daily refresh and the nightly tester.
+`master` is the current code (feature branches were merged into it on 2026-11-27):
+start new work from `master`.
+
 ## Commands
 
 ```bash
@@ -28,9 +36,9 @@ PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/b
   --cmsrepo cmsrepo --clang-root /home/rao/CHAT-BOT-AI/CLANG-LOGS --reconcile
 # add --clear only for a one-time full rebuild; --force to reimport unchanged sources
 
-# the user's actual daily refresh routine (manual, no cron — see "Shifter
-# documentation ingestion" below for why). Always run the cmsrepo half
-# FIRST, since --cmsrepo here also re-ingests cmsrepo's own top-level docs.
+# the daily refresh routine by hand (scripts/daily_refresh.sh runs the same from cron
+# on the PC; the VM worker has its own schedule, see deploy/vm/worker.py). Always run
+# the cmsrepo half FIRST, since --cmsrepo here also re-ingests cmsrepo's own top-level docs.
 cd cmsrepo && git fetch --prune origin master && git reset --hard origin/master \
   && git sparse-checkout reapply && cd ..
 PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/build_graph.py \
@@ -101,7 +109,7 @@ venv/bin/python scripts/validate_bot.py --base-url http://localhost:8002  # non-
 # set to a real logged-in identity).
 venv/bin/python scripts/validate_shift_summary.py
 
-# live question bank: ~200 questions CMSSW people ask (pasted RelVal exceptions and
+# live question bank: ~320 questions CMSSW people ask (pasted RelVal exceptions and
 # test-log problems, unit tests, workflows, PRs/Issues, IB flavours, comparisons,
 # build/Clang, exit codes/terms, follow-ups, typos, misuse), each with checks on its
 # answer plus global ones (dead ends, literal None, raw <tags>, 500s, >15k chars, >30 s).
@@ -115,6 +123,15 @@ venv/bin/python scripts/question_bank.py --check-facts
 # chat finds pasted stored problems (FAIL = exit 1); freshness, noisy "new",
 # fragmented signatures, junk categories (WARN); plus what a shifter sees.
 venv/bin/python scripts/validate_test_log_data.py --base-url http://localhost:8002 --username testshifter
+
+# production VM (details + cheat sheet: deploy/vm/README.md). Login: see that README.
+# update the code there (as kgbot, in /opt/cmssdt-kg-chatbot/deploy/vm): always --no-deps,
+# otherwise podman-compose also recreates Neo4j
+podman compose -p kg build api worker && podman rm -f kg_worker_1 kg_api_1 \
+  && podman compose -p kg up -d --no-deps api worker
+# worker (deploy/vm/worker.py): test-log batches every 5 min, cmsrepo hourly at :30,
+# exceptions + docs at 00:30/12:30; nightly backup 03:00 (deploy/vm/backup.sh), copied to the
+# PC by deploy/vm/fetch_backup.sh (cron 03:30)
 ```
 
 Tests mock the Neo4j driver / LLM client rather than requiring a live
@@ -210,6 +227,17 @@ additionally deletes graph records whose backing source file is gone
   changing detection or normalization, bump `SCANNER_VERSION`, and measure
   "new" generic lines over a week of data -- run-specific text (timestamps,
   hosts, paths) leaking into a signature makes every build look "new".
+  **Second path, inside cms-bot** (cms-sw/cms-bot#2908 open, #2909 merged; the
+  Jenkins job `send-test-log-scans` stays disabled until #2908 is in): cms-bot runs
+  `ib_test_log_problems.py` where it unpacks the logs (RelVals step by step), the
+  sender (`deploy/cmssdt/send_test_log_scans.py`) posts the files to
+  `POST /api/test-logs/batch` (`server/test_log_ingest.py`, token
+  `TEST_LOGS_INGEST_TOKEN`, saved to `received/`), and the VM worker merges them per
+  IB (`ingestion/merge_test_log_batches.py`) into `results/` and imports them.
+  **`ingestion/ib_test_log_scanner.py` and `ingestion/ib_test_log_problems.py` have
+  copies at the top of cms-bot** (Black-formatted, line length 99): a change here,
+  including a `SCANNER_VERSION` bump, must also go to cms-bot as a PR, or the two
+  scan differently. Compare by AST, not byte for byte.
   The zips are deleted after scanning, so old results can't be re-scanned:
   the importer re-signs every stored problem with `current_signature`
   (scanner) instead, and a normalization change only takes effect after
@@ -266,17 +294,11 @@ live during a chat request — and same incremental hashing
 (`source_needs_import`/`mark_source_imported`, reused directly from
 `build_graph.py`) so re-running is cheap.
 
-**There is no cron job for this, or for `build_graph.py` itself** — both are
-refreshed by hand, daily, as one combined routine (see the Commands section
-above). `shifter-wiki`'s own upstream commit history
-(`github.com/cms-sw/cmssdt-wiki/commits`) is never polled or watched; a new
-commit there only reaches the graph once someone runs `git fetch`/`reset`
-on `shifter-wiki/` and re-runs `ingest_shifter_docs.py` — this is a direct
-consequence of the "never call GitHub live" invariant below, not an
-oversight. If this ever needs to run on its own instead of by reminder, it's
-one crontab entry mirroring `ingestion/summarize_router_shadow.py`'s
-existing cron pattern — ask before adding it, since it's a durable
-system-level change.
+It is refreshed on a schedule, together with `build_graph.py`: on the PC by
+`scripts/daily_refresh.sh` (cron 00:30/12:30), on the VM by the worker (00:30/12:30).
+Each run does `git fetch`/`reset` of the wiki clone and re-runs
+`ingest_shifter_docs.py`; GitHub is never queried during a chat request
+(the "never call GitHub live" invariant below).
 
 A real, found-live failure mode worth knowing when touching this: the
 Jenkins-job wiki pages are dozens of near-identical entries back to back
@@ -321,8 +343,8 @@ MERGE/CREATE/DELETE/SET/REMOVE/DROP/`CALL db.`).
    (each returns `None` if it doesn't match) — this is legacy routing
    predating the `RequestPlanner` and still covers many capabilities the
    planner doesn't score yet (PR evidence, exception search, artifact search,
-   etc.). Read the big `if`-chain in `chat()` (~line 2757) to see exact order;
-   first non-`None` match wins.
+   etc.). Read the big `if`-chain in `_chat()` to see exact order (search for
+   `def _chat(`: line numbers move); first non-`None` match wins.
 3. Only if **nothing** matches does it fall through to the LLM path: a
    constrained, non-executable `propose_investigation_plan` call picks a
    registered capability + tool calls (validated by `validate_llm_plan`
@@ -331,7 +353,25 @@ MERGE/CREATE/DELETE/SET/REMOVE/DROP/`CALL db.`).
    `synthesize_evidence_answer` turns the evidence into prose. The LLM is
    never allowed to answer from its own knowledge — only from tool evidence.
 
-Two experimental phases are gated by env vars, each adding a real per-message
+`chat()` wraps this: with `ENABLE_AI_SUPERVISOR=true` it calls
+`_ai_supervised_chat()`, which runs `_chat()` first and then has the LLM read the
+question, the conversation and the answer. An answer that doesn't fit is mapped onto a
+question the lookups answer (`server/question_catalog.py`) or re-investigated with the
+read-only tools under the grounding checks; the quick checks ask `CERN_MODEL` and
+`CERN_REVIEW_MODEL` (default `gpt-oss-20b`) at once. If anything fails, the rules'
+answer stands. Production (`cmssdt-chatbot`): `CERN_MODEL=glm-5.3-flash-int4`, and
+`ENABLE_AI_SUPERVISOR`, `ENABLE_ROUTER_SHADOW`, `ENABLE_CAPABILITY_FALLBACK_TO_LLM`,
+`ENABLE_DETERMINISTIC_ANSWER_VERIFICATION` all **on**; `ENABLE_ANSWER_SYNTHESIS` off.
+`.env.example` has them all off.
+
+Rules-based helpers outside `api_server.py`: `server/github_ask.py` ("is there a
+PR/Issue about X?"), `server/pr_cause.py` ("which PR may have caused this?"),
+`server/paste_diagnosis.py` (reads a pasted CMSSW fatal exception),
+`server/cmssw_source.py` (read-only lookups in a local CMSSW checkout,
+`CMSSW_SOURCE_DIR`, to check what the LLM says about code),
+`server/sample_questions.py` (sample questions and "ask next" suggestions).
+
+Two older phases are gated by env vars, each adding a real per-message
 LLM call: `ENABLE_ROUTER_SHADOW` (logs an independent LLM classification
 against the deterministic planner's choice for later promotion-gate
 comparison, never used to answer — this deployment's `.env` has it **on**,
@@ -461,7 +501,8 @@ contradicted, one grace period if newly undecidable). `search_concepts`
 
 `AlertRule` nodes define threshold checks (`relval_failure_count`,
 `relval_recurrence`, `latest_ib_stalled`, `unittest_failure_count`,
-`build_failure_count`) evaluated on demand via `evaluate_rules()`
+`build_failure_count`, and the regression rules `relval_regression`,
+`unittest_regression`, `build_regression`) evaluated on demand via `evaluate_rules()`
 (`POST /api/alerts/evaluate`), notifying through a `Notifier` protocol
 (currently only `LogNotifier`). There is no `addon_*` rule type yet: the
 dashboard data has no per-test addOn results, and the addOn results now
@@ -479,7 +520,8 @@ does hybrid retrieval (OpenSearch when `OPENSEARCH_URL` is set, filesystem
 evidence scan as the inspectable fallback) surfaced as `citations` in chat
 responses. `ingestion/ingest_json_logs.py` is the chunked importer for large
 JSONL backfills (avoids sending an entire file through `/api/ingest` in one
-request).
+request). The production VM runs no OpenSearch/Logstash (dropped 2026-11-16: they only
+ever held one smoke-test event), so there retrieval is the filesystem fallback.
 
 ## Key invariants (violate these and answers become unsafe/wrong)
 
