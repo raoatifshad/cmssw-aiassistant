@@ -32,7 +32,7 @@ Structural checks, per architecture and per newly-failing/resolved category
 
 Usage:
     venv/bin/python scripts/validate_shift_summary.py [--base-url http://localhost:8002]
-        [--username mrao] [--windows 3]
+        [--username testshifter] [--windows 3]
 
 Requires the API server running with DEV_SHIFTER_LOGIN=true (this script
 logs in via the same /shift/dev-login bypass documented in
@@ -313,7 +313,7 @@ def run(base_url: str, username: str, num_windows: int, num_cycles: int = 3) -> 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://localhost:8001")
-    parser.add_argument("--username", default="mrao", help="Must be in SHIFTER_CERN_USERNAMES.")
+    parser.add_argument("--username", default="testshifter", help="Must be in SHIFTER_CERN_USERNAMES.")
     parser.add_argument("--windows", type=int, default=3, help="Past windows to check per release cycle, beyond the default.")
     parser.add_argument("--cycles", type=int, default=3, help="Newest release cycles to check (highest series first).")
     args = parser.parse_args()

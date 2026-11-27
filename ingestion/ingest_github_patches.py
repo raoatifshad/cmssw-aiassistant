@@ -1,7 +1,7 @@
 """Import which files each CMSSW PR touched, from the patch.txt files of the GitHub backup.
 
     PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python ingestion/ingest_github_patches.py \
-        --github-issues /home/rao/CHAT-BOT-AI/GITHUB-ISSUES/issues [--dry-run out.json] [--force]
+        --github-issues /path/to/GITHUB-ISSUES/issues [--dry-run out.json] [--force]
 
 Each <dir>/patch.txt sits next to the PR's issue.json. It is `git format-patch` output, so it lists every
 commit of the PR: a file changed and then changed back still counts, which is why this is "touched", not the

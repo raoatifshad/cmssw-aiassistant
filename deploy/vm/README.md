@@ -182,7 +182,7 @@ are not lost: the next good run sends everything not yet sent).
 ## Moving the live database here (one-off, done 2026-11-16)
 
 The database remembers the full path of every file it imported (`source_id`). When it moved
-from the developer PC (`/home/rao/...`) to the VM (`/data/sources/...`), `migrate_paths.py`
+from the developer PC (its home folder) to the VM (`/data/sources/...`), `migrate_paths.py`
 rewrote those paths once. It was removed afterwards (2026-11-27); it is in the git history
 (commit f5adcfb) if a database ever moves from a machine with other paths again.
 
@@ -228,7 +228,7 @@ podman unshare rm -rf $DATA_DIR/neo4j/*           # only with Neo4j stopped, and
   `podman unshare tar -C $DATA_DIR -xpf testlogs-<date>.tar`, then start the worker.
   It only adds or replaces files; stop if `results/` there is newer than the tar.
 * Copy outside the VM: `fetch_backup.sh` on the developer PC (cron 03:30 and 15 min after a boot)
-  copies the newest dump and tar to `/home/rao/CHAT-BOT-AI/vm-backups/`, checks the sha256, keeps 3;
+  copies the newest dump and tar to `$DEST` (set in the cron line), checks the sha256, keeps 3;
   `status.txt` there says OK or FAILED. Restored on the PC on 2026-11-23: same node counts.
 * EOS copy is built in but **off** (`BACKUP_EOS_ENABLED=0`). To switch it on, mount
   EOS (or make the folder reachable), set `BACKUP_EOS_ENABLED=1` and

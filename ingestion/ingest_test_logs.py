@@ -16,7 +16,7 @@ sources are never touched by build_graph.py --reconcile (different prefix), and
 results/ is kept, so the graph can always be rebuilt from it.
 
     PYTHONPATH=ingestion NEO4J_URI=bolt://localhost:7688 venv/bin/python \\
-        ingestion/ingest_test_logs.py --results /home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results
+        ingestion/ingest_test_logs.py --results /path/to/results
 """
 import argparse
 import gzip
@@ -266,7 +266,7 @@ def ingest_test_logs(driver, root: Path, force: bool = False) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--results", default="/home/rao/CHAT-BOT-AI/IB-TEST-LOGS/results")
+    parser.add_argument("--results", required=True, help="the results/ folder (on the VM: /data/results)")
     parser.add_argument("--force", action="store_true", help="reimport unchanged results files")
     args = parser.parse_args()
     driver = get_driver()
